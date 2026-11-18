@@ -1,0 +1,320 @@
+{
+  "name": "browser-control",
+  "version": "0.1.0",
+  "description": "Discover, connect to, and drive a real Chromium-based browser over the Chrome DevTools Protocol (CDP). General execute_cdp primitive, evaluate and navigate shortcuts, target discovery/routing, screenshot/PDF materialization, and cross-call CDP event polling.",
+  "entrypoint": "src/index.ts",
+  "delivery": {
+    "cli": true,
+    "mcp": true
+  },
+  "operations": [
+    {
+      "name": "list_browsers",
+      "description": "List running Chromium-based browsers that have remote debugging enabled, with each one's live port.",
+      "inputs": { "type": "object", "properties": {} },
+      "outputs": {
+        "type": "object",
+        "properties": {
+          "browsers": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": { "type": "string" },
+                "port": { "type": "number" },
+                "pid": { "type": "number" },
+                "profileDir": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "connect_browser",
+      "description": "Open and retain the browser-level CDP WebSocket. With no input it finds the live debugging port itself (never guess a port) and uses the preferred browser if one is set. browser picks one by name (chrome, beta, brave) and opens it if it is not running. Idempotent while connected. Asking for a different browser keeps the current connection open in the background, so switching back needs no new Allow prompt.",
+      "inputs": {
+        "type": "object",
+        "properties": {
+          "browser": { "type": "string" },
+          "wsUrl": { "type": "string" },
+          "profileDir": { "type": "string" },
+          "port": { "type": "number" },
+          "host": { "type": "string" },
+          "timeoutMs": { "type": "number" }
+        }
+      },
+      "outputs": {
+        "type": "object",
+        "properties": {
+          "connected": { "type": "boolean" },
+          "via": { "type": "object" },
+          "browserVersion": { "type": "string" }
+        }
+      }
+    },
+    {
+      "name": "disconnect_browser",
+      "description": "Close every retained CDP socket and clear the active route and event buffer. Rarely needed: reconnecting costs the user another Allow prompt.",
+      "inputs": { "type": "object", "properties": {} },
+      "outputs": { "type": "object", "properties": { "connected": { "type": "boolean" } } }
+    },
+    {
+      "name": "get_browser_status",
+      "description": "Report connection, active target routing, buffered event count, and the artifact directory.",
+      "inputs": { "type": "object", "properties": {} },
+      "outputs": {
+        "type": "object",
+        "properties": {
+          "connected": { "type": "boolean" },
+          "browser": { "type": "string" },
+          "port": { "type": "number" },
+          "wsUrl": { "type": "string" },
+          "browserVersion": { "type": "string" },
+          "activeTargetId": { "type": "string" },
+          "activeSessionId": { "type": "string" },
+          "eventsBuffered": { "type": "number" },
+          "alsoConnected": { "type": "array", "items": { "type": "string" } },
+          "artifactDir": { "type": "string" }
+        }
+      }
+    },
+    {
+      "name": "list_targets",
+      "description": "Enumerate CDP targets (tabs, out-of-process iframes, workers). Internal chrome:// and devtools:// URLs are hidden unless includeAll is set.",
+      "inputs": {
+        "type": "object",
+        "properties": {
+          "includeAll": { "type": "boolean" },
+          "types": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "outputs": {
+        "type": "object",
+        "properties": {
+          "targets": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "targetId": { "type": "string" },
+                "type": { "type": "string" },
+                "title": { "type": "string" },
+                "url": { "type": "string" },
+                "attached": { "type": "boolean" },
+                "openerId": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "select_target",
+      "description": "Attach to a target (flattened) and route subsequent target-scoped execute_cdp calls to it. Changes the single active route.",
+      "inputs": {
+        "type": "object",
+        "required": ["targetId"],
+        "properties": { "targetId": { "type": "string" } }
+      },
+      "outputs": {
+        "type": "object",
+        "properties": { "targetId": { "type": "string" }, "sessionId": { "type": "string" } }
+      }
+    },
+    {
+      "name": "clear_target",
+      "description": "Detach routing so target-scoped calls no longer auto-route.",
+      "inputs": { "type": "object", "properties": {} },
+      "outputs": {
+        "type": "object",
+        "properties": {
+          "activeTargetId": { "type": ["string", "null"] },
+          "activeSessionId": { "type": ["string", "null"] }
+        }
+      }
+    },
+    {
+      "name": "execute_cdp",
+      "description": "Call any Chrome DevTools Protocol method (Domain.command) and return its raw result. Browser.*, Target.*, and Extensions.* go to the browser endpoint; other methods route to the active target unless sessionId or targetId is given.",
+      "inputs": {
+        "type": "object",
+        "required": ["method"],
+        "properties": {
+          "method": {
+            "type": "string",
+            "pattern": "^[A-Za-z][A-Za-z0-9_]*\\.[A-Za-z][A-Za-z0-9_]*$"
+          },
+          "params": { "type": "object" },
+          "targetId": { "type": "string" },
+          "sessionId": { "type": "string" },
+          "timeoutMs": { "type": "number" }
+        }
+      },
+      "outputs": { "type": "object", "properties": { "result": {} } }
+    },
+    {
+      "name": "evaluate",
+      "description": "Run JavaScript in the page and return its value directly. Top-level await works, promises are awaited, and const/let can be re-declared between calls. A thrown error fails with JS_EXCEPTION. Wraps Runtime.evaluate.",
+      "inputs": {
+        "type": "object",
+        "required": ["expression"],
+        "properties": {
+          "expression": { "type": "string" },
+          "targetId": { "type": "string" },
+          "timeoutMs": { "type": "number" }
+        }
+      },
+      "outputs": { "type": "object", "properties": { "value": {} } }
+    },
+    {
+      "name": "navigate",
+      "description": "Navigate the target to a URL and wait for its load event. loaded:false means the page was still loading at timeoutMs (default 30000); a failed navigation is an error. Wraps Page.navigate.",
+      "inputs": {
+        "type": "object",
+        "required": ["url"],
+        "properties": {
+          "url": { "type": "string" },
+          "targetId": { "type": "string" },
+          "timeoutMs": { "type": "number" }
+        }
+      },
+      "outputs": {
+        "type": "object",
+        "properties": { "loaded": { "type": "boolean" }, "frameId": { "type": "string" } }
+      }
+    },
+    {
+      "name": "capture_screenshot",
+      "description": "Capture a page screenshot and write it to a file (path, or a unique file in the artifact directory), returning the path, MIME type, and byte size. Wraps Page.captureScreenshot.",
+      "inputs": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" },
+          "format": { "type": "string", "enum": ["png", "jpeg"] },
+          "quality": { "type": "number" },
+          "fullPage": { "type": "boolean" },
+          "clip": {
+            "type": "object",
+            "properties": {
+              "x": { "type": "number" },
+              "y": { "type": "number" },
+              "width": { "type": "number" },
+              "height": { "type": "number" },
+              "scale": { "type": "number" }
+            }
+          },
+          "targetId": { "type": "string" }
+        }
+      },
+      "outputs": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" },
+          "mimeType": { "type": "string" },
+          "bytes": { "type": "number" },
+          "width": { "type": "number" },
+          "height": { "type": "number" },
+          "targetId": { "type": ["string", "null"] }
+        }
+      }
+    },
+    {
+      "name": "capture_pdf",
+      "description": "Render the current page to a PDF file (path, or a unique file in the artifact directory), returning the path and byte size. Wraps Page.printToPDF.",
+      "inputs": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" },
+          "printBackground": { "type": "boolean" },
+          "landscape": { "type": "boolean" },
+          "paperWidth": { "type": "number" },
+          "paperHeight": { "type": "number" },
+          "marginTop": { "type": "number" },
+          "marginBottom": { "type": "number" },
+          "marginLeft": { "type": "number" },
+          "marginRight": { "type": "number" },
+          "pageRanges": { "type": "string" },
+          "scale": { "type": "number" },
+          "preferCSSPageSize": { "type": "boolean" },
+          "targetId": { "type": "string" }
+        }
+      },
+      "outputs": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" },
+          "mimeType": { "type": "string" },
+          "bytes": { "type": "number" },
+          "targetId": { "type": ["string", "null"] }
+        }
+      }
+    },
+    {
+      "name": "read_events",
+      "description": "Drain buffered CDP events collected across operations, optionally filtered by method, target, or session. Events only arrive after the relevant domain is enabled via execute_cdp.",
+      "inputs": {
+        "type": "object",
+        "properties": {
+          "method": { "type": "string" },
+          "targetId": { "type": "string" },
+          "sessionId": { "type": "string" },
+          "sinceSeq": { "type": "number" },
+          "limit": { "type": "number" },
+          "clear": { "type": "boolean" }
+        }
+      },
+      "outputs": {
+        "type": "object",
+        "properties": {
+          "events": { "type": "array", "items": { "type": "object" } },
+          "nextSeq": { "type": "number" },
+          "dropped": { "type": "number" }
+        }
+      }
+    },
+    {
+      "name": "wait_for_event",
+      "description": "Wait until the next CDP event matching a method (and optional shallow params subset) arrives, or until timeout. A timeout is a normal found:false result, not an error.",
+      "inputs": {
+        "type": "object",
+        "required": ["method"],
+        "properties": {
+          "method": { "type": "string" },
+          "match": { "type": "object" },
+          "targetId": { "type": "string" },
+          "sessionId": { "type": "string" },
+          "timeoutMs": { "type": "number" },
+          "consumeBuffer": { "type": "boolean" }
+        }
+      },
+      "outputs": {
+        "type": "object",
+        "properties": {
+          "found": { "type": "boolean" },
+          "event": { "type": "object" },
+          "timedOut": { "type": "boolean" },
+          "waitedMs": { "type": "number" }
+        }
+      }
+    }
+  ],
+  "config": {
+    "requiredEnv": [],
+    "optionalEnv": [
+      "BROWSER_CONTROL_BROWSER",
+      "BROWSER_CDP_WS_URL",
+      "BROWSER_PROFILE_DIR",
+      "BROWSER_CDP_TIMEOUT_MS",
+      "BROWSER_CDP_CALL_TIMEOUT_MS",
+      "BROWSER_ARTIFACT_DIR",
+      "BROWSER_EVENT_BUFFER_SIZE"
+    ],
+    "notes": "No credentials. The browser must have remote debugging enabled and must have granted the connection (chrome://inspect#remote-debugging, click Allow). All variables are optional overrides."
+  },
+  "state": {
+    "kind": "external-service",
+    "location": "BROWSER_ARTIFACT_DIR or the OS temp directory (browser-control/)",
+    "notes": "No durable capability state. The CDP connection, active target route, and bounded event buffer live in-process and are released by dispose(). Durable browser state (tabs, cookies, storage) lives in the browser, not here; screenshots/PDFs are written to an absolute artifact directory."
+  }
+}

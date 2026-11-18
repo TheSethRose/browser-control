@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# One shared background process holds the browser connections, so Chrome's "Allow remote
+# debugging" prompt appears once per browser, not once per call or per agent session.
+# Every command re-uses that process and starts it only if it is not running.
+#
+#   browser-control-daemon tabs                    list tabs; * marks the selected one
+#   browser-control-daemon eval '<js>' [targetId]  run JavaScript, print its value ('-' reads stdin)
+#   browser-control-daemon nav <url> [targetId]    navigate and wait for load
+#   browser-control-daemon call <op> ['<json>']    any operation, JSON in and out
+#   browser-control-daemon start [browser]         switch browser by name (chrome, beta, brave);
+#                                                  opens it if needed. Never pass a port.
+#   browser-control-daemon default [browser]       show or set the default browser
+#   browser-control-daemon ops | status
+#   browser-control-daemon stop --force            ONLY when the user asks: drops every approved
+#                                                  connection, so the user must click Allow again
+#
+# eval/nav/tabs print plain text; a failure prints {"ok":false,"error":…} and exits 1.
+set -euo pipefail
+here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+tmp="${TMPDIR:-/tmp}"
+dir="${BROWSER_CONTROL_DAEMON_DIR:-${tmp%/}/browser-control-daemon}"
+sock="$dir/sock"; log="$dir/daemon.log"; lock="$dir/starting"
+
+fail() { echo '{"ok":false,"error":{"code":"'"$1"'","message":"'"$2"'"}}'; exit 1; }
+
+# req <METHOD> <path> [body]: print the reply; exit status 0 ok, 1 failed, 7 not running.
+req() {
+  local rc=0
+  printf '%s' "${3:-}" | curl -sS --fail-with-body --unix-socket "$sock" -X "$1" \
+    --data-binary @- "http://daemon/$2" 2>/dev/null || rc=$?
+  case $rc in 0) ;; 22) return 1 ;; *) return 7 ;; esac
+}
+up() { req GET status >/dev/null; }
+
+# Start the daemon process if it is not running. Safe to call from several agents at once.
+ensure() {
+  up && return 0
+  command -v bun >/dev/null 2>&1 || { echo "browser-control-daemon: bun is required (https://bun.sh)" >&2; exit 127; }
+  mkdir -p "$dir"; chmod 700 "$dir"
+  # Drop a lock left by a start that died, then let only one caller start the process.
+  find "$lock" -maxdepth 0 -mmin +1 -exec rmdir {} \; 2>/dev/null || true
+  if mkdir "$lock" 2>/dev/null; then
+    up || { rm -f "$sock"; nohup bun "$here/../runtime/cli.js" --serve "$sock" >"$log" 2>&1 & }
+  fi
+  for _ in $(seq 100); do up && break; sleep 0.05; done
+  rmdir "$lock" 2>/dev/null || true
+  up || fail DAEMON_START_FAILED "daemon did not start; see $log. Tell the user; do not work around it."
+}
+# run <METHOD> <path> [body]: ensure the daemon, then make the request. The daemon connects
+# to the browser by itself on the first call that needs it.
+run() { ensure; req "$@" || exit 1; }
+
+target() { [[ -n "${1:-}" ]] && printf '?t=%s' "$1" || true; }
+body() { if [[ "$1" == "-" ]]; then cat; else printf '%s' "$1"; fi; }
+usage() { sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; }
+
+case "${1:-}" in
+  start)
+    case "${2:-}" in
+      "") input='{"timeoutMs":60000}' ;;
+      *[!0-9]*) input='{"browser":"'"${2//[\"\\]/}"'","timeoutMs":60000}' ;;
+      *) input='{"port":'"$2"',"timeoutMs":60000}' ;;
+    esac
+    run POST call/connect_browser "$input"
+    ;;
+  eval) run POST "eval$(target "${3:-}")" "$(body "${2:?usage: browser-control-daemon eval '<js>' [targetId]}")" ;;
+  nav) run POST "nav$(target "${3:-}")" "${2:?usage: browser-control-daemon nav <url> [targetId]}" ;;
+  tabs | ops) run GET "$1" ;;
+  call) run POST "call/${2:?usage: browser-control-daemon call <operation> ['<json>']}" "${3:-}" ;;
+  default)
+    file="${XDG_CONFIG_HOME:-$HOME/.config}/browser-control/default-browser"
+    if [[ -n "${2:-}" ]]; then mkdir -p "$(dirname "$file")"; printf '%s\n' "$2" >"$file"; fi
+    cat "$file" 2>/dev/null || echo "(none: the first browser with remote debugging on is used)"
+    ;;
+  status) req GET status || echo '{"ok":true,"data":{"running":false}}' ;;
+  stop)
+    [[ "${2:-}" == "--force" ]] || fail STOP_REFUSED "stopping drops every approved browser connection and the user must click Allow again. Nothing is fixed by restarting. Only if the user asked: stop --force"
+    req POST stop >/dev/null || true; echo '{"ok":true,"data":{"running":false}}'
+    ;;
+  help | -h | --help) usage ;;
+  *) usage; exit 2 ;;
+esac

@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Launch the bundled browser-control MCP server over stdio. Requires Bun.
+set -euo pipefail
+here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+command -v bun >/dev/null 2>&1 || { echo "browser-control-mcp: bun is required (https://bun.sh)" >&2; exit 127; }
+exec bun "$here/../runtime/mcp.js" "$@"

@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# browser-control CLI. An operation call goes through the shared daemon, so it re-uses the
+# approved browser connection instead of opening a new one (a new one makes the user click
+# Allow in Chrome). Flags (--list, --help, --session, --init) run the bundled CLI directly.
+set -euo pipefail
+here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+if [[ $# -gt 0 && "$1" != -* && "$1" != help && "$1" != operations ]]; then
+  exec "$here/browser-control-daemon" call "$@"
+fi
+command -v bun >/dev/null 2>&1 || { echo "browser-control: bun is required (https://bun.sh)" >&2; exit 127; }
+exec bun "$here/../runtime/cli.js" "$@"

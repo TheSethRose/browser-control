@@ -1,0 +1,43 @@
+{
+  "name": "browser-control",
+  "version": "0.1.0",
+  "description": "Drive a real Chromium-based browser over the Chrome DevTools Protocol: connect, inspect, evaluate, navigate, screenshot, and poll events, as a CLI, an MCP server, or a shared daemon.",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TheSethRose/browser-control.git"
+  },
+  "homepage": "https://github.com/TheSethRose/browser-control#readme",
+  "bugs": {
+    "url": "https://github.com/TheSethRose/browser-control/issues"
+  },
+  "keywords": [
+    "chrome",
+    "chromium",
+    "cdp",
+    "devtools-protocol",
+    "browser-automation",
+    "mcp",
+    "agent"
+  ],
+  "type": "module",
+  "bin": {
+    "browser-control": "./cli.ts"
+  },
+  "scripts": {
+    "cli": "bun ./cli.ts",
+    "mcp": "bun ./mcp.ts",
+    "daemon": "bun ./cli.ts --serve",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "build:skill": "mkdir -p .agents/skills/browser-control/runtime/src && bun build cli.ts --target bun --outfile .agents/skills/browser-control/runtime/cli.js && bun build mcp.ts --target bun --outfile .agents/skills/browser-control/runtime/mcp.js && cp capability.json README.md .agents/skills/browser-control/runtime/ && cp src/*.ts .agents/skills/browser-control/runtime/src/"
+  },
+  "dependencies": {
+    "@agent-software/core": "file:../agent-software/core"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.4",
+    "bun-types": "^1.4.2",
+    "typescript": "^5.9.3"
+  }
+}

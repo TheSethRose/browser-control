@@ -1,0 +1,3 @@
+interface:
+  display_name: "Browser Control"
+  short_description: "Drive a Chromium browser over CDP: sessions, input, network, artifacts"
