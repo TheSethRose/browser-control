@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "description": "Drive a real Chromium-based browser over the Chrome DevTools Protocol: connect, inspect, evaluate, navigate, screenshot, and poll events, as a CLI, an MCP server, or a shared daemon.",
   "private": true,
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/TheSethRose/browser-control.git"

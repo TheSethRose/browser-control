@@ -271,4 +271,4 @@ bun run build:skill # after changing src/, cli.ts, daemon.ts or capability.json
 
 `@agent-software/core` comes from the `agent-software` copy next to this one. That
 repository is the only source for the runtime. This one holds no copy of it. Work
-conventions are in [AGENTS.md](AGENTS.md). This repository is not licensed for distribution.
+conventions are in [AGENTS.md](AGENTS.md). The code is under the [MIT license](LICENSE).
