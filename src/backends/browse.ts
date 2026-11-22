@@ -79,6 +79,8 @@ export function createBrowseBackend(run: Runner = runBrowse): Backend {
 
     handles(op, input, isActive) {
       if (!OPS.has(op)) return false;
+      // Let CDP's input validation report a missing url.
+      if (op === "navigate" && (typeof input["url"] !== "string" || input["url"] === "")) return false;
       if (op === "select_target") return tabOf(input["targetId"]) !== undefined;
       if (tabOf(input["targetId"]) !== undefined) return true;
       if (input["targetId"] !== undefined) return false; // a CDP tab
