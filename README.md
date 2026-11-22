@@ -16,12 +16,22 @@ The same code runs three ways:
 - A standalone MCP server with plain tool names, for any MCP client.
 - A command-line tool that starts one process per call, for scripts and shells.
 
+## Set it up with your agent
+
+Paste this into Claude Code, Codex, opencode or another coding agent:
+
+```text
+Read https://github.com/TheSethRose/browser-control and install its browser-control skill for yourself, including Bun if it's missing. Then help me turn on remote debugging in my browser and test it by listing my open tabs.
+```
+
+Your browser will ask you to allow the connection once. Click Allow.
+
 ## Requirements
 
+To use the skill you need only Bun and a browser. The skill ships a prebuilt runtime, so it
+works from a fresh clone.
+
 - [Bun](https://bun.sh), the only runtime dependency.
-- A copy of the private `agent-software` repository in the folder next to this one. It has
-  the same GitHub owner as this repository and provides `@agent-software/core`
-  (`"@agent-software/core": "file:../agent-software/core"`).
 - A Chromium-based browser with remote debugging turned on. In current Chrome, open
   `chrome://inspect/#remote-debugging` and check **"Allow remote debugging for this browser
   instance"**. Other Chromium browsers have the same switch, or accept the
@@ -37,13 +47,17 @@ optional environment variables.
 
 ## Install
 
-The repository is private. Clone both repositories into the same folder so the
-`agent-software` dependency resolves:
+To use the skill, clone this repository and link the skill folder (see [Skill](#skill)):
 
 ```bash
-# <owner> is the GitHub account that hosts both repositories
-gh repo clone <owner>/agent-software
-gh repo clone <owner>/browser-control
+git clone https://github.com/TheSethRose/browser-control.git
+```
+
+To work on the code, you also need the private `agent-software` repository, cloned into the
+same parent folder. It provides `@agent-software/core`
+(`"@agent-software/core": "file:../agent-software/core"`). Then run:
+
+```bash
 cd browser-control
 bun install
 ```
@@ -165,10 +179,11 @@ All three run the same code in `src/`.
   downloads, artifacts, inspection, sessions and backends.
 - `scripts/`, which holds the daemon client.
 
-Copy or symlink the folder into your agent's skills folder:
+Copy or symlink the folder into your agent's skills folder. For Claude Code that is
+`~/.claude/skills`. Many other agents read `~/.agents/skills`. From the repository folder:
 
 ```bash
-ln -s "$PWD/.agents/skills/browser-control" ~/.agents/skills/browser-control
+ln -s "$PWD/.agents/skills/browser-control" ~/.claude/skills/browser-control
 ```
 
 The `runtime/` folder inside it is a prebuilt copy of this repository, so the skill works
@@ -256,5 +271,4 @@ bun run build:skill # after changing src/, cli.ts, daemon.ts or capability.json
 
 `@agent-software/core` comes from the `agent-software` copy next to this one. That
 repository is the only source for the runtime. This one holds no copy of it. Work
-conventions are in [AGENTS.md](AGENTS.md). This repository is private and not licensed for
-distribution.
+conventions are in [AGENTS.md](AGENTS.md). This repository is not licensed for distribution.
