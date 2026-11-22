@@ -25,6 +25,11 @@ One implementation ships three ways:
   `chrome://inspect/#remote-debugging` and check **"Allow remote debugging for this browser
   instance"**. Other Chromium browsers expose the same switch, or accept a
   `--remote-debugging-port` launch flag.
+- Optional: [opencode browse](https://opencode.ai/product/browse)
+  ([GitHub](https://github.com/anomalyco/browse)), a browser extension plus the `browse` CLI.
+  browser-control uses it only when it is installed, the extension is connected to its relay,
+  and `browse` is listed in the [backend order](#backends). Otherwise everything runs over
+  DevTools as usual.
 
 No API keys, accounts, or config files. Optional environment overrides are listed under
 [Configuration](#configuration).
@@ -194,8 +199,10 @@ its line. `src/backends/router.ts` picks a backend per call from the order above
 - While a backend's tab is selected, a tab operation it lacks fails with a clear message
   rather than acting on a different DevTools tab.
 
-`browse` ([opencode browse](https://opencode.ai/product/browse), its extension and `browse`
-CLI) runs `navigate`, `evaluate`, `capture_screenshot` and tab selection with no debugging
+`browse` ([opencode browse](https://opencode.ai/product/browse),
+[GitHub](https://github.com/anomalyco/browse)) is optional. It is used only when its `browse` CLI
+is installed, its extension is connected, and the order lists it (for example `browse,cdp`); if
+the CLI is missing or the extension isn't connected, calls fall back to DevTools. It runs `navigate`, `evaluate`, `capture_screenshot` and tab selection with no debugging
 port and no Allow click. Its tabs open in the background and it only sees tabs it opened or
 the user lent it. Everything else (`execute_cdp`, `capture_pdf`, events) stays on DevTools.
 The order is read on every call, so changing it needs no restart.

@@ -1,7 +1,10 @@
 # Backends: browse and DevTools
 
 The runtime can reach the browser two ways. DevTools (`cdp`) is the daemon's approved CDP
-connection. `browse` is opencode's browse extension, driven through its `browse` CLI. The
+connection. `browse` is opencode's browse extension
+([site](https://opencode.ai/product/browse), [GitHub](https://github.com/anomalyco/browse)),
+driven through its `browse` CLI. It is used only when the CLI is installed and the extension
+is connected; otherwise calls fall back to DevTools. The
 order lives in `~/.config/browser-control/backends` (or `BROWSER_CONTROL_BACKENDS`), for
 example `browse,cdp`, and is read on every call. `call get_browser_status` shows the order
 and which backend owns the current tab.

@@ -1,6 +1,7 @@
 /**
  * The `browse` backend: drives the browser through opencode's browse extension
- * (https://opencode.ai/product/browse) by calling its `browse` CLI.
+ * (https://opencode.ai/product/browse, https://github.com/anomalyco/browse) by calling its
+ * `browse` CLI. It is optional: used only when the CLI is installed and the extension connected.
  *
  * It needs no remote-debugging port and no per-connection "Allow" click, and its tabs open
  * in the background. It only sees tabs it opened or the user lent it, and it has no raw CDP
