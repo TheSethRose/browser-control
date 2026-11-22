@@ -1,42 +1,44 @@
 # browser-control
 
-Drive a real, signed-in Chromium browser over the [Chrome DevTools
-Protocol](https://chromedevtools.github.io/devtools-protocol/) — connect, pick a tab,
-inspect the DOM, run JavaScript, click and type, handle iframes and dialogs, watch network
-traffic, scroll, download, and capture screenshots and PDFs.
+browser-control drives the Chromium browser you already use over the [Chrome DevTools
+Protocol](https://chromedevtools.github.io/devtools-protocol/) (CDP). It can connect, pick a
+tab, read the DOM, run JavaScript, click and type, handle iframes and dialogs, watch network
+traffic, scroll, download files and save screenshots and PDFs.
 
-It talks to the browser you are already using, with your logins, extensions, and open tabs.
-There is no headless bundle and no throwaway profile. Chrome, Chromium, Edge, Brave, Arc,
-Vivaldi, Opera, Comet, and Canary all work.
+It works in your real browser, with your logins, extensions and open tabs. It doesn't use a
+headless browser or a throwaway profile. Chrome, Chromium, Edge, Brave, Arc, Vivaldi, Opera,
+Comet and Canary all work.
 
-One implementation ships three ways:
+The same code runs three ways:
 
-- **Shared daemon** (default for agents) — one long-lived process holds the connection, so
-  Chrome's "Allow remote debugging?" prompt appears once per browser instead of once per call.
-- **Standalone MCP server** — plain tool names, for any MCP client.
-- **Named CLI** — one process per call, for scripts and shells.
+- A shared daemon, the default for agents. One long-running process holds the connection,
+  so Chrome asks "Allow remote debugging?" once per browser instead of once per call.
+- A standalone MCP server with plain tool names, for any MCP client.
+- A command-line tool that starts one process per call, for scripts and shells.
 
 ## Requirements
 
-- [Bun](https://bun.sh) — the only runtime dependency.
-- A sibling checkout of the private `agent-software` repository (same GitHub owner as this one), which provides `@agent-software/core`
+- [Bun](https://bun.sh), the only runtime dependency.
+- A copy of the private `agent-software` repository in the folder next to this one. It has
+  the same GitHub owner as this repository and provides `@agent-software/core`
   (`"@agent-software/core": "file:../agent-software/core"`).
-- A Chromium-based browser with remote debugging allowed. In current Chrome, open
+- A Chromium-based browser with remote debugging turned on. In current Chrome, open
   `chrome://inspect/#remote-debugging` and check **"Allow remote debugging for this browser
-  instance"**. Other Chromium browsers expose the same switch, or accept a
+  instance"**. Other Chromium browsers have the same switch, or accept the
   `--remote-debugging-port` launch flag.
 - Optional: [opencode browse](https://opencode.ai/product/browse)
-  ([GitHub](https://github.com/anomalyco/browse)), a browser extension plus the `browse` CLI.
-  browser-control uses it only when it is installed, the extension is connected to its relay,
-  and `browse` is listed in the [backend order](#backends). Otherwise everything runs over
-  DevTools as usual.
+  ([GitHub](https://github.com/anomalyco/browse)), a browser extension with a `browse`
+  command-line tool. browser-control uses it only when three things are true. The `browse`
+  command is installed. The extension is connected to its relay. `browse` is listed in the
+  [backend order](#backends). Otherwise everything runs over DevTools.
 
-No API keys, accounts, or config files. Optional environment overrides are listed under
-[Configuration](#configuration).
+You need no API keys, accounts or config files. [Configuration](#configuration) lists the
+optional environment variables.
 
 ## Install
 
-Private repository — clone both, side by side, so the sibling dependency resolves:
+The repository is private. Clone both repositories into the same folder so the
+`agent-software` dependency resolves:
 
 ```bash
 # <owner> is the GitHub account that hosts both repositories
@@ -46,8 +48,8 @@ cd browser-control
 bun install
 ```
 
-That is enough to run `bun ./cli.ts` and `bun ./mcp.ts`. To get the `browser-control` command
-on your `PATH`:
+You can now run `bun ./cli.ts` and `bun ./mcp.ts`. To put the `browser-control` command on
+your `PATH`, run:
 
 ```bash
 bun link
@@ -55,8 +57,9 @@ bun link
 
 ## Quick start
 
-The daemon starts itself on the first command that needs it, connects on demand, and
-rediscovers the port if the browser restarts. You never manage the connection.
+The daemon starts on the first command that needs it and connects when a command needs a
+browser. If the browser restarts, the daemon finds the new port. You never manage the
+connection.
 
 ```bash
 BCD=./.agents/skills/browser-control/scripts/browser-control-daemon
@@ -69,40 +72,40 @@ $BCD call execute_cdp '{"method":"Network.enable"}'
 $BCD ops                                   # every operation with its input names
 ```
 
-Then compose procedures from the skill references — tabs, frames, input, dialogs, network,
-scrolling, downloads, cookies, artifacts. Those are workflows over `call`, not extra
-operations.
+For longer tasks, follow the skill's reference files for tabs, frames, input, dialogs,
+network, scrolling, downloads, cookies and artifacts. Each one is a set of steps built from
+`call`. None of them adds an operation.
 
-**Every new connection costs the user a click.** Chrome prompts the person at the keyboard
-to approve remote debugging for each new connection. The daemon already holds an approved
-one, so don't restart it, don't stop it, don't disconnect, and never pass a port. If a
-command waits and then reports a timeout, the user has not clicked Allow yet — ask them to,
-then run the same command again.
+Each new connection makes the user click Allow. Chrome asks the person at the keyboard to
+approve every new remote debugging connection. The daemon already holds an approved one. So
+don't restart it, stop it or disconnect it. Never pass a port. If a command waits and
+then reports a timeout, the user hasn't clicked Allow yet. Ask them to, then run the same
+command again.
 
 ## Operations
 
-`execute_cdp` is the general primitive. The rest exist where a raw protocol call is
-insufficient (binary artifacts, cross-call event state) or where writing it by hand is
-disproportionate (`evaluate`, `navigate`).
+`execute_cdp` sends any CDP command. The other operations exist for two reasons. Some jobs
+need more than one raw call, like writing a binary file or keeping events between calls.
+Others, like `evaluate` and `navigate`, would take too much code to write by hand each time.
 
-| Operation | Purpose |
+| Operation | What it does |
 | --- | --- |
-| `list_browsers` | List running Chromium browsers with remote debugging and their live ports. |
-| `connect_browser` | Open and retain the browser-level CDP WebSocket. Finds the live port itself; `browser` picks one by name and opens it if needed. |
-| `disconnect_browser` | Close the socket and clear route/buffer. |
-| `get_browser_status` | Connection, active route, buffered event count, artifact dir. |
-| `list_targets` | Enumerate targets (pages, OOPIFs, workers); hides `chrome://`/`devtools://`. |
-| `select_target` | Attach (flattened) and route target-scoped calls to one target. |
-| `clear_target` | Detach routing. |
-| `execute_cdp` | Call any `Domain.command` and return its raw result. |
-| `evaluate` | Run JavaScript and return its value (top-level await, promises awaited). |
-| `navigate` | Navigate and wait for the load event. |
-| `capture_screenshot` | Write a page screenshot to a file; return path/MIME/bytes. |
-| `capture_pdf` | Write the page as a PDF file; return path/bytes. |
-| `read_events` | Drain buffered CDP events across operations. |
-| `wait_for_event` | Wait for the next matching event, or time out (`found:false`). |
+| `list_browsers` | Lists running Chromium browsers that allow remote debugging, with their live ports. |
+| `connect_browser` | Opens the browser's CDP WebSocket and keeps it open. It finds the live port itself. `browser` picks one by name and opens it if needed. |
+| `disconnect_browser` | Closes the socket and clears the selected tab and the event buffer. |
+| `get_browser_status` | Shows the connection, the selected tab, the number of buffered events and the artifact folder. |
+| `list_targets` | Lists targets (pages, out-of-process iframes and workers). It hides `chrome://` and `devtools://` pages. |
+| `select_target` | Attaches to one target and sends later tab calls to it. |
+| `clear_target` | Stops sending calls to the selected target. |
+| `execute_cdp` | Calls any `Domain.command` and returns the raw result. |
+| `evaluate` | Runs JavaScript and returns its value. Top-level `await` works and promises are awaited. |
+| `navigate` | Navigates and waits for the load event. |
+| `capture_screenshot` | Saves a screenshot to a file and returns its path, type and size. |
+| `capture_pdf` | Saves the page as a PDF and returns its path and size. |
+| `read_events` | Returns and clears the CDP events buffered since the last read. |
+| `wait_for_event` | Waits for the next matching event. On timeout it returns `found:false`. |
 
-Typical flow:
+A typical flow:
 
 ```text
 connect_browser -> list_targets -> select_target
@@ -110,127 +113,148 @@ connect_browser -> list_targets -> select_target
  -> execute_cdp(Network.enable) -> read_events
 ```
 
-## Delivery surfaces
+## Ways to run it
 
-- **Daemon** (`cli.ts --serve <socket>`, implemented in `daemon.ts`; client
-  `.agents/skills/browser-control/scripts/browser-control-daemon`). One long-lived process
-  serves requests over a Unix socket. The client is a thin `curl` wrapper with `start`, `eval`,
-  `nav`, `tabs`, `call`, `ops`, `default`, `status`, and `stop --force`. Every command starts
-  the daemon if it is not running, and the daemon connects on the first call that needs a
-  browser. It keeps one connection per browser, rediscovers the port after a browser restart,
-  and refuses `disconnect_browser` and a bare `stop`, because each new connection costs the
-  user an Allow click. This is the default for agents.
-- **Standalone MCP** (`mcp.ts`) — one server, plain tool names (`list_browsers`,
-  `connect_browser`, `execute_cdp`): `bun ./mcp.ts`. Register it with any MCP client, e.g.
+### Daemon
 
-  ```json
-  {
-    "mcpServers": {
-      "browser-control": { "command": "bun", "args": ["/absolute/path/to/browser-control/mcp.ts"] }
-    }
+The daemon is `cli.ts --serve <socket>`, built in `daemon.ts`. Its client is
+`.agents/skills/browser-control/scripts/browser-control-daemon`, a small `curl` wrapper with
+these commands: `start`, `eval`, `nav`, `tabs`, `call`, `ops`, `default`, `status` and
+`stop --force`.
+
+One long-running process answers requests over a Unix socket. Every command starts the
+daemon if it isn't running. The daemon connects on the first call that needs a browser. It
+keeps one connection per browser and finds the new port after a browser restart. It refuses
+`disconnect_browser` and a plain `stop`, because each new connection makes the user click
+Allow. Agents use the daemon by default.
+
+### Standalone MCP server
+
+`mcp.ts` is one MCP server with plain tool names like `list_browsers`, `connect_browser` and
+`execute_cdp`. Start it with `bun ./mcp.ts`, or register it with any MCP client:
+
+```json
+{
+  "mcpServers": {
+    "browser-control": { "command": "bun", "args": ["/absolute/path/to/browser-control/mcp.ts"] }
   }
-  ```
+}
+```
 
-- **Named standalone CLI** (`cli.ts`, package `bin: browser-control`) — one process per call,
-  so use `--init` to connect first or `--session` for many operations in one process:
+### Command-line tool
 
-  ```bash
-  browser-control --init connect_browser '{"port":9222}' list_targets '{"types":["page"]}'
-  printf '%s\n' '{"operation":"execute_cdp","input":{"method":"Runtime.evaluate","params":{"expression":"document.title"}}}' \
-    | browser-control --init connect_browser '{"port":9222}' --session
-  ```
+`cli.ts` is installed as `browser-control` by `bun link`. Each call is a new process. Use
+`--init` to connect first, or `--session` to run many operations in one process:
 
-  Without linking, run `bun ./cli.ts …`.
+```bash
+browser-control --init connect_browser '{"port":9222}' list_targets '{"types":["page"]}'
+printf '%s\n' '{"operation":"execute_cdp","input":{"method":"Runtime.evaluate","params":{"expression":"document.title"}}}' \
+  | browser-control --init connect_browser '{"port":9222}' --session
+```
 
-All three call the same `src/` implementation.
+Without `bun link`, run `bun ./cli.ts …` instead.
+
+All three run the same code in `src/`.
 
 ## Skill
 
-`.agents/skills/browser-control/` is a ready-made agent skill: `SKILL.md` for routing,
-`references/` for one workflow each (tabs, frames, input, dialogs, network, scrolling,
-downloads, artifacts, inspection, sessions), and `scripts/` for the daemon client. Copy or
-symlink that folder into your agent's skill root:
+`.agents/skills/browser-control/` is an agent skill you can install as is. It holds:
+
+- `SKILL.md`, which tells the agent when and how to use the tool.
+- `references/`, one file per task: tabs, frames, input, dialogs, network, scrolling,
+  downloads, artifacts, inspection, sessions and backends.
+- `scripts/`, which holds the daemon client.
+
+Copy or symlink the folder into your agent's skills folder:
 
 ```bash
 ln -s "$PWD/.agents/skills/browser-control" ~/.agents/skills/browser-control
 ```
 
-`runtime/` inside it is a prebuilt bundle of this repository, so the skill works from a bare
-clone. It is generated by `bun run build:skill`; don't edit it by hand (see
+The `runtime/` folder inside it is a prebuilt copy of this repository, so the skill works
+from a fresh clone. `bun run build:skill` generates it. Don't edit it by hand (see
 [AGENTS.md](AGENTS.md)).
 
 ## Configuration
 
-Optional environment overrides (no credentials):
+These environment variables are optional. None of them holds a credential.
 
-| Variable | Purpose |
+| Variable | What it sets |
 | --- | --- |
-| `BROWSER_CONTROL_BROWSER` | Preferred browser name (`beta`, `chrome`, …) for a connect with no input. Overrides the one-line file `~/.config/browser-control/default-browser`. |
-| `BROWSER_CONTROL_BACKENDS` | Backend order, for example `browse,cdp`. Overrides the one-line file `~/.config/browser-control/backends`. Default `cdp` (DevTools only). See "Backends" below. |
-| `BROWSER_CDP_CALL_TIMEOUT_MS` | Reply timeout for a CDP call that sets none. Default 120000. |
-| `BROWSER_CONTROL_MAX_OUTPUT` | Daemon only: character cap on `eval`/`nav`/`tabs` text output. Default 50000. |
-| `BROWSER_CDP_WS_URL` | Explicit browser endpoint when auto-detect is wrong. |
-| `BROWSER_PROFILE_DIR` | Explicit profile directory to read `DevToolsActivePort`. |
-| `BROWSER_CDP_TIMEOUT_MS` | Socket-open timeout; raise for the browser's "Allow" prompt. Default 5000. |
-| `BROWSER_ARTIFACT_DIR` | Absolute directory for screenshots/PDFs. Default OS temp. |
-| `BROWSER_EVENT_BUFFER_SIZE` | Event ring-buffer capacity. Default 1000. |
+| `BROWSER_CONTROL_BROWSER` | The browser to use when a connect names none (`beta`, `chrome`, …). It overrides the one-line file `~/.config/browser-control/default-browser`. |
+| `BROWSER_CONTROL_BACKENDS` | The backend order, for example `browse,cdp`. It overrides the one-line file `~/.config/browser-control/backends`. The default is `cdp` (DevTools only). See [Backends](#backends). |
+| `BROWSER_CDP_CALL_TIMEOUT_MS` | How long a CDP call waits for a reply when it sets no timeout. Default 120000. |
+| `BROWSER_CONTROL_MAX_OUTPUT` | Daemon only. The most characters `eval`, `nav` and `tabs` print. Default 50000. |
+| `BROWSER_CDP_WS_URL` | The browser's WebSocket address, when finding it automatically fails. |
+| `BROWSER_PROFILE_DIR` | The profile folder to read `DevToolsActivePort` from. |
+| `BROWSER_CDP_TIMEOUT_MS` | How long opening the socket may take. Raise it to leave time for the browser's Allow prompt. Default 5000. |
+| `BROWSER_ARTIFACT_DIR` | The absolute folder for screenshots and PDFs. The default is the system temp folder. |
+| `BROWSER_EVENT_BUFFER_SIZE` | How many events the buffer keeps. Default 1000. |
 
-Ports change on every browser restart, so callers should not pass one. `connect_browser`
-finds running browsers two ways and merges the results:
+The port changes every time the browser restarts, so don't pass one. `connect_browser`
+finds running browsers two ways and combines the results:
 
-1. `DevToolsActivePort` in each known profile folder. macOS privacy (TCC) often blocks
-   reading it, and it can be stale.
-2. The OS process table: `lsof` lists loopback listeners, `ps` names the owning process, and
-   Chromium browsers are kept. This needs no file access and is always the live port.
+1. It reads `DevToolsActivePort` in each known profile folder. macOS privacy controls often
+   block this file. It can also be out of date.
+2. It reads the process table. `lsof` lists local listening ports, `ps` names the process
+   behind each one. Only Chromium browsers are kept. This needs no file access and
+   always finds the live port.
 
-`browser` selects by name (exact name first, then substring) and, on macOS, opens the app when
-it is not running. Chrome launched with `--remote-debugging-port` exposes `/json/version`;
-the user-enabled server exposes only a raw WebSocket; the port form handles both.
+`browser` matches by name, trying the exact name first and then part of a name. On macOS it
+opens the app if it isn't running. Chrome started with `--remote-debugging-port` answers
+`/json/version`. The server you turn on in `chrome://inspect` offers only a raw WebSocket.
+Connecting by port handles both.
 
 ## Backends
 
-DevTools (`cdp`) is built in and runs every operation. Extra backends live in `src/backends/`,
-one file each, listed in `src/backends/registry.ts`; removing one means deleting its file and
-its line. `src/backends/router.ts` picks a backend per call from the order above:
+DevTools (`cdp`) is built in and runs every operation. Other backends live in
+`src/backends/` (one file each) and are listed in `src/backends/registry.ts`. To remove one,
+delete its file and its line in the registry. `src/backends/router.ts` picks a backend for
+each call using the order from [Configuration](#configuration):
 
-- A target id with a backend prefix (`browse:12`) always goes to that backend.
-- Otherwise backends are tried in order; one that lacks the operation, or isn't available
-  (not installed, no browser paired), passes it to the next.
-- While a backend's tab is selected, a tab operation it lacks fails with a clear message
-  rather than acting on a different DevTools tab.
+- A target id with a backend prefix, like `browse:12`, always goes to that backend.
+- Otherwise the router tries backends in order. If a backend lacks the operation or isn't
+  available (not installed, or no browser paired), the next one gets the call.
+- While a backend's tab is selected, a tab operation that backend lacks fails with a clear
+  message. It never runs on a different DevTools tab instead.
 
-`browse` ([opencode browse](https://opencode.ai/product/browse),
-[GitHub](https://github.com/anomalyco/browse)) is optional. It is used only when its `browse` CLI
-is installed, its extension is connected, and the order lists it (for example `browse,cdp`); if
-the CLI is missing or the extension isn't connected, calls fall back to DevTools. It runs `navigate`, `evaluate`, `capture_screenshot` and tab selection with no debugging
-port and no Allow click. Its tabs open in the background and it only sees tabs it opened or
-the user lent it. Everything else (`execute_cdp`, `capture_pdf`, events) stays on DevTools.
-The order is read on every call, so changing it needs no restart.
+`browse` is [opencode browse](https://opencode.ai/product/browse)
+([GitHub](https://github.com/anomalyco/browse)). It is optional. browser-control uses it only
+when three things are true. The `browse` command is installed. Its extension is connected.
+The order lists it, for example `browse,cdp`. If the command is missing or the extension isn't connected, calls
+go to DevTools.
 
+browse runs `navigate`, `evaluate`, `capture_screenshot` and tab selection with no debugging
+port and no Allow click. Its tabs open in the background. It sees only tabs it opened or tabs
+the user lent it. Everything else, like `execute_cdp`, `capture_pdf` and events, stays on
+DevTools. The order is read on every call, so changing it needs no restart.
 
-`state.kind` is `external-service`: durable browser state (tabs, cookies, storage) lives in
-the browser. In-process state — the connection, single active target route, and bounded
-event buffer — is allocated by `initialize()` and released by `dispose()`, which closes the
-socket and rejects pending calls on reload/shutdown. The active route is shared mutable
-state; serialize routing-sensitive flows.
+## State
+
+The browser keeps the lasting state: tabs, cookies and storage (`state.kind` is
+`external-service`). The process keeps three things: the connection, the selected tab and a
+fixed-size event buffer. `initialize()` creates them. `dispose()` releases them. It also closes the
+socket and rejects pending calls on reload or shutdown. All callers share one selected tab,
+so run steps that depend on it one after another.
 
 ## Errors
 
-Operation handlers surface stable message prefixes (in the `EXECUTION_FAILED` envelope
-message): `NOT_CONNECTED`, `NO_ACTIVE_TARGET`, `CDP_TIMEOUT`, `JS_EXCEPTION`,
-`NAVIGATION_FAILED`, `INPUT_INVALID`, `ARTIFACT_WRITE_FAILED`. A session Chrome has dropped
-is re-attached once and the call retried. Raw CDP errors are surfaced verbatim as
-`CDP <code>: <message>`. A `wait_for_event` timeout is a normal `found:false` result, not an
+Each error message starts with a fixed code, inside the `EXECUTION_FAILED` envelope message.
+The codes are `NOT_CONNECTED`, `NO_ACTIVE_TARGET`, `CDP_TIMEOUT`, `JS_EXCEPTION`,
+`NAVIGATION_FAILED`, `INPUT_INVALID` and `ARTIFACT_WRITE_FAILED`. If Chrome drops a session,
+browser-control attaches again once and retries the call. Raw CDP errors come back unchanged
+as `CDP <code>: <message>`. A `wait_for_event` timeout returns `found:false` and isn't an
 error.
 
 ## Development
 
 ```bash
-bun test            # 41 tests
+bun test
 bun run typecheck
-bun run build:skill # after changing src/, cli.ts, daemon.ts, or capability.json
+bun run build:skill # after changing src/, cli.ts, daemon.ts or capability.json
 ```
 
-`@agent-software/core` resolves from the sibling `agent-software` checkout, which stays the
-single source of truth for the runtime — there is no vendored copy here. Work conventions are
-in [AGENTS.md](AGENTS.md). This repository is private and not licensed for distribution.
+`@agent-software/core` comes from the `agent-software` copy next to this one. That
+repository is the only source for the runtime. This one holds no copy of it. Work
+conventions are in [AGENTS.md](AGENTS.md). This repository is private and not licensed for
+distribution.
