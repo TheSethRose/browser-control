@@ -26,6 +26,9 @@ profile.
   `dispose()` lifecycle hooks.
 - `src/session.ts` — browser discovery (process table + `DevToolsActivePort`), connection,
   target routing, and CDP call plumbing.
+- `src/backends/` — optional extra backends beside CDP: `types.ts` (the `Backend` interface),
+  `router.ts` (per-call routing and the backend order), `registry.ts` (the list), and one file per
+  backend (`browse.ts`). CDP in `src/index.ts` stays the fallback for every operation.
 - `src/events.ts` — the bounded cross-call event ring buffer and `wait_for_event`.
 - `cli.ts` — thin standalone CLI bootstrap, and `--serve <socket>` to run the daemon.
 - `daemon.ts` — long-lived Unix-socket server over the same runtime, so one CDP connection
@@ -74,7 +77,7 @@ No linter is configured.
 ## Generated files
 
 `.agents/skills/browser-control/runtime/` is build output from `bun run build:skill`: it
-bundles `cli.ts`, `mcp.ts`, `capability.json`, `README.md`, and `src/*.ts` so the skill folder
+bundles `cli.ts`, `mcp.ts`, `capability.json`, `README.md`, and all of `src/` so the skill folder
 is self-contained. It is committed, because the skill is expected to work straight from a
 clone. **Never hand-edit anything under `runtime/`.** After changing `src/`, `cli.ts`,
 `daemon.ts`, or `capability.json`, run `bun run build:skill` and commit the result, or the

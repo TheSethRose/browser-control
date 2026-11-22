@@ -19,8 +19,7 @@ One implementation ships three ways:
 ## Requirements
 
 - [Bun](https://bun.sh) — the only runtime dependency.
-- A sibling checkout of the private [`agent-software`](https://github.com/TheSethRose/agent-software)
-  repository, which provides `@agent-software/core`
+- A sibling checkout of the private `agent-software` repository (same GitHub owner as this one), which provides `@agent-software/core`
   (`"@agent-software/core": "file:../agent-software/core"`).
 - A Chromium-based browser with remote debugging allowed. In current Chrome, open
   `chrome://inspect/#remote-debugging` and check **"Allow remote debugging for this browser
@@ -35,9 +34,9 @@ No API keys, accounts, or config files. Optional environment overrides are liste
 Private repository — clone both, side by side, so the sibling dependency resolves:
 
 ```bash
-mkdir -p ~/Developer/tools && cd ~/Developer/tools
-gh repo clone TheSethRose/agent-software
-gh repo clone TheSethRose/browser-control
+# <owner> is the GitHub account that hosts both repositories
+gh repo clone <owner>/agent-software
+gh repo clone <owner>/browser-control
 cd browser-control
 bun install
 ```
@@ -162,6 +161,7 @@ Optional environment overrides (no credentials):
 | Variable | Purpose |
 | --- | --- |
 | `BROWSER_CONTROL_BROWSER` | Preferred browser name (`beta`, `chrome`, …) for a connect with no input. Overrides the one-line file `~/.config/browser-control/default-browser`. |
+| `BROWSER_CONTROL_BACKENDS` | Backend order, for example `browse,cdp`. Overrides the one-line file `~/.config/browser-control/backends`. Default `cdp` (DevTools only). See "Backends" below. |
 | `BROWSER_CDP_CALL_TIMEOUT_MS` | Reply timeout for a CDP call that sets none. Default 120000. |
 | `BROWSER_CONTROL_MAX_OUTPUT` | Daemon only: character cap on `eval`/`nav`/`tabs` text output. Default 50000. |
 | `BROWSER_CDP_WS_URL` | Explicit browser endpoint when auto-detect is wrong. |
@@ -182,7 +182,24 @@ finds running browsers two ways and merges the results:
 it is not running. Chrome launched with `--remote-debugging-port` exposes `/json/version`;
 the user-enabled server exposes only a raw WebSocket; the port form handles both.
 
-## State and lifecycle
+## Backends
+
+DevTools (`cdp`) is built in and runs every operation. Extra backends live in `src/backends/`,
+one file each, listed in `src/backends/registry.ts`; removing one means deleting its file and
+its line. `src/backends/router.ts` picks a backend per call from the order above:
+
+- A target id with a backend prefix (`browse:12`) always goes to that backend.
+- Otherwise backends are tried in order; one that lacks the operation, or isn't available
+  (not installed, no browser paired), passes it to the next.
+- While a backend's tab is selected, a tab operation it lacks fails with a clear message
+  rather than acting on a different DevTools tab.
+
+`browse` ([opencode browse](https://opencode.ai/product/browse), its extension and `browse`
+CLI) runs `navigate`, `evaluate`, `capture_screenshot` and tab selection with no debugging
+port and no Allow click. Its tabs open in the background and it only sees tabs it opened or
+the user lent it. Everything else (`execute_cdp`, `capture_pdf`, events) stays on DevTools.
+The order is read on every call, so changing it needs no restart.
+
 
 `state.kind` is `external-service`: durable browser state (tabs, cookies, storage) lives in
 the browser. In-process state — the connection, single active target route, and bounded

@@ -30,7 +30,7 @@
     "daemon": "bun ./cli.ts --serve",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "build:skill": "mkdir -p .agents/skills/browser-control/runtime/src && bun build cli.ts --target bun --outfile .agents/skills/browser-control/runtime/cli.js && bun build mcp.ts --target bun --outfile .agents/skills/browser-control/runtime/mcp.js && cp capability.json README.md .agents/skills/browser-control/runtime/ && cp src/*.ts .agents/skills/browser-control/runtime/src/"
+    "build:skill": "mkdir -p .agents/skills/browser-control/runtime/src && bun build cli.ts --target bun --outfile .agents/skills/browser-control/runtime/cli.js && bun build mcp.ts --target bun --outfile .agents/skills/browser-control/runtime/mcp.js && cp capability.json README.md .agents/skills/browser-control/runtime/ && cp -R src/. .agents/skills/browser-control/runtime/src/"
   },
   "dependencies": {
     "@agent-software/core": "file:../agent-software/core"

@@ -19,6 +19,8 @@ import {
   type ConnectOptions,
   type PageTarget,
 } from "./session";
+import { createBackends } from "./backends/registry";
+import { route } from "./backends/router";
 
 /** The connection operations act on. */
 let connection: CdpConnection | undefined;
@@ -151,9 +153,11 @@ export const dispose: NonNullable<CapabilityModule["dispose"]> = async () => {
   for (const c of [connection, ...parked]) c?.close();
   connection = undefined;
   parked = [];
+  for (const b of backends) await b.dispose?.();
 };
 
-export const operations: Record<string, OperationHandler> = {
+/** The built-in DevTools (CDP) operations: every operation, and the fallback for other backends. */
+const cdpOperations: Record<string, OperationHandler> = {
   list_browsers: async () => {
     const browsers = await detectBrowsers();
     return {
@@ -297,10 +301,36 @@ export const operations: Record<string, OperationHandler> = {
     if (clip) params["clip"] = clip;
 
     const targetId = str(input["targetId"]);
-    const result = (await conn.call("Page.captureScreenshot", params, { targetId })) as {
-      data: string;
-    };
-    const data = Buffer.from(result.data, "base64");
+    const result = await conn
+      .call("Page.captureScreenshot", params, { targetId })
+      .catch(async (error: Error) => {
+        // Chrome can't capture beyond the viewport in a background tab ("Unable to capture
+        // screenshot"). Resize the viewport to the page instead, capture, then restore it.
+        if (input["fullPage"] !== true || clip || !/Unable to capture screenshot/.test(error.message)) throw error;
+        const metrics = (await conn.call("Page.getLayoutMetrics", {}, { targetId })) as {
+          cssContentSize?: { width: number; height: number };
+        };
+        const size = metrics.cssContentSize;
+        if (!size) throw error;
+        await conn.call(
+          "Emulation.setDeviceMetricsOverride",
+          {
+            width: Math.ceil(size.width),
+            height: Math.min(Math.ceil(size.height), 16_384),
+            deviceScaleFactor: 1,
+            mobile: false,
+          },
+          { targetId },
+        );
+        try {
+          const { captureBeyondViewport: _, ...rest } = params;
+          return await conn.call("Page.captureScreenshot", rest, { targetId });
+        } finally {
+          await conn.call("Emulation.clearDeviceMetricsOverride", {}, { targetId }).catch(() => {});
+        }
+      });
+    const { data: b64 } = result as { data: string };
+    const data = Buffer.from(b64, "base64");
     const extension = format === "jpeg" ? "jpg" : "png";
     const filePath = await writeArtifact(str(input["path"]), "screenshot", extension, data);
 
@@ -384,3 +414,8 @@ export const operations: Record<string, OperationHandler> = {
     );
   },
 };
+
+/** Extra backends (see `src/backends/`); CDP stays the fallback for whatever they lack. */
+const backends = createBackends();
+
+export const operations: Record<string, OperationHandler> = route(cdpOperations, backends);

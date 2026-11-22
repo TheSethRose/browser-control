@@ -1,6 +1,6 @@
 ---
 name: browser-control
-description: Drive the user's real Chrome (or any Chromium browser — Edge, Brave, Arc, Canary) over the Chrome DevTools Protocol with the bundled browser-control CLI/MCP — connect, pick a tab, inspect DOM, evaluate JS, click/type/upload, handle iframes, dialogs, network, downloads, cookies, scrolling, screenshots, and PDFs. Use whenever the user wants something done or checked in their own signed-in browser ("I've got it pulled up", "do it in my Chrome", "click through this dashboard"), for browser automation, scraping, form filling, or visual verification, even if they don't name the tool. Replaces chrome-bridge.
+description: Drive the user's real Chrome (or any Chromium browser — Edge, Brave, Arc, Canary) over the Chrome DevTools Protocol with the bundled browser-control CLI/MCP — connect, pick a tab, inspect DOM, evaluate JS, click/type/upload, handle iframes, dialogs, network, downloads, cookies, scrolling, screenshots, and PDFs. Use whenever the user wants something done or checked in their own signed-in browser ("I've got it pulled up", "do it in my Chrome", "click through this dashboard"), for browser automation, scraping, form filling, or visual verification, even if they don't name the tool. Also routes work through opencode's browse extension when it is enabled. Replaces chrome-bridge.
 ---
 
 # Browser Control
@@ -30,7 +30,8 @@ daemon already holds an approved one. Keep it:
   throws the approved connections away. `stop` and `disconnect_browser` refuse by design.
 - **Don't build your own path to the browser**: no second daemon, no
   `BROWSER_CONTROL_DAEMON_DIR`, no `runtime/cli.js`, no script of your own that opens a
-  connection. If a command fails, read the error, fix the command, or tell the user.
+  connection. (The `browse` CLI on `browse:<n>` tabs is fine: it uses the extension,
+  not a CDP connection.) If a command fails, read the error, fix the command, or tell the user.
 - **Never pass or guess a port.** The port changes when the browser restarts; the daemon
   finds the live one and reconnects by itself.
 - If a command waits and then says the connection timed out, the user has not clicked
@@ -51,7 +52,12 @@ If a command says remote debugging is off, ask the user to open
 `chrome://inspect/#remote-debugging` in that browser and tick **Allow remote debugging for
 this browser instance**, then stop. You can't enable it yourself.
 
-### Commands
+### Backends
+
+With `~/.config/browser-control/backends` set to `browse,cdp`, `nav` with no tab selected
+opens a background tab through opencode's browse extension (`browse:<n>` ids, no Allow
+click). A selected DevTools tab keeps calls on that tab. Before choosing between them, or
+before typing and clicking on a `browse:<n>` tab, read `references/backends.md`.
 
 | Command | What it does |
 | --- | --- |
@@ -101,6 +107,7 @@ Read only the reference the task needs.
 | Screenshot / PDF written to a file | `references/artifacts.md` |
 | Downloads and cookies | `references/downloads.md` |
 | Scroll and set an emulated viewport | `references/scrolling.md` |
+| Pick browse or DevTools; interact on `browse:<n>` tabs | `references/backends.md` |
 
 ## Protect the user's accounts
 
