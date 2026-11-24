@@ -134,7 +134,10 @@ connect_browser -> list_targets -> select_target
 The daemon is `cli.ts --serve <socket>`, built in `daemon.ts`. Its client is
 `.agents/skills/browser-control/scripts/browser-control-daemon`, a small `curl` wrapper with
 these commands: `start`, `eval`, `nav`, `tabs`, `call`, `ops`, `default`, `status` and
-`stop --force`.
+`stop --force`. It also exposes page helpers through the daemon (`snap`, `text`, `ocr`, `shot`,
+`click`, `type`, `key`, `fill`, `do`, `value`, `verdict` and `health`), which inject `src/page-helpers.js.txt` once per DevTools
+document and route `browse:<n>` tabs through the `browse` CLI automatically. They add no
+capability operations.
 
 One long-running process answers requests over a Unix socket. Every command starts the
 daemon if it isn't running. The daemon connects on the first call that needs a browser. It

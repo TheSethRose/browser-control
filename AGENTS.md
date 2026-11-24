@@ -37,10 +37,19 @@ profile.
   `browser-control__execute_cdp`).
 - `tests/` — `bun test` suites: manifest validity, operation behavior, session routing,
   standalone adapters.
+- `src/page-helpers.ts` + `src/page-helpers.js.txt` — the in-page helper script (`__bc`),
+  written as plain JavaScript in the `.js.txt` file and imported as text. `daemon.ts` injects
+  it lazily once per document. It lists controls with stable refs, finds a control by label,
+  reports what an action changed (`baseline`/`settle`/`diff`), returns readable text, and
+  draws screenshot marks. Bump `VERSION` in the `.js.txt` and `PAGE_HELPERS_VERSION` in the
+  `.ts` together on every change so tabs holding an old copy reinstall it. These are
+  daemon/skill procedures, not capability operations.
+- `src/ocr.ts` + `src/ocr.swift.txt` — text recognition for pages that are only a picture
+  (macOS Vision). The Swift source is compiled once into `~/.cache/browser-control/`.
 - `.agents/skills/browser-control/` — the skill that ships with this capability:
   `SKILL.md` (trigger + workflow routing), `references/*.md` (one procedure per file),
-  `scripts/` (the curl-over-Unix-socket daemon client), `agents/openai.yaml`, and
-  `runtime/` (**generated**, see below).
+  `scripts/` (the thin curl-over-Unix-socket daemon client + CLI/MCP wrappers),
+  `agents/openai.yaml`, and `runtime/` (**generated**, see below).
 
 This repository is **not standalone**: it depends on `@agent-software/core` from the
 `agent-software` repository, resolved as a sibling checkout
@@ -62,7 +71,8 @@ a port — `connect_browser` discovers the live one.
 
 ## Commands
 
-- Run all tests: `bun test`
+- Run all tests: `bun test` (if the standalone tests fail with "Cannot copy a socket file",
+  git's file watcher has a socket in `.git`: run `git fsmonitor--daemon stop` and retry)
 - Typecheck: `bun run typecheck`
 - Standalone CLI, one process per call: `bun ./cli.ts <operation> '<json>'`
   (add `--init <operation> '<json>'` to prepare state, or `--session` to read operations from

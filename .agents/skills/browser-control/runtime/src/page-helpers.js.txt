@@ -1,0 +1,570 @@
+(() => {
+  const VERSION = 5;
+  if (globalThis.__bc && globalThis.__bc.v === VERSION) return;
+
+  const INTERACTIVE = [
+    'a[href]', 'button', 'input:not([type="hidden"])', 'select', 'textarea', 'summary',
+    '[contenteditable=""]', '[contenteditable="true"]', '[tabindex]:not([tabindex="-1"])',
+    '[role="button"]', '[role="link"]', '[role="textbox"]', '[role="checkbox"]', '[role="radio"]',
+    '[role="tab"]', '[role="menuitem"]', '[role="menuitemcheckbox"]', '[role="menuitemradio"]',
+    '[role="switch"]', '[role="combobox"]', '[role="option"]', '[role="searchbox"]',
+    '[role="slider"]', '[role="spinbutton"]', '[role="treeitem"]',
+  ].join(',');
+  const CONTEXT = 'h1,h2,h3,h4,h5,h6,[role="heading"],label,p,li,[role="alert"],[role="status"],[role="dialog"]';
+  const LIMIT = 250;
+
+  const HONEYPOT_NAME = /honeypot|honey.?pot|bot.?field|leave.?this.?empty|do.?not.?fill|anti.?spam|gotcha|trap.?field/i;
+  const PAYMENT_FIELD = /card.?number|cardnumber|cc-?(number|csc|exp)|ccnumber|cvc|cvv|expir(y|ation)|security.?code|iban|account.?number|routing.?number|payment.?method/i;
+  const SUCCESS_TEXT = /thank you|thanks for|successfully|has been (submitted|received|added|saved|sent)|we(?:'| ha)ve received|submission (received|complete)|pending review|under review|awaiting (approval|moderation)|check your (e-?mail|inbox)|confirmation (e-?mail|link)/i;
+  const REJECT_TEXT = /please (fix|correct|complete|check)|(is |are )required\b|invalid\b|error(s)? (below|above|occurred|found)|something went wrong|could not (be )?(submit|process|save)|failed to|try again|not a valid|must (be|contain|not)|too (short|long|large|many)/i;
+  const REJECT_SURFACE = '[role="alert"], [aria-invalid="true"], .error, .form-error, .field-error, .invalid-feedback';
+
+  // Refs are stable: an element keeps its ref for as long as it stays in the document.
+  const refs = new Map();
+  const ids = new WeakMap();
+  let nextId = 1;
+  let base = null;
+  let frameEls = [];
+  let lastMutation = 0;
+  let leaving = false;
+  let wallCache;
+
+  const refOf = (el) => {
+    let id = ids.get(el);
+    if (!id) { id = `e${nextId++}`; ids.set(el, id); }
+    refs.set(id, new WeakRef(el));
+    return id;
+  };
+
+  try {
+    new MutationObserver(() => { lastMutation = performance.now(); wallCache = undefined; })
+      .observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
+    globalThis.navigation?.addEventListener('navigate', (e) => { if (!e.destination.sameDocument) leaving = true; });
+  } catch { /* observers are an optimisation only */ }
+
+  const clean = (s, n = 80) => String(s || '').replace(/\s+/g, ' ').trim().slice(0, n);
+  const styleIfShown = (el) => {
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return null;
+    const st = getComputedStyle(el);
+    return st.display !== 'none' && st.visibility !== 'hidden' && st.visibility !== 'collapse' ? st : null;
+  };
+  const shown = (el) => !!styleIfShown(el);
+
+  function* roots(start) {
+    const stack = [start];
+    while (stack.length) {
+      const root = stack.pop();
+      yield root;
+      const walker = (root.ownerDocument || root).createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+      const found = [];
+      for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+        if (n.shadowRoot) found.push(n.shadowRoot);
+        if (n.tagName === 'IFRAME' || n.tagName === 'FRAME') {
+          try { if (n.contentDocument) found.push(n.contentDocument); } catch { /* cross-origin */ }
+        }
+      }
+      stack.push(...found.reverse());
+    }
+  }
+
+  const roleOf = (el) => {
+    const explicit = el.getAttribute('role');
+    if (explicit) return explicit.split(' ')[0];
+    const tag = el.tagName.toLowerCase();
+    const type = (el.getAttribute('type') || 'text').toLowerCase();
+    if (tag === 'a') return 'link';
+    if (tag === 'button' || tag === 'summary') return 'button';
+    if (tag === 'select') return el.multiple ? 'listbox' : 'combobox';
+    if (tag === 'textarea') return 'textbox';
+    if (/^h[1-6]$/.test(tag)) return 'heading';
+    if (tag === 'li') return 'listitem';
+    if (tag === 'p') return 'text';
+    if (tag === 'input') {
+      return ({ checkbox: 'checkbox', radio: 'radio', range: 'slider', number: 'spinbutton', search: 'searchbox',
+        submit: 'button', button: 'button', reset: 'button', image: 'button', file: 'file' })[type] || 'textbox';
+    }
+    if (el.isContentEditable) return 'textbox';
+    return tag;
+  };
+
+  const nameOf = (el) => {
+    const doc = el.ownerDocument;
+    const by = el.getAttribute('aria-labelledby');
+    if (by) {
+      const text = by.split(/\s+/).map((id) => doc.getElementById(id)?.textContent || '').join(' ');
+      if (clean(text)) return clean(text);
+    }
+    const tag = el.tagName.toLowerCase();
+    const text = tag === 'input' || tag === 'select' || tag === 'textarea' ? '' : el.innerText || el.textContent;
+    return clean(el.getAttribute('aria-label') || (el.labels && el.labels[0]?.innerText) || el.getAttribute('placeholder')
+      || el.getAttribute('title') || el.getAttribute('alt') || text
+      || (tag === 'input' && /^(submit|button|reset)$/i.test(el.type) ? el.value : ''));
+  };
+
+  const isSecure = (el) => (el.getAttribute('type') || '').toLowerCase() === 'password'
+    || /password|one-time-code/i.test(el.getAttribute('autocomplete') || '');
+
+  const isTextControl = (el) => el.tagName === 'TEXTAREA'
+    || (el.tagName === 'INPUT' && !/^(checkbox|radio|submit|button|reset|image|file|range|color)$/i.test(el.type));
+
+  const hayOf = (el) => [el.name, el.id, el.getAttribute('placeholder'), el.getAttribute('aria-label'),
+    el.getAttribute('autocomplete'), el.labels && el.labels[0]?.textContent].join(' ');
+
+  const isTrap = (el, st) => {
+    if (!isTextControl(el)) return false;
+    const r = el.getBoundingClientRect();
+    return !!el.closest('[aria-hidden="true"]') || Number((st || getComputedStyle(el)).opacity) < 0.05
+      || r.right < -500 || r.bottom < -500 || el.tabIndex < 0 || HONEYPOT_NAME.test(hayOf(el));
+  };
+
+  const flagsOf = (el, st) => {
+    const f = [];
+    if (el.disabled || el.getAttribute('aria-disabled') === 'true' || el.closest?.('fieldset[disabled]')) f.push('disabled');
+    if (el.checked || el.getAttribute('aria-checked') === 'true') f.push('checked');
+    if (el.getAttribute('aria-expanded') === 'true') f.push('expanded');
+    if (el.required || el.getAttribute('aria-required') === 'true') f.push('required');
+    if (el.readOnly) f.push('readonly');
+    if (isSecure(el)) f.push('secure');
+    if (isTrap(el, st)) f.push('trap');
+    if (isTextControl(el) && PAYMENT_FIELD.test(hayOf(el))) f.push('payment');
+    return f;
+  };
+
+  const SSO_HOST = /(^|\.)(login\.microsoftonline\.com|accounts\.google\.com|okta\.com|oktapreview\.com|auth0\.com|login\.salesforce\.com|onelogin\.com|pingidentity\.com|duosecurity\.com)$/i;
+
+  const computeWall = () => {
+    // <team>.cloudflareaccess.com/browser/<url> is a working isolated page, not a sign-in gate.
+    if (location.pathname.includes('/cdn-cgi/access/')
+      || (/(^|\.)cloudflareaccess\.com$/i.test(location.hostname) && !location.pathname.startsWith('/browser/'))) return 'cloudflare-access';
+    if (SSO_HOST.test(location.hostname)) return 'sso';
+    const frame = [...document.querySelectorAll('iframe')].find((f) => shown(f)
+      && /recaptcha|hcaptcha|turnstile|challenges\.cloudflare\.com|arkoselabs|funcaptcha/i.test(`${f.src} ${f.title}`));
+    const text = ((document.body && document.body.innerText) || '').slice(0, 4000).toLowerCase();
+    if (frame || /verify (that )?you are (a )?human|are you a robot|checking your browser before accessing|press (and|&) hold to confirm you are a human/.test(text)) return 'captcha';
+    if (/^(429\b|too many requests|access denied|rate limit)/i.test(document.title.trim())
+      || /^(too many requests|rate limit exceeded|you have been rate limited|access denied)/.test(text.trim().slice(0, 200))) return 'rate-limit';
+    const password = [...document.querySelectorAll('input[type="password"]')].some(shown);
+    if (password && /(^|\/)(log-?in|sign-?in|auth|sso)(\/|\.|$|\?)/i.test(location.pathname)) return 'sign-in';
+    return null;
+  };
+  // The page text read is the slow part of a snapshot, so reuse it until the document changes.
+  const wall = () => {
+    if (!wallCache || wallCache.href !== location.href) wallCache = { href: location.href, kind: computeWall() };
+    return wallCache.kind;
+  };
+  const wallLine = (w) => `# WALL: ${w}. Stop and hand this tab to the user; do not solve or bypass it.`;
+
+  // 'picture' when the page is drawn into one big canvas (remote browser isolation, canvas apps):
+  // there are no controls to list, so it has to be read from pixels.
+  const surface = () => {
+    const area = innerWidth * innerHeight;
+    const big = [...document.querySelectorAll('canvas')].some((c) => {
+      const r = c.getBoundingClientRect();
+      return shown(c) && Math.max(0, Math.min(r.right, innerWidth) - Math.max(r.left, 0)) * Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0)) > area * 0.5;
+    });
+    return big ? 'picture' : 'dom';
+  };
+  const PICTURE_LINE = '# PICTURE PAGE: this page is drawn into a canvas (remote browser isolation or a canvas app), so its own controls cannot be listed. Read it with ocr, act with click --xy, type --focused and key.';
+
+  const lineOf = (el, st) => {
+    const name = nameOf(el);
+    const flags = flagsOf(el, st);
+    const value = isTextControl(el) && !isSecure(el) && el.value ? ` value="${clean(el.value, 40)}"` : '';
+    return `- ${roleOf(el)}${name ? ` "${name.replace(/"/g, "'")}"` : ''} [${refOf(el)}]${value}${flags.length ? ` [${flags.join(',')}]` : ''}`;
+  };
+
+  const scopeOf = (within) => {
+    if (!within) return document;
+    if (/^@?e\d+$/.test(within)) return resolve(within);
+    const el = [...document.querySelectorAll(within)].find(shown) || document.querySelector(within);
+    if (!el) throw new Error(`NO_MATCH: nothing matches --within ${within}`);
+    return el;
+  };
+
+  // Every visible control under `scope`, in document order: { el, line }.
+  function scan(opts = {}) {
+    const sel = opts.all ? `${INTERACTIVE},${CONTEXT}` : INTERACTIVE;
+    const limit = opts.limit || LIMIT;
+    const find = opts.find ? String(opts.find).toLowerCase() : null;
+    const scope = scopeOf(opts.within);
+    const items = [];
+    let more = false;
+    const take = (el) => {
+      const st = styleIfShown(el);
+      if (!st) return;
+      if (opts.all && el.matches(CONTEXT) && !el.matches(INTERACTIVE) && el.querySelector(INTERACTIVE)
+        && !/^H[1-6]$/.test(el.tagName)) return;
+      if (find && !`${roleOf(el)} ${nameOf(el)} ${isTextControl(el) && !isSecure(el) ? el.value : ''}`.toLowerCase().includes(find)) return;
+      if (items.length >= limit) { more = true; return; }
+      items.push({ el, line: lineOf(el, st) });
+    };
+    if (scope.nodeType === 1 && scope.matches(sel)) take(scope);
+    for (const root of roots(scope)) {
+      for (const el of root.querySelectorAll(sel)) {
+        if (more) break;
+        take(el);
+      }
+    }
+    return { items, more };
+  }
+
+  const crossOriginFrames = () => {
+    frameEls = [...document.querySelectorAll('iframe')].filter((f) => {
+      try { void f.contentDocument.body; return false; } catch { return shown(f); }
+    });
+    return frameEls;
+  };
+
+  function snapshot(opts = {}) {
+    const { items, more } = scan(opts);
+    const head = [`# ${clean(document.title, 100)} | ${location.origin}${location.pathname}`];
+    const w = wall();
+    if (w) head.push(wallLine(w));
+    if (surface() === 'picture') head.push(PICTURE_LINE);
+    if (opts.find) head.push(`# ${items.length} control(s) match "${clean(opts.find, 40)}"${more ? ` (first ${items.length} shown)` : ''}`);
+    else if (more) head.push(`# Only the first ${items.length} elements are listed. Narrow with --find <text> or --within <ref|css>.`);
+    const skipped = crossOriginFrames().length;
+    if (skipped && !opts.within) head.push(`# ${skipped} cross-origin iframe(s): their controls are listed below as f<n>:e<m> when reachable.`);
+    return [...head, ...items.map((i) => i.line)].join('\n');
+  }
+
+  // Cross-origin iframes the daemon can snapshot as their own targets.
+  function frames() {
+    return JSON.stringify(crossOriginFrames().map((f, i) => ({ i: i + 1, src: f.src, title: clean(f.title || f.name, 40) })));
+  }
+
+  function frameOffset(i) {
+    const f = frameEls[i - 1];
+    if (!f || !f.isConnected) throw new Error(`STALE_REF: iframe f${i} is gone. Run snap again.`);
+    const r = f.getBoundingClientRect();
+    return `${r.left + f.clientLeft} ${r.top + f.clientTop}`;
+  }
+
+  const BASE_LIMIT = 2000;
+  const mapOf = (items) => new Map(items.map((i) => [ids.get(i.el), i.line]));
+
+  // Remember the controls now, so diff() can report what an action changed.
+  function baseline() {
+    base = mapOf(scan({ limit: BASE_LIMIT }).items);
+    leaving = false;
+    return location.href;
+  }
+
+  // Wait until the document stops changing (or a navigation tears it down).
+  async function settle(maxMs = 400, quietMs = 120) {
+    if (document.hidden) return 'hidden';
+    const start = performance.now();
+    for (;;) {
+      await new Promise((r) => setTimeout(r, 40));
+      const now = performance.now();
+      const limit = leaving ? 5000 : maxMs;
+      if (now - start >= limit) return 'timeout';
+      if (!leaving && now - Math.max(lastMutation, start) >= quietMs) return 'quiet';
+    }
+  }
+
+  function diff(opts = {}) {
+    const max = opts.max || 30;
+    const out = [];
+    const from = opts.from || '';
+    if (from && from !== location.href) out.push(`# url: ${from} -> ${location.href}`);
+    const w = wall();
+    if (w) out.push(wallLine(w));
+    const now = mapOf(scan({ limit: BASE_LIMIT }).items);
+    const changes = [];
+    if (!base) {
+      out.push(`# new page: ${clean(document.title, 100)}`);
+      for (const line of now.values()) changes.push(`+ ${line.slice(2)}`);
+    } else {
+      for (const [id, line] of now) {
+        const old = base.get(id);
+        if (old === undefined) changes.push(`+ ${line.slice(2)}`);
+        else if (old !== line) changes.push(`~ ${line.slice(2)}`);
+      }
+      for (const [id, line] of base) if (!now.has(id)) changes.push(`- ${line.slice(2)}`);
+    }
+    base = now;
+    out.push(...changes.slice(0, max));
+    if (changes.length > max) out.push(`# … ${changes.length - max} more changes; run snap`);
+    if (!changes.length && out.length === 0) out.push('# no visible change yet');
+    return out.join('\n');
+  }
+
+  const TYPEABLE = /^(textbox|searchbox|combobox|spinbutton|listbox)$/;
+
+  // Find one control by its visible name. Never guesses: several matches is an error.
+  function locate(label, kind) {
+    const want = clean(label, 200).toLowerCase();
+    if (!want) throw new Error('INPUT_INVALID: a ref (e12) or a label is required');
+    let { items } = scan({ limit: 5000 });
+    if (kind === 'type') {
+      const typeable = items.filter((i) => TYPEABLE.test(roleOf(i.el)) || i.el.isContentEditable);
+      if (typeable.length) items = typeable;
+    }
+    const named = items.map((i) => ({ ...i, name: nameOf(i.el).toLowerCase() }));
+    let hits = named.filter((i) => i.name === want);
+    if (!hits.length) hits = named.filter((i) => i.name.includes(want));
+    const live = hits.filter((i) => !flagsOf(i.el).includes('disabled'));
+    if (live.length) hits = live;
+    if (hits.length === 1) return ids.get(hits[0].el);
+    if (hits.length > 1) {
+      throw new Error(`AMBIGUOUS: "${clean(label, 60)}" matches ${hits.length} controls; use one of these refs:\n${hits.slice(0, 12).map((h) => h.line).join('\n')}`);
+    }
+    const words = want.split(' ').filter((x) => x.length > 2);
+    const near = named.filter((i) => i.name && words.some((x) => i.name.includes(x))).slice(0, 5);
+    throw new Error(`NO_MATCH: no control named "${clean(label, 60)}".${near.length ? ` Closest:\n${near.map((h) => h.line).join('\n')}` : ' Run snap to see the controls.'}`);
+  }
+
+  const resolve = (ref) => {
+    const id = String(ref || '').replace(/^@/, '');
+    if (!/^e\d+$/.test(id)) throw new Error(`INPUT_INVALID: ref must look like e12, got "${ref}"`);
+    const el = refs.get(id)?.deref();
+    if (!el || !el.isConnected) throw new Error(`STALE_REF: ${id} is gone (page changed or navigated). Run snap again.`);
+    return el;
+  };
+
+  const frame = () => (document.hidden ? Promise.resolve()
+    : new Promise((r) => { const t = setTimeout(r, 50); requestAnimationFrame(() => { clearTimeout(t); r(); }); }));
+  const animating = () => { try { return document.getAnimations().some((a) => a.playState === 'running'); } catch { return true; } };
+  const describe = (el) => `${el.tagName.toLowerCase()}${el.id ? `#${el.id}` : ''}${typeof el.className === 'string' && el.className.trim() ? `.${el.className.trim().split(/\s+/).slice(0, 2).join('.')}` : ''}${nameOf(el) ? ` "${nameOf(el).slice(0, 40)}"` : ''}`;
+
+  async function point(ref, opts = {}) {
+    const el = resolve(ref);
+    const deadline = performance.now() + (opts.timeoutMs || 3000);
+    el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+    const check = (a, b) => {
+      if (!shown(el)) return 'not visible';
+      if (flagsOf(el).includes('disabled')) return 'disabled';
+      if (a.x !== b.x || a.y !== b.y || a.width !== b.width || a.height !== b.height) return 'still moving';
+      const root = el.getRootNode();
+      const hit = (root.elementFromPoint ? root : el.ownerDocument).elementFromPoint(b.left + b.width / 2, b.top + b.height / 2);
+      const ok = hit && (hit === el || el.contains(hit) || (el.labels && [...el.labels].some((l) => l.contains(hit))));
+      return ok ? null : `covered by ${hit ? describe(hit) : 'nothing (off screen)'}`;
+    };
+    let reason;
+    do {
+      const moving = animating();
+      if (moving) await frame();
+      const a = el.getBoundingClientRect();
+      await frame();
+      const b = el.getBoundingClientRect();
+      reason = check(a, b);
+      if (!reason) {
+        let px = b.left + b.width / 2, py = b.top + b.height / 2;
+        for (let w = el.ownerDocument.defaultView; w && w !== w.parent && w.frameElement; w = w.parent) {
+          const fr = w.frameElement.getBoundingClientRect();
+          px += fr.left + w.frameElement.clientLeft;
+          py += fr.top + w.frameElement.clientTop;
+        }
+        return `${Math.round(px)} ${Math.round(py)} ${document.hidden ? 'hidden' : 'visible'}`;
+      }
+    } while (!document.hidden && performance.now() < deadline);
+    throw new Error(`NOT_ACTIONABLE: ${String(ref).replace(/^@/, '')} ${reason}`);
+  }
+
+  function guard(ref) {
+    const flags = flagsOf(resolve(ref));
+    if (flags.includes('trap')) throw new Error(`REFUSED: ${ref} looks like a bot-trap field; leave it empty`);
+    if (flags.includes('payment')) throw new Error(`REFUSED: ${ref} is a payment field; the user enters payment details`);
+    return 'ok';
+  }
+
+  // The same refusals as guard(), for typing into whatever already has focus.
+  function guardFocused() {
+    let el = document.activeElement;
+    while (el && el.shadowRoot && el.shadowRoot.activeElement) el = el.shadowRoot.activeElement;
+    if (!el || el === document.body) return 'ok';
+    const flags = flagsOf(el);
+    if (flags.includes('trap')) throw new Error('REFUSED: the focused field looks like a bot-trap field; leave it empty');
+    if (flags.includes('payment')) throw new Error('REFUSED: the focused field is a payment field; the user enters payment details');
+    return 'ok';
+  }
+
+  function focusForType(ref) {
+    const el = resolve(ref);
+    guard(ref);
+    el.focus();
+    if (typeof el.select === 'function') el.select();
+    else if (el.isContentEditable) {
+      const range = el.ownerDocument.createRange();
+      range.selectNodeContents(el);
+      const s = el.ownerDocument.getSelection();
+      s.removeAllRanges(); s.addRange(range);
+    }
+    return el.ownerDocument.activeElement === el || el.contains(el.ownerDocument.activeElement) ? 'focused' : 'not focused';
+  }
+
+  function value(ref) {
+    const el = resolve(ref);
+    if (isSecure(el)) return '__secure__';
+    if ('value' in el && el.tagName !== 'BUTTON') return String(el.value);
+    return el.innerText;
+  }
+
+  function verdict() {
+    const text = (document.body && document.body.innerText) || '';
+    const surface = [...document.querySelectorAll(REJECT_SURFACE)].find((e) => shown(e) && clean(e.innerText));
+    const success = text.match(SUCCESS_TEXT);
+    const reject = surface ? clean(surface.innerText) : (text.match(REJECT_TEXT) || [])[0] || null;
+    const result = success && !surface ? 'confirmed' : reject ? 'rejected' : 'unverified';
+    return JSON.stringify({ result, success: success ? clean(success[0], 60) : null, rejection: reject && clean(reject, 80), url: location.origin + location.pathname });
+  }
+
+  function health(opts = {}) {
+    const tapMin = opts.tapMin || 24;
+    const out = { tap: [], tiny: [], contrast: [], unknownContrast: 0, headings: [], emptyLinks: [], unlabeled: [], duplicateIds: [], brokenImages: [], noAlt: [], meta: {} };
+    const cap = (list, item) => { if (list.length < 8) list.push(item); };
+    const vis = (e) => shown(e) && getComputedStyle(e).opacity !== '0';
+    const parse = (v) => { const m = v.match(/rgba?\(([^)]+)\)/); if (!m) return null; const p = m[1].split(/[ ,/]+/).filter(Boolean).map(Number); return { rgb: p.slice(0, 3), a: p[3] === undefined ? 1 : p[3] }; };
+    const lum = (rgb) => { const l = rgb.map((c) => { const v = c / 255; return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; }); return 0.2126 * l[0] + 0.7152 * l[1] + 0.0722 * l[2]; };
+    const bg = (e) => { for (let n = e; n; n = n.parentElement) { const s = getComputedStyle(n); if (s.backgroundImage !== 'none') return null; const c = parse(s.backgroundColor); if (c && c.a > 0.95) return c.rgb; } return [255, 255, 255]; };
+    const seen = new Set();
+    for (const e of document.body.querySelectorAll('*')) {
+      if (e.closest('svg') || !vis(e)) continue;
+      if (![...e.childNodes].some((n) => n.nodeType === 3 && n.textContent.trim().length > 1)) continue;
+      const s = getComputedStyle(e);
+      const size = parseFloat(s.fontSize);
+      if (size < 12) cap(out.tiny, `${describe(e)} ${size}px`);
+      const fg = parse(s.color); const b = bg(e);
+      if (!b) { out.unknownContrast++; continue; }
+      if (!fg || fg.a <= 0.9) continue;
+      const [hi, lo] = [lum(fg.rgb), lum(b)].sort((x, y) => y - x);
+      const ratio = (hi + 0.05) / (lo + 0.05);
+      const large = size >= 24 || (size >= 18.66 && parseInt(s.fontWeight, 10) >= 700);
+      const key = describe(e);
+      if (ratio < (large ? 3 : 4.5) && !seen.has(key)) { seen.add(key); cap(out.contrast, `${key} ${ratio.toFixed(2)}`); }
+    }
+    for (const e of document.querySelectorAll('a, button, input:not([type=hidden]), select, textarea, summary, [role=button]')) {
+      if (!vis(e)) continue;
+      const r = e.getBoundingClientRect();
+      if (r.width < tapMin || r.height < tapMin) cap(out.tap, `${describe(e)} ${Math.round(r.width)}x${Math.round(r.height)}`);
+    }
+    for (const h of document.querySelectorAll('h1,h2,h3,h4,h5,h6')) if (vis(h)) out.headings.push(Number(h.tagName[1]));
+    for (const a of document.querySelectorAll('a')) if (vis(a) && !nameOf(a) && !a.querySelector('img[alt]:not([alt=""])')) cap(out.emptyLinks, a.getAttribute('href') || '(no href)');
+    for (const c of document.querySelectorAll('input:not([type=hidden]):not([type=submit]):not([type=button]), select, textarea')) if (vis(c) && !nameOf(c)) cap(out.unlabeled, describe(c));
+    const ids = {};
+    document.querySelectorAll('[id]').forEach((e) => { ids[e.id] = (ids[e.id] || 0) + 1; });
+    for (const [id, n] of Object.entries(ids)) if (n > 1) cap(out.duplicateIds, `#${id} x${n}`);
+    for (const img of document.images) {
+      if (!vis(img)) continue;
+      if (img.complete && img.naturalWidth === 0) cap(out.brokenImages, img.getAttribute('src') || '(no src)');
+      if (!img.hasAttribute('alt')) cap(out.noAlt, img.getAttribute('src') || '(no src)');
+    }
+    const attr = (s, a) => document.querySelector(s)?.getAttribute(a) ?? null;
+    out.meta = {
+      title: document.title, description: attr('meta[name=description]', 'content'), lang: document.documentElement.lang || null,
+      canonical: attr('link[rel=canonical]', 'href'), viewport: attr('meta[name=viewport]', 'content'),
+      jsonld: [...document.querySelectorAll('script[type="application/ld+json"]')].map((n) => { try { const d = JSON.parse(n.textContent); return Array.isArray(d) || d?.['@type'] || d?.['@graph'] ? 'ok' : 'no @type'; } catch { return 'invalid JSON'; } }),
+    };
+    const levels = out.headings;
+    out.headingSkips = levels.filter((l, i) => i > 0 && l > levels[i - 1] + 1).length;
+    out.h1Count = levels.filter((l) => l === 1).length;
+    return JSON.stringify(out);
+  }
+
+  const deepHit = (x, y) => {
+    let el = document.elementFromPoint(x, y);
+    while (el && el.shadowRoot && el.shadowRoot.elementFromPoint(x, y) && el.shadowRoot.elementFromPoint(x, y) !== el) el = el.shadowRoot.elementFromPoint(x, y);
+    return el;
+  };
+
+  // What a click at these viewport coordinates would land on.
+  function hit(x, y) {
+    const el = deepHit(x, y);
+    if (!el) return 'hit: nothing (off screen)';
+    const control = el.closest(INTERACTIVE);
+    return `hit: ${control ? lineOf(control).slice(2) : describe(el)}`;
+  }
+
+  function rect(ref) {
+    const el = resolve(ref);
+    el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+    const r = el.getBoundingClientRect();
+    return JSON.stringify({ x: r.left + scrollX, y: r.top + scrollY, width: r.width, height: r.height, dpr: devicePixelRatio });
+  }
+
+  function viewport() {
+    return JSON.stringify({ x: scrollX, y: scrollY, width: innerWidth, height: innerHeight, dpr: devicePixelRatio });
+  }
+
+  // Draw each visible ref's number over its control for a screenshot; marks(false) removes them.
+  function marks(on) {
+    document.getElementById('__bc_marks')?.remove();
+    if (!on) return '0';
+    const host = document.createElement('div');
+    host.id = '__bc_marks';
+    host.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:2147483647';
+    const lines = [];
+    for (const { el, line } of scan({ limit: LIMIT }).items) {
+      if (el.ownerDocument !== document) continue;
+      const r = el.getBoundingClientRect();
+      if (r.bottom < 0 || r.right < 0 || r.top > innerHeight || r.left > innerWidth) continue;
+      const tag = document.createElement('span');
+      tag.textContent = ids.get(el).slice(1);
+      tag.style.cssText = `position:absolute;left:${Math.max(0, r.left)}px;top:${Math.max(0, r.top)}px;background:#d00;color:#fff;font:bold 11px/13px sans-serif;padding:0 3px;border-radius:2px`;
+      host.appendChild(tag);
+      lines.push(line);
+    }
+    document.documentElement.appendChild(host);
+    return lines.join('\n');
+  }
+
+  const SKIP_TEXT = /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|SVG|CANVAS|VIDEO|AUDIO|IFRAME|OBJECT|HEAD|INPUT|TEXTAREA|SELECT)$/i;
+  const BLOCK_TEXT = /^(ADDRESS|ARTICLE|ASIDE|BLOCKQUOTE|DD|DETAILS|DIALOG|DIV|DL|DT|FIELDSET|FIGCAPTION|FIGURE|FOOTER|FORM|H[1-6]|HEADER|HR|LI|MAIN|NAV|OL|P|PRE|SECTION|SUMMARY|TABLE|TBODY|THEAD|TFOOT|TR|UL)$/;
+
+  // The page's readable content as compact markdown. Never includes field values.
+  function text(opts = {}) {
+    const max = opts.max || 20000;
+    const main = !opts.within && !opts.all && [...document.querySelectorAll('main,[role="main"],article')].find(shown);
+    const root = opts.within ? scopeOf(opts.within) : main || document.body;
+    const out = [];
+    const hidden = (el) => (el.checkVisibility ? !el.checkVisibility({ checkVisibilityCSS: true }) : false);
+
+    const inline = (node) => {
+      if (node.nodeType === 3) return node.textContent;
+      if (node.nodeType !== 1 || SKIP_TEXT.test(node.tagName) || hidden(node)) return '';
+      if (node.tagName === 'BR') return '\n';
+      if (node.tagName === 'IMG') return node.alt ? `![${clean(node.alt, 80)}]` : '';
+      let inner = '';
+      for (const c of (node.shadowRoot || node).childNodes) inner += inline(c);
+      if (/^(BUTTON|LABEL|TD|TH|OPTION|SUMMARY)$/.test(node.tagName)) inner = ` ${inner} `;
+      const href = node.tagName === 'A' && node.getAttribute('href');
+      return href && clean(inner) && !/^(#|javascript:)/i.test(href) ? `[${clean(inner, 200)}](${node.href})` : inner;
+    };
+    const push = (s) => { const t = s.replace(/[ \t]+/g, ' ').replace(/\s*\n\s*/g, '\n').trim(); if (t) out.push(t); };
+
+    const walk = (el) => {
+      if (SKIP_TEXT.test(el.tagName)) {
+        if (el.tagName === 'IFRAME') { try { if (el.contentDocument?.body) walk(el.contentDocument.body); } catch { /* cross-origin */ } }
+        return;
+      }
+      if (hidden(el)) return;
+      const tag = el.tagName;
+      if (/^H[1-6]$/.test(tag)) return push(`${'#'.repeat(Number(tag[1]))} ${inline(el)}`);
+      if (tag === 'PRE') return push('```\n' + el.innerText.trim() + '\n```');
+      if (tag === 'TR') return push(`| ${[...el.cells].map((c) => clean(inline(c), 200)).join(' | ')} |`);
+      let run = '';
+      const flush = () => { if (run.trim()) push(tag === 'LI' ? `- ${run}` : run); run = ''; };
+      for (const c of (el.shadowRoot || el).childNodes) {
+        if (c.nodeType === 1 && (BLOCK_TEXT.test(c.tagName) || c.tagName === 'IFRAME' || c.querySelector?.('p,div,li,tr,h1,h2,h3,h4,h5,h6,section,article,ul,ol,table'))) { flush(); walk(c); }
+        else run += inline(c);
+      }
+      flush();
+    };
+
+    walk(root);
+    let body = out.join('\n\n').replace(/(^|\n)(- [^\n]*)\n\n(?=- )/g, '$1$2\n').replace(/(\|[^\n]*\|)\n\n(?=\|)/g, '$1\n');
+    const head = [`# ${clean(document.title, 100)} | ${location.origin}${location.pathname}`];
+    const w = wall();
+    if (w) head.push(wallLine(w));
+    if (main) head.push('# Main content only. Pass --all for the whole page.');
+    if (body.length > max) body = `${body.slice(0, max)}\n# [truncated ${body.length - max} of ${body.length} chars; narrow with --within <ref|css> or raise --max]`;
+    return `${head.join('\n')}\n\n${body}`;
+  }
+
+  Object.defineProperty(globalThis, '__bc', {
+    value: { v: VERSION, snapshot, wall, surface, point, guard, guardFocused, focusForType, value, verdict, health, frames, frameOffset, baseline, settle, diff, locate, hit, rect, viewport, marks, text },
+    configurable: true, enumerable: false,
+  });
+})();

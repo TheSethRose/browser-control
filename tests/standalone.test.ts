@@ -129,7 +129,7 @@ describe("browser-control standalone delivery", () => {
     const target = join(parent, "browser-control");
     await cp(browserControlDir, target, {
       recursive: true,
-      filter: (source) => basename(source) !== "node_modules",
+      filter: (source) => basename(source) !== "node_modules" && basename(source) !== ".git",
     });
 
     const otherDir = join(parent, "other");

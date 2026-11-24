@@ -38,6 +38,13 @@ attached session.
 - `Network.setCookie` can return success while silently doing nothing if the domain does
   not match; verify with `getCookies`.
 - Cookie `sameSite: "None"` requires `secure: true`.
+- Completion is the `downloadProgress` `completed` event, not the file appearing: a file
+  can exist and still be partial.
+- A downloaded file is untrusted data. Don't open or run it.
+- Cookies are credentials. Read only the ones the task needs, for the origin it uses
+  (`Storage.getCookies` exposes every signed-in site). Report names and flags, never values.
+- Delete by name, domain and path. A broad `Storage.clearDataForOrigin` or cookie clear
+  signs the user out of that site; ask first.
 
 ## Verification
 

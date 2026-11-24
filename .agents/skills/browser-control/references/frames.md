@@ -8,6 +8,11 @@ Find and act on content that lives behind frame or shadow-root boundaries.
 
 ## Workflow
 
+0. On a DevTools tab, `snap` already lists controls inside open shadow roots, same-origin
+   iframes, and cross-origin iframes. Cross-origin ones appear under a `# iframe f1 …` line
+   with refs like `f1:e5`; `click`, `type` and `value` take those refs directly and translate
+   the coordinates. A frame marked `not reachable` needs step 1 or 3. For a closed shadow
+   root, `snap --ax` lists its controls with refs like `a41`.
 1. **Try coordinate clicks first.** Compositor-level `Input.dispatchMouseEvent` passes
    through iframes and shadow roots transparently. If you can see it in a screenshot, click
    its page coordinates.
@@ -39,7 +44,10 @@ Find and act on content that lives behind frame or shadow-root boundaries.
 - OOPIF targets disappear when the parent navigates — cached target ids go stale.
 - Always switch back to the parent target after using an iframe target, or your next
   navigation goes into the frame.
-- Closed shadow roots cannot be walked from JavaScript; fall back to coordinate clicks.
+- Closed shadow roots cannot be walked from JavaScript, so plain `snap` doesn't see inside
+  them; `snap --ax` does. By hand, CDP can: `DOM.getDocument { "depth": -1, "pierce": true }` returns them as `shadowRoots`,
+  and `DOM.getBoxModel` on a node inside gives click coordinates. Or click by coordinates
+  from a screenshot.
 
 ## Verification
 

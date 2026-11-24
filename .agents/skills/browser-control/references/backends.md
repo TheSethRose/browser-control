@@ -25,9 +25,9 @@ and which backend owns the current tab.
 | Task | Use |
 | --- | --- |
 | A tab the user already has open | DevTools (browse only sees tabs it opened or was lent) |
-| New background tab to read, eval or screenshot | browse (`nav` with no tab) |
-| Typing, clicking or filling like a person would | browse CLI, below |
-| Hand control to the user (login, 2FA, CAPTCHA) | browse CLI: `browse handoff '<message>' <n>` |
+| New background tab to read, eval, or screenshot | browse (`nav` with no tab) |
+| Typing, clicking, or snapping on either tab | `$BCD snap`, `click`, `type`, `key`, `value`, `verdict`, `health` (daemon routes `browse:<n>` tabs to the `browse` CLI automatically) |
+| Hand control to the user (login, 2FA, CAPTCHA) | browse tab: `browse handoff '<message>' <n>`; DevTools tab: `references/safety.md` |
 | PDF, cookies, network, dialogs, events, any raw CDP | DevTools |
 | Fast scripted form submit (set value, submit in JS) | DevTools |
 
@@ -36,15 +36,18 @@ viewport screenshots about the same, full-page screenshots work in both.
 
 ## Interacting on a browse tab
 
-The runtime wraps only `nav`, `eval` and screenshots. For the rest, call the `browse` CLI
-directly with the tab number `<n>` from `browse:<n>`. It uses the extension, not a CDP
-connection, so it needs no Allow click and doesn't break the "no second path" rule.
+The daemon routes `nav`, `eval`, screenshots, and the page helpers (`snap`, `click`, `type`,
+`key`, `value`, `verdict`, `health`) to `browse` automatically whenever the target is a
+`browse:<n>` tab. For browse-only actions such as `handoff`, call the `browse` CLI directly
+with the tab number `<n>` from `browse:<n>`. It uses the extension, not a CDP connection, so
+it needs no Allow click and doesn't break the "no second path" rule.
 
 ```bash
-browse snapshot <n> --interactive      # controls with refs, e.g. - button "Save" [ref=e12]
-browse fill <n> --json '{"ref":"e5","value":"text"}'
-browse click <n> --json '{"ref":"e12"}'
-browse press <n> Enter
+$BCD snap browse:<n>                     # routes to: browse snapshot <n> --interactive
+$BCD type e5 'text' browse:<n>           # routes to: browse fill <n> --json '{"ref":"e5","value":"text"}'
+$BCD click e12 browse:<n>                # routes to: browse click <n> --json '{"ref":"e12"}'
+$BCD key Enter browse:<n>                # routes to: browse press <n> Enter
+browse handoff 'Solve the CAPTCHA' <n>   # browse-only handoff
 ```
 
 A ref stops working when the page navigates or re-renders that element (typeahead inputs
@@ -52,4 +55,4 @@ do), so snapshot again after each step that changes the page. Failure example: f
 search box, then pressing Enter on a stale ref, did nothing because the typeahead had
 replaced the input; clicking the suggestion's ref from a fresh snapshot worked.
 
-The account-safety rules in `SKILL.md` apply to browse tabs too.
+The account-safety rules in `references/safety.md` apply to browse tabs too.

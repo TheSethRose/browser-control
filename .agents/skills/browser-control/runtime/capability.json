@@ -169,14 +169,15 @@
     },
     {
       "name": "navigate",
-      "description": "Navigate the target to a URL and wait for its load event. loaded:false means the page was still loading at timeoutMs (default 30000); a failed navigation is an error. Wraps Page.navigate.",
+      "description": "Navigate the target to a URL and wait for its load event (or, with until:\"domcontentloaded\", only until the document is parsed). loaded:false means the page was still loading at timeoutMs (default 30000); a failed navigation is an error. Wraps Page.navigate.",
       "inputs": {
         "type": "object",
         "required": ["url"],
         "properties": {
           "url": { "type": "string" },
           "targetId": { "type": "string" },
-          "timeoutMs": { "type": "number" }
+          "timeoutMs": { "type": "number" },
+          "until": { "type": "string", "enum": ["load", "domcontentloaded"] }
         }
       },
       "outputs": {

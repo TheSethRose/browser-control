@@ -274,7 +274,14 @@ const cdpOperations: Record<string, OperationHandler> = {
     const targetId = str(input["targetId"]);
     await conn.call("Page.enable", {}, { targetId });
     const sessionId = await eventSession(conn, targetId, undefined);
-    const loadEvent = { method: "Page.loadEventFired", sessionId };
+    const until = str(input["until"]) ?? "load";
+    if (until !== "load" && until !== "domcontentloaded") {
+      throw new Error("INPUT_INVALID: until must be load or domcontentloaded");
+    }
+    const loadEvent = {
+      method: until === "load" ? "Page.loadEventFired" : "Page.domContentEventFired",
+      sessionId,
+    };
     // Drop stale load events so only this navigation's can match.
     conn.readEvents(loadEvent, 0, true);
     const nav = (await conn.call("Page.navigate", { url }, { targetId })) as {

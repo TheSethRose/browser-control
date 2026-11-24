@@ -40,6 +40,16 @@ Use `Network.*` to observe traffic; use `Fetch.*` to intercept and rewrite it.
 - `wait_for_event` rejects only on connection loss; a non-matching state yields
   `found: false`.
 - Network events are large. Pass `method` and a small `limit` to `read_events`.
+- `wait_for_event` checks the buffer first, so an old event can satisfy it. Drain the method
+  with `read_events` before arming the wait, and match on something specific (`type`, the
+  status, or part of the URL), not "the next response".
+- Interception turns off the HTTP cache for matched URLs, which changes timing. Always
+  `Fetch.disable` afterwards, and say in the report which responses were mocked: a mocked
+  result tests the page, not the real service.
+- Mock only on pages the user owns or a test target.
+- Replaying a captured request carries the user's cookies, so it is an authenticated action.
+  It needs the same approval as a click, and anti-abuse systems watch for it.
+- Headers and bodies can hold tokens or passwords. Mask them before they reach output.
 
 ## Verification
 
