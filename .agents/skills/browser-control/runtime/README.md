@@ -131,11 +131,13 @@ connect_browser -> list_targets -> select_target
 
 ### Daemon
 
-The daemon is `cli.ts --serve <socket>`, built in `daemon.ts`. Its client is
+The daemon is `cli.ts --serve <socket>`, built in `daemon.ts` (with page execution in
+`src/page-runner.ts` and OCR/picture tracking in `src/picture.ts`). Its client is
 `.agents/skills/browser-control/scripts/browser-control-daemon`, a small `curl` wrapper with
-these commands: `start`, `eval`, `nav`, `tabs`, `call`, `ops`, `default`, `status` and
-`stop --force`. It also exposes page helpers through the daemon (`snap`, `text`, `ocr`, `shot`,
-`click`, `type`, `key`, `fill`, `do`, `value`, `verdict` and `health`), which inject `src/page-helpers.js.txt` once per DevTools
+these commands: `start`, `eval`, `nav`, `tabs`, `call`, `ops`, `default`, `status`,
+`check-update` and `stop --force`. It also exposes page helpers through the daemon (`snap`,
+`text`, `ocr`, `shot`, `click`, `type`, `select`, `upload`, `wait`, `key`, `fill`, `do`,
+`value`, `verdict` and `health`), which inject `src/page-helpers.js.txt` once per DevTools
 document and route `browse:<n>` tabs through the `browse` CLI automatically. They add no
 capability operations.
 
@@ -177,9 +179,9 @@ All three run the same code in `src/`.
 
 `.agents/skills/browser-control/` is an agent skill you can install as is. It holds:
 
-- `SKILL.md`, which tells the agent when and how to use the tool.
-- `references/`, one file per task: tabs, frames, input, dialogs, network, scrolling,
-  downloads, artifacts, inspection, sessions and backends.
+- `SKILL.md`, which tells the agent when and how to use the tool and how to check for updates.
+- `references/`, five task-shaped guides: `safety.md`, `dom-and-input.md`, `network-and-apis.md`,
+  `visual-and-picture.md`, and `sessions-and-backends.md`.
 - `scripts/`, which holds the daemon client.
 
 Copy or symlink the folder into your agent's skills folder. For Claude Code that is

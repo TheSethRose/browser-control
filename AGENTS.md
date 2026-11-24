@@ -31,24 +31,30 @@ profile.
   backend (`browse.ts`). CDP in `src/index.ts` stays the fallback for every operation.
 - `src/events.ts` — the bounded cross-call event ring buffer and `wait_for_event`.
 - `cli.ts` — thin standalone CLI bootstrap, and `--serve <socket>` to run the daemon.
-- `daemon.ts` — long-lived Unix-socket server over the same runtime, so one CDP connection
-  (and one Chrome "Allow" prompt) serves many short client calls.
+- `daemon.ts` — thin Unix-socket server over the same runtime, so one CDP connection
+  (and one Chrome "Allow" prompt) serves many short client calls; exposes build hash +
+  version in `/status` and writes `<socket>.build` for stale-daemon detection.
+- `src/page-runner.ts` — the daemon's `/page/*` runner (`snap`, `click`, `type`, `select`,
+  `upload`, `wait`, `key`, `fill`, `do`, `value`, `text`, `ocr`, `shot`, `nav`, `verdict`,
+  `health`), accessibility formatting, tab matching, and `browse:<n>` parity.
+- `src/picture.ts` — picture-page OCR diffing, canvas redraw hash polling, and image width
+  measurement.
 - `mcp.ts` — thin standalone MCP bootstrap (plain tool names: `execute_cdp`, not
   `browser-control__execute_cdp`).
 - `tests/` — `bun test` suites: manifest validity, operation behavior, session routing,
-  standalone adapters.
+  standalone adapters, page helpers.
 - `src/page-helpers.ts` + `src/page-helpers.js.txt` — the in-page helper script (`__bc`),
-  written as plain JavaScript in the `.js.txt` file and imported as text. `daemon.ts` injects
-  it lazily once per document. It lists controls with stable refs, finds a control by label,
-  reports what an action changed (`baseline`/`settle`/`diff`), returns readable text, and
-  draws screenshot marks. Bump `VERSION` in the `.js.txt` and `PAGE_HELPERS_VERSION` in the
-  `.ts` together on every change so tabs holding an old copy reinstall it. These are
-  daemon/skill procedures, not capability operations.
+  written as plain JavaScript in the `.js.txt` file and imported as text. `src/page-runner.ts`
+  injects it lazily once per document. `PAGE_HELPERS_VERSION` is parsed directly from
+  `const VERSION = <n>;` in `.js.txt`, so bump `VERSION` in `.js.txt` on every change so
+  tabs holding an old copy reinstall it. These are daemon/skill procedures, not capability
+  operations.
 - `src/ocr.ts` + `src/ocr.swift.txt` — text recognition for pages that are only a picture
-  (macOS Vision). The Swift source is compiled once into `~/.cache/browser-control/`.
+  (macOS Vision). The Swift source is compiled once into `~/.cache/browser-control/` and
+  kept warm in `--loop` mode across OCR calls.
 - `.agents/skills/browser-control/` — the skill that ships with this capability:
-  `SKILL.md` (trigger + workflow routing), `references/*.md` (one procedure per file),
-  `scripts/` (the thin curl-over-Unix-socket daemon client + CLI/MCP wrappers),
+  `SKILL.md` (trigger + workflow routing + update check), `references/*.md` (5 task-shaped
+  references), `scripts/` (the thin curl-over-Unix-socket daemon client + CLI/MCP wrappers),
   `agents/openai.yaml`, and `runtime/` (**generated**, see below).
 
 This repository is **not standalone**: it depends on `@agent-software/core` from the

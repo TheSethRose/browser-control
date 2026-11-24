@@ -2,12 +2,14 @@
  * In-page helpers (`__bc`) and input metadata used by the daemon's `/page/*` routes.
  *
  * The in-page code lives in `page-helpers.js.txt` (plain JavaScript, imported as text).
- * Bump `VERSION` there and `PAGE_HELPERS_VERSION` here together whenever it changes, so
- * tabs holding an older `__bc` copy reinstall it automatically.
+ * `PAGE_HELPERS_VERSION` is read directly from `const VERSION = <n>;` in that file, so
+ * bumping it in one place causes tabs holding an older `__bc` copy to reinstall it.
  */
 import source from "./page-helpers.js.txt";
 
-export const PAGE_HELPERS_VERSION = 5;
+const versionMatch = /\bconst VERSION = (\d+);/.exec(source);
+if (!versionMatch) throw new Error("page-helpers.js.txt is missing const VERSION = <n>;");
+export const PAGE_HELPERS_VERSION = Number(versionMatch[1]);
 
 /**
  * In-page IIFE installed once per document. Keeps refs in memory (WeakRef), so an element
@@ -15,6 +17,12 @@ export const PAGE_HELPERS_VERSION = 5;
  * the length of one screenshot.
  */
 export const PAGE_HELPERS_SOURCE: string = source;
+
+/** Field-name patterns also checked on `browse:<n>` tabs where `__bc` refs aren't used. */
+export const HONEYPOT_NAME =
+  /honeypot|honey.?pot|bot.?field|leave.?this.?empty|do.?not.?fill|anti.?spam|gotcha|trap.?field/i;
+export const PAYMENT_FIELD =
+  /card.?number|cardnumber|cc-?(number|csc|exp)|ccnumber|cvc|cvv|expir(y|ation)|security.?code|iban|account.?number|routing.?number|payment.?method/i;
 
 export interface KeySpec {
   key: string;
@@ -50,12 +58,4 @@ export function parseLocator(raw: unknown): Locator {
   if (frame) return { kind: "frame", frame: Number(frame[1]), ref: frame[2]! };
   if (/^a[0-9]+$/.test(s)) return { kind: "ax", node: Number(s.slice(1)) };
   return { kind: "label", label: raw.trim() };
-}
-
-/** Validate and normalize a snapshot ref like `e12` or `@e12`. */
-export function parseRef(raw: unknown): string {
-  if (typeof raw !== "string" || !/^@?e[0-9]+$/.test(raw)) {
-    throw new Error(`INPUT_INVALID: ref must look like e12 (from snap), got '${String(raw ?? "")}'`);
-  }
-  return raw.replace(/^@/, "");
 }

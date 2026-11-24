@@ -1,28 +1,58 @@
 // Text recognition for pages that are only a picture (remote-isolated browsers, canvas apps).
-// Usage: ocr <image>. Prints one line per piece of text: x y width height <text>, as
-// fractions of the image measured from its top-left corner.
+// Single-shot: ocr <image>
+// Warm worker: ocr --loop  (reads one image path per stdin line, ends each reply with __BC_OCR_END__)
 import Foundation
 import Vision
 import AppKit
 
-guard CommandLine.arguments.count == 2,
-      let image = NSImage(contentsOfFile: CommandLine.arguments[1]),
-      let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
-    FileHandle.standardError.write("ocr: cannot read the image\n".data(using: .utf8)!)
+func makeRequest() -> VNRecognizeTextRequest {
+    let request = VNRecognizeTextRequest()
+    request.recognitionLevel = .accurate
+    request.usesLanguageCorrection = false
+    return request
+}
+
+func recognize(path: String, request: VNRecognizeTextRequest) -> String? {
+    guard let image = NSImage(contentsOfFile: path),
+          let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+        return "cannot read the image"
+    }
+    do {
+        try VNImageRequestHandler(cgImage: cg, options: [:]).perform([request])
+    } catch {
+        return error.localizedDescription
+    }
+    for observation in request.results ?? [] {
+        guard let best = observation.topCandidates(1).first else { continue }
+        let b = observation.boundingBox
+        let text = best.string.replacingOccurrences(of: "\n", with: " ")
+        print(String(format: "%.4f %.4f %.4f %.4f %@", b.minX, 1 - b.maxY, b.width, b.height, text))
+    }
+    return nil
+}
+
+if CommandLine.arguments.count == 2 && CommandLine.arguments[1] == "--loop" {
+    let request = makeRequest()
+    while let raw = readLine() {
+        let path = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if path.isEmpty { continue }
+        autoreleasepool {
+            if let err = recognize(path: path, request: request) {
+                print("__BC_OCR_ERR__ \(err)")
+            } else {
+                print("__BC_OCR_END__")
+            }
+            fflush(stdout)
+        }
+    }
+    exit(0)
+}
+
+guard CommandLine.arguments.count == 2 else {
+    FileHandle.standardError.write("usage: ocr <image> | ocr --loop\n".data(using: .utf8)!)
     exit(2)
 }
-let request = VNRecognizeTextRequest()
-request.recognitionLevel = .accurate
-request.usesLanguageCorrection = false
-do {
-    try VNImageRequestHandler(cgImage: cg, options: [:]).perform([request])
-} catch {
-    FileHandle.standardError.write("ocr: \(error.localizedDescription)\n".data(using: .utf8)!)
+if let err = recognize(path: CommandLine.arguments[1], request: makeRequest()) {
+    FileHandle.standardError.write("ocr: \(err)\n".data(using: .utf8)!)
     exit(1)
-}
-for observation in request.results ?? [] {
-    guard let best = observation.topCandidates(1).first else { continue }
-    let b = observation.boundingBox
-    let text = best.string.replacingOccurrences(of: "\n", with: " ")
-    print(String(format: "%.4f %.4f %.4f %.4f %@", b.minX, 1 - b.maxY, b.width, b.height, text))
 }

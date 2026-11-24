@@ -1,6 +1,6 @@
 {
   "name": "browser-control",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Discover, connect to, and drive a real Chromium-based browser over the Chrome DevTools Protocol (CDP). General execute_cdp primitive, evaluate and navigate shortcuts, target discovery/routing, screenshot/PDF materialization, and cross-call CDP event polling.",
   "entrypoint": "src/index.ts",
   "delivery": {

@@ -1,5 +1,5 @@
 (() => {
-  const VERSION = 5;
+  const VERSION = 6;
   if (globalThis.__bc && globalThis.__bc.v === VERSION) return;
 
   const INTERACTIVE = [
@@ -12,6 +12,7 @@
   ].join(',');
   const CONTEXT = 'h1,h2,h3,h4,h5,h6,[role="heading"],label,p,li,[role="alert"],[role="status"],[role="dialog"]';
   const LIMIT = 250;
+  const DIAG_MAX = 30;
 
   const HONEYPOT_NAME = /honeypot|honey.?pot|bot.?field|leave.?this.?empty|do.?not.?fill|anti.?spam|gotcha|trap.?field/i;
   const PAYMENT_FIELD = /card.?number|cardnumber|cc-?(number|csc|exp)|ccnumber|cvc|cvv|expir(y|ation)|security.?code|iban|account.?number|routing.?number|payment.?method/i;
@@ -24,10 +25,24 @@
   const ids = new WeakMap();
   let nextId = 1;
   let base = null;
+  let baseEntries = null;
+  let baseMutation = -1;
+  let baseFull = false;
+  let lastScan = null;
   let frameEls = [];
   let lastMutation = 0;
   let leaving = false;
   let wallCache;
+
+  // Passive status-only ring buffer (4xx/5xx resource responses + uncaught JS errors).
+  // Never reads headers, bodies, cookies, or query strings.
+  const diag = [];
+  let diagSeq = 0;
+  let baseDiagSeq = 0;
+  const pushDiag = (line) => {
+    diag.push({ seq: ++diagSeq, line });
+    if (diag.length > DIAG_MAX) diag.shift();
+  };
 
   const refOf = (el) => {
     let id = ids.get(el);
@@ -36,13 +51,44 @@
     return id;
   };
 
+  const clean = (s, n = 80) => String(s || '').replace(/\s+/g, ' ').trim().slice(0, n);
+  const safePath = (u) => {
+    try {
+      const p = new URL(u, location.href);
+      return p.origin === location.origin ? p.pathname : `${p.origin}${p.pathname}`;
+    } catch {
+      return String(u || '').split('?')[0].slice(0, 120);
+    }
+  };
+
   try {
     new MutationObserver(() => { lastMutation = performance.now(); wallCache = undefined; })
       .observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
     globalThis.navigation?.addEventListener('navigate', (e) => { if (!e.destination.sameDocument) leaving = true; });
   } catch { /* observers are an optimisation only */ }
 
-  const clean = (s, n = 80) => String(s || '').replace(/\s+/g, ' ').trim().slice(0, n);
+  try {
+    new PerformanceObserver((list) => {
+      for (const e of list.getEntries()) {
+        if (e.responseStatus >= 400) {
+          pushDiag(`# HTTP ${e.responseStatus} (${e.initiatorType || 'res'}) ${safePath(e.name)}`);
+        }
+      }
+    }).observe({ type: 'resource', buffered: false });
+  } catch { /* PerformanceObserver responseStatus may be unavailable */ }
+
+  try {
+    globalThis.addEventListener?.('error', (e) => {
+      const msg = e.error?.message || e.message || 'uncaught error';
+      pushDiag(`# JS error: ${clean(msg, 120)}`);
+    });
+    globalThis.addEventListener?.('unhandledrejection', (e) => {
+      const r = e.reason;
+      const msg = r && typeof r === 'object' && 'message' in r ? r.message : String(r || 'unhandled rejection');
+      pushDiag(`# JS error: ${clean(msg, 120)}`);
+    });
+  } catch { /* ignore */ }
+
   const styleIfShown = (el) => {
     const r = el.getBoundingClientRect();
     if (r.width <= 0 || r.height <= 0) return null;
@@ -155,17 +201,56 @@
   };
   const wallLine = (w) => `# WALL: ${w}. Stop and hand this tab to the user; do not solve or bypass it.`;
 
+  const mainCanvas = () => {
+    const area = innerWidth * innerHeight;
+    if (area <= 0) return null;
+    let best = null;
+    let bestArea = area * 0.5;
+    for (const c of document.querySelectorAll('canvas')) {
+      if (!shown(c)) continue;
+      const r = c.getBoundingClientRect();
+      const vis = Math.max(0, Math.min(r.right, innerWidth) - Math.max(r.left, 0))
+        * Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0));
+      if (vis > bestArea) { best = c; bestArea = vis; }
+    }
+    return best;
+  };
+
   // 'picture' when the page is drawn into one big canvas (remote browser isolation, canvas apps):
   // there are no controls to list, so it has to be read from pixels.
-  const surface = () => {
-    const area = innerWidth * innerHeight;
-    const big = [...document.querySelectorAll('canvas')].some((c) => {
-      const r = c.getBoundingClientRect();
-      return shown(c) && Math.max(0, Math.min(r.right, innerWidth) - Math.max(r.left, 0)) * Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0)) > area * 0.5;
-    });
-    return big ? 'picture' : 'dom';
-  };
+  const surface = () => (mainCanvas() ? 'picture' : 'dom');
   const PICTURE_LINE = '# PICTURE PAGE: this page is drawn into a canvas (remote browser isolation or a canvas app), so its own controls cannot be listed. Read it with ocr, act with click --xy, type --focused and key.';
+
+  let probeCanvas = null;
+  // Fast 16x16 downsample hash of the main canvas to detect remote redraws without full OCR.
+  // Returns '' when unreadable (tainted canvas or WebGL without preserveDrawingBuffer).
+  function canvasHash() {
+    const c = mainCanvas();
+    if (!c) return '';
+    try {
+      if (!probeCanvas) {
+        probeCanvas = document.createElement('canvas');
+        probeCanvas.width = 16;
+        probeCanvas.height = 16;
+      }
+      const ctx = probeCanvas.getContext('2d', { willReadFrequently: true });
+      if (!ctx) return '';
+      ctx.clearRect(0, 0, 16, 16);
+      ctx.drawImage(c, 0, 0, 16, 16);
+      const data = ctx.getImageData(0, 0, 16, 16).data;
+      let h = 2166136261;
+      let nonZero = 0;
+      for (let i = 0; i < data.length; i += 4) {
+        const px = (data[i] << 16) | (data[i + 1] << 8) | data[i + 2] | (data[i + 3] << 24);
+        if (px !== 0) nonZero++;
+        h ^= px;
+        h = Math.imul(h, 16777619);
+      }
+      return nonZero === 0 ? '' : (h >>> 0).toString(16);
+    } catch {
+      return '';
+    }
+  }
 
   const lineOf = (el, st) => {
     const name = nameOf(el);
@@ -182,12 +267,17 @@
     return el;
   };
 
+  const activeModal = () => {
+    const open = [...document.querySelectorAll('dialog[open],[role="dialog"][aria-modal="true"],[role="alertdialog"][aria-modal="true"]')].filter(shown);
+    return open.length ? open[open.length - 1] : null;
+  };
+
   // Every visible control under `scope`, in document order: { el, line }.
   function scan(opts = {}) {
     const sel = opts.all ? `${INTERACTIVE},${CONTEXT}` : INTERACTIVE;
     const limit = opts.limit || LIMIT;
     const find = opts.find ? String(opts.find).toLowerCase() : null;
-    const scope = scopeOf(opts.within);
+    const scope = opts.withinEl || scopeOf(opts.within);
     const items = [];
     let more = false;
     const take = (el) => {
@@ -216,16 +306,34 @@
     return frameEls;
   };
 
+  const BASE_LIMIT = 2000;
+  const mapOf = (items) => new Map(items.map((i) => [ids.get(i.el), i.line]));
+  // Pure JS property signature (zero layout reads) to catch form changes that skip MutationObserver.
+  const stateSig = (el) => `${el.value ?? ''}\0${el.checked ? 1 : 0}\0${el.disabled ? 1 : 0}\0${el.selectedIndex ?? ''}`;
+  const entriesOf = (items) => items.map((i) => ({ el: i.el, sig: stateSig(i.el) }));
+  const entriesUnchanged = (entries) => {
+    for (let i = 0; i < entries.length; i++) {
+      const { el, sig } = entries[i];
+      if (!el.isConnected || stateSig(el) !== sig) return false;
+    }
+    return true;
+  };
+
   function snapshot(opts = {}) {
-    const { items, more } = scan(opts);
+    const modal = !opts.within ? activeModal() : null;
+    const { items, more } = scan(modal ? { ...opts, withinEl: modal } : opts);
+    if (!opts.all && !opts.find && !opts.within && !modal && !more) {
+      lastScan = { map: mapOf(items), entries: entriesOf(items), mutation: lastMutation, href: location.href, full: true };
+    }
     const head = [`# ${clean(document.title, 100)} | ${location.origin}${location.pathname}`];
     const w = wall();
     if (w) head.push(wallLine(w));
     if (surface() === 'picture') head.push(PICTURE_LINE);
+    if (modal) head.push('# Modal open: scoped to it. Pass --within body for the whole page.');
     if (opts.find) head.push(`# ${items.length} control(s) match "${clean(opts.find, 40)}"${more ? ` (first ${items.length} shown)` : ''}`);
     else if (more) head.push(`# Only the first ${items.length} elements are listed. Narrow with --find <text> or --within <ref|css>.`);
-    const skipped = crossOriginFrames().length;
-    if (skipped && !opts.within) head.push(`# ${skipped} cross-origin iframe(s): their controls are listed below as f<n>:e<m> when reachable.`);
+    const skipped = !opts.within && !modal ? crossOriginFrames().length : 0;
+    if (skipped) head.push(`# ${skipped} cross-origin iframe(s): their controls are listed below as f<n>:e<m> when reachable.`);
     return [...head, ...items.map((i) => i.line)].join('\n');
   }
 
@@ -241,12 +349,24 @@
     return `${r.left + f.clientLeft} ${r.top + f.clientTop}`;
   }
 
-  const BASE_LIMIT = 2000;
-  const mapOf = (items) => new Map(items.map((i) => [ids.get(i.el), i.line]));
+  function captureScan() {
+    if (lastScan && lastScan.full && lastScan.mutation === lastMutation && lastScan.href === location.href
+      && entriesUnchanged(lastScan.entries)) {
+      return lastScan;
+    }
+    const { items, more } = scan({ limit: BASE_LIMIT });
+    lastScan = { map: mapOf(items), entries: entriesOf(items), mutation: lastMutation, href: location.href, full: !more };
+    return lastScan;
+  }
 
   // Remember the controls now, so diff() can report what an action changed.
   function baseline() {
-    base = mapOf(scan({ limit: BASE_LIMIT }).items);
+    const snap = captureScan();
+    base = snap.map;
+    baseEntries = snap.entries;
+    baseMutation = snap.mutation;
+    baseFull = snap.full;
+    baseDiagSeq = diagSeq;
     leaving = false;
     return location.href;
   }
@@ -268,10 +388,22 @@
     const max = opts.max || 30;
     const out = [];
     const from = opts.from || '';
-    if (from && from !== location.href) out.push(`# url: ${from} -> ${location.href}`);
+    const urlChanged = !!(from && from !== location.href);
+    if (urlChanged) out.push(`# url: ${from} -> ${location.href}`);
     const w = wall();
     if (w) out.push(wallLine(w));
-    const now = mapOf(scan({ limit: BASE_LIMIT }).items);
+    const diagLines = diag.filter((d) => d.seq > baseDiagSeq).slice(-5).map((d) => d.line);
+    baseDiagSeq = diagSeq;
+
+    if (base && baseEntries && baseFull && !urlChanged && lastMutation === baseMutation && entriesUnchanged(baseEntries)) {
+      out.push(...diagLines);
+      if (out.length === 0) out.push('# no visible change yet');
+      return out.join('\n');
+    }
+
+    const { items, more } = scan({ limit: BASE_LIMIT });
+    const now = mapOf(items);
+    lastScan = { map: now, entries: entriesOf(items), mutation: lastMutation, href: location.href, full: !more };
     const changes = [];
     if (!base) {
       out.push(`# new page: ${clean(document.title, 100)}`);
@@ -285,8 +417,12 @@
       for (const [id, line] of base) if (!now.has(id)) changes.push(`- ${line.slice(2)}`);
     }
     base = now;
+    baseEntries = lastScan.entries;
+    baseMutation = lastMutation;
+    baseFull = !more;
     out.push(...changes.slice(0, max));
     if (changes.length > max) out.push(`# … ${changes.length - max} more changes; run snap`);
+    out.push(...diagLines);
     if (!changes.length && out.length === 0) out.push('# no visible change yet');
     return out.join('\n');
   }
@@ -301,6 +437,9 @@
     if (kind === 'type') {
       const typeable = items.filter((i) => TYPEABLE.test(roleOf(i.el)) || i.el.isContentEditable);
       if (typeable.length) items = typeable;
+    } else if (kind === 'select') {
+      const selectable = items.filter((i) => i.el.tagName === 'SELECT' || /^(combobox|listbox)$/.test(roleOf(i.el)));
+      if (selectable.length) items = selectable;
     }
     const named = items.map((i) => ({ ...i, name: nameOf(i.el).toLowerCase() }));
     let hits = named.filter((i) => i.name === want);
@@ -393,6 +532,107 @@
       s.removeAllRanges(); s.addRange(range);
     }
     return el.ownerDocument.activeElement === el || el.contains(el.ownerDocument.activeElement) ? 'focused' : 'not focused';
+  }
+
+  // Native <select>: set value without opening an OS dropdown. Returns '__not_native__' for ARIA comboboxes.
+  function select(ref, option) {
+    const el = resolve(ref);
+    if (flagsOf(el).includes('disabled')) throw new Error(`NOT_ACTIONABLE: ${ref} disabled`);
+    if (el.tagName !== 'SELECT') return '__not_native__';
+    const raw = String(option ?? '');
+    const want = clean(raw, 200).toLowerCase();
+    const opts = [...el.options].filter((o) => !o.disabled);
+    let hits = opts.filter((o) => o.value === raw);
+    if (!hits.length) hits = opts.filter((o) => clean(o.textContent, 200).toLowerCase() === want);
+    if (!hits.length && want) hits = opts.filter((o) => clean(o.textContent, 200).toLowerCase().includes(want));
+    const list = (arr) => arr.slice(0, 12).map((o) => `"${clean(o.textContent || o.value, 40)}" (value="${o.value}")`).join(', ');
+    if (hits.length === 0) throw new Error(`NO_MATCH: no option "${clean(raw, 60)}" in ${ref}. Options: ${list(opts)}`);
+    if (hits.length > 1) throw new Error(`AMBIGUOUS: "${clean(raw, 60)}" matches ${hits.length} options: ${list(hits)}`);
+    const chosen = hits[0];
+    const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')?.set;
+    if (setter) setter.call(el, chosen.value);
+    else el.value = chosen.value;
+    el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+    return clean(chosen.textContent || chosen.value, 80);
+  }
+
+  // Find a visible option in an open custom ARIA dropdown/combobox.
+  function locateOption(option) {
+    const want = clean(option, 200).toLowerCase();
+    const found = [];
+    for (const root of roots(document)) {
+      for (const el of root.querySelectorAll('[role="option"],[role="menuitem"],[role="menuitemradio"]')) {
+        if (!shown(el) || flagsOf(el).includes('disabled')) continue;
+        found.push({ el, name: nameOf(el).toLowerCase(), line: lineOf(el) });
+      }
+    }
+    let hits = found.filter((i) => i.name === want);
+    if (!hits.length && want) hits = found.filter((i) => i.name.includes(want));
+    if (hits.length === 1) return refOf(hits[0].el);
+    if (hits.length > 1) {
+      throw new Error(`AMBIGUOUS: option "${clean(option, 60)}" matches ${hits.length} items:\n${hits.slice(0, 12).map((h) => h.line).join('\n')}`);
+    }
+    throw new Error(`NO_MATCH: no open option "${clean(option, 60)}".${found.length ? ` Visible:\n${found.slice(0, 10).map((h) => h.line).join('\n')}` : ''}`);
+  }
+
+  // Find an <input type="file"> (including hidden ones) by ref, label, or CSS selector.
+  function locateFile(refOrLabel) {
+    const raw = String(refOrLabel ?? '').trim();
+    if (!raw) throw new Error('INPUT_INVALID: a file input ref, label, or CSS selector is required');
+    if (/^@?e\d+$/.test(raw)) {
+      const el = resolve(raw);
+      if (el.tagName === 'INPUT' && el.type === 'file') return refOf(el);
+      if (el.tagName === 'LABEL' && el.control?.tagName === 'INPUT' && el.control.type === 'file') return refOf(el.control);
+      const inner = el.querySelector?.('input[type="file"]');
+      if (inner) return refOf(inner);
+      throw new Error(`INPUT_INVALID: ${raw} is not a file input`);
+    }
+    const all = [];
+    for (const root of roots(document)) {
+      for (const el of root.querySelectorAll('input[type="file"]')) all.push(el);
+    }
+    if (!all.length) throw new Error('NO_MATCH: no <input type="file"> found on this page');
+    try {
+      const byCss = [...document.querySelectorAll(raw)].filter((e) => e.tagName === 'INPUT' && e.type === 'file');
+      if (byCss.length === 1) return refOf(byCss[0]);
+    } catch { /* not a CSS selector */ }
+    const want = clean(raw, 200).toLowerCase();
+    const named = all.map((el) => {
+      const label = clean(nameOf(el) || el.name || el.id || el.accept || 'file', 80);
+      return { el, label, hay: `${label} ${hayOf(el)} ${el.accept || ''}`.toLowerCase(), line: `- file "${label}" [${refOf(el)}]` };
+    });
+    let hits = named.filter((i) => i.label.toLowerCase() === want);
+    if (!hits.length) hits = named.filter((i) => i.hay.includes(want));
+    if (!hits.length && all.length === 1 && want === 'file') hits = named;
+    if (hits.length === 1) return refOf(hits[0].el);
+    if (hits.length > 1) {
+      throw new Error(`AMBIGUOUS: "${clean(raw, 60)}" matches ${hits.length} file inputs:\n${hits.slice(0, 10).map((h) => h.line).join('\n')}`);
+    }
+    throw new Error(`NO_MATCH: no file input matching "${clean(raw, 60)}". Available:\n${named.slice(0, 10).map((h) => h.line).join('\n')}`);
+  }
+
+  // Check wait conditions (all provided conditions must match).
+  function checkWait(opts = {}) {
+    const w = wall() || '';
+    let matched = true;
+    if (opts.url && !location.href.toLowerCase().includes(String(opts.url).toLowerCase())) matched = false;
+    if (matched && opts.selector) {
+      let found = false;
+      for (const root of roots(document)) {
+        try {
+          if ([...root.querySelectorAll(opts.selector)].some(shown)) { found = true; break; }
+        } catch {
+          throw new Error(`INPUT_INVALID: invalid CSS selector "${opts.selector}"`);
+        }
+      }
+      if (!found) matched = false;
+    }
+    if (matched && opts.text) {
+      const body = ((document.body && document.body.innerText) || '').toLowerCase();
+      if (!body.includes(String(opts.text).toLowerCase())) matched = false;
+    }
+    return JSON.stringify({ matched, url: location.href, wall: w });
   }
 
   function value(ref) {
@@ -564,7 +804,11 @@
   }
 
   Object.defineProperty(globalThis, '__bc', {
-    value: { v: VERSION, snapshot, wall, surface, point, guard, guardFocused, focusForType, value, verdict, health, frames, frameOffset, baseline, settle, diff, locate, hit, rect, viewport, marks, text },
+    value: {
+      v: VERSION, snapshot, wall, surface, canvasHash, point, guard, guardFocused, focusForType,
+      select, locateOption, locateFile, el: resolve, checkWait, value, verdict, health, frames,
+      frameOffset, baseline, settle, diff, locate, hit, rect, viewport, marks, text,
+    },
     configurable: true, enumerable: false,
   });
 })();
