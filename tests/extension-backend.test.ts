@@ -629,6 +629,22 @@ describe("relay token files", () => {
     expect(statSync(file).mode & 0o777).toBe(0o600);
   });
 
+  test("concurrent rotations of a leaked token agree on one new token", async () => {
+    const file = pjoin(mkdtempSync(pjoin(ptmp(), "bc-tok-")), "extension-relay.json");
+    writeFileSync(file, JSON.stringify({ token: "b".repeat(64) }), { mode: 0o644 });
+    const tokens = await Promise.all(Array.from({ length: 16 }, () => ensure(file)));
+    expect(new Set(tokens).size).toBe(1);
+    expect(JSON.parse(readFileSync(file, "utf8")).token).toBe(tokens[0]);
+  });
+
+  test("a malformed private token file is replaced", async () => {
+    const file = pjoin(mkdtempSync(pjoin(ptmp(), "bc-tok-")), "extension-relay.json");
+    writeFileSync(file, "not json", { mode: 0o600 });
+    const token = await ensure(file);
+    expect(token).toMatch(/^[0-9a-f]{64}$/);
+    expect(JSON.parse(readFileSync(file, "utf8")).token).toBe(token);
+  });
+
   test("pairing.json replaces an existing open file with a private one", async () => {
     const dir = mkdtempSync(pjoin(ptmp(), "bc-pair-"));
     const ext = pjoin(dir, "ext");

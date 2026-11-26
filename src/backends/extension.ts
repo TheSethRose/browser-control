@@ -11,7 +11,7 @@
  */
 
 import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { link, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { link, mkdir, readFile, rename, rmdir, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import type { Server, ServerWebSocket } from "bun";
@@ -80,16 +80,26 @@ export function defaultTokenFilePath(): string {
   return join(config, "browser-control", "extension-relay.json");
 }
 
-async function readPrivateToken(tokenFile: string): Promise<string | undefined | "too-open"> {
+type TokenRead = { token: string } | { state: "missing" | "bad" };
+
+async function readPrivateToken(tokenFile: string): Promise<TokenRead> {
+  let info;
   try {
-    const info = await stat(tokenFile);
-    if ((info.mode & 0o077) !== 0 || (typeof process.getuid === "function" && info.uid !== process.getuid())) return "too-open";
-    const parsed = JSON.parse(await readFile(tokenFile, "utf8")) as { token?: unknown };
-    if (typeof parsed.token === "string" && HEX_64_RE.test(parsed.token)) return parsed.token.toLowerCase();
-  } catch {
-    /* missing or invalid */
+    info = await stat(tokenFile);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { state: "missing" };
+    throw error;
   }
-  return undefined;
+  if ((info.mode & 0o077) !== 0 || (typeof process.getuid === "function" && info.uid !== process.getuid())) {
+    return { state: "bad" };
+  }
+  try {
+    const parsed = JSON.parse(await readFile(tokenFile, "utf8")) as { token?: unknown };
+    if (typeof parsed.token === "string" && HEX_64_RE.test(parsed.token)) return { token: parsed.token.toLowerCase() };
+  } catch {
+    /* unreadable or not JSON */
+  }
+  return { state: "bad" };
 }
 
 /** Write `body` to a new 0600 temp file beside `file`, then publish it. `replace: false` keeps an existing file. */
@@ -113,17 +123,48 @@ async function publishPrivateFile(file: string, body: string, replace: boolean):
   }
 }
 
+const LOCK_STALE_MS = 10_000;
+
+/** Run `fn` while holding `<file>.lock` (an atomic mkdir), so only one process rotates the token. */
+async function withFileLock<T>(file: string, fn: () => Promise<T>): Promise<T> {
+  const lock = `${file}.lock`;
+  for (let waited = 0; ; waited += 25) {
+    try {
+      await mkdir(lock, { mode: 0o700 });
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      const age = await stat(lock).then((i) => Date.now() - i.mtimeMs, () => 0);
+      if (age > LOCK_STALE_MS) await rmdir(lock).catch(() => {});
+      if (waited > LOCK_STALE_MS * 2) throw new Error(`EXECUTION_FAILED: relay token lock ${lock} is stuck`);
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    await rmdir(lock).catch(() => {});
+  }
+}
+
+const newTokenBody = (token: string) => `${JSON.stringify({ token }, null, 2)}\n`;
+
 export async function ensureRelayToken(tokenFile: string = defaultTokenFilePath()): Promise<string> {
   await mkdir(dirname(tokenFile), { recursive: true, mode: 0o700 });
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const existing = await readPrivateToken(tokenFile);
-    if (typeof existing === "string" && existing !== "too-open") return existing;
-    // A token others could read is spent: rotate it. Otherwise create once; a concurrent creator may win.
+  const first = await readPrivateToken(tokenFile);
+  if ("token" in first) return first.token;
+  if (first.state === "missing") {
     const token = randomBytes(32).toString("hex");
-    const body = `${JSON.stringify({ token }, null, 2)}\n`;
-    if (await publishPrivateFile(tokenFile, body, existing === "too-open")) return token;
+    if (await publishPrivateFile(tokenFile, newTokenBody(token), false)) return token;
   }
-  throw new Error(`EXECUTION_FAILED: could not create a private relay token at ${tokenFile}`);
+  // Broken or readable by others: replace it once, under a lock, after re-checking.
+  return withFileLock(tokenFile, async () => {
+    const again = await readPrivateToken(tokenFile);
+    if ("token" in again) return again.token;
+    const token = randomBytes(32).toString("hex");
+    await publishPrivateFile(tokenFile, newTokenBody(token), true);
+    return token;
+  });
 }
 
 export async function setupExtensionPairing(

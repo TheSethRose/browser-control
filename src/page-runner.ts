@@ -10,6 +10,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { runBrowse, type Runner } from "./backends/browse";
+import { backendOrder } from "./backends/router";
 import { extensionTabOf, getRegisteredExtensionBcCall, type BcCallFn } from "./backends/extension";
 import { inspectIssues, inspectPerf, inspectStyles } from "./devtools";
 import {
@@ -212,7 +213,7 @@ export function createPageHelperHandler(
   const recentTyped = new Map<string, Record<string, string>>();
 
   async function runBcCall(call: ReturnType<typeof normalizeHelperCall>, targetId: string, timeoutMs?: number): Promise<InvokeResult> {
-    const fn = options.bcCall ?? getRegisteredExtensionBcCall();
+    const fn = options.bcCall ?? (backendOrder().includes("extension") ? getRegisteredExtensionBcCall() : undefined);
     if (!fn) {
       return failure("EXECUTION_FAILED", "BACKEND_UNAVAILABLE: extension backend is not active");
     }
