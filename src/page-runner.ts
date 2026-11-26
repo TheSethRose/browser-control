@@ -212,14 +212,6 @@ export function createPageHelperHandler(
     const normalized = normalizeHelperCall(call);
     const callExpr = renderSteps(normalized);
     const extra = { isolated: true, ...(targetId ? { targetId } : {}), ...(timeoutMs ? { timeoutMs } : {}) };
-    if (!normalized.steps.some((s) => s.kind === "bc")) {
-      const res = await invoke("evaluate", { expression: callExpr, ...extra });
-      if (res.ok) {
-        const ctx = (res.data as Json)["contextId"];
-        if (typeof ctx === "number") contextIds.set(targetId ?? "", ctx);
-      }
-      return helperError(res);
-    }
     const probe = `globalThis.__bc && globalThis.__bc.v === ${PAGE_HELPERS_VERSION} ? (${callExpr}) : "${NEED_INSTALL}"`;
     const first = await invoke("evaluate", { expression: probe, ...extra });
     if (!first.ok) return helperError(first);
@@ -232,6 +224,20 @@ export function createPageHelperHandler(
       if (typeof secondCtx === "number") contextIds.set(targetId ?? "", secondCtx);
     }
     return helperError(second);
+  }
+
+  /** A plain page property read: no __bc probe, and it never updates the helper context cache. */
+  function readProperty(
+    kind: "readyState" | "origin" | "host" | "href",
+    targetId?: string,
+    opts: { isolated?: boolean; timeoutMs?: number } = {},
+  ): Promise<InvokeResult> {
+    return invoke("evaluate", {
+      expression: renderSteps(normalizeHelperCall({ kind })),
+      ...(opts.isolated ? { isolated: true } : {}),
+      ...(targetId ? { targetId } : {}),
+      ...(opts.timeoutMs ? { timeoutMs: opts.timeoutMs } : {}),
+    });
   }
 
   const picture = createPictureTracker(invoke, evalHelper, recognize);
@@ -558,7 +564,7 @@ export function createPageHelperHandler(
 
   async function waitParsed(targetId?: string): Promise<void> {
     for (let i = 0; i < 40; i++) {
-      const ready = await evalHelper({ kind: "readyState" }, targetId, 2_000);
+      const ready = await readProperty("readyState", targetId, { timeoutMs: 2_000 });
       if (ready.ok && valueOf(ready) !== "loading") return;
       await sleep(125);
     }
@@ -1134,7 +1140,7 @@ export function createPageHelperHandler(
 
   /** Capture recent first-party 2xx GET JSON responses from buffered CDP Network events. */
   async function captureRecordedGets(targetId?: string): Promise<RecordedGet[]> {
-    const hrefRes = await evalHelper({ kind: "origin" }, targetId);
+    const hrefRes = await readProperty("origin", targetId, { isolated: true });
     const pageOrigin = hrefRes.ok ? valueOf(hrefRes) : "";
     const evRes = await invoke("read_events", { method: "Network.responseReceived", limit: 200, clear: false, ...(targetId ? { targetId } : {}) });
     if (!evRes.ok) return [];
@@ -1168,7 +1174,7 @@ export function createPageHelperHandler(
     let site = typeof input["site"] === "string" && input["site"].trim() !== "" ? input["site"].trim() : "";
     if (sub === "list") return success(await listNotes(options.notesDir));
     if (!site) {
-      const urlRes = await evalHelper({ kind: "host" }, targetId);
+      const urlRes = await readProperty("host", targetId, { isolated: true });
       if (!urlRes.ok || !valueOf(urlRes)) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: pass a site host or select a tab");
       site = valueOf(urlRes);
     }
@@ -1358,7 +1364,7 @@ export function createPageHelperHandler(
         if (steps.length === 0) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: no steps given");
         const start = browseTab === undefined
           ? await evalHelper({ kind: "bc", method: "baseline" }, targetId)
-          : await evalHelper({ kind: "href" }, targetId);
+          : await readProperty("href", targetId);
         if (browseTab === undefined && start && !start.ok) return start;
         const startUrl = start?.ok ? valueOf(start) : "";
         const out: string[] = [];

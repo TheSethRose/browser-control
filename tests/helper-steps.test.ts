@@ -476,14 +476,20 @@ describe("page-runner emits byte-identical CDP evaluate and Runtime.evaluate exp
       await writeFile(filePath, "hi");
 
       const evalExprs: string[] = [];
+      const evalCalls: Record<string, unknown>[] = [];
       const runtimeEvalExprs: string[] = [];
+      const runtimeEvalContexts: unknown[] = [];
 
       const invoke = async (op: string, input: Record<string, unknown> = {}): Promise<InvokeResult> => {
         if (op === "get_browser_status") return { ok: true, data: { connected: true } };
         if (op === "evaluate") {
           const expr = String(input["expression"] ?? "");
           evalExprs.push(expr);
-          if (expr === "location.host") return { ok: true, data: { value: "example.com" } };
+          evalCalls.push(input);
+          // Plain property reads report a different context than helper calls; it must never reach upload/styles.
+          if (/^(?:location\.(?:host|origin|href)|document\.readyState)$/.test(expr)) {
+            return { ok: true, data: { value: expr === "location.host" ? "example.com" : "complete", contextId: 99 } };
+          }
           if (expr.includes("__bc.locateFile")) return { ok: true, data: { value: "e55" } };
           if (expr.includes("__bc.locateOption")) return { ok: true, data: { value: "e99" } };
           if (expr.includes("__bc.locate")) return { ok: true, data: { value: "e7" } };
@@ -506,12 +512,13 @@ describe("page-runner emits byte-identical CDP evaluate and Runtime.evaluate exp
           if (expr.includes("location.href, __bc.wall()")) return { ok: true, data: { value: "https://a.test/\n" } };
           if (expr.includes("__bc.surface")) return { ok: true, data: { value: "dom" } };
           if (expr.includes("__bc.snapshot")) return { ok: true, data: { value: '# T | https://a.test/\n- button "Ok" [e1]' } };
-          return { ok: true, data: { value: "ok" } };
+          return { ok: true, data: { value: "ok", contextId: 7 } };
         }
         if (op === "execute_cdp") {
           if (input["method"] === "Runtime.evaluate") {
             const params = input["params"] as Record<string, unknown>;
             runtimeEvalExprs.push(String(params["expression"] ?? ""));
+            runtimeEvalContexts.push(params["contextId"]);
             return { ok: true, data: { result: { result: { objectId: "obj-1" } } } };
           }
           if (input["method"] === "DOM.requestNode") return { ok: true, data: { result: { nodeId: 10 } } };
@@ -592,6 +599,15 @@ describe("page-runner emits byte-identical CDP evaluate and Runtime.evaluate exp
       expect(evalExprs).toContain("location.host");
       // resolveObject expressions for upload and styles
       expect(runtimeEvalExprs).toEqual(['__bc.el("e55")', '__bc.el("e12")', 'document.querySelector(".card > h2")']);
+      // Property reads keep their pre-refactor options and never overwrite the helper context used by upload/styles.
+      const opts = (expr: string) => evalCalls.filter((c) => c["expression"] === expr).map(({ expression: _e, ...rest }) => rest);
+      for (const o of opts("location.host")) expect(o).toEqual({ isolated: true });
+      for (const o of opts("location.origin")) expect(o).toEqual({ isolated: true });
+      for (const o of opts("document.readyState")) expect(o).toEqual({ timeoutMs: 2_000 });
+      for (const o of opts("location.href")) expect(o).toEqual({});
+      expect(opts("location.host").length + opts("location.origin").length).toBeGreaterThan(0);
+      expect(runtimeEvalContexts.filter((c) => c !== undefined).every((c) => c === 7)).toBe(true);
+      expect(runtimeEvalContexts).not.toContain(99);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
