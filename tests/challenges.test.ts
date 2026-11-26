@@ -424,4 +424,19 @@ describe("classifyChallenge: review regressions", () => {
     );
     expect(d).toMatchObject({ vendor: "recaptcha", kind: "interactive" });
   });
+
+  test("S6: 'press and hold ... to verify the LED' is not a PerimeterX challenge", () => {
+    expect(classifyChallenge(probe({ text: "Press and hold the power button to verify the LED turns on." }))).toBeUndefined();
+  });
+
+  test("S9: a 403 Akamai Access Denied page keeps the akamai vendor", () => {
+    const d = classifyChallenge(
+      probe({
+        status: 403,
+        title: "Access Denied",
+        text: "You don't have permission to access this server. Reference #18.abc.123",
+      }),
+    );
+    expect(d).toMatchObject({ vendor: "akamai", kind: "block" });
+  });
 });

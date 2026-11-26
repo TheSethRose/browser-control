@@ -130,6 +130,8 @@ export function classifyChallenge(probe: ChallengeProbe): ChallengeDetection | u
 
   // An HTTP refusal with an explicit denial title is a block at any length, even if it offers a CAPTCHA form.
   if (refused && denialTitle) {
+    const akamai = title === "access denied" && /you don't have permission to access/.test(text) && /reference #?\d/.test(text);
+    if (akamai) return { vendor: "akamai", kind: "block", reason: "title: Access Denied (Akamai reference)" };
     return { vendor: "generic", kind: "block", reason: reason(`status ${probe.status}, title: ${probe.title.trim()}`) };
   }
 
@@ -165,7 +167,7 @@ export function classifyChallenge(probe: ChallengeProbe): ChallengeDetection | u
     has(probe, "#px-captcha") ||
     has(probe, "#px-captcha-wrapper") ||
     has(probe, "[id^='px-captcha']") ||
-    (shortPage(probe) && /press (?:&|and) hold[^.\n]{0,40}\b(?:human|robot|not a bot|verify)/.test(text))
+    (shortPage(probe) && /press (?:&|and) hold[^.\n]{0,40}\b(?:(?:you are|you're) (?:a )?human|not a (?:ro)?bot)/.test(text))
   ) {
     return {
       vendor: "perimeterx",
