@@ -606,3 +606,36 @@ describe("extension relay backend", () => {
     expect(client.receivedReqs.some((r) => r.op === "cdp")).toBe(true);
   });
 });
+
+describe("relay token files", () => {
+  const { mkdtempSync, writeFileSync, statSync, readFileSync } = require("node:fs") as typeof import("node:fs");
+  const { join: pjoin } = require("node:path") as typeof import("node:path");
+  const { tmpdir: ptmp } = require("node:os") as typeof import("node:os");
+  const { ensureRelayToken: ensure, setupExtensionPairing: setup } = require("../src/backends/extension") as typeof import("../src/backends/extension");
+
+  test("concurrent first starts agree on one token", async () => {
+    const file = pjoin(mkdtempSync(pjoin(ptmp(), "bc-tok-")), "extension-relay.json");
+    const tokens = await Promise.all(Array.from({ length: 16 }, () => ensure(file)));
+    expect(new Set(tokens).size).toBe(1);
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+  });
+
+  test("a token file others can read is rotated, not reused", async () => {
+    const file = pjoin(mkdtempSync(pjoin(ptmp(), "bc-tok-")), "extension-relay.json");
+    const leaked = "a".repeat(64);
+    writeFileSync(file, JSON.stringify({ token: leaked }), { mode: 0o644 });
+    const token = await ensure(file);
+    expect(token).not.toBe(leaked);
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+  });
+
+  test("pairing.json replaces an existing open file with a private one", async () => {
+    const dir = mkdtempSync(pjoin(ptmp(), "bc-pair-"));
+    const ext = pjoin(dir, "ext");
+    require("node:fs").mkdirSync(ext);
+    writeFileSync(pjoin(ext, "pairing.json"), "{}", { mode: 0o644 });
+    const { pairingFile } = await setup(ext, { tokenFile: pjoin(dir, "relay.json") });
+    expect(statSync(pairingFile).mode & 0o777).toBe(0o600);
+    expect(JSON.parse(readFileSync(pairingFile, "utf8")).token).toMatch(/^[0-9a-f]{64}$/);
+  });
+});

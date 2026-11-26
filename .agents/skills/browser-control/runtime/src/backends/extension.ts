@@ -11,7 +11,7 @@
  */
 
 import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { link, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import type { Server, ServerWebSocket } from "bun";
@@ -80,21 +80,50 @@ export function defaultTokenFilePath(): string {
   return join(config, "browser-control", "extension-relay.json");
 }
 
-export async function ensureRelayToken(tokenFile: string = defaultTokenFilePath()): Promise<string> {
+async function readPrivateToken(tokenFile: string): Promise<string | undefined | "too-open"> {
   try {
-    const raw = await readFile(tokenFile, "utf8");
-    const parsed = JSON.parse(raw) as { token?: unknown };
-    if (typeof parsed.token === "string" && HEX_64_RE.test(parsed.token)) {
-      return parsed.token.toLowerCase();
-    }
+    const info = await stat(tokenFile);
+    if ((info.mode & 0o077) !== 0 || (typeof process.getuid === "function" && info.uid !== process.getuid())) return "too-open";
+    const parsed = JSON.parse(await readFile(tokenFile, "utf8")) as { token?: unknown };
+    if (typeof parsed.token === "string" && HEX_64_RE.test(parsed.token)) return parsed.token.toLowerCase();
   } catch {
-    /* file missing or invalid; generate a new token */
+    /* missing or invalid */
   }
-  const token = randomBytes(32).toString("hex");
+  return undefined;
+}
+
+/** Write `body` to a new 0600 temp file beside `file`, then publish it. `replace: false` keeps an existing file. */
+async function publishPrivateFile(file: string, body: string, replace: boolean): Promise<boolean> {
+  const tmp = `${file}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+  await writeFile(tmp, body, { mode: 0o600, flag: "wx" });
+  try {
+    if (replace) {
+      await rename(tmp, file);
+      return true;
+    }
+    try {
+      await link(tmp, file);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+      throw error;
+    }
+  } finally {
+    await unlink(tmp).catch(() => {});
+  }
+}
+
+export async function ensureRelayToken(tokenFile: string = defaultTokenFilePath()): Promise<string> {
   await mkdir(dirname(tokenFile), { recursive: true, mode: 0o700 });
-  await writeFile(tokenFile, `${JSON.stringify({ token }, null, 2)}\n`, { mode: 0o600 });
-  await chmod(tokenFile, 0o600).catch(() => {});
-  return token;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const existing = await readPrivateToken(tokenFile);
+    if (typeof existing === "string" && existing !== "too-open") return existing;
+    // A token others could read is spent: rotate it. Otherwise create once; a concurrent creator may win.
+    const token = randomBytes(32).toString("hex");
+    const body = `${JSON.stringify({ token }, null, 2)}\n`;
+    if (await publishPrivateFile(tokenFile, body, existing === "too-open")) return token;
+  }
+  throw new Error(`EXECUTION_FAILED: could not create a private relay token at ${tokenFile}`);
 }
 
 export async function setupExtensionPairing(
@@ -107,8 +136,7 @@ export async function setupExtensionPairing(
   const resolvedDir = resolvePath(extensionDir);
   await mkdir(resolvedDir, { recursive: true });
   const pairingFile = join(resolvedDir, "pairing.json");
-  await writeFile(pairingFile, `${JSON.stringify({ token, port }, null, 2)}\n`, { mode: 0o600 });
-  await chmod(pairingFile, 0o600).catch(() => {});
+  await publishPrivateFile(pairingFile, `${JSON.stringify({ token, port }, null, 2)}\n`, true);
   return { tokenFile, pairingFile, port };
 }
 
@@ -167,7 +195,6 @@ export function getRegisteredExtensionBcCall(): BcCallFn | undefined {
 }
 
 type WsState = {
-  connId: string;
   stage: "awaiting_hello" | "awaiting_response" | "ready";
   authenticated: boolean;
   handshakeTimer?: ReturnType<typeof setTimeout>;
@@ -176,8 +203,6 @@ type WsState = {
   profileId?: string;
   browser?: string;
   extensionVersion?: string;
-  protocolVersion?: number;
-  helpersVersion?: number;
 };
 
 type PendingReq = {
@@ -390,8 +415,6 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
       data.profileId = profileId;
       data.browser = browser;
       data.extensionVersion = version;
-      data.protocolVersion = protocolVersion;
-      data.helpersVersion = helpersVersion;
       data.stage = "awaiting_response";
 
       const proof = hmacHex(relayToken!, relayProofMessage(boundPort!, extNonce, relayNonce));
@@ -506,7 +529,6 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
                 }
                 const upgraded = s.upgrade(request, {
                   data: {
-                    connId: randomUUID(),
                     stage: "awaiting_hello",
                     authenticated: false,
                   },

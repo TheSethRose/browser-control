@@ -626,14 +626,15 @@ async function handleRequest(msg) {
 function sendJsonTo(entry, obj) {
   if (!entry?.ws || entry.ws.readyState !== WebSocket.OPEN) return false;
   const serialized = JSON.stringify(obj);
-  if (serialized.length > MAX_FRAME_BYTES) {
+  const bytes = serialized.length * 3 > MAX_FRAME_BYTES ? new TextEncoder().encode(serialized).length : serialized.length;
+  if (bytes > MAX_FRAME_BYTES) {
     if (obj.type === "res" && obj.id !== undefined) {
       entry.ws.send(
         JSON.stringify({
           type: "res",
           id: obj.id,
           ok: false,
-          error: `EXECUTION_FAILED: Result too large (${serialized.length} bytes > ${MAX_FRAME_BYTES} limit)`,
+          error: `EXECUTION_FAILED: Result too large (${bytes} bytes > ${MAX_FRAME_BYTES} limit)`,
         }),
       );
     }
@@ -722,6 +723,7 @@ async function openRelaySocket(port, versionInfo) {
     }
 
     if (entry.state === "hello" && msg.type === "auth.challenge") {
+      entry.state = "verifying";
       const relayNonce = msg.nonce;
       const relayProof = msg.proof;
       if (!isValidNonceHex(relayNonce)) {
@@ -748,6 +750,11 @@ async function openRelaySocket(port, versionInfo) {
     }
 
     if (msg.type === "welcome") {
+      // Only a relay that proved the token and got our proof back may open the session.
+      if (entry.state !== "auth_sent") {
+        ws.close(4006, "welcome before auth");
+        return;
+      }
       entry.state = "ready";
       if (msg.instanceId) entry.instanceId = msg.instanceId;
       lastError = "";
