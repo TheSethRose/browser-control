@@ -20,7 +20,7 @@ import {
   type PageTarget,
 } from "./session";
 import { createBackends } from "./backends/registry";
-import { route } from "./backends/router";
+import { backendOrder, route } from "./backends/router";
 
 /** The connection operations act on. */
 let connection: CdpConnection | undefined;
@@ -147,6 +147,14 @@ export const initialize: NonNullable<CapabilityModule["initialize"]> = async () 
     /* surfacing happens on the first artifact write */
   });
   getConnection();
+  const order = backendOrder();
+  for (const b of backends) {
+    if (order.includes(b.name)) {
+      await Promise.resolve(b.start?.()).catch(() => {
+        /* unavailability surfaces cleanly on the first call / status */
+      });
+    }
+  }
 };
 
 export const dispose: NonNullable<CapabilityModule["dispose"]> = async () => {

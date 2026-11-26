@@ -10,6 +10,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { runBrowse, type Runner } from "./backends/browse";
+import { extensionTabOf, getRegisteredExtensionBcCall, type BcCallFn } from "./backends/extension";
 import { inspectIssues, inspectPerf, inspectStyles } from "./devtools";
 import {
   buildFlow,
@@ -195,6 +196,7 @@ export function createPageHelperHandler(
     sessionId?: string;
     sleep?: (ms: number) => Promise<void>;
     rng?: () => number;
+    bcCall?: BcCallFn;
   } = {},
 ) {
   const daemonSessionId = options.sessionId ?? randomUUID().slice(0, 12);
@@ -209,8 +211,29 @@ export function createPageHelperHandler(
   /** Non-secret typed values remembered per tab for `flow save` parameterization. */
   const recentTyped = new Map<string, Record<string, string>>();
 
+  async function runBcCall(call: ReturnType<typeof normalizeHelperCall>, targetId: string, timeoutMs?: number): Promise<InvokeResult> {
+    const fn = options.bcCall ?? getRegisteredExtensionBcCall();
+    if (!fn) {
+      return failure("EXECUTION_FAILED", "BACKEND_UNAVAILABLE: extension backend is not active");
+    }
+    try {
+      const data = await fn({
+        targetId,
+        steps: call.steps,
+        join: call.join,
+        ...(timeoutMs ? { timeoutMs } : {}),
+      });
+      return { ok: true, data };
+    } catch (error) {
+      return helperError(failure("EXECUTION_FAILED", (error as Error).message));
+    }
+  }
+
   async function evalHelper(call: HelperCall, targetId?: string, timeoutMs?: number): Promise<InvokeResult> {
     const normalized = normalizeHelperCall(call);
+    if (extensionTabOf(targetId) !== undefined) {
+      return runBcCall(normalized, targetId!, timeoutMs);
+    }
     const callExpr = renderSteps(normalized);
     const extra = { isolated: true, ...(targetId ? { targetId } : {}), ...(timeoutMs ? { timeoutMs } : {}) };
     const probe = `globalThis.__bc && globalThis.__bc.v === ${PAGE_HELPERS_VERSION} ? (${callExpr}) : "${NEED_INSTALL}"`;
@@ -233,6 +256,9 @@ export function createPageHelperHandler(
     targetId?: string,
     opts: { isolated?: boolean; timeoutMs?: number } = {},
   ): Promise<InvokeResult> {
+    if (extensionTabOf(targetId) !== undefined) {
+      return runBcCall({ steps: [{ kind }] }, targetId!, opts.timeoutMs);
+    }
     return invoke("evaluate", {
       expression: renderSteps(normalizeHelperCall({ kind })),
       ...(opts.isolated ? { isolated: true } : {}),
@@ -243,14 +269,28 @@ export function createPageHelperHandler(
 
   const picture = createPictureTracker(invoke, evalHelper, recognize);
 
-  async function resolveBrowseTab(targetId?: string): Promise<number | undefined> {
-    if (targetId !== undefined) return browseTabNumber(targetId);
+  async function resolveTargetBackend(targetId?: string): Promise<{ browseTab?: number; extensionTarget?: string }> {
+    if (targetId !== undefined) {
+      return {
+        browseTab: browseTabNumber(targetId),
+        extensionTarget: extensionTabOf(targetId) !== undefined ? targetId : undefined,
+      };
+    }
     const status = await invoke("get_browser_status");
-    if (!status.ok) return undefined;
+    if (!status.ok) return {};
     const backends = (status.data as Json)["backends"] as Json | undefined;
-    if (backends?.["active"] !== "browse") return undefined;
-    const browseState = backends["browse"] as Json | undefined;
-    return browseTabNumber(browseState?.["activeTargetId"]);
+    if (backends?.["active"] === "browse") {
+      const browseState = backends["browse"] as Json | undefined;
+      return { browseTab: browseTabNumber(browseState?.["activeTargetId"]) };
+    }
+    if (backends?.["active"] === "extension") {
+      const extState = backends["extension"] as Json | undefined;
+      const activeId = extState?.["activeTargetId"];
+      if (extensionTabOf(activeId) !== undefined) {
+        return { extensionTarget: activeId as string };
+      }
+    }
+    return {};
   }
 
   async function callBrowse(tool: string, args: Json, timeoutMs = 60_000): Promise<InvokeResult> {
@@ -1486,8 +1526,9 @@ export function createPageHelperHandler(
     }
   }
 
-  async function handlePage(action: string, input: Json, targetId?: string): Promise<InvokeResult> {
-    const browseTab = await resolveBrowseTab(targetId);
+  async function handlePage(action: string, input: Json, rawTargetId?: string): Promise<InvokeResult> {
+    const { browseTab, extensionTarget } = await resolveTargetBackend(rawTargetId);
+    const targetId = rawTargetId ?? extensionTarget;
     const quiet = input["quiet"] === true;
 
     switch (action) {

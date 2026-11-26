@@ -208,9 +208,17 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
           invoke("get_browser_status"),
         ]);
         const state = status.ok ? (status.data as Json) : {};
-        const active = state["activeTargetId"];
+        const backendsState = state["backends"] as Json | undefined;
+        const activeBackendName = typeof backendsState?.["active"] === "string" ? (backendsState["active"] as string) : undefined;
+        const activeBackendInfo = activeBackendName ? (backendsState?.[activeBackendName] as Json | undefined) : undefined;
+        const active = state["activeTargetId"] ?? activeBackendInfo?.["activeTargetId"];
         const others = (state["alsoConnected"] as string[] | undefined) ?? [];
-        const header = `# ${state["browser"] ?? "browser"}${others.length > 0 ? ` (also connected: ${others.join(", ")}; switch with: start <name>)` : ""}`;
+        const browserLabel =
+          state["browser"] ??
+          (activeBackendName === "extension"
+            ? (activeBackendInfo?.["browser"] ?? "extension")
+            : activeBackendName ?? "browser");
+        const header = `# ${browserLabel}${others.length > 0 ? ` (also connected: ${others.join(", ")}; switch with: start <name>)` : ""}`;
         return text(
           targets,
           (data) =>
