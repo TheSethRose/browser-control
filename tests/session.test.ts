@@ -226,6 +226,14 @@ describe("CdpConnection routing", () => {
     connection.close();
   });
 
+  test("a new session enables Page right away so later dialogs are tracked", async () => {
+    const { connection, socket } = await connectFake();
+    socket.auto["Target.attachToTarget"] = { sessionId: "s9" };
+    await connection.use("t9");
+    expect(socket.sent.find((m) => m.method === "Page.enable")?.sessionId).toBe("s9");
+    connection.close();
+  });
+
   test("target-scoped calls without a route fail with NO_ACTIVE_TARGET", async () => {
     const { connection } = await connectFake();
     await expect(connection.call("Page.navigate", {})).rejects.toThrow("NO_ACTIVE_TARGET");

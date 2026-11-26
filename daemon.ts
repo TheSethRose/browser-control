@@ -6,9 +6,9 @@
 //   POST /eval               JavaScript body  -> the value as text
 //   POST /nav                URL body         -> navigate result as text (?until=load&snap=1)
 //   POST /page/<action>      JSON body        -> page helper result as text
-//        actions: snap, text, form, query, read-urls, click, type, select, upload, drag,
-//                 wait, key, value, ocr, do, shot, verdict, health, styles, issues, perf,
-//                 notes, flow, script
+//        actions: snap, text, form, query, read-urls, click, hover, dialog, emulate, type,
+//                 select, upload, drag, wait, key, value, ocr, do, shot, verdict, health,
+//                 styles, issues, perf, notes, flow, script
 //   GET  /tabs               one page per line, "*" marks the active target
 //   GET  /ops                one operation per line with its input names
 //   GET  /status             daemon pid, version, build hash + get_browser_status
@@ -31,7 +31,7 @@ type Json = Record<string, unknown>;
 
 const UNTRUSTED_PAGE_ACTIONS = new Set([
   "snap", "text", "form", "query", "read-urls", "ocr", "value", "verdict", "health",
-  "styles", "issues", "perf", "click", "type", "select", "upload", "drag", "wait", "key", "do",
+  "styles", "issues", "perf", "click", "hover", "dialog", "type", "select", "upload", "drag", "wait", "key", "do",
   "notes", "flow", "script",
 ]);
 
