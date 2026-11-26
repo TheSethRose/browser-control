@@ -117,8 +117,8 @@ describe("classifyChallenge: perimeterx", () => {
     expect(classifyChallenge(press)).toMatchObject({ vendor: "perimeterx", kind: "interactive" });
   });
 
-  test("the phrase alone counts", () => {
-    expect(classifyChallenge(probe({ text: "Before we continue, press and hold." }))).toMatchObject({
+  test("the phrase with a verification cue counts", () => {
+    expect(classifyChallenge(probe({ text: "Before we continue... Press & Hold to confirm you are a human (and not a bot)." }))).toMatchObject({
       vendor: "perimeterx",
       kind: "interactive",
     });
@@ -171,6 +171,7 @@ describe("classifyChallenge: aws-waf", () => {
     const challenge = probe({
       url: "https://shop.example/",
       title: "",
+      status: 202,
       text: "One moment",
       scriptSrcs: ["https://abc123.edge.sdk.awswaf.com/abc/challenge.js"],
     });
@@ -345,5 +346,52 @@ describe("describeChallenge", () => {
     expect(describeChallenge({ vendor: "generic", kind: "block", reason: "status 403" }, "not a url")).toContain(
       "not a url",
     );
+  });
+});
+
+describe("classifyChallenge: review regressions", () => {
+  const awsSdk = "https://abc123.edge.sdk.awswaf.com/abc123/challenge.js";
+
+  test("S1: a 403 Access Denied page that loads the AWS WAF SDK is a block, not a wait", () => {
+    const d = classifyChallenge(probe({ status: 403, title: "Access Denied", text: "Access denied", scriptSrcs: [awsSdk] }));
+    expect(d).toMatchObject({ kind: "block" });
+  });
+
+  test("S2: a 403 Forbidden page with a long header and footer is still a block", () => {
+    const d = classifyChallenge(probe({ status: 403, title: "403 Forbidden", text: "Menu ".repeat(400), textLength: 2_000 }));
+    expect(d).toMatchObject({ vendor: "generic", kind: "block" });
+  });
+
+  test("S3: a sign-in page with invisible reCAPTCHA and Google's disclosure is not flagged", () => {
+    const d = classifyChallenge(
+      probe({
+        title: "Sign in",
+        text: "Email Password Sign in. This site is protected by reCAPTCHA and the Google Privacy Policy and Terms of Service apply.",
+        frameUrls: ["https://www.google.com/recaptcha/api2/anchor?ar=1&k=abc&size=invisible"],
+      }),
+    );
+    expect(d).toBeUndefined();
+  });
+
+  test("S4: a short contact form with a Turnstile widget is not a navigation challenge", () => {
+    const d = classifyChallenge(
+      probe({
+        title: "Contact us",
+        text: "Name Email Message Send",
+        frameUrls: ["https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/b/turnstile/if/ov2/av0/rcv/abc"],
+        selectors: [".cf-turnstile"],
+        visibleSelectors: [".cf-turnstile"],
+      }),
+    );
+    expect(d).toBeUndefined();
+  });
+
+  test("S5: a short signed-in page that loads the AWS WAF SDK is not flagged", () => {
+    expect(classifyChallenge(probe({ status: 200, title: "Welcome", text: "Signed in.", scriptSrcs: [awsSdk] }))).toBeUndefined();
+  });
+
+  test("S6: 'press and hold the power button' is not a PerimeterX challenge", () => {
+    const d = classifyChallenge(probe({ title: "Reset your phone", text: "Press and hold the power button for 10 seconds." }));
+    expect(d).toBeUndefined();
   });
 });

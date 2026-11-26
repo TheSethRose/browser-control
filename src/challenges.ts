@@ -136,8 +136,10 @@ export function classifyChallenge(probe: ChallengeProbe): ChallengeDetection | u
     has(probe, "#challenge-running") ||
     has(probe, "#cf-challenge-running") ||
     has(probe, "#challenge-stage");
-  const turnstileFrame = hasFrame(probe, /^https:\/\/challenges\.cloudflare\.com\/.*(turnstile|challenge-platform)/);
-  if (cloudflareInterstitial || (turnstileFrame !== undefined && shortPage(probe))) {
+  // The managed-challenge orchestrator frame marks an interstitial; a Turnstile widget frame alone is
+  // often a site's own form widget, so it never flags a page by itself.
+  const orchestrator = hasFrame(probe, /^https:\/\/challenges\.cloudflare\.com\/cdn-cgi\/challenge-platform\/.*\/orchestrate\//);
+  if (cloudflareInterstitial || (orchestrator !== undefined && shortPage(probe))) {
     // The managed challenge shows Turnstile's checkbox only when it wants a click; until then it clears itself.
     const widget =
       visible(probe, ".cf-turnstile") ||
@@ -145,9 +147,9 @@ export function classifyChallenge(probe: ChallengeProbe): ChallengeDetection | u
     return {
       vendor: "cloudflare",
       kind: widget ? "interactive" : "non-interactive",
-      reason: cloudflareInterstitial
-        ? reason(`title: ${probe.title.trim()}`)
-        : reason(`iframe ${turnstileFrame ?? "challenges.cloudflare.com"}`),
+      reason: reason(
+        cloudflareInterstitial ? (probe.title.trim() ? `title: ${probe.title.trim()}` : "element #challenge-*") : `iframe ${orchestrator}`,
+      ),
     };
   }
 
@@ -156,7 +158,7 @@ export function classifyChallenge(probe: ChallengeProbe): ChallengeDetection | u
     has(probe, "#px-captcha") ||
     has(probe, "#px-captcha-wrapper") ||
     has(probe, "[id^='px-captcha']") ||
-    /press (?:&|and) hold/.test(text)
+    (/press (?:&|and) hold/.test(text) && shortPage(probe) && /human|robot|verify|confirm/.test(text))
   ) {
     return {
       vendor: "perimeterx",
@@ -210,7 +212,8 @@ export function classifyChallenge(probe: ChallengeProbe): ChallengeDetection | u
   const awsCaptcha = has(probe, "awswaf-captcha") || has(probe, "#captcha-container awswaf-captcha");
   const awsScript = hasScript(probe, /\.awswaf\.com\//);
   if (awsCaptcha) return { vendor: "aws-waf", kind: "interactive", reason: "element awswaf-captcha" };
-  if (awsScript !== undefined && shortPage(probe) && (has(probe, "#challenge-container") || textLengthOf(probe) < 300)) {
+  const refused = probe.status === 403 || probe.status === 451;
+  if (awsScript !== undefined && !refused && shortPage(probe) && (has(probe, "#challenge-container") || probe.status === 202)) {
     return { vendor: "aws-waf", kind: "non-interactive", reason: reason(`script ${awsScript}`) };
   }
 
@@ -222,7 +225,7 @@ export function classifyChallenge(probe: ChallengeProbe): ChallengeDetection | u
     );
     const hcaptcha = hasFrame(probe, /^https:\/\/(?:newassets\.|assets\.)?hcaptcha\.com\/captcha\//);
     const wallText =
-      /verify you are (?:a )?human|are you a robot|not a robot|unusual traffic|security check|complete the captcha|captcha/.test(
+      /verify you are (?:a )?human|are you a robot|not a robot|unusual traffic|security check|complete the captcha/.test(
         text,
       ) || /captcha|security check|verify/.test(title);
     if (hcaptcha !== undefined && wallText) {
@@ -237,10 +240,15 @@ export function classifyChallenge(probe: ChallengeProbe): ChallengeDetection | u
     }
   }
 
+  const denialTitle = /^(?:access denied|403 forbidden|forbidden|blocked|request blocked|you have been blocked)$/.test(title);
+  if (refused && denialTitle) {
+    return { vendor: "generic", kind: "block", reason: reason(`status ${probe.status}, title: ${probe.title.trim()}`) };
+  }
+
   // Generic block and verification pages, short pages only.
   if (shortPage(probe)) {
     if (
-      /^(?:access denied|403 forbidden|forbidden|blocked|request blocked|you have been blocked)$/.test(title) ||
+      denialTitle ||
       /^(?:access to this page has been denied|access denied)\b/.test(text.trim())
     ) {
       return {
