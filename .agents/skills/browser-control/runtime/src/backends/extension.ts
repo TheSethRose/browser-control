@@ -137,7 +137,7 @@ export async function ensureRelayToken(tokenFile: string = defaultTokenFilePath(
     if ("token" in read) return read.token;
     if (read.state === "bad") {
       throw new Error(
-        `EXECUTION_FAILED: relay token file ${tokenFile} is not private or not valid; run: browser-control-daemon extension setup (or bun ./cli.ts extension-setup <extensionDir>) to replace it`,
+        `EXECUTION_FAILED: relay token file ${tokenFile} is not private or not valid; run: bun ./cli.ts extension-setup <extensionDir> to replace it`,
       );
     }
     const token = randomBytes(32).toString("hex");
