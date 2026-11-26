@@ -40,24 +40,32 @@ Chrome shows **Allow remote debugging?** per new connection. Never waste the use
 
 ## Commands
 
-Page commands take `[targetId]` last, `--match <text>`, and `--quiet`. Unknown `--flags` fail with `INPUT_INVALID` (`--` escapes values starting with `--`).
+Page commands take `[targetId]` last, `--match <text>`, `--quiet`, and `--no-boundaries`. Helpers run in an isolated world; page-derived output is wrapped in nonce untrusted-content markers and control characters are escaped. Unknown `--flags` fail with `INPUT_INVALID` (`--` escapes values starting with `--`).
 
 | Command | Action |
 | --- | --- |
-| `tabs` / `start <browser>` / `default [browser]` | List tabs / switch browser / get or set default browser. |
+| `tabs` / `start <browser>` / `default [browser]` | List tabs / switch browser (`chrome`, `beta`, `brave`, `ardia`, …) / get or set default browser. |
 | `nav <url> [--snap] [--until load]` | Navigate until parsed & quiet (`--until load` waits all resources). Flags `# REDIRECTED:` / `# WALL:`. |
-| `snap [--all] [--find <t>] [--within <r\|css>] [--ax]` | Controls with refs (`e12`, `f2:e5` iframe, `a41` AX/closed shadow). Auto-scopes to modals. Flags: `disabled`, `checked`, `required`, `secure`, `trap`, `payment`. |
-| `text [--all] [--within <r\|css>] [--max <n>]` | Readable markdown (main content unless `--all`; never field values). |
-| `value <ref\|label>` | Control value (never reads secure fields). |
-| `click <ref\|label>` / `click --xy <x,y>` | Checked click (visible, enabled, still, uncovered) or CSS-pixel click. |
-| `type [--keys] <ref\|label> <text>` / `--focused <t>` | Click, replace text (`--keys`: key events), read back. Refuses `trap` & `payment`. |
+| `snap [--all] [--full] [--find <t>] [--within <r\|css>] [--ax] [--out <p>]` | Controls with refs (`e12`, `f2:e5` iframe, `a41` AX). Diffs repeats on same page, folds disabled runs, auto-scopes modals, shows site notes. Flags: `disabled`, `checked`, `required`, `secure`, `trap`, `payment`. |
+| `text [--all] [--within <r\|css>] [--max <n>] [--scroll] [--filter <t>] [--limit <n>] [--out <p>]` | Readable markdown (folds nav/filter sidebars unless `--all`; `--scroll` reads virtualized/infinite lists). |
+| `form [--within <r\|css>] [--out <p>]` | List visible form fields with values, required/invalid errors, `<select>` options, live refs, and submit buttons. |
+| `query <css> [--fields k=sel,...] [--limit <n>] [--all] [--out <p>]` | Extract repeated cards or HTML/ARIA tables straight into JSON rows without `eval`. |
+| `read-urls <u1> [u2 ...] [--concurrency <n>] [--timeout <ms>] [--out <p>]` | Parallel logged-in `fetch()` for up to 50 same-site URLs inside the tab without navigating. |
+| `value <ref\|label>` | Control value (never reads secure fields; masks card numbers). |
+| `click <ref\|label>` / `click --xy <x,y>` | Checked click (verifies ref drift, waits up to 1.5 s for disabled targets, reports blocker & dismiss refs, confirms input delivery). |
+| `type [--fast] [--keys] <ref\|label> <text>` / `--focused [--fast] <t>` | Click, replace text with natural human typing (cadence, hold times, occasional self-corrected typos; `--fast` for instant insert + real last key; `--keys` for fast raw key events; handles `date`/`time`/`range`/`color`, grid cells, focus swaps), read back. Refuses `trap` & `payment`. |
 | `select <ref\|label> <option>` | Choose option in native `<select>` (no OS menu) or ARIA combobox. |
 | `upload <ref\|label> <path>` | Attach file to `<input type="file">` without OS picker. |
+| `drag <from> <to> [--side before\|after]` | HTML5 drag-and-drop (`Input.setInterceptDrags`) or mouse drag; reports new sortable list position. |
 | `wait [--text <t>] [--selector <css>] [--url <u>] [--timeout <ms>]` | Wait until all conditions match (default 10 s, max 60 s). |
 | `key <Enter\|Tab\|Escape\|Backspace\|ArrowDown\|ArrowUp\|Space>` | Dispatch key press. |
-| `fill '{"<r\|l>":"<t>",…}'` / `do '[…]'` | Batch fields or steps; stops on failure, read-back mismatch, host change, or `# WALL:`. |
-| `ocr [--find <t>]` / `shot [--ref <r>] [--marks] [--full] [--png] [--to <p>]` | macOS Vision OCR (`x,y "text"`) for `# PICTURE PAGE` / CSS-pixel JPEG (`--full` = device px). |
-| `verdict` / `health` / `eval '<js>'` / `call <op> ['<json>']` / `ops` / `status` | Submit verdict / page audit JSON / run JS (`-` stdin, `await`) / raw CDP op / daemon info. |
+| `fill [--fast] '{"<r\|l>":"<t>",…}'` / `do '[…]'` | Batch fields or steps (`click`, `type`, `select`, `upload`, `drag`, `wait`, `key`); heals unique redrawn refs; stops on failure, mismatch, host change, or `# WALL:`. |
+| `script '<js>' [--timeout <ms>] [--out <p>]` | Single-call JS loop with `page` API and persistent session `state`; `--out file.csv` exports object lists to CSV. |
+| `notes <get\|set\|append\|rm\|approve\|list> [site] [text]` | Per-site agent memory shown at top of `snap` (quarantined until 3 sessions/2 days or `approve`). |
+| `flow <record\|save\|run\|list\|show\|rm> [name] [--param k=v] [--where f=v] [--fields a,b]` | Save and replay read-only first-party GET JSON endpoints via in-tab `fetch()` with shape-drift checks. |
+| `styles <r\|css>` / `issues [--kind <k>]` / `perf [--reload] [--duration <ms>]` | Matched CSS rules, DevTools Audits issues (cookies stripped), and FCP/LCP/CLS/TBT/long-task traces. |
+| `ocr [--find <t>]` / `shot [--ref <r>] [--marks] [--full] [--png] [--to <p>]` | macOS Vision OCR (`x,y "text"`) for `# PICTURE PAGE` / CSS-pixel JPEG (`--marks` draws badges off-DOM on macOS). |
+| `verdict` / `health` / `eval '<js>'` / `call <op> ['<json>']` / `ops` / `status` | Submit verdict / page audit JSON / run JS (`-` stdin, `await`) / raw CDP op (blocks `Browser.close` & `*.crash*`) / daemon info. |
 | `check-update [--force]` | Check [GitHub repo](https://github.com/TheSethRose/browser-control) for a newer published version (cached 24 h). |
 
 Refs stay valid until replaced (`STALE_REF` → re-snap). `# WALL:` → stop and hand off. `# PICTURE PAGE` → `ocr`, `click --xy`, `type --focused`. Failures print error JSON and exit 1.

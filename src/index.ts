@@ -248,22 +248,53 @@ const cdpOperations: Record<string, OperationHandler> = {
   evaluate: async (input) => {
     const expression = str(input["expression"]);
     if (!expression) throw new Error("INPUT_INVALID: expression is required");
-    // replMode allows top-level await and re-declaring const/let between calls.
-    const { result, exceptionDetails } = (await getConnection().call(
-      "Runtime.evaluate",
-      { expression, returnByValue: true, awaitPromise: true, replMode: true },
-      { targetId: str(input["targetId"]), timeoutMs: num(input["timeoutMs"]) },
-    )) as {
-      result?: { value?: unknown; unserializableValue?: string; description?: string };
-      exceptionDetails?: { text?: string; exception?: { description?: string } };
-    };
+    const conn = getConnection();
+    const targetId = str(input["targetId"]);
+    const timeoutMs = num(input["timeoutMs"]);
+    const isolated = input["isolated"] === true;
+
+    const runEval = async (contextId?: number) =>
+      (await conn.call(
+        "Runtime.evaluate",
+        {
+          expression,
+          returnByValue: true,
+          awaitPromise: true,
+          ...(contextId !== undefined ? { contextId } : { replMode: true }),
+        },
+        { targetId, timeoutMs },
+      )) as {
+        result?: { value?: unknown; unserializableValue?: string; description?: string };
+        exceptionDetails?: { text?: string; exception?: { description?: string } };
+      };
+
+    let contextId: number | undefined;
+    let reply: Awaited<ReturnType<typeof runEval>>;
+    if (isolated) {
+      contextId = await conn.getIsolatedContextId(targetId);
+      try {
+        reply = await runEval(contextId);
+      } catch (err) {
+        if (contextId !== undefined && /Cannot find context with specified id|Execution context was destroyed/i.test((err as Error).message)) {
+          contextId = await conn.getIsolatedContextId(targetId, true);
+          reply = await runEval(contextId);
+        } else {
+          throw err;
+        }
+      }
+    } else {
+      reply = await runEval(undefined);
+    }
+
+    const { result, exceptionDetails } = reply;
     if (exceptionDetails) {
       const detail = exceptionDetails.exception?.description ?? exceptionDetails.text ?? "unknown";
       throw new Error(`JS_EXCEPTION: ${detail.slice(0, 600)}`);
     }
-    if (!result) return {};
+    if (!result) return contextId !== undefined ? { contextId } : {};
     return {
       value: "value" in result ? result.value : (result.unserializableValue ?? result.description),
+      ...(contextId !== undefined ? { contextId } : {}),
     };
   },
 

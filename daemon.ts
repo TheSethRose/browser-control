@@ -6,14 +6,16 @@
 //   POST /eval               JavaScript body  -> the value as text
 //   POST /nav                URL body         -> navigate result as text (?until=load&snap=1)
 //   POST /page/<action>      JSON body        -> page helper result as text
-//        actions: snap, click, type, select, upload, wait, key, value, text, ocr, do, shot, verdict, health
+//        actions: snap, text, form, query, read-urls, click, type, select, upload, drag,
+//                 wait, key, value, ocr, do, shot, verdict, health, styles, issues, perf,
+//                 notes, flow, script
 //   GET  /tabs               one page per line, "*" marks the active target
 //   GET  /ops                one operation per line with its input names
 //   GET  /status             daemon pid, version, build hash + get_browser_status
 //   POST /stop               dispose and exit
 //
-// /eval, /nav and /page/* take ?t=<targetId> or ?m=<text in the tab's url or title>, and
-// ?q=1 to leave out the "what changed" lines after an action.
+// /eval, /nav and /page/* take ?t=<targetId> or ?m=<text in the tab's url or title>,
+// ?q=1 to leave out the "what changed" lines after an action, and ?raw=1 to omit untrusted boundaries.
 import { openStandaloneCapability, type InvokeResult } from "@agent-software/core";
 import { createHash } from "node:crypto";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -21,19 +23,28 @@ import { join } from "node:path";
 import { disposeOcr } from "./src/ocr";
 import { createPageHelperHandler, formatAxTree, matchTab } from "./src/page-runner";
 import { imageWidth } from "./src/picture";
+import { escapeControls, withRemedy, wrapUntrusted } from "./src/safety";
 
 export { createPageHelperHandler, formatAxTree, imageWidth, matchTab };
 
 type Json = Record<string, unknown>;
 
+const UNTRUSTED_PAGE_ACTIONS = new Set([
+  "snap", "text", "form", "query", "read-urls", "ocr", "value", "verdict", "health",
+  "styles", "issues", "perf", "click", "type", "select", "upload", "drag", "wait", "key", "do",
+  "notes", "flow", "script",
+]);
+
 const failure = (code: string, message: string): InvokeResult =>
   ({ ok: false, error: { code, message } }) as InvokeResult;
 
-/** Strings print bare; everything else prints as JSON. */
-function asText(value: unknown, maxChars: number): string {
-  const text = typeof value === "string" ? value : (JSON.stringify(value) ?? "undefined");
-  if (text.length <= maxChars) return text;
-  return `${text.slice(0, maxChars)}\n[truncated ${text.length - maxChars} of ${text.length} chars; narrow the expression or raise BROWSER_CONTROL_MAX_OUTPUT]`;
+/** Strings print bare; everything else prints as JSON. Control characters are escaped. */
+function asText(value: unknown, maxChars: number, untrusted: boolean): string {
+  const raw = typeof value === "string" ? value : (JSON.stringify(value) ?? "undefined");
+  const clipped = raw.length <= maxChars
+    ? raw
+    : `${raw.slice(0, maxChars)}\n[truncated ${raw.length - maxChars} of ${raw.length} chars; narrow the expression or raise BROWSER_CONTROL_MAX_OUTPUT]`;
+  return untrusted ? wrapUntrusted(clipped) : escapeControls(clipped);
 }
 
 /** Short SHA-256 fingerprint of the running script so the client can detect a stale daemon build. */
@@ -58,6 +69,7 @@ function readVersion(capabilityDir: string): string {
 export async function serveDaemon(capabilityDir: string, socketPath: string): Promise<void> {
   const capability = await openStandaloneCapability(capabilityDir);
   const maxChars = Number(process.env["BROWSER_CONTROL_MAX_OUTPUT"]) || 50_000;
+  const boundariesDefault = process.env["BROWSER_CONTROL_CONTENT_BOUNDARIES"] !== "0";
   const build = buildHash(process.argv[1]);
   const version = readVersion(capabilityDir);
   const buildFile = `${socketPath}.build`;
@@ -76,9 +88,6 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
     }
   };
 
-  // The last successful connect input, minus any port: ports change when the browser
-  // restarts, so a reconnect must rediscover the live one.
-  // Before any connect it is the default: preferred browser, with time to click Allow.
   let reconnectInput: Json = { timeoutMs: 60_000 };
 
   /** Invoke; if there is no browser connection (never made, or dropped), connect once and retry. */
@@ -105,12 +114,14 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
 
   const handlePage = createPageHelperHandler(invoke);
 
-  const json = (result: InvokeResult) =>
-    new Response(`${JSON.stringify(result)}\n`, { status: result.ok ? 200 : 400 });
+  const json = (result: InvokeResult) => {
+    const out = result.ok ? result : failure(result.error.code, escapeControls(withRemedy(result.error.message)));
+    return new Response(`${JSON.stringify(out)}\n`, { status: result.ok ? 200 : 400 });
+  };
 
   /** Text reply: `pick(data)` on success, the error JSON on failure. */
-  const text = (result: InvokeResult, pick: (data: any) => unknown) =>
-    result.ok ? new Response(`${asText(pick(result.data), maxChars)}\n`) : json(result);
+  const text = (result: InvokeResult, pick: (data: any) => unknown, untrusted = false) =>
+    result.ok ? new Response(`${asText(pick(result.data), maxChars, untrusted)}\n`) : json(result);
 
   const parseJsonBody = (raw: string): { ok: true; value: Json } | { ok: false; res: Response } => {
     if (raw === "") return { ok: true, value: {} };
@@ -136,8 +147,6 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
   process.on("SIGINT", stop);
   process.on("SIGTERM", stop);
 
-  // idleTimeout 0: operations may legitimately run for minutes. (Cast: bun-types leave
-  // idleTimeout off the unix-socket overload, but the runtime honors it.)
   Bun.serve({
     unix: socketPath,
     idleTimeout: 0,
@@ -146,7 +155,6 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
       const [route, operation] = url.pathname.slice(1).split("/");
       const started = performance.now();
       const reply = await respond(request, url, route ?? "", operation ?? "");
-      // One line per request in daemon.log: where the time goes, never what was sent.
       if (route !== "status") {
         console.log(`${new Date().toISOString()} ${Math.round(performance.now() - started)}ms ${reply.status} /${route}${operation ? `/${operation}` : ""}`);
       }
@@ -164,6 +172,7 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
       targetId = tab.targetId;
     }
     const quiet = url.searchParams.get("q") === "1";
+    const wrap = boundariesDefault && url.searchParams.get("raw") !== "1";
 
     switch (route) {
       case "call": {
@@ -172,7 +181,7 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
         return json(await invoke(operation, parsed.value));
       }
       case "eval":
-        return text(await invoke("evaluate", { expression: body, targetId }), (data) => data.value);
+        return text(await invoke("evaluate", { expression: body, targetId }), (data) => data.value, wrap);
       case "nav":
         return text(
           await handlePage(
@@ -181,11 +190,17 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
             targetId,
           ),
           (data) => data.value,
+          wrap,
         );
       case "page": {
         const parsed = parseJsonBody(body);
         if (!parsed.ok) return parsed.res;
-        return text(await handlePage(operation, { ...parsed.value, ...(quiet ? { quiet: true } : {}) }, targetId), (data) => data.value);
+        const shouldWrap = wrap && UNTRUSTED_PAGE_ACTIONS.has(operation) && !parsed.value["out"];
+        return text(
+          await handlePage(operation, { ...parsed.value, ...(quiet ? { quiet: true } : {}) }, targetId),
+          (data) => data.value,
+          shouldWrap,
+        );
       }
       case "tabs": {
         const [targets, status] = await Promise.all([
@@ -195,15 +210,17 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
         const state = status.ok ? (status.data as Json) : {};
         const active = state["activeTargetId"];
         const others = (state["alsoConnected"] as string[] | undefined) ?? [];
-        // The header says which browser these tabs are in: a missing tab is often in the other one.
         const header = `# ${state["browser"] ?? "browser"}${others.length > 0 ? ` (also connected: ${others.join(", ")}; switch with: start <name>)` : ""}`;
-        return text(targets, (data) =>
-          [
-            header,
-            ...(data.targets as Array<{ targetId: string; url: string; title: string }>).map(
-              (t) => `${t.targetId === active ? "*" : " "} ${t.targetId} ${t.url.slice(0, 100)} | ${t.title.slice(0, 60)}`,
-            ),
-          ].join("\n"),
+        return text(
+          targets,
+          (data) =>
+            [
+              header,
+              ...(data.targets as Array<{ targetId: string; url: string; title: string }>).map(
+                (t) => `${t.targetId === active ? "*" : " "} ${t.targetId} ${t.url.slice(0, 100)} | ${t.title.slice(0, 60)}`,
+              ),
+            ].join("\n"),
+          wrap,
         );
       }
       case "ops":

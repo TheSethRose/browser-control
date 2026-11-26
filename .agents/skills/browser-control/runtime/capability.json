@@ -162,10 +162,17 @@
         "properties": {
           "expression": { "type": "string" },
           "targetId": { "type": "string" },
-          "timeoutMs": { "type": "number" }
+          "timeoutMs": { "type": "number" },
+          "isolated": { "type": "boolean" }
         }
       },
-      "outputs": { "type": "object", "properties": { "value": {} } }
+      "outputs": {
+        "type": "object",
+        "properties": {
+          "value": {},
+          "contextId": { "type": "number" }
+        }
+      }
     },
     {
       "name": "navigate",

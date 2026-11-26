@@ -34,6 +34,23 @@ export async function imageWidth(path: string): Promise<number | undefined> {
   return undefined;
 }
 
+/** Resize an image file in-place to exact pixel dimensions (macOS `sips`). Returns true on success. */
+export async function resizeImage(path: string, width: number, height: number): Promise<boolean> {
+  if (process.platform !== "darwin") return false;
+  const w = Math.max(1, Math.round(width));
+  const h = Math.max(1, Math.round(height));
+  try {
+    const proc = Bun.spawn(["sips", "-z", String(h), String(w), path], {
+      stdout: "ignore",
+      stderr: "ignore",
+      stdin: "ignore",
+    });
+    return (await proc.exited) === 0;
+  } catch {
+    return false;
+  }
+}
+
 export function createPictureTracker(
   invoke: Invoker,
   evalHelper: EvalHelper,
@@ -72,12 +89,14 @@ export function createPictureTracker(
   ): Promise<{ ok: true; lines: Map<string, string> } | { ok: false; res: InvokeResult }> {
     const box = await evalHelper("__bc.viewport()", targetId);
     if (!box.ok) return { ok: false, res: box };
-    const v = JSON.parse(valueOf(box)) as { x: number; y: number; width: number; height: number };
+    const v = JSON.parse(valueOf(box)) as { width: number; height: number };
     const path = join(tmpdir(), `bc-ocr-${randomUUID()}.png`);
+    // Omit `clip` so Chromium reads the compositor surface directly instead of toggling
+    // device-emulation metrics (which flickers visible windows). Vision returns normalized
+    // 0..1 boxes, so native Retina captures still map to exact CSS click coordinates below.
     const shot = await invoke("capture_screenshot", {
       format: "png",
       path,
-      clip: { x: v.x, y: v.y, width: v.width, height: v.height, scale: 1 },
       ...(targetId ? { targetId } : {}),
     });
     if (!shot.ok) return { ok: false, res: shot };

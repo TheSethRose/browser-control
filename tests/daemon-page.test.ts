@@ -6,6 +6,7 @@ import { join, resolve } from "node:path";
 import { buildHash, createPageHelperHandler, formatAxTree, matchTab } from "../daemon";
 import { PAGE_HELPERS_SOURCE, PAGE_HELPERS_VERSION, parseLocator } from "../src/page-helpers";
 import { parseBrowseSnapshot } from "../src/page-runner";
+import { buildHumanKeystrokes, QWERTY_NEIGHBORS } from "../src/typing";
 import type { Runner } from "../src/backends/browse";
 import { parseBoxes } from "../src/ocr";
 
@@ -223,14 +224,74 @@ describe("daemon page helpers", () => {
     expect(cdpMethods(calls).length).toBe(before);
   });
 
-  test("type supports Input.insertText, --keys, and readback", async () => {
-    const { calls, invoke } = makeFakeInvoker({ readback: "ab" });
-    const handle = createPageHelperHandler(invoke);
+  test("type defaults to human keystrokes with pauses and supports --fast and --keys", async () => {
+    const pauses: number[] = [];
+    const { calls, invoke } = makeFakeInvoker({ readback: "hello" });
+    const handle = createPageHelperHandler(invoke, undefined, undefined, {
+      sleep: async (ms) => {
+        pauses.push(ms);
+      },
+      rng: () => 0.5, // deterministic, no typo triggered at 0.5 >= 0.045
+    });
 
-    const res = await handle("type", { ref: "e2", text: "ab", keys: true, quiet: true });
-    expect(text(res)).toContain("delivered (read back matches)");
-    const keyEvents = calls.filter((c) => c.op === "execute_cdp" && c.input["method"] === "Input.dispatchKeyEvent");
+    const human = await handle("type", { ref: "e2", text: "hello", quiet: true });
+    expect(text(human)).toContain("delivered (read back matches)");
+    const humanKeys = calls.filter((c) => c.op === "execute_cdp" && c.input["method"] === "Input.dispatchKeyEvent");
+    expect(humanKeys).toHaveLength(10); // 5 chars * (keyDown + keyUp)
+    expect((humanKeys[0]!.input["params"] as Record<string, unknown>)["code"]).toBe("KeyH");
+    expect(pauses.length).toBeGreaterThanOrEqual(9); // hold + inter-key pauses
+
+    const fastMock = makeFakeInvoker({ readback: "hello" });
+    const fastHandle = createPageHelperHandler(fastMock.invoke);
+    const fastRes = await fastHandle("type", { ref: "e2", text: "hello", fast: true, quiet: true });
+    expect(text(fastRes)).toContain("delivered (read back matches)");
+    expect(cdpMethods(fastMock.calls).slice(-3)).toEqual([
+      "Input.insertText",
+      "Input.dispatchKeyEvent",
+      "Input.dispatchKeyEvent",
+    ]);
+
+    const keysMock = makeFakeInvoker({ readback: "ab" });
+    const keysHandle = createPageHelperHandler(keysMock.invoke);
+    const keysRes = await keysHandle("type", { ref: "e2", text: "ab", keys: true, quiet: true });
+    expect(text(keysRes)).toContain("delivered (read back matches)");
+    const keyEvents = keysMock.calls.filter((c) => c.op === "execute_cdp" && c.input["method"] === "Input.dispatchKeyEvent");
     expect(keyEvents).toHaveLength(4);
+  });
+
+  test("buildHumanKeystrokes emits QWERTY neighbor typos + Backspace and always reconstructs text", () => {
+    // Low rng triggers typo on interior lowercase letters
+    let seq = 0;
+    const lowRng = () => {
+      const vals = [0.01, 0.2, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5];
+      return vals[seq++ % vals.length]!;
+    };
+    const input = "search query! 🚀";
+    const plan = buildHumanKeystrokes(input, { rng: lowRng, typoRate: 0.5, maxTypos: 2 });
+
+    let buf = "";
+    let backspaces = 0;
+    for (let i = 0; i < plan.length; i++) {
+      const step = plan[i]!;
+      if (step.kind === "backspace") {
+        buf = buf.slice(0, -1);
+        backspaces++;
+      } else if (step.kind === "insert") {
+        buf += step.text;
+      } else {
+        buf += step.ch;
+        if (plan[i + 1]?.kind === "backspace") {
+          const intended = plan[i + 2];
+          if (intended?.kind === "char") {
+            expect(QWERTY_NEIGHBORS[intended.ch]).toContain(step.ch);
+          }
+        }
+      }
+    }
+    expect(buf).toBe(input);
+    expect(backspaces).toBeGreaterThanOrEqual(1);
+    expect(backspaces).toBeLessThanOrEqual(2);
+    expect(plan.at(-1)!.pauseAfterMs).toBe(0);
   });
 
   test("select handles native <select> and custom ARIA comboboxes", async () => {
@@ -445,13 +506,14 @@ describe("picture pages and daemon script flags", () => {
     ]);
   });
 
-  test("ocr prints click coordinates in CSS pixels, and canvas hash speeds up redraw diff", async () => {
-    const { invoke } = makeFakeInvoker({ canvasHashes: ["aaa", "bbb"] });
+  test("ocr captures without clip (avoiding flicker), prints CSS coordinates, and canvas hash speeds up redraw diff", async () => {
+    const { calls, invoke } = makeFakeInvoker({ canvasHashes: ["aaa", "bbb"] });
     let screen = [{ x: 0.1, y: 0.2, width: 0.2, height: 0.04, text: "New mail" }];
     const handle = createPageHelperHandler(invoke, undefined, async () => screen);
 
     const first = await handle("ocr", {});
     expect(text(first)).toContain('200,110 "New mail"');
+    expect(calls.find((c) => c.op === "capture_screenshot")?.input["clip"]).toBeUndefined();
     expect(text(await handle("ocr", { find: "nothing" }))).not.toContain("New mail");
 
     screen = [...screen, { x: 0.5, y: 0.5, width: 0.2, height: 0.04, text: "Compose" }];
@@ -461,12 +523,37 @@ describe("picture pages and daemon script flags", () => {
     expect(text(clicked)).toBe('click 200,110: delivered. hit: canvas#c\n+ 600,260 "Compose"');
   });
 
-  test("type --focused sends text without a ref", async () => {
+  test("viewport shot omits clip to avoid browser flicker", async () => {
     const { calls, invoke } = makeFakeInvoker();
-    const handle = createPageHelperHandler(invoke, undefined, async () => []);
+    const handle = createPageHelperHandler(invoke);
+    const res = await handle("shot", {});
+    expect(res.ok).toBe(true);
+    expect(text(res)).toContain("CSS-pixel scale");
+    const shotCalls = calls.filter((c) => c.op === "capture_screenshot");
+    expect(shotCalls).toHaveLength(1);
+    expect(shotCalls[0]!.input["clip"]).toBeUndefined();
+  });
+
+  test("type --focused defaults to human keystrokes and supports --fast", async () => {
+    const { calls, invoke } = makeFakeInvoker();
+    const handle = createPageHelperHandler(invoke, undefined, async () => [], {
+      sleep: async () => {},
+      rng: () => 0.5,
+    });
     const res = await handle("type", { focused: true, text: "hi", quiet: true });
     expect(text(res)).toStartWith("type --focused: sent");
-    expect(cdpMethods(calls)).toEqual(["Input.insertText"]);
+    expect(cdpMethods(calls)).toEqual([
+      "Input.dispatchKeyEvent",
+      "Input.dispatchKeyEvent",
+      "Input.dispatchKeyEvent",
+      "Input.dispatchKeyEvent",
+    ]);
+
+    const fastMock = makeFakeInvoker();
+    const fastHandle = createPageHelperHandler(fastMock.invoke, undefined, async () => []);
+    const fastRes = await fastHandle("type", { focused: true, text: "hi", fast: true, quiet: true });
+    expect(text(fastRes)).toStartWith("type --focused: sent");
+    expect(cdpMethods(fastMock.calls)).toEqual(["Input.insertText"]);
   });
 
   test("browser-control-daemon rejects unknown --flags with INPUT_INVALID", async () => {

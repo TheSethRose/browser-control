@@ -1,0 +1,84 @@
+// Draw numbered reference badges directly onto a screenshot image without touching the page DOM.
+// Usage: marks <image-path> <boxes-json>
+import CoreGraphics
+import CoreText
+import Foundation
+import ImageIO
+
+struct Box: Decodable {
+    let id: String
+    let x: Double
+    let y: Double
+}
+
+guard CommandLine.arguments.count == 3 else {
+    FileHandle.standardError.write("usage: marks <image> <json>\n".data(using: .utf8)!)
+    exit(2)
+}
+
+let imagePath = CommandLine.arguments[1]
+let jsonData = CommandLine.arguments[2].data(using: .utf8) ?? Data()
+guard let boxes = try? JSONDecoder().decode([Box].self, from: jsonData) else {
+    FileHandle.standardError.write("marks: invalid boxes JSON\n".data(using: .utf8)!)
+    exit(1)
+}
+
+let url = URL(fileURLWithPath: imagePath) as CFURL
+guard let src = CGImageSourceCreateWithURL(url, nil),
+      let cgImage = CGImageSourceCreateImageAtIndex(src, 0, nil),
+      let uti = CGImageSourceGetType(src) else {
+    FileHandle.standardError.write("marks: cannot read image\n".data(using: .utf8)!)
+    exit(1)
+}
+
+let width = cgImage.width
+let height = cgImage.height
+let cs = CGColorSpaceCreateDeviceRGB()
+guard let ctx = CGContext(
+    data: nil,
+    width: width,
+    height: height,
+    bitsPerComponent: 8,
+    bytesPerRow: 0,
+    space: cs,
+    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+) else {
+    exit(1)
+}
+
+ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+let font = CTFontCreateWithName("Helvetica-Bold" as CFString, 11, nil)
+let white = CGColor(colorSpace: cs, components: [1, 1, 1, 1])!
+let red = CGColor(colorSpace: cs, components: [0.85, 0.08, 0.08, 0.94])!
+
+for b in boxes {
+    let attrs: [NSAttributedString.Key: Any] = [
+        NSAttributedString.Key(kCTFontAttributeName as String): font,
+        NSAttributedString.Key(kCTForegroundColorAttributeName as String): white,
+    ]
+    let attrStr = NSAttributedString(string: b.id, attributes: attrs)
+    let line = CTLineCreateWithAttributedString(attrStr)
+    let bounds = CTLineGetImageBounds(line, ctx)
+    let bw = max(14.0, ceil(bounds.width) + 6.0)
+    let bh = 15.0
+    let rx = min(max(0.0, b.x), Double(width) - bw)
+    let ry = min(max(0.0, Double(height) - b.y - bh), Double(height) - bh)
+    let rect = CGRect(x: rx, y: ry, width: bw, height: bh)
+    ctx.setFillColor(red)
+    let path = CGPath(roundedRect: rect, cornerWidth: 2, cornerHeight: 2, transform: nil)
+    ctx.addPath(path)
+    ctx.fillPath()
+    ctx.textMatrix = .identity
+    ctx.textPosition = CGPoint(x: rx + 3.0, y: ry + 3.0)
+    CTLineDraw(line, ctx)
+}
+
+guard let outImage = ctx.makeImage(),
+      let dest = CGImageDestinationCreateWithURL(url, uti, 1, nil) else {
+    exit(1)
+}
+CGImageDestinationAddImage(dest, outImage, nil)
+if !CGImageDestinationFinalize(dest) {
+    exit(1)
+}

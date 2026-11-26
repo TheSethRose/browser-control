@@ -7,7 +7,7 @@
 #   nav <url> [--snap] [--until load] navigate; --snap also lists the controls
 #   eval '<js>'                       run JavaScript, print its value ('-' reads stdin)
 #   call <op> ['<json>']              any operation, JSON in and out
-#   start [browser]                   switch browser by name (chrome, beta, brave); opens it
+#   start [browser]                   switch browser by name (chrome, beta, brave, ardia); opens it
 #                                     if needed. Never pass a port.
 #   default [browser]                 show or set the default browser
 #   ops | status | check-update [--force]
@@ -15,31 +15,32 @@
 #                                     so the user must click Allow again
 #
 # Read the page:
-#   snap [--all] [--find <text>] [--within <ref|css>] [--ax]   controls with refs: - button "Save" [e12]
-#   text [--all] [--within <ref|css>] [--max <chars>]          readable content as markdown
+#   snap [--all] [--full] [--find <t>] [--within <r|css>] [--ax] [--out <p>]
+#   text [--all] [--within <r|css>] [--max <n>] [--scroll] [--filter <t>] [--limit <n>] [--out <p>]
+#   form [--within <r|css>] [--out <p>]           list fields, values, validation errors & submits
+#   query <css> [--fields k=sel,...] [--limit <n>] [--all] [--out <p>]
+#   read-urls <u1> [u2 ...] [--concurrency <n>] [--timeout <ms>] [--out <p>]
 #   value <ref|label>                 a control's value (never a secure field)
-#   ocr [--find <text>]               text read from a picture of the tab, each with x,y to click:
-#                                     for pages that are only a canvas (remote isolation)
-#   shot [--ref <ref>] [--marks] [--full] [--png] [--to <path>]  small JPEG; --marks numbers the controls
-#   verdict | health                  after a submit: confirmed/rejected/unverified | page health JSON
+#   ocr [--find <text>]               text read from a picture of the tab, each with x,y to click
+#   shot [--ref <ref>] [--marks] [--full] [--png] [--to <path>]
+#   verdict | health | styles <ref|css> [--properties a,b] | issues [--kind <k>] [--clear]
+#   perf [--reload] [--duration <ms>]
 #
-# Act on it (each prints what changed; --quiet leaves that out):
-#   click <ref|label>                 checked click: visible, enabled, still, not covered
-#   click --xy <x,y>                  click CSS-pixel coordinates; prints what was hit
-#   type [--keys] <ref|label> <text>  replace the field's text, read it back
-#   type --focused <text>             type into whatever has focus (after click --xy)
-#   select <ref|label> <option>       choose an option in a native <select> or ARIA combobox
-#   upload <ref|label> <path>         set a file on an <input type="file"> (never opens OS picker)
+# Act on it (each prints what changed; --quiet leaves that out; --no-boundaries omits markers):
+#   click <ref|label> | click --xy <x,y>
+#   type [--fast] [--keys] <ref|label> <text> | type --focused [--fast] <text>
+#   select <ref|label> <option>       native <select> or ARIA combobox
+#   upload <ref|label> <path>         <input type="file"> (never opens OS picker)
+#   drag <from> <to> [--side before|after]        HTML5 drag-and-drop or mouse drag
 #   wait [--text <t>] [--selector <css>] [--url <u>] [--timeout <ms>]
 #   key <Enter|Tab|Escape|Backspace|ArrowDown|ArrowUp|Space>
-#   fill '{"<ref|label>":"<text>",…}' several fields in one call
-#   do '[{"type":["Email","a@b.co"]},{"select":["Role","Admin"]},{"wait":"Saved"}]'
-#                                     several steps in one call; stops on first failure ('-' reads stdin)
+#   fill [--fast] '{"<ref|label>":"<text>",…}' | do '[…]'  batch fields or steps ('-' reads stdin)
+#   script '<js>' [--timeout <ms>] [--out <path>] Playwright-like loop with persistent `state`
+#   notes <get|set|append|rm|approve|list> [site] [text]
+#   flow <record|save|run|list|show|rm> [name] [--site <s>] [--param k=v] [--where f=v] [--fields a,b] [--limit <n>]
 #
 # A <ref> is e12 (from snap), f2:e5 (inside iframe 2), a41 (from snap --ax), or a control's
-# visible label in quotes. A label that fits several controls fails and lists them.
-# Every page command takes a targetId as its last argument, or --match <text in url or title>.
-# Plain-text output; a failure prints {"ok":false,"error":…} and exits 1.
+# visible label in quotes. Every page command takes a targetId last or --match <text>.
 set -euo pipefail
 here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 tmp="${TMPDIR:-/tmp}"
@@ -77,7 +78,6 @@ local_version() {
   sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -n1
 }
 
-# Returns 0 when semver $1 > $2 (major.minor.patch).
 semver_gt() {
   local a1 a2 a3 b1 b2 b3
   IFS=. read -r a1 a2 a3 <<<"${1#v}"
@@ -120,8 +120,6 @@ check_update() {
   fi
 }
 
-# req <METHOD> <path> [body]: print the reply. Status 0 ok, 1 the daemon said no,
-# 7 not running (nothing was sent), 9 the connection broke after the request went out.
 req() {
   local rc=0
   printf '%s' "${3:-}" | curl -sS --fail-with-body --unix-socket "$sock" -X "$1" \
@@ -130,12 +128,10 @@ req() {
 }
 up() { req GET status >/dev/null; }
 
-# Start the daemon process if it is not running. Safe to call from several agents at once.
 ensure() {
   up && return 0
   command -v bun >/dev/null 2>&1 || { echo "browser-control-daemon: bun is required (https://bun.sh)" >&2; exit 127; }
   mkdir -p "$dir"; chmod 700 "$dir"
-  # Drop a lock left by a start that died, then let only one caller start the process.
   find "$lock" -maxdepth 0 -mmin +1 -exec rmdir {} \; 2>/dev/null || true
   if mkdir "$lock" 2>/dev/null; then
     up || { rm -f "$sock" "$build_file"; nohup bun "$here/../runtime/cli.js" --serve "$sock" >"$log" 2>&1 & }
@@ -145,8 +141,6 @@ ensure() {
   up || fail DAEMON_START_FAILED "daemon did not start; see $log. Tell the user; do not work around it."
 }
 
-# run <METHOD> <path> [body]: send the request; start the daemon only when nothing answers.
-# The daemon connects to the browser by itself on the first call that needs it.
 run() {
   local rc=0 out started=0
   out="$(req "$@")" || rc=$?
@@ -163,7 +157,6 @@ run() {
   exit 1
 }
 
-# JSON string literal without starting another process.
 json_str() {
   local s=$1
   if [[ "$s" == *[$'\001'-$'\010'$'\013'$'\014'$'\016'-$'\037']* ]]; then
@@ -182,28 +175,36 @@ urlencode() {
   printf '%s' "$out"
 }
 body() { if [[ "$1" == "-" ]]; then cat; else printf '%s' "$1"; fi; }
-usage() { sed -n '2,43p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,44p' "$0" | sed 's/^# \{0,1\}//'; }
 
 cmd="${1:-}"; [[ $# -gt 0 ]] && shift
 
 # Flags may sit anywhere after the command; unknown --flags are rejected immediately.
-match=""; quiet=""; all=false; ax=false; keys=false; focused=false; marks=false; full=false; png=false; snap=""
-find=""; within=""; max=""; until=""; xy=""; ref_flag=""; to=""
+match=""; quiet=""; raw=""; all=false; ax=false; keys=false; fast=false; focused=false; marks=false; full=false; png=false; snap=""
+scroll=false; reload=false; clear_flag=false
+find=""; within=""; max=""; until=""; xy=""; ref_flag=""; to=""; out_path=""
 wait_text=""; wait_selector=""; wait_url=""; timeout=""
+filter=""; limit=""; fields=""; concurrency=""; side=""; duration=""; kind=""; properties=""; site=""
+params_list=(); where_list=()
 args=()
-case "$cmd" in snap | text | ocr | click | type | select | upload | wait | key | value | shot | nav | eval | fill | do | verdict | health)
+case "$cmd" in snap | text | form | query | read-urls | ocr | click | type | select | upload | drag | wait | key | value | shot | nav | eval | fill | do | verdict | health | styles | issues | perf | notes | flow | script)
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --match) match="${2:?--match needs text from the tab url or title}"; shift 2 ;;
       --quiet) quiet=1; shift ;;
+      --no-boundaries) raw=1; shift ;;
       --all) all=true; shift ;;
       --ax) ax=true; shift ;;
       --keys) keys=true; shift ;;
+      --fast) fast=true; shift ;;
       --focused) focused=true; shift ;;
       --marks) marks=true; shift ;;
       --full) full=true; shift ;;
       --png) png=true; shift ;;
       --snap) snap=1; shift ;;
+      --scroll) scroll=true; shift ;;
+      --reload) reload=true; shift ;;
+      --clear) clear_flag=true; shift ;;
       --find) find="${2:?--find needs text}"; shift 2 ;;
       --within) within="${2:?--within needs a ref or CSS selector}"; shift 2 ;;
       --max) max="${2:?--max needs a number}"; shift 2 ;;
@@ -211,10 +212,22 @@ case "$cmd" in snap | text | ocr | click | type | select | upload | wait | key |
       --xy) xy="${2:?--xy needs x,y}"; shift 2 ;;
       --ref) ref_flag="${2:?--ref needs a ref}"; shift 2 ;;
       --to) to="${2:?--to needs a file path}"; shift 2 ;;
+      --out) out_path="${2:?--out needs a file path}"; shift 2 ;;
       --text) wait_text="${2:?--text needs text to wait for}"; shift 2 ;;
       --selector) wait_selector="${2:?--selector needs a CSS selector}"; shift 2 ;;
       --url) wait_url="${2:?--url needs a URL substring}"; shift 2 ;;
       --timeout) timeout="${2:?--timeout needs milliseconds}"; shift 2 ;;
+      --filter) filter="${2:?--filter needs text}"; shift 2 ;;
+      --limit) limit="${2:?--limit needs a number}"; shift 2 ;;
+      --fields) fields="${2:?--fields needs k=sel,... or a,b}"; shift 2 ;;
+      --concurrency) concurrency="${2:?--concurrency needs a number}"; shift 2 ;;
+      --side) side="${2:?--side needs before or after}"; shift 2 ;;
+      --duration) duration="${2:?--duration needs milliseconds}"; shift 2 ;;
+      --kind) kind="${2:?--kind needs an issue kind}"; shift 2 ;;
+      --properties) properties="${2:?--properties needs comma-separated CSS properties}"; shift 2 ;;
+      --site) site="${2:?--site needs a site host}"; shift 2 ;;
+      --param) params_list+=("${2:?--param needs key=value}"); shift 2 ;;
+      --where) where_list+=("${2:?--where needs field=value}"); shift 2 ;;
       --) shift; while [[ $# -gt 0 ]]; do args+=("$1"); shift; done ;;
       --*) fail INPUT_INVALID "unknown flag: $1 (pass -- before a positional argument starting with --)" ;;
       *) args+=("$1"); shift ;;
@@ -224,14 +237,34 @@ case "$cmd" in snap | text | ocr | click | type | select | upload | wait | key |
 esac
 arg() { printf '%s' "${args[$1]:-}"; }
 
-# query <targetId>: the ?t=…&m=…&q=1 part of the request path.
 query() {
   local q=""
   [[ -z "${1:-}" ]] || q+="&t=$(urlencode "$1")"
   [[ -z "$match" ]] || q+="&m=$(urlencode "$match")"
   [[ -z "$quiet" ]] || q+="&q=1"
+  [[ -z "$raw" ]] || q+="&raw=1"
   [[ -z "${2:-}" ]] || q+="&$2"
   [[ -z "$q" ]] || printf '?%s' "${q#&}"
+}
+
+abs_path() { local p="$1"; [[ "$p" == /* ]] && printf '%s' "$p" || printf '%s' "$PWD/$p"; }
+
+kv_json_obj() {
+  local out="{" sep="" item k v
+  for item in "$@"; do
+    k="${item%%=*}"; v="${item#*=}"
+    out+="${sep}$(json_str "$k"):$(json_str "$v")"; sep=","
+  done
+  printf '%s}' "$out"
+}
+
+csv_json_arr() {
+  local out="[" sep="" part
+  local IFS=,
+  for part in $1; do
+    out+="${sep}$(json_str "$part")"; sep=","
+  done
+  printf '%s]' "$out"
 }
 
 case "$cmd" in
@@ -255,16 +288,50 @@ case "$cmd" in
     ;;
   tabs | ops) run GET "$cmd" ;;
   snap)
-    input='{"all":'"$all"',"ax":'"$ax"
+    input='{"all":'"$all"',"ax":'"$ax"',"full":'"$full"
     [[ -z "$find" ]] || input+=',"find":'"$(json_str "$find")"
     [[ -z "$within" ]] || input+=',"within":'"$(json_str "$within")"
+    [[ -z "$out_path" ]] || input+=',"out":'"$(json_str "$(abs_path "$out_path")")"
     run POST "page/snap$(query "$(arg 0)")" "$input}"
     ;;
   text)
-    input='{"all":'"$all"
+    input='{"all":'"$all"',"scroll":'"$scroll"
     [[ -z "$within" ]] || input+=',"within":'"$(json_str "$within")"
     [[ -z "$max" ]] || input+=',"max":'"$((max))"
+    [[ -z "$filter" ]] || input+=',"filter":'"$(json_str "$filter")"
+    [[ -z "$limit" ]] || input+=',"limit":'"$((limit))"
+    [[ -z "$timeout" ]] || input+=',"timeoutMs":'"$((timeout))"
+    [[ -z "$out_path" ]] || input+=',"out":'"$(json_str "$(abs_path "$out_path")")"
     run POST "page/text$(query "$(arg 0)")" "$input}"
+    ;;
+  form)
+    input='{' ; sep=''
+    if [[ -n "$within" ]]; then input+="${sep}\"within\":$(json_str "$within")"; sep=','; fi
+    if [[ -n "$out_path" ]]; then input+="${sep}\"out\":$(json_str "$(abs_path "$out_path")")"; fi
+    run POST "page/form$(query "$(arg 0)")" "$input}"
+    ;;
+  query)
+    [[ -n "$(arg 0)" ]] || fail INPUT_INVALID "usage: browser-control-daemon query <css> [--fields k=sel,...] [--limit N] [targetId]"
+    input='{"selector":'"$(json_str "$(arg 0)")"',"all":'"$all"
+    [[ -z "$limit" ]] || input+=',"limit":'"$((limit))"
+    if [[ -n "$fields" ]]; then
+      IFS=, read -ra fpairs <<<"$fields"
+      input+=',"fields":'"$(kv_json_obj "${fpairs[@]}")"
+    fi
+    [[ -z "$out_path" ]] || input+=',"out":'"$(json_str "$(abs_path "$out_path")")"
+    run POST "page/query$(query "$(arg 1)")" "$input}"
+    ;;
+  read-urls)
+    [[ ${#args[@]} -ge 1 ]] || fail INPUT_INVALID "usage: browser-control-daemon read-urls <url1> [url2 ...] [--concurrency N]"
+    uarr="[" ; sep=""
+    for u in "${args[@]}"; do uarr+="${sep}$(json_str "$u")"; sep=","; done
+    uarr+="]"
+    input='{"urls":'"$uarr"
+    [[ -z "$concurrency" ]] || input+=',"concurrency":'"$((concurrency))"
+    [[ -z "$timeout" ]] || input+=',"timeoutMs":'"$((timeout))"
+    [[ -z "$max" ]] || input+=',"maxChars":'"$((max))"
+    [[ -z "$out_path" ]] || input+=',"out":'"$(json_str "$(abs_path "$out_path")")"
+    run POST "page/read-urls$(query "")" "$input}"
     ;;
   click)
     if [[ -n "$xy" ]]; then
@@ -281,12 +348,12 @@ case "$cmd" in
     ;;
   type)
     if [[ "$focused" == true ]]; then
-      [[ ${#args[@]} -ge 1 ]] || fail INPUT_INVALID "usage: browser-control-daemon type --focused <text> [targetId]"
-      run POST "page/type$(query "$(arg 1)")" '{"focused":true,"text":'"$(json_str "$(arg 0)")"'}'
+      [[ ${#args[@]} -ge 1 ]] || fail INPUT_INVALID "usage: browser-control-daemon type --focused [--fast] [--keys] <text> [targetId]"
+      run POST "page/type$(query "$(arg 1)")" '{"focused":true,"text":'"$(json_str "$(arg 0)")"',"fast":'"$fast"',"keys":'"$keys"'}'
       exit 0
     fi
-    [[ ${#args[@]} -ge 2 ]] || fail INPUT_INVALID "usage: browser-control-daemon type [--keys] <ref|label> <text> [targetId]"
-    run POST "page/type$(query "$(arg 2)")" '{"ref":'"$(json_str "$(arg 0)")"',"text":'"$(json_str "$(arg 1)")"',"keys":'"$keys"'}'
+    [[ ${#args[@]} -ge 2 ]] || fail INPUT_INVALID "usage: browser-control-daemon type [--fast] [--keys] <ref|label> <text> [targetId]"
+    run POST "page/type$(query "$(arg 2)")" '{"ref":'"$(json_str "$(arg 0)")"',"text":'"$(json_str "$(arg 1)")"',"fast":'"$fast"',"keys":'"$keys"'}'
     ;;
   select)
     [[ ${#args[@]} -ge 2 ]] || fail INPUT_INVALID "usage: browser-control-daemon select <ref|label> <option> [targetId]"
@@ -294,14 +361,18 @@ case "$cmd" in
     ;;
   upload)
     [[ ${#args[@]} -ge 2 ]] || fail INPUT_INVALID "usage: browser-control-daemon upload <ref|label> <path> [targetId]"
-    fpath="$(arg 1)"
-    [[ "$fpath" == /* ]] || fpath="$PWD/$fpath"
+    fpath="$(abs_path "$(arg 1)")"
     run POST "page/upload$(query "$(arg 2)")" '{"ref":'"$(json_str "$(arg 0)")"',"path":'"$(json_str "$fpath")"'}'
+    ;;
+  drag)
+    [[ ${#args[@]} -ge 2 ]] || fail INPUT_INVALID "usage: browser-control-daemon drag <from> <to> [--side before|after] [targetId]"
+    input='{"from":'"$(json_str "$(arg 0)")"',"to":'"$(json_str "$(arg 1)")"
+    [[ -z "$side" ]] || input+=',"side":'"$(json_str "$side")"
+    run POST "page/drag$(query "$(arg 2)")" "$input}"
     ;;
   wait)
     [[ -n "$wait_text" || -n "$wait_selector" || -n "$wait_url" ]] || fail INPUT_INVALID "usage: browser-control-daemon wait [--text <t>] [--selector <css>] [--url <u>] [--timeout <ms>] [targetId]"
-    input='{'
-    sep=''
+    input='{' ; sep=''
     if [[ -n "$wait_text" ]]; then input+="${sep}\"text\":$(json_str "$wait_text")"; sep=','; fi
     if [[ -n "$wait_selector" ]]; then input+="${sep}\"selector\":$(json_str "$wait_selector")"; sep=','; fi
     if [[ -n "$wait_url" ]]; then input+="${sep}\"url\":$(json_str "$wait_url")"; sep=','; fi
@@ -320,8 +391,8 @@ case "$cmd" in
     run POST "page/value$(query "$(arg 1)")" '{"ref":'"$(json_str "$(arg 0)")"'}'
     ;;
   fill)
-    [[ -n "$(arg 0)" ]] || fail INPUT_INVALID "usage: browser-control-daemon fill '{\\\"<ref|label>\\\":\\\"<text>\\\"}' [targetId]"
-    run POST "page/do$(query "$(arg 1)")" '{"fill":'"$(body "$(arg 0)")"'}'
+    [[ -n "$(arg 0)" ]] || fail INPUT_INVALID "usage: browser-control-daemon fill [--fast] '{\\\"<ref|label>\\\":\\\"<text>\\\"}' [targetId]"
+    run POST "page/do$(query "$(arg 1)")" '{"fill":'"$(body "$(arg 0)")"',"fast":'"$fast"'}'
     ;;
   do)
     [[ -n "$(arg 0)" ]] || fail INPUT_INVALID "usage: browser-control-daemon do '<json array of steps>' [targetId]"
@@ -330,11 +401,58 @@ case "$cmd" in
   shot)
     input='{"marks":'"$marks"',"full":'"$full"',"png":'"$png"
     [[ -z "$ref_flag" ]] || input+=',"ref":'"$(json_str "$ref_flag")"
-    if [[ -n "$to" ]]; then
-      [[ "$to" == /* ]] || to="$PWD/$to"
-      input+=',"path":'"$(json_str "$to")"
-    fi
+    [[ -z "$to" ]] || input+=',"path":'"$(json_str "$(abs_path "$to")")"
     run POST "page/shot$(query "$(arg 0)")" "$input}"
+    ;;
+  styles)
+    [[ -n "$(arg 0)" ]] || fail INPUT_INVALID "usage: browser-control-daemon styles <ref|css> [--properties a,b] [targetId]"
+    input='{"ref":'"$(json_str "$(arg 0)")"
+    [[ -z "$properties" ]] || input+=',"properties":'"$(csv_json_arr "$properties")"
+    run POST "page/styles$(query "$(arg 1)")" "$input}"
+    ;;
+  issues)
+    input='{"clear":'"$clear_flag"
+    [[ -z "$kind" ]] || input+=',"kind":'"$(json_str "$kind")"
+    run POST "page/issues$(query "$(arg 0)")" "$input}"
+    ;;
+  perf)
+    input='{"reload":'"$reload"
+    [[ -z "$duration" ]] || input+=',"durationMs":'"$((duration))"
+    run POST "page/perf$(query "$(arg 0)")" "$input}"
+    ;;
+  notes)
+    sub="$(arg 0)"; [[ -n "$sub" ]] || sub="get"
+    input='{"sub":'"$(json_str "$sub")"
+    if [[ "$sub" == "set" || "$sub" == "append" ]]; then
+      if [[ ${#args[@]} -ge 3 ]]; then
+        input+=',"site":'"$(json_str "$(arg 1)")"',"text":'"$(json_str "$(body "$(arg 2)")")"
+      else
+        input+=',"text":'"$(json_str "$(body "$(arg 1)")")"
+      fi
+    elif [[ -n "$(arg 1)" ]]; then
+      input+=',"site":'"$(json_str "$(arg 1)")"
+    fi
+    [[ -z "$site" ]] || input+=',"site":'"$(json_str "$site")"
+    run POST "page/notes$(query "")" "$input}"
+    ;;
+  flow)
+    sub="$(arg 0)"; [[ -n "$sub" ]] || sub="list"
+    input='{"sub":'"$(json_str "$sub")"
+    [[ -z "$(arg 1)" ]] || input+=',"name":'"$(json_str "$(arg 1)")"
+    [[ -z "$site" ]] || input+=',"site":'"$(json_str "$site")"
+    [[ -z "$limit" ]] || input+=',"limit":'"$((limit))"
+    [[ -z "$fields" ]] || input+=',"fields":'"$(csv_json_arr "$fields")"
+    if [[ ${#params_list[@]} -gt 0 ]]; then input+=',"params":'"$(kv_json_obj "${params_list[@]}")"; fi
+    if [[ ${#where_list[@]} -gt 0 ]]; then input+=',"where":'"$(kv_json_obj "${where_list[@]}")"; fi
+    run POST "page/flow$(query "")" "$input}"
+    ;;
+  script)
+    [[ ${#args[@]} -ge 1 ]] || fail INPUT_INVALID "usage: browser-control-daemon script '<js>' [--timeout <ms>] [--out <path>] [targetId]"
+    code="$(body "$(arg 0)")"
+    input='{"code":'"$(json_str "$code")"
+    [[ -z "$timeout" ]] || input+=',"timeoutMs":'"$((timeout))"
+    [[ -z "$out_path" ]] || input+=',"out":'"$(json_str "$(abs_path "$out_path")")"
+    run POST "page/script$(query "$(arg 1)")" "$input}"
     ;;
   verdict | health) run POST "page/$cmd$(query "$(arg 0)")" '{}' ;;
   call)

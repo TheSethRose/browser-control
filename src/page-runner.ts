@@ -1,12 +1,28 @@
 /**
  * Page helper runner shared by the daemon HTTP handler and unit tests.
- * Injects `__bc` lazily once per document, dispatches mouse/key input in-process, reports what
- * each action changed, and routes `browse:<n>` tabs cleanly with label and guard parity.
+ * Runs `__bc` in an isolated world (falling back cleanly on mocks/browse tabs),
+ * dispatches mouse/key/drag input in-process with delivery checks, reports DOM diffs,
+ * and exposes structured readers (`form`, `query`, `read-urls`, `text --scroll`),
+ * DevTools inspection (`styles`, `issues`, `perf`), site notes, saved GET flows, and `script`.
  */
 import type { InvokeResult } from "@agent-software/core";
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { runBrowse, type Runner } from "./backends/browse";
+import { inspectIssues, inspectPerf, inspectStyles } from "./devtools";
+import {
+  buildFlow,
+  fillFlowUrl,
+  listFlows,
+  loadFlowFile,
+  removeFlowFile,
+  saveFlowFile,
+  shapeFlowResult,
+  type RecordedGet,
+} from "./flows";
+import { drawMarksOnImage, type MarkBox } from "./marks";
+import { appendNote, approveNote, getNote, listNotes, noteHeaderForUrl, removeNote, setNote } from "./notes";
 import { recognizeText, type Recognizer } from "./ocr";
 import {
   HONEYPOT_NAME,
@@ -17,7 +33,10 @@ import {
   parseLocator,
   type Locator,
 } from "./page-helpers";
-import { createPictureTracker, imageWidth } from "./picture";
+import { createPictureTracker, imageWidth, resizeImage } from "./picture";
+import { buildHumanKeystrokes } from "./typing";
+import { didYouMean, withRemedy } from "./safety";
+import { createScriptRunner, writeOutputFile } from "./script";
 
 type Json = Record<string, unknown>;
 export type Invoker = (operation: string, input?: Json) => Promise<InvokeResult>;
@@ -26,6 +45,12 @@ const NEED_INSTALL = "__BC_NEED_INSTALL__";
 /** Input events never return while a JavaScript dialog is open, so don't wait the full CDP timeout. */
 const INPUT_TIMEOUT_MS = 10_000;
 const DIALOG_HINT = "the page stopped responding; a JavaScript dialog is probably open (references/dom-and-input.md)";
+
+const PAGE_ACTIONS = [
+  "snap", "text", "form", "query", "read-urls", "ocr", "shot", "click", "type", "select",
+  "upload", "drag", "wait", "key", "fill", "do", "value", "nav", "verdict", "health",
+  "styles", "issues", "perf", "notes", "flow", "script",
+] as const;
 
 const failure = (code: string, message: string): InvokeResult =>
   ({ ok: false, error: { code, message } }) as InvokeResult;
@@ -111,7 +136,7 @@ export async function matchTab(
 /** A helper's own refusal arrives wrapped as a JavaScript exception with a stack; keep just the message. */
 function helperError(res: InvokeResult): InvokeResult {
   if (res.ok) return res;
-  const m = /^JS_EXCEPTION: (?:Error: )?((?:AMBIGUOUS|NO_MATCH|STALE_REF|NOT_ACTIONABLE|REFUSED|INPUT_INVALID): [\s\S]*?)(?:\n\s+at [\s\S]*)?$/.exec(
+  const m = /^JS_EXCEPTION: (?:Error: )?((?:AMBIGUOUS|NO_MATCH|STALE_REF|REF_DRIFTED|NOT_ACTIONABLE|REFUSED|INPUT_INVALID|INPUT_NOT_DELIVERED|FLOW_DRIFTED): [\s\S]*?)(?:\n\s+at [\s\S]*)?$/.exec(
     res.error.message,
   );
   return m ? failure(res.error.code, m[1]!) : res;
@@ -158,19 +183,40 @@ export function createPageHelperHandler(
   invoke: Invoker,
   browseRunner: Runner = runBrowse,
   recognize: Recognizer = recognizeText,
+  options: {
+    notesDir?: string;
+    flowsDir?: string;
+    sessionId?: string;
+    sleep?: (ms: number) => Promise<void>;
+    rng?: () => number;
+  } = {},
 ) {
+  const daemonSessionId = options.sessionId ?? randomUUID().slice(0, 12);
+  const pause = options.sleep ?? sleep;
+  const rng = options.rng ?? Math.random;
   /** Cross-origin iframe targets from the last snap of each tab: f1 is index 0. */
   const frameTargets = new Map<string, string[]>();
+  /** Last isolated-world executionContextId seen per target, used by upload/styles. */
+  const contextIds = new Map<string, number>();
   /** Last parsed snapshot entries per browse tab, used for trap/payment guard checks. */
   const browseCache = new Map<number, Map<string, BrowseEntry>>();
+  /** Non-secret typed values remembered per tab for `flow save` parameterization. */
+  const recentTyped = new Map<string, Record<string, string>>();
 
   async function evalHelper(callExpr: string, targetId?: string, timeoutMs?: number): Promise<InvokeResult> {
-    const extra = { ...(targetId ? { targetId } : {}), ...(timeoutMs ? { timeoutMs } : {}) };
+    const extra = { isolated: true, ...(targetId ? { targetId } : {}), ...(timeoutMs ? { timeoutMs } : {}) };
     const probe = `globalThis.__bc && globalThis.__bc.v === ${PAGE_HELPERS_VERSION} ? (${callExpr}) : "${NEED_INSTALL}"`;
     const first = await invoke("evaluate", { expression: probe, ...extra });
     if (!first.ok) return helperError(first);
+    const firstCtx = (first.data as Json)["contextId"];
+    if (typeof firstCtx === "number") contextIds.set(targetId ?? "", firstCtx);
     if ((first.data as Json)["value"] !== NEED_INSTALL) return first;
-    return helperError(await invoke("evaluate", { expression: `${PAGE_HELPERS_SOURCE}\n${callExpr}`, ...extra }));
+    const second = await invoke("evaluate", { expression: `${PAGE_HELPERS_SOURCE}\n${callExpr}`, ...extra });
+    if (second.ok) {
+      const secondCtx = (second.data as Json)["contextId"];
+      if (typeof secondCtx === "number") contextIds.set(targetId ?? "", secondCtx);
+    }
+    return helperError(second);
   }
 
   const picture = createPictureTracker(invoke, evalHelper, recognize);
@@ -265,22 +311,47 @@ export function createPageHelperHandler(
     });
   }
 
-  async function clickCoords(x: number, y: number, targetId?: string): Promise<InvokeResult> {
+  /** Resolve a JS expression into a CDP RemoteObjectId in the same world where `__bc` lives. */
+  async function resolveObject(
+    expr: string,
+    targetId?: string,
+  ): Promise<{ ok: true; objectId: string } | { ok: false; res: InvokeResult }> {
+    const ctxId = contextIds.get(targetId ?? "");
+    const evalObj = await cdp(
+      "Runtime.evaluate",
+      { expression: expr, returnByValue: false, ...(ctxId !== undefined ? { contextId: ctxId } : {}) },
+      targetId,
+    );
+    if (!evalObj.ok) return { ok: false, res: evalObj };
+    const objectId = ((((evalObj.data as Json)["result"] as Json | undefined)?.["result"] as Json | undefined)?.["objectId"]) as
+      | string
+      | undefined;
+    if (!objectId) {
+      return { ok: false, res: failure("EXECUTION_FAILED", `NOT_ACTIONABLE: could not resolve element (${expr})`) };
+    }
+    return { ok: true, objectId };
+  }
+
+  async function clickCoords(x: number, y: number, targetId?: string, clickCount = 1): Promise<InvokeResult> {
     const m1 = await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x, y }, targetId, INPUT_TIMEOUT_MS);
     if (!m1.ok) return m1;
-    const m2 = await cdp(
-      "Input.dispatchMouseEvent",
-      { type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1 },
-      targetId,
-      INPUT_TIMEOUT_MS,
-    );
-    if (!m2.ok) return m2;
-    return cdp(
-      "Input.dispatchMouseEvent",
-      { type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: 1 },
-      targetId,
-      INPUT_TIMEOUT_MS,
-    );
+    for (let c = 1; c <= clickCount; c++) {
+      const m2 = await cdp(
+        "Input.dispatchMouseEvent",
+        { type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: c },
+        targetId,
+        INPUT_TIMEOUT_MS,
+      );
+      if (!m2.ok) return m2;
+      const m3 = await cdp(
+        "Input.dispatchMouseEvent",
+        { type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: c },
+        targetId,
+        INPUT_TIMEOUT_MS,
+      );
+      if (!m3.ok) return m3;
+    }
+    return success("ok");
   }
 
   /** Turn a label into a ref; everything else passes through. */
@@ -288,14 +359,29 @@ export function createPageHelperHandler(
     raw: unknown,
     kind: "click" | "type" | "select" | "read",
     targetId?: string,
-  ): Promise<{ ok: true; loc: Exclude<Locator, { kind: "label" }> } | { ok: false; res: InvokeResult }> {
+    healInBatch = false,
+  ): Promise<{ ok: true; loc: Exclude<Locator, { kind: "label" }>; healedFrom?: string } | { ok: false; res: InvokeResult }> {
     let loc: Locator;
     try {
       loc = parseLocator(raw);
     } catch (error) {
       return { ok: false, res: failure("INPUT_VALIDATION_FAILED", (error as Error).message) };
     }
-    if (loc.kind !== "label") return { ok: true, loc };
+    if (loc.kind !== "label") {
+      if (loc.kind === "dom") {
+        const ver = await evalHelper(`__bc.verifyRef(${js(loc.ref)})`, targetId);
+        if (!ver.ok) {
+          if (healInBatch && messageOf(ver).startsWith("STALE_REF")) {
+            const healed = await evalHelper(`__bc.healRef(${js(loc.ref)})`, targetId);
+            if (healed.ok && /^e\d+$/.test(valueOf(healed))) {
+              return { ok: true, loc: { kind: "dom", ref: valueOf(healed) }, healedFrom: loc.ref };
+            }
+          }
+          return { ok: false, res: ver };
+        }
+      }
+      return { ok: true, loc };
+    }
     const found = await evalHelper(`__bc.locate(${js(loc.label)}, ${js(kind)})`, targetId);
     if (!found.ok) return { ok: false, res: found };
     return { ok: true, loc: { kind: "dom", ref: valueOf(found) } };
@@ -361,15 +447,27 @@ export function createPageHelperHandler(
     return { ok: true, pt: { x, y, hidden: parts[2] === "hidden", before: href } };
   }
 
-  async function clickAt(pt: Point, targetId?: string): Promise<InvokeResult> {
+  async function clickAt(pt: Point, targetId?: string, clickCount = 1): Promise<InvokeResult> {
     if (pt.hidden) {
       const foc = await cdp("Emulation.setFocusEmulationEnabled", { enabled: true }, targetId);
       if (!foc.ok) return foc;
     }
-    return clickCoords(pt.x, pt.y, targetId);
+    return clickCoords(pt.x, pt.y, targetId, clickCount);
   }
 
-  async function pressKey(name: string, targetId?: string): Promise<InvokeResult> {
+  /** Arm isolated-world event probe and read back trusted event counts after input. */
+  async function readProbe(targetId?: string): Promise<Record<string, number> | undefined> {
+    const res = await evalHelper("__bc.readInputProbe()", targetId, 2_000);
+    if (!res.ok) return undefined;
+    try {
+      const parsed = JSON.parse(valueOf(res)) as Record<string, number>;
+      return typeof parsed === "object" && parsed !== null && "mousedown" in parsed ? parsed : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  async function pressKey(name: string, targetId?: string, holdMs = 0): Promise<InvokeResult> {
     const spec = KEYS[name];
     if (!spec) {
       return failure("INPUT_VALIDATION_FAILED", `INPUT_INVALID: key must be ${Object.keys(KEYS).join(", ")}`);
@@ -379,10 +477,69 @@ export function createPageHelperHandler(
       ? await cdp("Input.dispatchKeyEvent", { type: "keyDown", ...base, text: spec.text }, targetId, INPUT_TIMEOUT_MS)
       : await cdp("Input.dispatchKeyEvent", { type: "rawKeyDown", ...base }, targetId, INPUT_TIMEOUT_MS);
     if (!down.ok) return down;
+    if (holdMs > 0) await pause(holdMs);
     return cdp("Input.dispatchKeyEvent", { type: "keyUp", ...base }, targetId, INPUT_TIMEOUT_MS);
   }
 
-  /** The document was replaced mid-call: give the new one a moment to parse. */
+  async function dispatchText(
+    text: string,
+    mode: "human" | "fast" | "keys",
+    targetId?: string,
+    opts: { focused?: boolean } = {},
+  ): Promise<InvokeResult> {
+    if (text === "") {
+      return pressKey("Backspace", targetId);
+    }
+    if (mode === "fast") {
+      if (!opts.focused && text.length >= 2 && !/[\r\n\t]$/.test(text)) {
+        // Insert all but the last character fast, then send the final character as real key events to wake autocompletes/frameworks.
+        const ins = await cdp("Input.insertText", { text: text.slice(0, -1) }, targetId, INPUT_TIMEOUT_MS);
+        if (!ins.ok) return ins;
+        const last = text.slice(-1);
+        const kd = await cdp("Input.dispatchKeyEvent", { type: "keyDown", key: last, text: last }, targetId, INPUT_TIMEOUT_MS);
+        if (!kd.ok) return kd;
+        return cdp("Input.dispatchKeyEvent", { type: "keyUp", key: last }, targetId, INPUT_TIMEOUT_MS);
+      }
+      return cdp("Input.insertText", { text }, targetId, INPUT_TIMEOUT_MS);
+    }
+    if (mode === "keys") {
+      for (const ch of text) {
+        const kd = await cdp("Input.dispatchKeyEvent", { type: "keyDown", key: ch, text: ch }, targetId, INPUT_TIMEOUT_MS);
+        if (!kd.ok) return kd;
+        const ku = await cdp("Input.dispatchKeyEvent", { type: "keyUp", key: ch }, targetId, INPUT_TIMEOUT_MS);
+        if (!ku.ok) return ku;
+      }
+      return success("ok");
+    }
+    // Default: human/natural typing with realistic hold times, variable cadence, and occasional self-corrected typos.
+    const plan = buildHumanKeystrokes(text, { rng });
+    for (const step of plan) {
+      if (step.kind === "backspace") {
+        const bs = await pressKey("Backspace", targetId, step.holdMs);
+        if (!bs.ok) return bs;
+      } else if (step.kind === "insert") {
+        const ins = await cdp("Input.insertText", { text: step.text }, targetId, INPUT_TIMEOUT_MS);
+        if (!ins.ok) return ins;
+      } else {
+        const base: Json = {
+          key: step.spec.key,
+          code: step.spec.code,
+          windowsVirtualKeyCode: step.spec.windowsVirtualKeyCode,
+          ...(step.spec.modifiers ? { modifiers: step.spec.modifiers } : {}),
+        };
+        const down = step.spec.text !== undefined
+          ? await cdp("Input.dispatchKeyEvent", { type: "keyDown", ...base, text: step.spec.text }, targetId, INPUT_TIMEOUT_MS)
+          : await cdp("Input.dispatchKeyEvent", { type: "rawKeyDown", ...base }, targetId, INPUT_TIMEOUT_MS);
+        if (!down.ok) return down;
+        if (step.holdMs > 0) await pause(step.holdMs);
+        const up = await cdp("Input.dispatchKeyEvent", { type: "keyUp", ...base }, targetId, INPUT_TIMEOUT_MS);
+        if (!up.ok) return up;
+      }
+      if (step.pauseAfterMs > 0) await pause(step.pauseAfterMs);
+    }
+    return success("ok");
+  }
+
   async function waitParsed(targetId?: string): Promise<void> {
     for (let i = 0; i < 40; i++) {
       const ready = await invoke("evaluate", {
@@ -395,7 +552,6 @@ export function createPageHelperHandler(
     }
   }
 
-  /** What changed since the baseline, once the page has settled. Survives a navigation. */
   async function changes(before: string | undefined, targetId?: string): Promise<string> {
     const expr = `(await __bc.settle(), __bc.diff(${js({ from: before ?? "" })}))`;
     let res = await evalHelper(expr, targetId, 8_000);
@@ -477,9 +633,10 @@ export function createPageHelperHandler(
     const steps: Step[] = [];
     if (input["fill"] !== undefined) {
       if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return "fill takes a JSON object of label or ref to text";
+      const fast = input["fast"] === true;
       for (const [ref, text] of Object.entries(raw as Json)) {
         if (typeof text !== "string") return `fill: the value for "${ref}" must be a string`;
-        steps.push({ action: "type", input: { ref, text }, label: `type ${js(ref)}` });
+        steps.push({ action: "type", input: { ref, text, ...(fast ? { fast: true } : {}) }, label: `type ${js(ref)}` });
       }
       return steps;
     }
@@ -494,17 +651,28 @@ export function createPageHelperHandler(
       } else if (verb === "key" && typeof arg === "string") {
         steps.push({ action: "key", input: { key: arg }, label: `key ${arg}` });
       } else if (verb === "type" && Array.isArray(arg) && typeof arg[0] === "string" && typeof arg[1] === "string") {
-        steps.push({ action: "type", input: { ref: arg[0], text: arg[1], keys: arg[2] === "keys" || arg[2] === true }, label: `type ${js(arg[0])}` });
+        steps.push({
+          action: "type",
+          input: {
+            ref: arg[0],
+            text: arg[1],
+            fast: arg[2] === "fast",
+            keys: arg[2] === "keys" || arg[2] === true,
+          },
+          label: `type ${js(arg[0])}`,
+        });
       } else if (verb === "select" && Array.isArray(arg) && typeof arg[0] === "string" && typeof arg[1] === "string") {
         steps.push({ action: "select", input: { ref: arg[0], option: arg[1] }, label: `select ${js(arg[0])}` });
       } else if (verb === "upload" && Array.isArray(arg) && typeof arg[0] === "string" && typeof arg[1] === "string") {
         steps.push({ action: "upload", input: { ref: arg[0], path: arg[1] }, label: `upload ${js(arg[0])}` });
+      } else if (verb === "drag" && Array.isArray(arg) && typeof arg[0] === "string" && typeof arg[1] === "string") {
+        steps.push({ action: "drag", input: { from: arg[0], to: arg[1], ...(typeof arg[2] === "string" ? { side: arg[2] } : {}) }, label: `drag ${js(arg[0])} -> ${js(arg[1])}` });
       } else if (verb === "wait" && typeof arg === "string") {
         steps.push({ action: "wait", input: { text: arg }, label: `wait ${js(arg)}` });
       } else if (verb === "wait" && typeof arg === "object" && arg !== null && !Array.isArray(arg)) {
         steps.push({ action: "wait", input: arg as Json, label: "wait" });
       } else {
-        return `step ${i + 1}: use {"click":"<ref|label>"}, {"type":["<ref|label>","<text>"]}, {"select":["<ref|label>","<option>"]}, {"upload":["<ref|label>","<abs-path>"]}, {"wait":"<text>"}, or {"key":"<name>"}`;
+        return `step ${i + 1}: use {"click":"<ref|label>"}, {"type":["<ref|label>","<text>"]}, {"select":["<ref|label>","<option>"]}, {"upload":["<ref|label>","<abs-path>"]}, {"drag":["<from>","<to>"]}, {"wait":"<text>"}, or {"key":"<name>"}`;
       }
     }
     return steps;
@@ -565,12 +733,83 @@ export function createPageHelperHandler(
     return res;
   }
 
+  /** Perform HTML5 drag-and-drop (via Input.setInterceptDrags) or plain mouse drag. */
+  async function runDrag(input: Json, targetId: string | undefined, quiet: boolean, healInBatch: boolean): Promise<InvokeResult> {
+    const fromLoc = await locate(input["from"], "click", targetId, healInBatch);
+    if (!fromLoc.ok) return fromLoc.res;
+    const toLoc = await locate(input["to"], "click", targetId, healInBatch);
+    if (!toLoc.ok) return toLoc.res;
+    if (fromLoc.loc.kind !== "dom" || toLoc.loc.kind !== "dom") {
+      return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: drag requires DOM refs or labels on the main page");
+    }
+    const before = quiet ? undefined : await evalHelper("__bc.baseline()", targetId);
+    const side = input["side"] === "before" || input["side"] === "after" ? input["side"] : "";
+    const infoRes = await evalHelper(`__bc.dragInfo(${js(fromLoc.loc.ref)}, ${js(toLoc.loc.ref)}, ${js(side)})`, targetId);
+    if (!infoRes.ok) return infoRes;
+    const info = JSON.parse(valueOf(infoRes)) as {
+      sx: number; sy: number; dx: number; dy: number; draggable: boolean; listMeta: Json | null;
+    };
+
+    let html5Dropped = false;
+    let dragIntercepted: { data?: Json } | undefined;
+    let mouseDown = false;
+    if (info.draggable) {
+      await cdp("Input.setInterceptDrags", { enabled: true }, targetId, 4_000);
+    }
+    try {
+      await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: info.sx, y: info.sy }, targetId, INPUT_TIMEOUT_MS);
+      await cdp("Input.dispatchMouseEvent", { type: "mousePressed", x: info.sx, y: info.sy, button: "left", buttons: 1, clickCount: 1 }, targetId, INPUT_TIMEOUT_MS);
+      mouseDown = true;
+      const mx = Math.round((info.sx + info.dx) / 2);
+      const my = Math.round((info.sy + info.dy) / 2);
+      if (info.draggable) {
+        const waitDrag = invoke("wait_for_event", { method: "Input.dragIntercepted", timeoutMs: 1200, ...(targetId ? { targetId } : {}) });
+        await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: mx, y: my, button: "left", buttons: 1 }, targetId, INPUT_TIMEOUT_MS);
+        const ev = await waitDrag;
+        if (ev.ok && (ev.data as Json)["found"] === true) {
+          dragIntercepted = (((ev.data as Json)["event"] as Json)?.["params"] as { data?: Json }) ?? {};
+          const dragData = dragIntercepted.data ?? { items: [], dragOperationsMask: 1 };
+          await cdp("Input.dispatchDragEvent", { type: "dragEnter", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
+          await cdp("Input.dispatchDragEvent", { type: "dragOver", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
+          const dropRes = await cdp("Input.dispatchDragEvent", { type: "drop", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
+          html5Dropped = dropRes.ok;
+        } else {
+          await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: info.dx, y: info.dy, button: "left", buttons: 1 }, targetId, INPUT_TIMEOUT_MS);
+        }
+      } else {
+        await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: mx, y: my, button: "left", buttons: 1 }, targetId, INPUT_TIMEOUT_MS);
+        await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: info.dx, y: info.dy, button: "left", buttons: 1 }, targetId, INPUT_TIMEOUT_MS);
+      }
+    } finally {
+      if (info.draggable && dragIntercepted && !html5Dropped) {
+        await cdp("Input.dispatchDragEvent", { type: "dragCancel", x: info.dx, y: info.dy, data: dragIntercepted.data ?? { items: [], dragOperationsMask: 1 } }, targetId, 2_000).catch(() => {});
+      }
+      if (mouseDown) {
+        await cdp("Input.dispatchMouseEvent", { type: "mouseReleased", x: info.dx, y: info.dy, button: "left", buttons: 0, clickCount: 1 }, targetId, 2_000).catch(() => {});
+      }
+      if (info.draggable) {
+        await cdp("Input.setInterceptDrags", { enabled: false }, targetId, 2_000).catch(() => {});
+      }
+    }
+
+    const posRes = info.listMeta ? await evalHelper(`__bc.listPosition(${js(info.listMeta)})`, targetId) : undefined;
+    const posNote = posRes?.ok && valueOf(posRes) ? ` (${valueOf(posRes)})` : "";
+    const mode = info.draggable ? (html5Dropped ? "HTML5 drag and drop" : "mouse drag fallback") : "mouse drag";
+    return withChanges(
+      `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}: delivered (${mode})${posNote}`,
+      before?.ok ? valueOf(before) : undefined,
+      quiet,
+      targetId,
+    );
+  }
+
   async function act(
     action: string,
     input: Json,
     targetId: string | undefined,
     quiet: boolean,
     browseTab: number | undefined,
+    healInBatch = false,
   ): Promise<InvokeResult> {
     switch (action) {
       case "click": {
@@ -596,13 +835,19 @@ export function createPageHelperHandler(
           const res = await callBrowse("click", { tab: browseTab, ref: resolved.ref });
           return res.ok && !quiet ? browseDelta(res, browseTab) : res;
         }
-        const found = await locate(input["ref"], "click", targetId);
+        const found = await locate(input["ref"], "click", targetId, healInBatch);
         if (!found.ok) return found.res;
         const at = await pointOf(found.loc, targetId, !quiet);
         if (!at.ok) return at.res;
+        if (found.loc.kind === "dom") await evalHelper("__bc.armInputProbe()", targetId, 2_000).catch(() => {});
         const clicked = await clickAt(at.pt, targetId);
         if (!clicked.ok) return inputFailed(clicked, `click ${nameOf(found.loc)}`);
-        return withChanges(`click ${nameOf(found.loc)} at ${at.pt.x},${at.pt.y}: delivered`, at.pt.before, quiet, targetId);
+        const probe = found.loc.kind === "dom" ? await readProbe(targetId) : undefined;
+        const healPrefix = found.healedFrom ? `↻ ${found.healedFrom}->${nameOf(found.loc)} ` : "";
+        const delivery = probe && probe["mousedown"] === 0 && probe["mouseup"] === 0
+          ? "delivered_unverified (no mouse events reached page)"
+          : "delivered";
+        return withChanges(`${healPrefix}click ${nameOf(found.loc)} at ${at.pt.x},${at.pt.y}: ${delivery}`, at.pt.before, quiet, targetId);
       }
 
       case "type": {
@@ -610,7 +855,8 @@ export function createPageHelperHandler(
           return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: text is required");
         }
         const text = input["text"];
-        const keys = input["keys"] === true;
+        const mode: "human" | "fast" | "keys" =
+          input["fast"] === true ? "fast" : input["keys"] === true ? "keys" : "human";
         if (browseTab !== undefined) {
           if (input["focused"] === true) {
             return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: type --focused needs a DevTools tab");
@@ -628,57 +874,113 @@ export function createPageHelperHandler(
           const isPic = !quiet && (await picture.isPicture(targetId));
           const beforeHash = isPic ? await picture.canvasHash(targetId) : "";
           const before = quiet || isPic ? undefined : await evalHelper("__bc.baseline()", targetId);
-          const ins = await cdp("Input.insertText", { text }, targetId, INPUT_TIMEOUT_MS);
-          if (!ins.ok) return inputFailed(ins, "type --focused");
+          const sent = await dispatchText(text, mode, targetId, { focused: true });
+          if (!sent.ok) return inputFailed(sent, "type --focused");
           const line = "type --focused: sent to whatever has focus (not read back)";
           if (isPic) return success(`${line}\n${await picture.pictureChanges(targetId, beforeHash)}`);
           return withChanges(line, before?.ok ? valueOf(before) : undefined, quiet, targetId);
         }
-        const found = await locate(input["ref"], "type", targetId);
+        const found = await locate(input["ref"], "type", targetId, healInBatch);
         if (!found.ok) return found.res;
         const loc = found.loc;
-        const name = nameOf(loc);
-        // Field checks run where the field lives: its own target for a cross-origin iframe.
+        let name = nameOf(loc);
+        const healPrefix = found.healedFrom ? `↻ ${found.healedFrom}->${name} ` : "";
         const fieldTarget = loc.kind === "frame" ? frameTarget(loc.frame, targetId) : targetId;
+
         if (loc.kind !== "ax") {
           const g = await evalHelper(`__bc.guard(${js(loc.ref)})`, fieldTarget);
           if (!g.ok) return g;
+
+          // Native date/time/month/week/color/range inputs set .value cleanly without segmented key quirks.
+          const typedCheck = await evalHelper(`__bc.setTypedValue(${js(loc.ref)}, ${js(text)})`, fieldTarget);
+          if (!typedCheck.ok) return typedCheck;
+          if (valueOf(typedCheck).startsWith('{"typed":true')) {
+            const parsed = JSON.parse(valueOf(typedCheck)) as { type: string; value: string; matched: boolean };
+            const before = quiet ? undefined : await evalHelper("__bc.baseline()", targetId);
+            const note = parsed.matched ? "read back matches" : `normalized to "${parsed.value}"`;
+            return withChanges(`${healPrefix}type ${name} (${parsed.type}): delivered (${note})`, before?.ok ? valueOf(before) : undefined, quiet, targetId);
+          }
+
+          // Spreadsheet / ARIA grid cell editing: double-click or Enter, fill editor, Enter to commit.
+          const cellCheck = await evalHelper(`__bc.cellInfo(${js(loc.ref)})`, fieldTarget);
+          if (cellCheck.ok && valueOf(cellCheck).startsWith('{"cell":true')) {
+            const cInfo = JSON.parse(valueOf(cellCheck)) as { before: string; editorRef: string | null };
+            const before = quiet ? undefined : await evalHelper("__bc.baseline()", targetId);
+            let editorRef = cInfo.editorRef;
+            if (!editorRef) {
+              const pt = await pointOf(loc, targetId, false);
+              if (!pt.ok) return pt.res;
+              await clickAt(pt.pt, targetId, 2);
+              await sleep(150);
+              const ed = await evalHelper("__bc.cellEditor()", fieldTarget);
+              editorRef = ed.ok && /^e\d+$/.test(valueOf(ed)) ? valueOf(ed) : null;
+              if (!editorRef) {
+                await pressKey("Enter", targetId);
+                await sleep(150);
+                const ed2 = await evalHelper("__bc.cellEditor()", fieldTarget);
+                editorRef = ed2.ok && /^e\d+$/.test(valueOf(ed2)) ? valueOf(ed2) : null;
+              }
+            }
+            if (editorRef) {
+              await evalHelper(`__bc.focusForType(${js(editorRef)})`, fieldTarget);
+            }
+            const sent = await dispatchText(text, mode, targetId);
+            if (!sent.ok) return inputFailed(sent, `type ${name}`);
+            await pressKey("Enter", targetId);
+            await sleep(150);
+            const afterRes = await evalHelper(`__bc.cellRead(${js(loc.ref)}, ${js(cInfo.before)})`, fieldTarget);
+            if (afterRes.ok) {
+              const after = JSON.parse(valueOf(afterRes)) as { after: string; before: string; error: string };
+              if (after.error) {
+                await pressKey("Escape", targetId).catch(() => {});
+                return failure("EXECUTION_FAILED", `REJECTED: grid cell ${name} rejected "${text}": ${after.error}`);
+              }
+              return withChanges(
+                `${healPrefix}~ gridcell ${name}: "${after.after}" (was "${after.before}")`,
+                before?.ok ? valueOf(before) : undefined,
+                quiet,
+                targetId,
+              );
+            }
+          }
         }
+
         const at = await pointOf(loc, targetId, !quiet);
         if (!at.ok) return at.res;
         const clicked = await clickAt(at.pt, targetId);
         if (!clicked.ok) return inputFailed(clicked, `type ${name}`);
+        let activeRef = loc.kind === "ax" ? "" : loc.ref;
+        let retargetNote = "";
         if (loc.kind !== "ax") {
           const st = await evalHelper(`__bc.focusForType(${js(loc.ref)})`, fieldTarget);
           if (!st.ok) return st;
-          if (valueOf(st) !== "focused") {
+          const stVal = valueOf(st);
+          if (stVal.startsWith("retargeted:")) {
+            activeRef = stVal.slice("retargeted:".length);
+            name = loc.kind === "frame" ? `f${loc.frame}:${activeRef}` : activeRef;
+            retargetNote = ` (retargeted -> ${name})`;
+          } else if (stVal !== "focused") {
             return failure("EXECUTION_FAILED", `type ${name}: not_delivered (the click did not focus it; try snap again)`);
           }
         }
-        if (text === "") {
-          const bs = await pressKey("Backspace", targetId);
-          if (!bs.ok) return bs;
-        } else if (keys) {
-          for (const ch of text) {
-            const kd = await cdp("Input.dispatchKeyEvent", { type: "keyDown", key: ch, text: ch }, targetId, INPUT_TIMEOUT_MS);
-            if (!kd.ok) return kd;
-            const ku = await cdp("Input.dispatchKeyEvent", { type: "keyUp", key: ch }, targetId, INPUT_TIMEOUT_MS);
-            if (!ku.ok) return ku;
-          }
-        } else {
-          const ins = await cdp("Input.insertText", { text }, targetId, INPUT_TIMEOUT_MS);
-          if (!ins.ok) return ins;
-        }
+        const sent = await dispatchText(text, mode, targetId);
+        if (!sent.ok) return inputFailed(sent, `type ${name}`);
         if (loc.kind === "ax") {
-          return withChanges(`type ${name}: delivered_unverified (accessibility ref, not read back)`, at.pt.before, quiet, targetId);
+          return withChanges(`${healPrefix}type ${name}: delivered_unverified (accessibility ref, not read back)`, at.pt.before, quiet, targetId);
         }
-        const readback = await evalHelper(`__bc.value(${js(loc.ref)})`, fieldTarget);
+        const readback = await evalHelper(`__bc.value(${js(activeRef)})`, fieldTarget);
         const got = readback.ok ? valueOf(readback) : "__unknown__";
+        if (got !== "__secure__" && typeof input["ref"] === "string" && text.length >= 2) {
+          const key = input["ref"].replace(/^@/, "").replace(/[^a-zA-Z0-9_]/g, "_").toLowerCase().slice(0, 20) || "q";
+          const bag = recentTyped.get(targetId ?? "") ?? {};
+          bag[key] = text;
+          recentTyped.set(targetId ?? "", bag);
+        }
         const msg = got === "__secure__"
-          ? `type ${name}: delivered_unverified (secure field, not read back)`
+          ? `${healPrefix}type ${name}${retargetNote}: delivered_unverified (secure field, not read back)`
           : got === text
-            ? `type ${name}: delivered (read back matches)`
-            : `type ${name}: delivered_unverified (read back "${got.slice(0, 80)}"). Do not retype blindly; snap first.`;
+            ? `${healPrefix}type ${name}${retargetNote}: delivered (read back matches)`
+            : `${healPrefix}type ${name}${retargetNote}: delivered_unverified (read back "${got.slice(0, 80)}"). Do not retype blindly; snap first.`;
         return withChanges(msg, at.pt.before, quiet, targetId);
       }
 
@@ -690,7 +992,7 @@ export function createPageHelperHandler(
           return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: select needs a DevTools tab");
         }
         const option = input["option"];
-        const found = await locate(input["ref"], "select", targetId);
+        const found = await locate(input["ref"], "select", targetId, healInBatch);
         if (!found.ok) return found.res;
         const loc = found.loc;
         if (loc.kind === "ax") {
@@ -711,7 +1013,6 @@ export function createPageHelperHandler(
             targetId,
           );
         }
-        // Custom ARIA combobox/listbox: click trigger, let options mount, click matching option.
         const at = await pointOf(loc, targetId, false);
         if (!at.ok) return at.res;
         const opened = await clickAt(at.pt, targetId);
@@ -759,26 +1060,21 @@ export function createPageHelperHandler(
         const located = await evalHelper(`__bc.locateFile(${js(frame ? frame[2]! : refInput)})`, fieldTarget);
         if (!located.ok) return located;
         const fileRef = valueOf(located);
-        const evalObj = await cdp(
-          "Runtime.evaluate",
-          { expression: `__bc.el(${js(fileRef)})`, returnByValue: false },
-          fieldTarget,
-        );
-        if (!evalObj.ok) return evalObj;
-        const objectId = ((((evalObj.data as Json)["result"] as Json | undefined)?.["result"] as Json | undefined)?.["objectId"]) as
-          | string
-          | undefined;
-        if (!objectId) {
-          return failure("EXECUTION_FAILED", `NOT_ACTIONABLE: could not resolve file input ${fileRef}`);
-        }
+        const objRes = await resolveObject(`__bc.el(${js(fileRef)})`, fieldTarget);
+        if (!objRes.ok) return objRes.res;
         try {
-          const set = await cdp("DOM.setFileInputFiles", { objectId, files: [filePath] }, fieldTarget);
+          const set = await cdp("DOM.setFileInputFiles", { objectId: objRes.objectId, files: [filePath] }, fieldTarget);
           if (!set.ok) return set;
         } finally {
-          await cdp("Runtime.releaseObject", { objectId }, fieldTarget).catch(() => {});
+          await cdp("Runtime.releaseObject", { objectId: objRes.objectId }, fieldTarget).catch(() => {});
         }
         const label = frame ? `f${frame[1]}:${fileRef}` : fileRef;
         return withChanges(`upload ${label} <- ${filePath}: delivered`, before?.ok ? valueOf(before) : undefined, quiet, targetId);
+      }
+
+      case "drag": {
+        if (browseTab !== undefined) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: drag needs a DevTools tab");
+        return runDrag(input, targetId, quiet, healInBatch);
       }
 
       case "wait":
@@ -807,13 +1103,150 @@ export function createPageHelperHandler(
     }
   }
 
-  return async function handlePage(action: string, input: Json, targetId?: string): Promise<InvokeResult> {
+  /** Capture recent first-party 2xx GET JSON responses from buffered CDP Network events. */
+  async function captureRecordedGets(targetId?: string): Promise<RecordedGet[]> {
+    const hrefRes = await invoke("evaluate", { expression: "location.origin", isolated: true, ...(targetId ? { targetId } : {}) });
+    const pageOrigin = hrefRes.ok ? valueOf(hrefRes) : "";
+    const evRes = await invoke("read_events", { method: "Network.responseReceived", limit: 200, clear: false, ...(targetId ? { targetId } : {}) });
+    if (!evRes.ok) return [];
+    const events = ((evRes.data as Json)["events"] as Array<{ params?: Json }>) ?? [];
+    const out: RecordedGet[] = [];
+    for (const ev of events.slice(-30).reverse()) {
+      const p = ev.params ?? {};
+      const resp = (p["response"] as Json | undefined) ?? {};
+      const status = Number(resp["status"] ?? 0);
+      const url = String(resp["url"] ?? "");
+      const mime = String(resp["mimeType"] ?? "").toLowerCase();
+      const requestId = String(p["requestId"] ?? "");
+      if (status < 200 || status >= 300 || !mime.includes("json") || !requestId) continue;
+      let u: URL;
+      try { u = new URL(url); } catch { continue; }
+      if (pageOrigin && u.origin !== pageOrigin) continue;
+      const bodyRes = await cdp("Network.getResponseBody", { requestId }, targetId, 3_000);
+      if (!bodyRes.ok) continue;
+      const rawBody = String((((bodyRes.data as Json)["result"] as Json | undefined)?.["body"]) ?? "");
+      if (!rawBody || rawBody.length > 2_000_000) continue;
+      try {
+        out.push({ id: requestId, url, origin: u.origin, status, body: JSON.parse(rawBody), at: Date.now() });
+      } catch { /* non-JSON */ }
+      if (out.length >= 8) break;
+    }
+    return out;
+  }
+
+  async function handleNotes(input: Json, targetId?: string): Promise<InvokeResult> {
+    const sub = String(input["sub"] ?? "get").toLowerCase();
+    let site = typeof input["site"] === "string" && input["site"].trim() !== "" ? input["site"].trim() : "";
+    if (sub === "list") return success(await listNotes(options.notesDir));
+    if (!site) {
+      const urlRes = await invoke("evaluate", { expression: "location.host", isolated: true, ...(targetId ? { targetId } : {}) });
+      if (!urlRes.ok || !valueOf(urlRes)) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: pass a site host or select a tab");
+      site = valueOf(urlRes);
+    }
+    try {
+      if (sub === "get") {
+        const found = await getNote(site, options.notesDir);
+        if (!found) return success(`# no notes for ${site}`);
+        return success(`# notes for ${site} (${found.trusted ? "trusted" : "quarantined"}):\n${found.text.trimEnd()}`);
+      }
+      if (sub === "set") return success(await setNote(site, String(input["text"] ?? ""), options.notesDir));
+      if (sub === "append") return success(await appendNote(site, String(input["text"] ?? ""), options.notesDir));
+      if (sub === "rm" || sub === "delete") return success(await removeNote(site, options.notesDir));
+      if (sub === "approve") return success(await approveNote(site, options.notesDir));
+      return failure("INPUT_VALIDATION_FAILED", `INPUT_INVALID: notes subcommand must be get, set, append, rm, approve, or list`);
+    } catch (err) {
+      return failure("EXECUTION_FAILED", (err as Error).message);
+    }
+  }
+
+  async function handleFlow(input: Json, targetId?: string): Promise<InvokeResult> {
+    const sub = String(input["sub"] ?? "list").toLowerCase();
+    const site = typeof input["site"] === "string" && input["site"].trim() !== "" ? input["site"].trim() : undefined;
+    try {
+      if (sub === "list") return success(await listFlows(site, options.flowsDir));
+      if (sub === "record") {
+        const en = await cdp("Network.enable", {}, targetId);
+        return en.ok ? success("flow recording enabled (Network.enable active on this tab; run actions then: flow save <name>)") : en;
+      }
+      const name = typeof input["name"] === "string" ? input["name"].trim() : "";
+      if (!name) return failure("INPUT_VALIDATION_FAILED", `INPUT_INVALID: flow ${sub} requires a flow name`);
+      if (sub === "show") {
+        const flow = await loadFlowFile(name, site, options.flowsDir);
+        return success(JSON.stringify(flow, null, 2));
+      }
+      if (sub === "rm" || sub === "delete") {
+        return success(await removeFlowFile(name, site, options.flowsDir));
+      }
+      if (sub === "save") {
+        const recorded = await captureRecordedGets(targetId);
+        if (recorded.length === 0) {
+          return failure("EXECUTION_FAILED", "NO_MATCH: no recent first-party 2xx GET JSON responses captured; run `flow record` before the search/lookup");
+        }
+        const chosen = recorded.sort((a, b) => JSON.stringify(b.body).length - JSON.stringify(a.body).length)[0]!;
+        const givenParams = (input["params"] && typeof input["params"] === "object" ? input["params"] : {}) as Record<string, string>;
+        const mergedParams = { ...(recentTyped.get(targetId ?? "") ?? {}), ...givenParams };
+        const flow = buildFlow(name, chosen, mergedParams);
+        const savedPath = await saveFlowFile(flow, options.flowsDir);
+        return success(`saved flow ${flow.name} (${flow.site}) -> ${flow.urlTemplate}\nparams: ${flow.params.map((p) => p.name).join(", ") || "(none)"}\nfile: ${savedPath}`);
+      }
+      if (sub === "run") {
+        const flow = await loadFlowFile(name, site, options.flowsDir);
+        const givenParams = (input["params"] && typeof input["params"] === "object" ? input["params"] : {}) as Record<string, string>;
+        const url = fillFlowUrl(flow, givenParams);
+        const fetchExpr = `(async () => {
+          const r = await fetch(${js(url)}, { method: "GET", credentials: "include", cache: "no-store", redirect: "manual" });
+          if (r.type === "opaqueredirect" || (r.status >= 300 && r.status < 400)) return JSON.stringify({ error: "REDIRECTED: flow redirected (possible sign-in wall)" });
+          if (r.status === 401 || r.status === 403) return JSON.stringify({ error: "AUTH_EXPIRED: HTTP " + r.status });
+          if (r.status === 429) return JSON.stringify({ error: "RATE_LIMITED: HTTP 429" });
+          if (!r.ok) return JSON.stringify({ error: "HTTP_ERROR: HTTP " + r.status });
+          const text = await r.text();
+          if (text.length > 8_000_000) return JSON.stringify({ error: "ANSWER_TOO_LARGE: response exceeded 8 MB" });
+          return JSON.stringify({ ok: true, body: JSON.parse(text) });
+        })()`;
+        const fetched = await invoke("evaluate", { expression: fetchExpr, isolated: true, ...(targetId ? { targetId } : {}), timeoutMs: 30_000 });
+        if (!fetched.ok) return fetched;
+        const parsed = JSON.parse(valueOf(fetched)) as { ok?: boolean; error?: string; body?: unknown };
+        if (parsed.error) return failure("EXECUTION_FAILED", parsed.error);
+        const shaped = shapeFlowResult(flow, parsed.body, {
+          fields: Array.isArray(input["fields"]) ? (input["fields"] as unknown[]).map(String) : undefined,
+          where: input["where"] && typeof input["where"] === "object" ? (input["where"] as Record<string, string>) : undefined,
+          limit: Number(input["limit"]) > 0 ? Number(input["limit"]) : undefined,
+        });
+        if (shaped.drifted) {
+          flow.verified = false;
+          await saveFlowFile(flow, options.flowsDir).catch(() => {});
+          return failure("EXECUTION_FAILED", shaped.text);
+        }
+        return success(shaped.text);
+      }
+      return failure("INPUT_VALIDATION_FAILED", `INPUT_INVALID: flow subcommand must be record, save, run, list, show, or rm`);
+    } catch (err) {
+      return failure("EXECUTION_FAILED", (err as Error).message);
+    }
+  }
+
+  let runScript: ReturnType<typeof createScriptRunner>;
+
+  async function maybeSaveOut(res: InvokeResult, input: Json): Promise<InvokeResult> {
+    const outPath = typeof input["out"] === "string" && input["out"].trim() !== "" ? input["out"].trim() : "";
+    if (!outPath || !res.ok) return res;
+    try {
+      const digest = await writeOutputFile(outPath, valueOf(res));
+      const preview = valueOf(res).split("\n").slice(0, 12).join("\n");
+      return success(`${digest}\n${preview}`);
+    } catch (err) {
+      return failure("EXECUTION_FAILED", `ARTIFACT_WRITE_FAILED: ${(err as Error).message}`);
+    }
+  }
+
+  async function handlePage(action: string, input: Json, targetId?: string): Promise<InvokeResult> {
     const browseTab = await resolveBrowseTab(targetId);
     const quiet = input["quiet"] === true;
 
     switch (action) {
       case "snap": {
         const all = input["all"] === true;
+        const full = input["full"] === true;
         const find = typeof input["find"] === "string" && input["find"] !== "" ? input["find"] : undefined;
         const within = typeof input["within"] === "string" && input["within"] !== "" ? input["within"] : undefined;
         if (browseTab !== undefined) {
@@ -824,28 +1257,68 @@ export function createPageHelperHandler(
             ...(within ? { within } : {}),
           });
           if (res.ok) cacheBrowseSnapshot(browseTab, valueOf(res));
-          return res;
+          return maybeSaveOut(res, input);
         }
-        if (input["ax"] === true) return snapAx(find, targetId);
-        const opts: Json = { all, ...(find ? { find } : {}), ...(within ? { within } : {}) };
+        if (input["ax"] === true) return maybeSaveOut(await snapAx(find, targetId), input);
+        const opts: Json = {
+          all,
+          ...(full ? { full: true } : {}),
+          ...(find ? { find } : {}),
+          ...(within ? { within } : {}),
+        };
         const res = await evalHelper(`__bc.snapshot(${js(opts)})`, targetId);
         if (!res.ok) return res;
         let out = valueOf(res);
+        // Attach per-site agent notes if present for the page's origin.
+        const urlMatch = /^# .* \| (https?:\/\/[^\s]+)/.exec(out);
+        if (urlMatch?.[1]) {
+          const header = await noteHeaderForUrl(urlMatch[1], daemonSessionId, options.notesDir);
+          if (header) out = `${header}\n${out}`;
+        }
         if (!within && out.includes("cross-origin iframe(s)")) {
           const frames = await snapFrames(opts, targetId);
           if (frames.length) out += `\n${frames.join("\n")}`;
         }
-        if (!find && !within && !out.includes("\n- ") && !out.includes("# WALL:")) {
+        if (!find && !within && !out.includes("\n- ") && !out.includes("# WALL:") && !out.includes("# snap diff")) {
           const ax = await snapAx(undefined, targetId);
           if (ax.ok && valueOf(ax).includes("\n- ")) out += `\n# No controls found in the DOM.\n${valueOf(ax)}`;
         }
-        return success(out);
+        return maybeSaveOut(success(out), input);
+      }
+
+      case "form": {
+        if (browseTab !== undefined) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: form needs a DevTools tab");
+        const opts: Json = typeof input["within"] === "string" && input["within"] !== "" ? { within: input["within"] } : {};
+        return maybeSaveOut(await evalHelper(`__bc.form(${js(opts)})`, targetId), input);
+      }
+
+      case "query": {
+        if (browseTab !== undefined) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: query needs a DevTools tab");
+        const opts: Json = {
+          selector: input["selector"],
+          ...(input["fields"] ? { fields: input["fields"] } : {}),
+          ...(Number(input["limit"]) > 0 ? { limit: Number(input["limit"]) } : {}),
+          ...(input["all"] === true ? { all: true } : {}),
+        };
+        return maybeSaveOut(await evalHelper(`__bc.query(${js(opts)})`, targetId), input);
+      }
+
+      case "read-urls": {
+        if (browseTab !== undefined) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: read-urls needs a DevTools tab");
+        const opts: Json = {
+          urls: input["urls"],
+          ...(Number(input["concurrency"]) > 0 ? { concurrency: Number(input["concurrency"]) } : {}),
+          ...(Number(input["timeoutMs"]) > 0 ? { timeoutMs: Number(input["timeoutMs"]) } : {}),
+          ...(Number(input["maxChars"]) > 0 ? { maxChars: Number(input["maxChars"]) } : {}),
+        };
+        return maybeSaveOut(await evalHelper(`await __bc.readUrls(${js(opts)})`, targetId, 75_000), input);
       }
 
       case "click":
       case "type":
       case "select":
       case "upload":
+      case "drag":
       case "wait":
       case "key":
         return act(action, input, targetId, quiet, browseTab);
@@ -862,7 +1335,7 @@ export function createPageHelperHandler(
         const out: string[] = [];
         let stopped: string | undefined;
         for (const [i, step] of steps.entries()) {
-          const res = await act(step.action, { ...step.input, quiet: true }, targetId, true, browseTab);
+          const res = await act(step.action, { ...step.input, quiet: true }, targetId, true, browseTab, true);
           if (!res.ok) {
             out.push(`${i + 1}. ${step.label}: FAILED ${messageOf(res)}`);
             stopped = `step ${i + 1} failed`;
@@ -873,13 +1346,13 @@ export function createPageHelperHandler(
             browseTab === undefined &&
             step.action === "type" &&
             !valueOf(res).includes(": delivered (") &&
-            !valueOf(res).includes("secure field")
+            !valueOf(res).includes("secure field") &&
+            !valueOf(res).startsWith("~ gridcell")
           ) {
             stopped = `step ${i + 1} was not read back as typed`;
             break;
           }
           if (i === steps.length - 1) continue;
-          // Let the page react before the next step, and stop if it left the site or hit a wall.
           const state = await evalHelper(
             '(await __bc.settle(), [location.href, __bc.wall() || ""].join("\\n"))',
             targetId,
@@ -934,11 +1407,21 @@ export function createPageHelperHandler(
       }
 
       case "text": {
+        if (input["scroll"] === true) {
+          if (browseTab !== undefined) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: text --scroll needs a DevTools tab");
+          const opts: Json = {
+            ...(typeof input["within"] === "string" && input["within"] !== "" ? { within: input["within"] } : {}),
+            ...(typeof input["filter"] === "string" && input["filter"] !== "" ? { match: input["filter"] } : {}),
+            ...(Number(input["limit"]) > 0 ? { limit: Number(input["limit"]) } : {}),
+            ...(Number(input["timeoutMs"]) > 0 ? { timeoutMs: Number(input["timeoutMs"]) } : {}),
+          };
+          return maybeSaveOut(await evalHelper(`await __bc.scrollRead(${js(opts)})`, targetId, 65_000), input);
+        }
         const opts: Json = {};
         if (typeof input["within"] === "string" && input["within"] !== "") opts["within"] = input["within"];
         if (input["all"] === true) opts["all"] = true;
         if (Number(input["max"]) > 0) opts["max"] = Number(input["max"]);
-        return evalHelper(`__bc.text(${js(opts)})`, targetId);
+        return maybeSaveOut(await evalHelper(`__bc.text(${js(opts)})`, targetId), input);
       }
 
       case "ocr": {
@@ -972,8 +1455,9 @@ export function createPageHelperHandler(
             ? success(`${String((shot.data as Json)["path"])}\n# Full page, device pixels: coordinates do not match click --xy.`)
             : shot;
         }
+        const hasRef = input["ref"] !== undefined && input["ref"] !== "";
         let box: InvokeResult;
-        if (input["ref"] !== undefined && input["ref"] !== "") {
+        if (hasRef) {
           const found = await locate(input["ref"], "read", targetId);
           if (!found.ok) return found.res;
           if (found.loc.kind !== "dom") return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: shot --ref needs a page ref like e12");
@@ -983,23 +1467,86 @@ export function createPageHelperHandler(
         }
         if (!box.ok) return box;
         const r = JSON.parse(valueOf(box)) as { x: number; y: number; width: number; height: number; dpr: number };
-        const marks = input["marks"] === true ? await evalHelper("__bc.marks(true)", targetId) : undefined;
-        if (marks && !marks.ok) return marks;
-        const width = Math.max(1, r.width);
-        const capture = (scale: number) =>
-          invoke("capture_screenshot", { ...base, clip: { x: r.x, y: r.y, width, height: Math.max(1, r.height), scale } });
-        let shot = await capture(1 / (r.dpr || 1));
-        if (shot.ok && r.dpr > 1) {
-          const got = await imageWidth(String((shot.data as Json)["path"]));
-          if (got !== undefined && got < width * 0.75) shot = await capture(1);
+        const wantMarks = input["marks"] === true;
+        let nativeBoxes: { boxes: MarkBox[]; legend: string } | undefined;
+        let domMarksLegend: string | undefined;
+        if (wantMarks && !hasRef) {
+          const mb = await evalHelper("__bc.markBoxes()", targetId);
+          if (mb.ok) {
+            try {
+              const parsed = JSON.parse(valueOf(mb)) as { boxes: MarkBox[]; legend: string };
+              if (Array.isArray(parsed.boxes)) nativeBoxes = parsed;
+            } catch { /* fallback to DOM marks */ }
+          }
         }
-        if (marks) await evalHelper("__bc.marks(false)", targetId);
+        let domMarksActive = false;
+        if (wantMarks && !nativeBoxes) {
+          const dm = await evalHelper("__bc.marks(true)", targetId);
+          if (!dm.ok) return dm;
+          domMarksLegend = valueOf(dm);
+          domMarksActive = true;
+        }
+
+        const width = Math.max(1, Math.round(r.width));
+        const height = Math.max(1, Math.round(r.height));
+        const captureClipped = (scale: number) =>
+          invoke("capture_screenshot", { ...base, clip: { x: r.x, y: r.y, width, height, scale } });
+        let shot: InvokeResult;
+        const clearDomMarks = async () => {
+          if (domMarksActive) {
+            domMarksActive = false;
+            await evalHelper("__bc.marks(false)", targetId);
+          }
+        };
+        try {
+          if (hasRef) {
+            shot = await captureClipped(1 / (r.dpr || 1));
+            if (shot.ok && r.dpr > 1) {
+              const got = await imageWidth(String((shot.data as Json)["path"]));
+              if (got !== undefined && got < width * 0.75) shot = await captureClipped(1);
+            }
+          } else {
+            shot = await invoke("capture_screenshot", base);
+            if (shot.ok) {
+              const outPath = String((shot.data as Json)["path"]);
+              const got = await imageWidth(outPath);
+              if (got !== undefined && got > width * 1.1) {
+                if (process.platform === "darwin") await clearDomMarks();
+                const resized = await resizeImage(outPath, width, height);
+                if (!resized && r.dpr > 1) shot = await captureClipped(1 / r.dpr);
+              }
+            }
+          }
+        } finally {
+          await clearDomMarks();
+        }
         if (!shot.ok) return shot;
-        const lines = [String((shot.data as Json)["path"])];
-        if (input["ref"] === undefined || input["ref"] === "") {
+        const outPath = String((shot.data as Json)["path"]);
+        let marksLegend = domMarksLegend;
+        if (nativeBoxes) {
+          const drawn = await drawMarksOnImage(outPath, nativeBoxes.boxes);
+          if (drawn) {
+            marksLegend = nativeBoxes.legend;
+          } else {
+            // Non-macOS or swiftc absent: fall back to temporary DOM badges so --marks still works.
+            const dm = await evalHelper("__bc.marks(true)", targetId);
+            if (dm.ok) {
+              try {
+                await invoke("capture_screenshot", { ...base, path: outPath });
+                const got = await imageWidth(outPath);
+                if (got !== undefined && got > width * 1.1) await resizeImage(outPath, width, height);
+                marksLegend = valueOf(dm);
+              } finally {
+                await evalHelper("__bc.marks(false)", targetId).catch(() => {});
+              }
+            }
+          }
+        }
+        const lines = [outPath];
+        if (!hasRef) {
           lines.push("# CSS-pixel scale: a point in the picture is the same x,y for click --xy.");
         }
-        if (marks) lines.push("# The number on each control is its ref: 12 is e12.", valueOf(marks));
+        if (marksLegend !== undefined) lines.push("# The number on each control is its ref: 12 is e12.", marksLegend);
         return success(lines.join("\n"));
       }
 
@@ -1032,14 +1579,50 @@ export function createPageHelperHandler(
         return success(lines.join("\n"));
       }
 
+      case "styles":
+        if (browseTab !== undefined) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: styles needs a DevTools tab");
+        return inspectStyles(invoke, resolveObject, input, targetId);
+
+      case "issues":
+        if (browseTab !== undefined) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: issues needs a DevTools tab");
+        return inspectIssues(invoke, input, targetId);
+
+      case "perf":
+        if (browseTab !== undefined) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: perf needs a DevTools tab");
+        return inspectPerf(invoke, input, targetId);
+
+      case "notes":
+        return handleNotes(input, targetId);
+
+      case "flow":
+        return handleFlow(input, targetId);
+
+      case "script":
+        return runScript(input, targetId);
+
       case "verdict":
         return evalHelper("__bc.verdict()", targetId);
 
       case "health":
         return evalHelper("__bc.health()", targetId);
 
-      default:
-        return failure("OPERATION_NOT_FOUND", `unknown page helper: ${action}`);
+      default: {
+        const hint = didYouMean(action, PAGE_ACTIONS);
+        return failure(
+          "OPERATION_NOT_FOUND",
+          `unknown page helper: ${action}${hint ? `. Did you mean "${hint}"?` : ""}`,
+        );
+      }
     }
+  }
+
+  runScript = createScriptRunner(handlePage, (expression, tid) =>
+    invoke("evaluate", { expression, ...(tid ? { targetId: tid } : {}) }),
+  );
+
+  return async function handlePageWithRemedies(action: string, input: Json, targetId?: string): Promise<InvokeResult> {
+    const res = await handlePage(action, input, targetId);
+    if (!res.ok) return failure(res.error.code, withRemedy(res.error.message));
+    return res;
   };
 }

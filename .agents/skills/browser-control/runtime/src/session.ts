@@ -84,6 +84,7 @@ type Pending = {
   resolve: (value: unknown) => void;
   reject: (error: unknown) => void;
   timer: ReturnType<typeof setTimeout>;
+  sessionId?: string;
 };
 
 type Waiter = {
@@ -103,6 +104,11 @@ export function isBrowserLevelMethod(method: string): boolean {
     method.startsWith("Target.") ||
     method.startsWith("Extensions.")
   );
+}
+
+/** CDP methods that kill or crash the user's browser or tab are blocked at the transport layer. */
+export function isBlockedCdpMethod(method: string): boolean {
+  return method === "Browser.close" || /^[A-Za-z0-9_]+\.crash/i.test(method);
 }
 
 /** Parse both lines of DevToolsActivePort (port, then WS path). */
@@ -137,6 +143,7 @@ export function getBrowserCandidates(
     push("Vivaldi", `${base}/Vivaldi`);
     push("Opera", `${base}/com.operasoftware.Opera`);
     push("Comet", `${base}/Comet`);
+    push("Ardia", `${base}/Ardia`);
     push("Google Chrome Canary", `${base}/Google/Chrome Canary`);
   } else if (platform === "win32") {
     const local = env["LOCALAPPDATA"] ?? `${home}\\AppData\\Local`;
@@ -158,6 +165,7 @@ export function getBrowserCandidates(
     push("Brave", `${cfg}/BraveSoftware/Brave-Browser`);
     push("Vivaldi", `${cfg}/vivaldi`);
     push("Opera", `${cfg}/opera`);
+    push("Ardia", `${cfg}/ardia`);
     push("Google Chrome Canary", `${cfg}/google-chrome-unstable`);
   }
   return list;
@@ -196,7 +204,7 @@ export async function readDevToolsActivePort(
   );
 }
 
-const CHROMIUM_NAME = /chrom|edge|brave|vivaldi|opera|comet|helium|\barc\b|\bdia\b/i;
+const CHROMIUM_NAME = /chrom|edge|brave|vivaldi|opera|comet|helium|ardia|\barc\b|\bdia\b/i;
 
 /** Loopback TCP listeners from `lsof -nP -iTCP -sTCP:LISTEN -Fpn` output. */
 export function parseLsofListeners(text: string): Array<{ pid: number; port: number }> {
@@ -355,6 +363,9 @@ export class CdpConnection {
   private waiters: Waiter[] = [];
   private activeTargetId?: string;
   private sessionByTarget = new Map<string, string>();
+  private crashedTargets = new Set<string>();
+  private isolatedContextByTarget = new Map<string, number>();
+  private inspectorEnabledTargets = new Set<string>();
   private via?: BrowserEndpoint;
   private browserVersion?: string;
   private readonly createWebSocket: WebSocketFactory;
@@ -513,6 +524,9 @@ export class CdpConnection {
     this.browserVersion = undefined;
     this.activeTargetId = undefined;
     this.sessionByTarget.clear();
+    this.crashedTargets.clear();
+    this.isolatedContextByTarget.clear();
+    this.inspectorEnabledTargets.clear();
     this.events.clear();
     try {
       ws?.close();
@@ -530,6 +544,47 @@ export class CdpConnection {
 
   clearActive(): void {
     this.activeTargetId = undefined;
+  }
+
+  /** Return (or lazily create) a cached isolated world executionContextId for a target. */
+  async getIsolatedContextId(targetId?: string, forceFresh = false): Promise<number | undefined> {
+    const tid = targetId ?? this.activeTargetId;
+    if (!tid) return undefined;
+    if (!forceFresh) {
+      const existing = this.isolatedContextByTarget.get(tid);
+      if (existing !== undefined) return existing;
+    }
+    this.isolatedContextByTarget.delete(tid);
+    // Lazily enable Inspector once per target so Inspector.targetCrashed arrives promptly.
+    if (!this.inspectorEnabledTargets.has(tid)) {
+      this.inspectorEnabledTargets.add(tid);
+      await this.call("Inspector.enable", {}, { targetId: tid, timeoutMs: 2000 }).catch(() => {});
+    }
+    try {
+      const tree = (await this.call("Page.getFrameTree", {}, { targetId: tid, timeoutMs: 5000 })) as {
+        frameTree?: { frame?: { id?: string } };
+      };
+      const frameId = tree?.frameTree?.frame?.id;
+      if (!frameId) return undefined;
+      const world = (await this.call(
+        "Page.createIsolatedWorld",
+        { frameId, worldName: "browser-control", grantUniveralAccess: true },
+        { targetId: tid, timeoutMs: 5000 },
+      )) as { executionContextId?: number };
+      if (typeof world?.executionContextId === "number") {
+        this.isolatedContextByTarget.set(tid, world.executionContextId);
+        return world.executionContextId;
+      }
+    } catch {
+      /* target may not support Page.createIsolatedWorld (e.g. worker) */
+    }
+    return undefined;
+  }
+
+  /** Clear cached isolated world context for a target (e.g. after navigation or context destruction). */
+  clearIsolatedContext(targetId?: string): void {
+    const tid = targetId ?? this.activeTargetId;
+    if (tid) this.isolatedContextByTarget.delete(tid);
   }
 
   /** Attach to a target without changing the active route. */
@@ -584,6 +639,9 @@ export class CdpConnection {
     params: unknown = {},
     opts: { sessionId?: string; targetId?: string; timeoutMs?: number } = {},
   ): Promise<unknown> {
+    if (isBlockedCdpMethod(method)) {
+      throw new Error(`REFUSED: ${method} is blocked so browser-control never closes or crashes the user's browser`);
+    }
     if (!this.isConnected()) throw new Error("NOT_CONNECTED: call connect_browser first");
     const timeoutMs = opts.timeoutMs ?? this.callTimeoutMs;
     if (opts.sessionId !== undefined || isBrowserLevelMethod(method)) {
@@ -592,6 +650,13 @@ export class CdpConnection {
     const targetId = opts.targetId ?? this.activeTargetId;
     if (targetId === undefined) {
       throw new Error(`NO_ACTIVE_TARGET: ${method} needs a target; call select_target first`);
+    }
+    if (this.crashedTargets.has(targetId)) {
+      if (method === "Page.reload" || method === "Page.navigate") {
+        this.crashedTargets.delete(targetId);
+      } else {
+        throw new Error(`TAB_CRASHED: tab ${targetId} renderer crashed; reload it (nav <url>) or pick another tab`);
+      }
     }
     try {
       return await this.send(method, params, await this.attach(targetId), timeoutMs);
@@ -631,7 +696,7 @@ export class CdpConnection {
         this.pending.delete(id);
         reject(new Error(`CDP_TIMEOUT: ${method} did not respond within ${timeoutMs}ms`));
       }, timeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
+      this.pending.set(id, { resolve, reject, timer, sessionId });
       try {
         ws.send(JSON.stringify(message));
       } catch (error) {
@@ -717,7 +782,45 @@ export class CdpConnection {
       const event = this.events.push(message.method, message.params ?? {}, message.sessionId);
       if (message.method === "Target.detachedFromTarget") {
         for (const [targetId, sessionId] of this.sessionByTarget) {
-          if (sessionId === message.params?.sessionId) this.sessionByTarget.delete(targetId);
+          if (sessionId === message.params?.sessionId) {
+            this.sessionByTarget.delete(targetId);
+            this.crashedTargets.delete(targetId);
+            this.isolatedContextByTarget.delete(targetId);
+            this.inspectorEnabledTargets.delete(targetId);
+          }
+        }
+      }
+      if (message.method === "Page.frameNavigated" && !message.params?.frame?.parentId && typeof message.sessionId === "string") {
+        for (const [targetId, sid] of this.sessionByTarget) {
+          if (sid === message.sessionId) this.isolatedContextByTarget.delete(targetId);
+        }
+      }
+      if (message.method === "Runtime.executionContextDestroyed" && typeof message.params?.executionContextId === "number") {
+        for (const [targetId, ctxId] of this.isolatedContextByTarget) {
+          if (ctxId === message.params.executionContextId) this.isolatedContextByTarget.delete(targetId);
+        }
+      }
+      if (message.method === "Inspector.targetCrashed" && typeof message.sessionId === "string") {
+        const crashedSid = message.sessionId;
+        let crashedTarget = "";
+        for (const [targetId, sid] of this.sessionByTarget) {
+          if (sid === crashedSid) {
+            crashedTarget = targetId;
+            this.crashedTargets.add(targetId);
+          }
+        }
+        const msg = `TAB_CRASHED: tab ${crashedTarget || crashedSid} renderer crashed; reload it (nav <url>) or pick another tab`;
+        for (const [id, pending] of this.pending) {
+          if (pending.sessionId === crashedSid) {
+            this.pending.delete(id);
+            clearTimeout(pending.timer);
+            pending.reject(new Error(msg));
+          }
+        }
+      }
+      if (message.method === "Inspector.targetReloadedAfterCrash" && typeof message.sessionId === "string") {
+        for (const [targetId, sid] of this.sessionByTarget) {
+          if (sid === message.sessionId) this.crashedTargets.delete(targetId);
         }
       }
       for (const waiter of this.waiters) {
