@@ -22,7 +22,15 @@ import { BackendUnavailable, prefixOf, type Backend, type OpInput } from "./type
 export const CDP = "cdp";
 
 /** Operations that act on one tab. */
-const TAB_OPS = new Set(["evaluate", "navigate", "capture_screenshot", "capture_pdf", "execute_cdp"]);
+const TAB_OPS = new Set([
+  "evaluate",
+  "navigate",
+  "capture_screenshot",
+  "capture_pdf",
+  "execute_cdp",
+  "read_events",
+  "wait_for_event",
+]);
 
 export function backendOrder(): string[] {
   let raw = process.env["BROWSER_CONTROL_BACKENDS"]?.trim();

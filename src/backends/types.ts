@@ -33,6 +33,8 @@ export interface Backend {
   status(): Promise<Record<string, unknown>>;
   /** Forget the selected tab. */
   clearActive(): void;
+  /** Optional startup hook (called when this backend is enabled in backendOrder). */
+  start?(): Promise<void> | void;
   dispose?(): Promise<void> | void;
 }
 

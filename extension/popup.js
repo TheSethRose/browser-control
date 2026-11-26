@@ -16,9 +16,10 @@ async function refresh() {
   currentTabId = s.activeTabId;
   statusEl.textContent = s.connected ? "Connected" : s.hasToken ? "Waiting for relay" : "Not paired";
   statusEl.className = `pill ${s.connected ? "on" : "off"}`;
+  const ports = Array.isArray(s.ports) && s.ports.length > 0 ? s.ports : [s.port || 49222];
   infoEl.textContent = s.connected
-    ? `Paired on 127.0.0.1:${s.port}. ${s.attachedCount} tab(s) with debugger attached.`
-    : (s.lastError && s.lastError !== "Waiting for relay" ? s.lastError : `Waiting for relay on 127.0.0.1:${s.port}`);
+    ? `Paired on 127.0.0.1:${ports.join(", ")}. ${s.attachedCount} tab(s) with debugger attached.`
+    : (s.lastError && s.lastError !== "Waiting for relay" ? s.lastError : `Waiting for relay on 127.0.0.1:49222-49229`);
   modeAll.className = s.mode === "all" ? "primary" : "";
   modeLent.className = s.mode === "lent" ? "primary" : "";
   lendBtn.style.display = s.mode === "lent" ? "block" : "none";

@@ -1,43 +1,97 @@
 // Browser Control Companion — MV3 background service worker.
-// Two-tier local-only relay (127.0.0.1):
+// Two-tier local-only relay (127.0.0.1, ports 49222-49229):
 //   1. Silent tier (no yellow banner): chrome.tabs + chrome.scripting (ISOLATED world) for __bc reads.
 //   2. Full CDP tier (on-demand): chrome.debugger per tab, auto-detached after 30s idle.
+//
+// Keepalive (`chrome.runtime.getPlatformInfo`) and mutual HMAC handshake patterns adapted from
+// anomalyco/browse (MIT License).
+
+import {
+  PROTOCOL_VERSION,
+  detectBrowserBrand,
+  extProofMessage,
+  getOrCreateProfileId,
+  hmacHex,
+  isValidNonceHex,
+  randomNonceHex,
+  relayProofMessage,
+  verifyHmacHex,
+} from "./lib/pairing.js";
 
 const DEFAULT_PORT = 49222;
+const PORT_RANGE_START = 49222;
+const PORT_RANGE_END = 49229;
+const VERSION_PROBE_TIMEOUT_MS = 800;
 const DEBUGGER_IDLE_MS = 30_000;
 const KEEPALIVE_MS = 20_000;
+const MAX_FRAME_BYTES = 64 * 1024 * 1024;
 const PAGE_HELPERS_FILE = "page-helpers.js";
 const PAGE_HELPERS_VERSION = 7;
 
-let ws = null;
-let connected = false;
-let lastError = "";
+const BACKOFF_MIN_MS = 1_000;
+const BACKOFF_IDLE_CAP_MS = 15_000;
+const WAITING = "Waiting for relay";
+
 let config = { port: DEFAULT_PORT, token: "", mode: "all" }; // mode: "all" | "lent"
+let lastError = "";
 const lentTabs = new Set();
 const agentTabs = new Set();
-const attachedTabs = new Map(); // tabId -> { timer, isolatedContextId? }
-let keepaliveTimer = null;
-let reconnectTimer = null;
-let connecting = false;
-const BACKOFF_MIN_MS = 3_000;
-const BACKOFF_MAX_MS = 60_000;
+const attachedTabs = new Map(); // tabId -> { timer, holdUntil?, isolatedContextId? }
+const connections = new Map(); // port -> { port, ws, state, extNonce, instanceId, keepaliveTimer, touchedTabs }
+
+let scanTimer = null;
+let scanning = false;
 let backoffMs = BACKOFF_MIN_MS;
-const WAITING = "Waiting for relay";
+let cachedProfileId = null;
+
+function connectedPorts() {
+  const ports = [];
+  for (const [port, entry] of connections) {
+    if (entry.state === "ready" && entry.ws && entry.ws.readyState === WebSocket.OPEN) {
+      ports.push(port);
+    }
+  }
+  return ports.sort((a, b) => a - b);
+}
+
+function isAnyConnected() {
+  return connectedPorts().length > 0;
+}
 
 function nextBackoff() {
   const ms = backoffMs;
-  backoffMs = Math.min(backoffMs * 2, BACKOFF_MAX_MS);
+  backoffMs = Math.min(Math.round(backoffMs * 2), BACKOFF_IDLE_CAP_MS);
   return ms;
 }
 
+function candidatePorts() {
+  const ports = [];
+  for (let p = PORT_RANGE_START; p <= PORT_RANGE_END; p++) ports.push(p);
+  if (
+    Number.isInteger(config.port) &&
+    config.port > 0 &&
+    config.port <= 65535 &&
+    !ports.includes(config.port)
+  ) {
+    ports.unshift(config.port);
+  }
+  return ports;
+}
+
 // A missing relay is normal. Chrome lists every refused WebSocket on chrome://extensions,
-// so probe with a caught fetch first; any HTTP answer (even 404) means something is listening.
-async function relayUp(port) {
+// so probe /version with a caught fetch first and open a WebSocket only when app === "browser-control".
+async function probeVersion(port) {
   try {
-    await fetch(`http://127.0.0.1:${port}/version`, { cache: "no-store", signal: AbortSignal.timeout(800) });
-    return true;
+    const resp = await fetch(`http://127.0.0.1:${port}/version`, {
+      cache: "no-store",
+      signal: AbortSignal.timeout(VERSION_PROBE_TIMEOUT_MS),
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    if (data && data.app === "browser-control") return data;
+    return null;
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -57,7 +111,7 @@ async function loadConfig() {
   // pairing.json wins: `extension setup` rewrites it, so a rotated token must beat a stale stored one.
   config = {
     port: Number(fileCfg?.port || stored.port || DEFAULT_PORT),
-    token: String(fileCfg?.token || stored.token || ""),
+    token: String(fileCfg?.token || stored.token || "").trim(),
     mode: stored.mode === "lent" ? "lent" : "all",
   };
   return config;
@@ -107,7 +161,7 @@ function updateBadge() {
   if (attachedTabs.size > 0) {
     chrome.action.setBadgeText({ text: String(attachedTabs.size) });
     chrome.action.setBadgeBackgroundColor({ color: "#2563eb" });
-  } else if (connected) {
+  } else if (isAnyConnected()) {
     chrome.action.setBadgeText({ text: "ON" });
     chrome.action.setBadgeBackgroundColor({ color: "#16a34a" });
   } else {
@@ -137,6 +191,10 @@ async function ensureAttached(tabId) {
   await chrome.debugger.attach({ tabId }, "1.3");
   const entry = { timer: null, isolatedContextId: undefined };
   attachedTabs.set(tabId, entry);
+  // Keep background tabs unthrottled while debugger is attached.
+  await chrome.debugger
+    .sendCommand({ tabId }, "Emulation.setFocusEmulationEnabled", { enabled: true })
+    .catch(() => {});
   touchDebuggerTimer(tabId);
   updateBadge();
   return entry;
@@ -292,6 +350,112 @@ async function getIsolatedContextForDebugger(tabId, forceFresh = false) {
   return undefined;
 }
 
+function stripHash(url) {
+  const idx = String(url || "").indexOf("#");
+  return idx >= 0 ? String(url).slice(0, idx) : String(url || "");
+}
+
+async function navigateTab(tabId, rawUrl, until, timeoutMs) {
+  let url = String(rawUrl || "");
+  if (url.startsWith("about:blank#")) url = "about:blank";
+  const wantDcl = until === "domcontentloaded";
+
+  if (tabId) {
+    if (!tabAllowed(tabId)) throw new Error(`REFUSED: tab ${tabId} is not lent`);
+    const existing = await chrome.tabs.get(tabId).catch(() => null);
+    if (existing?.url && url.includes("#") && stripHash(existing.url) === stripHash(url) && existing.url !== url) {
+      await chrome.tabs.update(tabId, { url });
+      const updated = await chrome.tabs.get(tabId).catch(() => null);
+      return { tabId, loaded: true, url: updated?.url || url, title: updated?.title || "" };
+    }
+  }
+
+  let tid = tabId;
+  let resolveLoaded;
+  let done = false;
+  const pendingEvents = [];
+
+  const loadedPromise = new Promise((resolve) => {
+    resolveLoaded = resolve;
+  });
+
+  const finish = (ok) => {
+    if (done) return;
+    done = true;
+    clearTimeout(timer);
+    chrome.tabs.onUpdated.removeListener(onUpdated);
+    if (chrome.webNavigation?.onDOMContentLoaded) {
+      chrome.webNavigation.onDOMContentLoaded.removeListener(onDcl);
+    }
+    resolveLoaded(ok);
+  };
+
+  const timer = setTimeout(() => finish(false), timeoutMs);
+
+  const onUpdated = (updatedId, info) => {
+    if (tid === undefined) {
+      pendingEvents.push({ type: "updated", tabId: updatedId, status: info.status });
+      return;
+    }
+    if (updatedId !== tid) return;
+    if (info.status === "complete") finish(true);
+  };
+
+  const onDcl = (details) => {
+    if (details.frameId !== 0) return;
+    if (tid === undefined) {
+      pendingEvents.push({ type: "dcl", tabId: details.tabId });
+      return;
+    }
+    if (details.tabId !== tid) return;
+    finish(true);
+  };
+
+  chrome.tabs.onUpdated.addListener(onUpdated);
+  if (wantDcl && chrome.webNavigation?.onDOMContentLoaded) {
+    chrome.webNavigation.onDOMContentLoaded.addListener(onDcl);
+  }
+
+  try {
+    if (!tid) {
+      const created = await chrome.tabs.create({ url, active: false });
+      tid = created.id;
+      agentTabs.add(tid);
+      await saveTabSets();
+      for (const ev of pendingEvents) {
+        if (ev.tabId !== tid) continue;
+        if (ev.type === "dcl" || (ev.type === "updated" && ev.status === "complete")) {
+          finish(true);
+          break;
+        }
+      }
+      if (!done) {
+        const cur = await chrome.tabs.get(tid).catch(() => null);
+        if (cur && cur.status === "complete" && cur.url && cur.url !== "about:blank") {
+          finish(true);
+        } else if (cur && cur.status === "complete" && url === "about:blank") {
+          finish(true);
+        }
+      }
+    } else {
+      await chrome.tabs.update(tid, { url });
+      if (!done) {
+        const cur = await chrome.tabs.get(tid).catch(() => null);
+        if (cur && cur.status === "complete" && stripHash(cur.url || "") === stripHash(url)) {
+          finish(true);
+        }
+      }
+    }
+  } catch (err) {
+    finish(false);
+    throw err;
+  }
+
+  const loaded = await loadedPromise;
+  const finalTab = await chrome.tabs.get(tid).catch(() => null);
+  return { tabId: tid, loaded, url: finalTab?.url || url, title: finalTab?.title || "" };
+}
+
 async function handleRequest(msg) {
   const { op, params = {} } = msg;
   const tabId = params.tabId !== undefined ? Number(params.tabId) : undefined;
@@ -361,39 +525,8 @@ async function handleRequest(msg) {
     }
 
     case "navigate": {
-      const url = String(params.url || "");
-      const until = params.until === "domcontentloaded" ? "loading" : "complete";
       const timeoutMs = Number(params.timeoutMs) || 30_000;
-      let tid = tabId;
-      if (!tid) {
-        const created = await chrome.tabs.create({ url, active: false });
-        tid = created.id;
-        agentTabs.add(tid);
-        await saveTabSets();
-      } else {
-        if (!tabAllowed(tid)) throw new Error(`REFUSED: tab ${tid} is not lent`);
-        await chrome.tabs.update(tid, { url });
-      }
-      const loaded = await new Promise((resolve) => {
-        let done = false;
-        const finish = (ok) => {
-          if (done) return;
-          done = true;
-          clearTimeout(timer);
-          chrome.tabs.onUpdated.removeListener(onUpd);
-          resolve(ok);
-        };
-        const timer = setTimeout(() => finish(false), timeoutMs);
-        const onUpd = (updatedId, info) => {
-          if (updatedId !== tid) return;
-          if (info.status === "complete" || (until === "loading" && info.status === "loading")) {
-            finish(true);
-          }
-        };
-        chrome.tabs.onUpdated.addListener(onUpd);
-      });
-      const finalTab = await chrome.tabs.get(tid).catch(() => null);
-      return { tabId: tid, loaded, url: finalTab?.url || url, title: finalTab?.title || "" };
+      return await navigateTab(tabId, params.url, params.until, timeoutMs);
     }
 
     case "bc_call": {
@@ -441,7 +574,10 @@ async function handleRequest(msg) {
         throw new Error(`REFUSED: ${method} is blocked so browser-control never closes or crashes the user's browser`);
       }
       await ensureAttached(tabId);
-      const result = await chrome.debugger.sendCommand({ tabId }, method, params.params || {});
+      const target = typeof params.sessionId === "string" && params.sessionId !== ""
+        ? { tabId, sessionId: params.sessionId }
+        : { tabId };
+      const result = await chrome.debugger.sendCommand(target, method, params.params || {});
       return { result: result ?? {} };
     }
 
@@ -487,130 +623,273 @@ async function handleRequest(msg) {
   }
 }
 
-function sendJson(obj) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(obj));
+function sendJsonTo(entry, obj) {
+  if (!entry?.ws || entry.ws.readyState !== WebSocket.OPEN) return false;
+  const serialized = JSON.stringify(obj);
+  const bytes = serialized.length * 3 > MAX_FRAME_BYTES ? new TextEncoder().encode(serialized).length : serialized.length;
+  if (bytes > MAX_FRAME_BYTES) {
+    if (obj.type === "res" && obj.id !== undefined) {
+      entry.ws.send(
+        JSON.stringify({
+          type: "res",
+          id: obj.id,
+          ok: false,
+          error: `EXECUTION_FAILED: Result too large (${bytes} bytes > ${MAX_FRAME_BYTES} limit)`,
+        }),
+      );
+    }
+    return false;
+  }
+  entry.ws.send(serialized);
+  return true;
+}
+
+function closeConnection(port) {
+  const entry = connections.get(port);
+  if (!entry) return;
+  if (entry.keepaliveTimer) {
+    clearInterval(entry.keepaliveTimer);
+    entry.keepaliveTimer = null;
+  }
+  connections.delete(port);
+  try {
+    entry.ws?.close();
+  } catch {
+    /* ignore */
   }
 }
 
-function scheduleReconnect(delayMs = 3000) {
-  if (reconnectTimer) clearTimeout(reconnectTimer);
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    connect().catch(() => {});
+function closeAllConnections() {
+  for (const port of [...connections.keys()]) {
+    closeConnection(port);
+  }
+}
+
+function scheduleScan(delayMs) {
+  if (scanTimer) clearTimeout(scanTimer);
+  scanTimer = setTimeout(() => {
+    scanTimer = null;
+    scanAndConnect().catch(() => {});
   }, delayMs);
 }
 
-async function connect() {
-  if (connecting) return;
-  connecting = true;
+async function openRelaySocket(port, versionInfo) {
+  if (connections.has(port)) return;
+  if (!cachedProfileId) cachedProfileId = await getOrCreateProfileId();
+  const browser = detectBrowserBrand();
+  const extVersion = chrome.runtime.getManifest().version;
+  const token = config.token;
+  const extNonce = randomNonceHex(16);
+
+  let ws;
   try {
-    await connectOnce();
-  } finally {
-    connecting = false;
-  }
-}
-
-async function connectOnce() {
-  await loadConfig();
-  if (!config.token) {
-    connected = false;
-    lastError = "Not paired yet. Run: browser-control-daemon extension setup";
-    updateBadge();
-    return;
-  }
-  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
-
-  if (!(await relayUp(config.port))) {
-    connected = false;
-    lastError = WAITING;
-    updateBadge();
-    scheduleReconnect(nextBackoff());
+    ws = new WebSocket(`ws://127.0.0.1:${port}/extension`);
+  } catch {
     return;
   }
 
-  const url = `ws://127.0.0.1:${config.port}/extension`;
-  try {
-    ws = new WebSocket(url);
-  } catch (err) {
-    lastError = String(err?.message || err);
-    scheduleReconnect(nextBackoff());
-    return;
-  }
+  const entry = {
+    port,
+    ws,
+    state: "connecting",
+    extNonce,
+    instanceId: versionInfo?.instanceId || "",
+    keepaliveTimer: null,
+    touchedTabs: new Set(),
+  };
+  connections.set(port, entry);
 
   ws.addEventListener("open", () => {
-    sendJson({ type: "hello", token: config.token, version: chrome.runtime.getManifest().version });
+    if (connections.get(port) !== entry) return;
+    entry.state = "hello";
+    sendJsonTo(entry, {
+      type: "hello",
+      profileId: cachedProfileId,
+      browser,
+      version: extVersion,
+      helpersVersion: PAGE_HELPERS_VERSION,
+      protocolVersion: PROTOCOL_VERSION,
+      nonce: extNonce,
+    });
   });
 
   ws.addEventListener("message", async (ev) => {
+    if (connections.get(port) !== entry) return;
     let msg;
     try {
       msg = JSON.parse(String(ev.data));
     } catch {
       return;
     }
+
+    if (entry.state === "hello" && msg.type === "auth.challenge") {
+      entry.state = "verifying";
+      const relayNonce = msg.nonce;
+      const relayProof = msg.proof;
+      if (!isValidNonceHex(relayNonce)) {
+        ws.close(4006, "invalid relay nonce");
+        return;
+      }
+      const validRelay = await verifyHmacHex(
+        token,
+        relayProofMessage(port, extNonce, relayNonce.toLowerCase()),
+        relayProof,
+      );
+      if (!validRelay) {
+        lastError = `Relay auth failed on port ${port}`;
+        ws.close(4006, "invalid relay proof");
+        return;
+      }
+      const extProof = await hmacHex(
+        token,
+        extProofMessage(port, relayNonce.toLowerCase(), extNonce),
+      );
+      entry.state = "auth_sent";
+      sendJsonTo(entry, { type: "auth.response", proof: extProof });
+      return;
+    }
+
     if (msg.type === "welcome") {
-      connected = true;
+      // Only a relay that proved the token and got our proof back may open the session.
+      if (entry.state !== "auth_sent") {
+        ws.close(4006, "welcome before auth");
+        return;
+      }
+      entry.state = "ready";
+      if (msg.instanceId) entry.instanceId = msg.instanceId;
       lastError = "";
       backoffMs = BACKOFF_MIN_MS;
       updateBadge();
-      if (keepaliveTimer) clearInterval(keepaliveTimer);
-      keepaliveTimer = setInterval(() => sendJson({ type: "ping" }), KEEPALIVE_MS);
+      if (entry.keepaliveTimer) clearInterval(entry.keepaliveTimer);
+      entry.keepaliveTimer = setInterval(async () => {
+        // Calling chrome.runtime.getPlatformInfo() resets Chromium's 30 s MV3 worker idle timer.
+        try {
+          await chrome.runtime.getPlatformInfo();
+        } catch {
+          /* ignore */
+        }
+        sendJsonTo(entry, { type: "ping" });
+      }, KEEPALIVE_MS);
       return;
     }
+
     if (msg.type === "pong") return;
-    if (msg.type === "req" && msg.id !== undefined) {
+
+    if (entry.state === "ready" && msg.type === "req" && msg.id !== undefined) {
       try {
         await tabSetsReady;
+        if (msg.params && msg.params.tabId !== undefined) {
+          entry.touchedTabs.add(Number(msg.params.tabId));
+        }
         const result = await handleRequest(msg);
-        sendJson({ type: "res", id: msg.id, ok: true, result });
+        if (result && typeof result.tabId === "number") {
+          entry.touchedTabs.add(result.tabId);
+        }
+        sendJsonTo(entry, { type: "res", id: msg.id, ok: true, result });
       } catch (err) {
-        sendJson({ type: "res", id: msg.id, ok: false, error: String(err?.message || err) });
+        sendJsonTo(entry, { type: "res", id: msg.id, ok: false, error: String(err?.message || err) });
       }
     }
   });
 
   ws.addEventListener("close", (ev) => {
-    connected = false;
-    ws = null;
-    if (keepaliveTimer) { clearInterval(keepaliveTimer); keepaliveTimer = null; }
-    lastError = ev.reason || WAITING;
+    if (entry.keepaliveTimer) {
+      clearInterval(entry.keepaliveTimer);
+      entry.keepaliveTimer = null;
+    }
+    if (connections.get(port) === entry) {
+      connections.delete(port);
+    }
+    if (!isAnyConnected()) {
+      lastError = ev.reason && ev.code !== 1000 && ev.code !== 1001 ? ev.reason : WAITING;
+      scheduleScan(nextBackoff());
+    }
     updateBadge();
-    scheduleReconnect(nextBackoff());
   });
 
   ws.addEventListener("error", () => {
-    lastError = WAITING;
+    if (!isAnyConnected()) lastError = WAITING;
   });
 }
 
-// Forward CDP events from attached tabs straight back into browser-control's EventBuffer.
+async function scanAndConnect() {
+  if (scanning) return;
+  scanning = true;
+  try {
+    await loadConfig();
+    if (!config.token) {
+      lastError = "Not paired yet. Run: browser-control-daemon extension setup";
+      updateBadge();
+      return;
+    }
+
+    const ports = candidatePorts().filter((p) => !connections.has(p));
+    const results = await Promise.all(
+      ports.map(async (port) => ({ port, info: await probeVersion(port) })),
+    );
+
+    let foundAny = false;
+    for (const { port, info } of results) {
+      if (info) {
+        foundAny = true;
+        await openRelaySocket(port, info);
+      }
+    }
+
+    if (!foundAny && !isAnyConnected()) {
+      lastError = WAITING;
+      updateBadge();
+      scheduleScan(nextBackoff());
+    }
+  } finally {
+    scanning = false;
+  }
+}
+
+// Forward CDP events from attached tabs only to authenticated daemon sockets that touched that tab.
 chrome.debugger.onEvent.addListener((source, method, params) => {
   if (typeof source.tabId !== "number") return;
   if (method === "Page.frameNavigated" && !params?.frame?.parentId) {
     const entry = attachedTabs.get(source.tabId);
     if (entry) entry.isolatedContextId = undefined;
   }
-  sendJson({ type: "event", tabId: source.tabId, method, params: params || {} });
+  const payload = {
+    type: "event",
+    tabId: source.tabId,
+    ...(source.sessionId ? { sessionId: source.sessionId } : {}),
+    method,
+    params: params || {},
+  };
+  for (const conn of connections.values()) {
+    if (conn.state === "ready" && conn.touchedTabs.has(source.tabId)) {
+      sendJsonTo(conn, payload);
+    }
+  }
 });
 
 chrome.debugger.onDetach.addListener((source) => {
-  if (typeof source.tabId !== "number") return;
+  if (typeof source.tabId !== "number" || source.sessionId) return;
   const entry = attachedTabs.get(source.tabId);
   if (entry?.timer) clearTimeout(entry.timer);
   attachedTabs.delete(source.tabId);
   updateBadge();
 });
 
-chrome.tabs.onRemoved.addListener((tabId) => {
+function forgetTab(tabId) {
   const wasAgent = agentTabs.delete(tabId);
   const wasLent = lentTabs.delete(tabId);
   if (wasAgent || wasLent) saveTabSets().catch(() => {});
   const entry = attachedTabs.get(tabId);
   if (entry?.timer) clearTimeout(entry.timer);
   attachedTabs.delete(tabId);
+  for (const conn of connections.values()) {
+    conn.touchedTabs.delete(tabId);
+  }
   updateBadge();
-});
+}
+
+chrome.tabs.onRemoved.addListener((tabId) => forgetTab(tabId));
+chrome.tabs.onReplaced.addListener((_addedTabId, removedTabId) => forgetTab(removedTabId));
 
 // Popup control messages.
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -619,10 +898,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg.type === "status") {
       const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
       const activeId = activeTab?.id;
+      const ports = connectedPorts();
       sendResponse({
-        connected,
+        connected: ports.length > 0,
+        ports,
         lastError,
-        port: config.port,
+        port: ports[0] || config.port,
         hasToken: Boolean(config.token),
         mode: config.mode,
         attachedCount: attachedTabs.size,
@@ -647,12 +928,14 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       sendResponse({ ok: true });
     } else if (msg.type === "pair") {
       await chrome.storage.local.set({ port: Number(msg.port || DEFAULT_PORT), token: String(msg.token || "").trim() });
-      if (ws) { try { ws.close(); } catch { /* ignore */ } ws = null; }
-      await connect();
+      closeAllConnections();
+      backoffMs = BACKOFF_MIN_MS;
+      await scanAndConnect();
       sendResponse({ ok: true });
     } else if (msg.type === "reconnect") {
-      if (ws) { try { ws.close(); } catch { /* ignore */ } ws = null; }
-      await connect();
+      closeAllConnections();
+      backoffMs = BACKOFF_MIN_MS;
+      await scanAndConnect();
       sendResponse({ ok: true });
     }
   })();
@@ -662,9 +945,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 // 30 s is Chrome's minimum alarm period (Chrome 120+); it bounds how long a freshly started daemon waits for us.
 chrome.alarms.create("bc-keepalive", { periodInMinutes: 0.5 });
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === "bc-keepalive" && !connected) connect().catch(() => {});
+  if (alarm.name === "bc-keepalive") scanAndConnect().catch(() => {});
 });
 
-chrome.runtime.onStartup.addListener(() => connect().catch(() => {}));
-chrome.runtime.onInstalled.addListener(() => connect().catch(() => {}));
-connect().catch(() => {});
+chrome.runtime.onStartup.addListener(() => scanAndConnect().catch(() => {}));
+chrome.runtime.onInstalled.addListener(() => scanAndConnect().catch(() => {}));
+scanAndConnect().catch(() => {});
