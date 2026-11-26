@@ -5,13 +5,15 @@ import { createPageHelperHandler } from "../src/page-runner";
 type Call = { op: string; input: Record<string, unknown> };
 
 /** Fake runtime: serves helper calls locally and records every execute_cdp call. */
-function makeFakeInvoker(options: { dialogError?: string } = {}) {
+function makeFakeInvoker(options: { dialogError?: string; activeTargetId?: string; cdpDelayMs?: number } = {}) {
   const calls: Call[] = [];
   const ok = (value: unknown): InvokeResult => ({ ok: true, data: { value } });
 
   const invoke = async (op: string, input: Record<string, unknown> = {}): Promise<InvokeResult> => {
     calls.push({ op, input });
-    if (op === "get_browser_status") return { ok: true, data: { connected: true } };
+    if (op === "get_browser_status") {
+      return { ok: true, data: { connected: true, ...(options.activeTargetId ? { activeTargetId: options.activeTargetId } : {}) } };
+    }
     if (op === "evaluate") {
       const expr = String(input["expression"] ?? "");
       if (expr.includes("__bc.verifyRef")) return ok("e1");
@@ -26,6 +28,7 @@ function makeFakeInvoker(options: { dialogError?: string } = {}) {
       return ok("ok");
     }
     if (op === "execute_cdp") {
+      if (options.cdpDelayMs) await new Promise((r) => setTimeout(r, options.cdpDelayMs));
       if (input["method"] === "Page.handleJavaScriptDialog" && options.dialogError) {
         return { ok: false, error: { code: "EXECUTION_FAILED", message: options.dialogError } };
       }
@@ -259,6 +262,32 @@ describe("emulate", () => {
     await handle("emulate", { reset: true });
     await handle("emulate", { reducedMotion: false });
     expect(cdpCalls().at(-1)?.params).toEqual({ features: [{ name: "prefers-reduced-motion", value: "no-preference" }] });
+  });
+
+  test("media cache follows the real active tab, not the implicit route", async () => {
+    const opts: { activeTargetId?: string } = { activeTargetId: "tabA" };
+    const { invoke, cdpCalls } = makeFakeInvoker(opts);
+    const handle = createPageHelperHandler(invoke);
+
+    await handle("emulate", { colorScheme: "dark" });
+    opts.activeTargetId = "tabB";
+    await handle("emulate", { reducedMotion: true });
+    const last = cdpCalls().at(-1);
+    expect(last?.targetId).toBe("tabB");
+    expect(last?.params).toEqual({ features: [{ name: "prefers-reduced-motion", value: "reduce" }] });
+  });
+
+  test("parallel media updates on one tab both survive", async () => {
+    const { invoke, cdpCalls } = makeFakeInvoker({ activeTargetId: "tabA", cdpDelayMs: 5 });
+    const handle = createPageHelperHandler(invoke);
+
+    await Promise.all([handle("emulate", { colorScheme: "dark" }), handle("emulate", { reducedMotion: true })]);
+    expect(cdpCalls().at(-1)?.params).toEqual({
+      features: [
+        { name: "prefers-color-scheme", value: "dark" },
+        { name: "prefers-reduced-motion", value: "reduce" },
+      ],
+    });
   });
 
   test("viewport over Chrome's limit is rejected before reset runs", async () => {

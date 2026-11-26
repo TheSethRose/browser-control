@@ -1313,7 +1313,7 @@ export function createPageHelperHandler(
     const accept = sub === "accept";
     const params: Json = { accept };
     if (accept && typeof text === "string" && text !== "") params["promptText"] = text;
-    // Page is enabled on attach (index.ts); a second Page.enable would block behind an open dialog.
+    // Page is enabled on attach (session.ts ensureSession); a second Page.enable would block behind an open dialog.
     const res = await cdp("Page.handleJavaScriptDialog", params, targetId, INPUT_TIMEOUT_MS);
     if (!res.ok) {
       if (/no dialog|not showing|not open/i.test(messageOf(res))) {
@@ -1329,9 +1329,30 @@ export function createPageHelperHandler(
   }
 
   const mediaByTarget = new Map<string, Map<string, string>>();
+  const emulateQueue = new Map<string, Promise<unknown>>();
+
+  /** Pin emulate to a real tab id and run one emulate per tab at a time, so the media cache stays right. */
+  async function runEmulate(input: Json, targetId: string | undefined, browseTab: number | undefined): Promise<InvokeResult> {
+    if (browseTab !== undefined) return runEmulateNow(input, targetId, browseTab);
+    let pinned = targetId;
+    if (pinned === undefined) {
+      const status = await invoke("get_browser_status");
+      const active = status.ok ? (status.data as Json)["activeTargetId"] : undefined;
+      if (typeof active === "string") pinned = active;
+    }
+    const key = pinned ?? "";
+    const run = (emulateQueue.get(key) ?? Promise.resolve()).then(() => runEmulateNow(input, pinned, browseTab));
+    const tail = run.catch(() => undefined);
+    emulateQueue.set(key, tail);
+    try {
+      return await run;
+    } finally {
+      if (emulateQueue.get(key) === tail) emulateQueue.delete(key);
+    }
+  }
 
   /** Device, media, network, and user-agent emulation. Reset uses Chrome's double-clear race fix. */
-  async function runEmulate(input: Json, targetId: string | undefined, browseTab: number | undefined): Promise<InvokeResult> {
+  async function runEmulateNow(input: Json, targetId: string | undefined, browseTab: number | undefined): Promise<InvokeResult> {
     if (browseTab !== undefined) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: emulate needs a DevTools tab");
     const keys = ["viewport", "mobile", "colorScheme", "reducedMotion", "offline", "ua", "reset"] as const;
 
