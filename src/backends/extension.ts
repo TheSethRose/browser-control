@@ -11,7 +11,7 @@
  */
 
 import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { link, mkdir, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { link, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import type { Server, ServerWebSocket } from "bun";
@@ -123,69 +123,35 @@ async function publishPrivateFile(file: string, body: string, replace: boolean):
   }
 }
 
-const LOCK_WAIT_MS = 20_000;
-
-function processAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
-
-/** True when the lock's holder has exited (or never wrote its pid and the lock is old). */
-async function lockAbandoned(lock: string): Promise<boolean> {
-  const pid = Number(await readFile(join(lock, "pid"), "utf8").catch(() => ""));
-  if (Number.isInteger(pid) && pid > 0) return !processAlive(pid);
-  const age = await stat(lock).then((i) => Date.now() - i.mtimeMs, () => 0);
-  return age > LOCK_WAIT_MS;
-}
-
-/**
- * Run `fn` while holding `<file>.lock` (an atomic mkdir holding the owner's pid), so only one
- * process rotates the token. A lock is taken over only after its owner process has exited, so a
- * paused holder can never be overtaken mid-write.
- */
-async function withFileLock<T>(file: string, fn: () => Promise<T>): Promise<T> {
-  const lock = `${file}.lock`;
-  for (let waited = 0; ; waited += 25) {
-    try {
-      await mkdir(lock, { mode: 0o700 });
-      await writeFile(join(lock, "pid"), String(process.pid), { mode: 0o600 });
-      break;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      if (await lockAbandoned(lock)) await rm(lock, { recursive: true, force: true });
-      else if (waited > LOCK_WAIT_MS) throw new Error(`EXECUTION_FAILED: relay token lock ${lock} is held by a running process`);
-      await new Promise((r) => setTimeout(r, 25));
-    }
-  }
-  try {
-    return await fn();
-  } finally {
-    await rm(lock, { recursive: true, force: true });
-  }
-}
-
 const newTokenBody = (token: string) => `${JSON.stringify({ token }, null, 2)}\n`;
 
+/**
+ * The daemon's token: read it, or create it once if missing (atomic; a concurrent creator wins and
+ * everyone reads its file). A broken or non-private file is never reused or rotated here; only
+ * `extension-setup` replaces it, so two daemons can never end up with different tokens.
+ */
 export async function ensureRelayToken(tokenFile: string = defaultTokenFilePath()): Promise<string> {
   await mkdir(dirname(tokenFile), { recursive: true, mode: 0o700 });
-  const first = await readPrivateToken(tokenFile);
-  if ("token" in first) return first.token;
-  if (first.state === "missing") {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const read = await readPrivateToken(tokenFile);
+    if ("token" in read) return read.token;
+    if (read.state === "bad") {
+      throw new Error(
+        `EXECUTION_FAILED: relay token file ${tokenFile} is not private or not valid; run: browser-control-daemon extension setup (or bun ./cli.ts extension-setup <extensionDir>) to replace it`,
+      );
+    }
     const token = randomBytes(32).toString("hex");
     if (await publishPrivateFile(tokenFile, newTokenBody(token), false)) return token;
   }
-  // Broken or readable by others: replace it once, under a lock, after re-checking.
-  return withFileLock(tokenFile, async () => {
-    const again = await readPrivateToken(tokenFile);
-    if ("token" in again) return again.token;
-    const token = randomBytes(32).toString("hex");
-    await publishPrivateFile(tokenFile, newTokenBody(token), true);
-    return token;
-  });
+  throw new Error(`EXECUTION_FAILED: could not read the relay token at ${tokenFile}`);
+}
+
+/** Replace a broken or non-private token file with a new private one (user-run setup only). */
+async function repairRelayToken(tokenFile: string): Promise<string> {
+  await mkdir(dirname(tokenFile), { recursive: true, mode: 0o700 });
+  const read = await readPrivateToken(tokenFile);
+  if (!("token" in read) && read.state === "bad") await publishPrivateFile(tokenFile, newTokenBody(randomBytes(32).toString("hex")), true);
+  return ensureRelayToken(tokenFile);
 }
 
 export async function setupExtensionPairing(
@@ -194,7 +160,7 @@ export async function setupExtensionPairing(
 ): Promise<{ tokenFile: string; pairingFile: string; port: number }> {
   const tokenFile = options.tokenFile ?? defaultTokenFilePath();
   const port = options.port ?? PORT_RANGE_START;
-  const token = await ensureRelayToken(tokenFile);
+  const token = await repairRelayToken(tokenFile);
   const resolvedDir = resolvePath(extensionDir);
   await mkdir(resolvedDir, { recursive: true });
   const pairingFile = join(resolvedDir, "pairing.json");
@@ -558,7 +524,12 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
     if (startPromise) return startPromise;
     startPromise = (async () => {
       startError = undefined;
-      relayToken = options.token ?? (await ensureRelayToken(options.tokenFile));
+      try {
+        relayToken = options.token ?? (await ensureRelayToken(options.tokenFile));
+      } catch (error) {
+        startError = (error as Error).message.replace(/^EXECUTION_FAILED: /, "");
+        throw new BackendUnavailable(NAME, startError);
+      }
       let lastErr: unknown;
       for (let port = portStart; port <= portEnd; port++) {
         try {

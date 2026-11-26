@@ -620,39 +620,28 @@ describe("relay token files", () => {
     expect(statSync(file).mode & 0o777).toBe(0o600);
   });
 
-  test("a token file others can read is rotated, not reused", async () => {
-    const file = pjoin(mkdtempSync(pjoin(ptmp(), "bc-tok-")), "extension-relay.json");
+  test("the daemon refuses a token file others can read, and setup replaces it", async () => {
+    const dir = mkdtempSync(pjoin(ptmp(), "bc-tok-"));
+    const file = pjoin(dir, "extension-relay.json");
     const leaked = "a".repeat(64);
     writeFileSync(file, JSON.stringify({ token: leaked }), { mode: 0o644 });
-    const token = await ensure(file);
+    await expect(ensure(file)).rejects.toThrow("not private or not valid");
+    expect(JSON.parse(readFileSync(file, "utf8")).token).toBe(leaked);
+    const ext = pjoin(dir, "ext");
+    require("node:fs").mkdirSync(ext);
+    await setup(ext, { tokenFile: file });
+    const token = JSON.parse(readFileSync(file, "utf8")).token;
     expect(token).not.toBe(leaked);
     expect(statSync(file).mode & 0o777).toBe(0o600);
+    expect(JSON.parse(readFileSync(pjoin(ext, "pairing.json"), "utf8")).token).toBe(token);
   });
 
-  test("concurrent rotations of a leaked token agree on one new token", async () => {
-    const file = pjoin(mkdtempSync(pjoin(ptmp(), "bc-tok-")), "extension-relay.json");
-    writeFileSync(file, JSON.stringify({ token: "b".repeat(64) }), { mode: 0o644 });
-    const tokens = await Promise.all(Array.from({ length: 16 }, () => ensure(file)));
-    expect(new Set(tokens).size).toBe(1);
-    expect(JSON.parse(readFileSync(file, "utf8")).token).toBe(tokens[0]);
-  });
-
-  test("a rotation lock left by a dead process is taken over", async () => {
-    const file = pjoin(mkdtempSync(pjoin(ptmp(), "bc-tok-")), "extension-relay.json");
-    writeFileSync(file, "{}", { mode: 0o600 });
-    require("node:fs").mkdirSync(`${file}.lock`);
-    writeFileSync(pjoin(`${file}.lock`, "pid"), "2147483646");
-    const token = await ensure(file);
-    expect(JSON.parse(readFileSync(file, "utf8")).token).toBe(token);
-    expect(require("node:fs").existsSync(`${file}.lock`)).toBe(false);
-  });
-
-  test("a malformed private token file is replaced", async () => {
+  test("concurrent daemons never rotate a broken token file", async () => {
     const file = pjoin(mkdtempSync(pjoin(ptmp(), "bc-tok-")), "extension-relay.json");
     writeFileSync(file, "not json", { mode: 0o600 });
-    const token = await ensure(file);
-    expect(token).toMatch(/^[0-9a-f]{64}$/);
-    expect(JSON.parse(readFileSync(file, "utf8")).token).toBe(token);
+    const results = await Promise.allSettled(Array.from({ length: 16 }, () => ensure(file)));
+    expect(results.every((r) => r.status === "rejected")).toBe(true);
+    expect(readFileSync(file, "utf8")).toBe("not json");
   });
 
   test("pairing.json replaces an existing open file with a private one", async () => {
