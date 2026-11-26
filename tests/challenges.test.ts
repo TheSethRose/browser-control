@@ -394,4 +394,34 @@ describe("classifyChallenge: review regressions", () => {
     const d = classifyChallenge(probe({ title: "Reset your phone", text: "Press and hold the power button for 10 seconds." }));
     expect(d).toBeUndefined();
   });
+
+  test("S2: a 403 Access Denied page with a CAPTCHA support form is still a block", () => {
+    const d = classifyChallenge(
+      probe({
+        status: 403,
+        title: "Access Denied",
+        text: "Complete the CAPTCHA to contact support.",
+        frameUrls: ["https://www.google.com/recaptcha/api2/anchor?k=abc"],
+      }),
+    );
+    expect(d).toMatchObject({ vendor: "generic", kind: "block" });
+  });
+
+  test("S6: a phone reset page that says 'confirm' is not a PerimeterX challenge", () => {
+    const d = classifyChallenge(
+      probe({ text: "Press and hold the power button for 10 seconds. Confirm that the device has restarted." }),
+    );
+    expect(d).toBeUndefined();
+  });
+
+  test("S8: an explicit 'solve the CAPTCHA' wall with a reCAPTCHA frame is interactive", () => {
+    const d = classifyChallenge(
+      probe({
+        title: "One more step",
+        text: "Please solve the CAPTCHA to continue.",
+        frameUrls: ["https://www.google.com/recaptcha/api2/anchor?k=abc"],
+      }),
+    );
+    expect(d).toMatchObject({ vendor: "recaptcha", kind: "interactive" });
+  });
 });

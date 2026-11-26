@@ -125,6 +125,13 @@ export function classifyChallenge(probe: ChallengeProbe): ChallengeDetection | u
   const text = probe.text.toLowerCase();
   const host = hostOf(probe.url);
   const reason = (value: string) => value.slice(0, 160);
+  const refused = probe.status === 403 || probe.status === 451;
+  const denialTitle = /^(?:access denied|403 forbidden|forbidden|blocked|request blocked|you have been blocked)$/.test(title);
+
+  // An HTTP refusal with an explicit denial title is a block at any length, even if it offers a CAPTCHA form.
+  if (refused && denialTitle) {
+    return { vendor: "generic", kind: "block", reason: reason(`status ${probe.status}, title: ${probe.title.trim()}`) };
+  }
 
   // Cloudflare
   if (/sorry, you have been blocked/.test(text) && (has(probe, "#cf-error-details") || /cloudflare/.test(text))) {
@@ -158,7 +165,7 @@ export function classifyChallenge(probe: ChallengeProbe): ChallengeDetection | u
     has(probe, "#px-captcha") ||
     has(probe, "#px-captcha-wrapper") ||
     has(probe, "[id^='px-captcha']") ||
-    (/press (?:&|and) hold/.test(text) && shortPage(probe) && /human|robot|verify|confirm/.test(text))
+    (shortPage(probe) && /press (?:&|and) hold[^.\n]{0,40}\b(?:human|robot|not a bot|verify)/.test(text))
   ) {
     return {
       vendor: "perimeterx",
@@ -212,7 +219,6 @@ export function classifyChallenge(probe: ChallengeProbe): ChallengeDetection | u
   const awsCaptcha = has(probe, "awswaf-captcha") || has(probe, "#captcha-container awswaf-captcha");
   const awsScript = hasScript(probe, /\.awswaf\.com\//);
   if (awsCaptcha) return { vendor: "aws-waf", kind: "interactive", reason: "element awswaf-captcha" };
-  const refused = probe.status === 403 || probe.status === 451;
   if (awsScript !== undefined && !refused && shortPage(probe) && (has(probe, "#challenge-container") || probe.status === 202)) {
     return { vendor: "aws-waf", kind: "non-interactive", reason: reason(`script ${awsScript}`) };
   }
@@ -225,7 +231,7 @@ export function classifyChallenge(probe: ChallengeProbe): ChallengeDetection | u
     );
     const hcaptcha = hasFrame(probe, /^https:\/\/(?:newassets\.|assets\.)?hcaptcha\.com\/captcha\//);
     const wallText =
-      /verify you are (?:a )?human|are you a robot|not a robot|unusual traffic|security check|complete the captcha/.test(
+      /verify you are (?:a )?human|are you a robot|not a robot|unusual traffic|security check|(?:solve|complete) the captcha|captcha to continue/.test(
         text,
       ) || /captcha|security check|verify/.test(title);
     if (hcaptcha !== undefined && wallText) {
@@ -238,11 +244,6 @@ export function classifyChallenge(probe: ChallengeProbe): ChallengeDetection | u
     if (/^www\.google\./.test(host) && /\/sorry\//.test(probe.url)) {
       return { vendor: "recaptcha", kind: "interactive", reason: "url: google.com/sorry" };
     }
-  }
-
-  const denialTitle = /^(?:access denied|403 forbidden|forbidden|blocked|request blocked|you have been blocked)$/.test(title);
-  if (refused && denialTitle) {
-    return { vendor: "generic", kind: "block", reason: reason(`status ${probe.status}, title: ${probe.title.trim()}`) };
   }
 
   // Generic block and verification pages, short pages only.
