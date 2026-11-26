@@ -52,9 +52,9 @@ const INPUT_TIMEOUT_MS = 10_000;
 const DIALOG_HINT = "the page stopped responding; a JavaScript dialog is probably open (references/dom-and-input.md)";
 
 const PAGE_ACTIONS = [
-  "snap", "text", "form", "query", "read-urls", "ocr", "shot", "click", "type", "select",
+  "snap", "text", "form", "query", "read-urls", "ocr", "shot", "click", "hover", "type", "select",
   "upload", "drag", "wait", "key", "fill", "do", "value", "nav", "verdict", "health",
-  "styles", "issues", "perf", "notes", "flow", "script",
+  "styles", "issues", "perf", "dialog", "emulate", "notes", "flow", "script",
 ] as const;
 
 const failure = (code: string, message: string): InvokeResult =>
@@ -1262,6 +1262,189 @@ export function createPageHelperHandler(
 
   let runScript: ReturnType<typeof createScriptRunner>;
 
+  /** Move the pointer onto a ref/label or `--xy` point without pressing a button. */
+  async function runHover(
+    input: Json,
+    targetId: string | undefined,
+    quiet: boolean,
+    browseTab: number | undefined,
+  ): Promise<InvokeResult> {
+    if (browseTab !== undefined) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: hover needs a DevTools tab");
+    if (Array.isArray(input["xy"])) {
+      const [x, y] = (input["xy"] as unknown[]).map(Number);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) {
+        return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: --xy takes x,y in CSS pixels");
+      }
+      const hit = await evalHelper(
+        { steps: [{ kind: "bc", method: "baseline" }, { kind: "bc", method: "hit", args: [x!, y!] }], join: "\n" },
+        targetId,
+      );
+      if (!hit.ok) return hit;
+      const [before, what] = valueOf(hit).split("\n");
+      const moved = await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: x!, y: y! }, targetId, INPUT_TIMEOUT_MS);
+      if (!moved.ok) return inputFailed(moved, `hover ${x},${y}`);
+      return withChanges(`hover ${x},${y}: delivered. ${what ?? ""}`.trimEnd(), before, quiet, targetId);
+    }
+    const found = await locate(input["ref"], "click", targetId);
+    if (!found.ok) return found.res;
+    const at = await pointOf(found.loc, targetId, !quiet);
+    if (!at.ok) return at.res;
+    if (at.pt.hidden) {
+      const foc = await cdp("Emulation.setFocusEmulationEnabled", { enabled: true }, targetId);
+      if (!foc.ok) return foc;
+    }
+    const moved = await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: at.pt.x, y: at.pt.y }, targetId, INPUT_TIMEOUT_MS);
+    if (!moved.ok) return inputFailed(moved, `hover ${nameOf(found.loc)}`);
+    return withChanges(`hover ${nameOf(found.loc)} at ${at.pt.x},${at.pt.y}: delivered`, at.pt.before, quiet, targetId);
+  }
+
+  /** Accept or dismiss an open JavaScript alert/confirm/prompt/beforeunload dialog. */
+  async function runDialog(input: Json, targetId: string | undefined, browseTab: number | undefined): Promise<InvokeResult> {
+    const sub = String(input["sub"] ?? "").toLowerCase();
+    if (sub !== "accept" && sub !== "dismiss") {
+      return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: dialog subcommand must be accept or dismiss");
+    }
+    if (browseTab !== undefined) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: dialog needs a DevTools tab");
+    const text = input["text"];
+    if (text !== undefined && typeof text !== "string") {
+      return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: dialog prompt text must be a string");
+    }
+    const accept = sub === "accept";
+    const params: Json = { accept };
+    if (accept && typeof text === "string" && text !== "") params["promptText"] = text;
+    // Chrome only tracks open dialogs while the Page domain is enabled.
+    const enabled = await cdp("Page.enable", {}, targetId);
+    if (!enabled.ok) return enabled;
+    const res = await cdp("Page.handleJavaScriptDialog", params, targetId, INPUT_TIMEOUT_MS);
+    if (!res.ok) {
+      if (/no dialog|not showing|not open/i.test(messageOf(res))) {
+        return failure(
+          "EXECUTION_FAILED",
+          `NO_MATCH: no JavaScript dialog is open (Page.handleJavaScriptDialog said: ${messageOf(res)})`,
+        );
+      }
+      return res;
+    }
+    if (accept) return success(typeof params["promptText"] === "string" ? `dialog accept: accepted with prompt text ${js(params["promptText"])}` : "dialog accept: accepted");
+    return success("dialog dismiss: dismissed");
+  }
+
+  /** Device, media, network, and user-agent emulation. Reset uses Chrome's double-clear race fix. */
+  async function runEmulate(input: Json, targetId: string | undefined, browseTab: number | undefined): Promise<InvokeResult> {
+    if (browseTab !== undefined) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: emulate needs a DevTools tab");
+    const keys = ["viewport", "mobile", "colorScheme", "reducedMotion", "offline", "ua", "reset"] as const;
+
+    let width = 0;
+    let height = 0;
+    let scale: number | undefined;
+    const viewport = input["viewport"];
+    if (viewport !== undefined) {
+      const match = typeof viewport === "string" ? /^(\d+)x(\d+)(?:@(\d+(?:\.\d+)?))?$/.exec(viewport) : null;
+      if (!match) {
+        return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: viewport must be WxH or WxH@scale, e.g. 390x844 or 390x844@3");
+      }
+      width = Number(match[1]);
+      height = Number(match[2]);
+      scale = match[3] !== undefined ? Number(match[3]) : undefined;
+      if (width <= 0 || height <= 0 || (scale !== undefined && !(scale > 0))) {
+        return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: viewport width, height, and scale must be greater than zero");
+      }
+    }
+    const mobile = input["mobile"];
+    if (mobile !== undefined && typeof mobile !== "boolean") {
+      return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: mobile takes true or false");
+    }
+    const colorScheme = input["colorScheme"];
+    if (colorScheme !== undefined && colorScheme !== "dark" && colorScheme !== "light") {
+      return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: colorScheme must be dark or light");
+    }
+    const reducedMotion = input["reducedMotion"];
+    if (reducedMotion !== undefined && typeof reducedMotion !== "boolean") {
+      return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: reducedMotion takes true or false");
+    }
+    const offline = input["offline"];
+    if (offline !== undefined && typeof offline !== "boolean") {
+      return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: offline takes true or false");
+    }
+    const ua = input["ua"];
+    if (ua !== undefined && typeof ua !== "string") {
+      return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: ua takes a user-agent string");
+    }
+    const reset = input["reset"];
+    if (reset !== undefined && typeof reset !== "boolean") {
+      return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: reset takes true or false");
+    }
+    const wantReset = reset === true;
+    const optionsGiven = keys.filter((key) => key !== "reset" && input[key] !== undefined).length;
+    if (optionsGiven === 0 && !wantReset) {
+      return failure(
+        "INPUT_VALIDATION_FAILED",
+        "INPUT_INVALID: emulate needs at least one option: viewport, mobile, colorScheme, reducedMotion, offline, ua, or reset",
+      );
+    }
+
+    const applied: string[] = [];
+    if (wantReset) {
+      const first = await cdp("Emulation.clearDeviceMetricsOverride", {}, targetId);
+      if (!first.ok) return first;
+      await pause(100);
+      const second = await cdp("Emulation.clearDeviceMetricsOverride", {}, targetId);
+      if (!second.ok) return second;
+      const touchOff = await cdp("Emulation.setTouchEmulationEnabled", { enabled: false }, targetId);
+      if (!touchOff.ok) return touchOff;
+      const media = await cdp("Emulation.setEmulatedMedia", { features: [] }, targetId);
+      if (!media.ok) return media;
+      const online = await cdp("Network.emulateNetworkConditions", {
+        offline: false,
+        latency: 0,
+        downloadThroughput: -1,
+        uploadThroughput: -1,
+      }, targetId);
+      if (!online.ok) return online;
+      const uaOff = await cdp("Emulation.setUserAgentOverride", { userAgent: "" }, targetId);
+      if (!uaOff.ok) return uaOff;
+      applied.push("reset");
+    }
+    if (viewport !== undefined) {
+      const metrics: Json = { width, height, deviceScaleFactor: scale ?? 0, mobile: mobile === true };
+      const set = await cdp("Emulation.setDeviceMetricsOverride", metrics, targetId);
+      if (!set.ok) return set;
+      applied.push(`viewport ${width}x${height}${scale !== undefined ? `@${scale}` : ""}`);
+    }
+    if (mobile === true) {
+      const touch = await cdp("Emulation.setTouchEmulationEnabled", { enabled: true }, targetId);
+      if (!touch.ok) return touch;
+      applied.push("mobile");
+    }
+    if (colorScheme !== undefined || reducedMotion !== undefined) {
+      const features: Json[] = [];
+      if (colorScheme !== undefined) features.push({ name: "prefers-color-scheme", value: colorScheme });
+      if (reducedMotion !== undefined) {
+        features.push({ name: "prefers-reduced-motion", value: reducedMotion === true ? "reduce" : "no-preference" });
+      }
+      const media = await cdp("Emulation.setEmulatedMedia", { features }, targetId);
+      if (!media.ok) return media;
+      if (colorScheme !== undefined) applied.push(`color-scheme ${colorScheme}`);
+      if (reducedMotion !== undefined) applied.push(`reduced-motion ${reducedMotion === true ? "reduce" : "no-preference"}`);
+    }
+    if (offline !== undefined) {
+      const net = await cdp("Network.emulateNetworkConditions", {
+        offline,
+        latency: 0,
+        downloadThroughput: -1,
+        uploadThroughput: -1,
+      }, targetId);
+      if (!net.ok) return net;
+      applied.push(offline ? "offline" : "online");
+    }
+    if (ua !== undefined) {
+      const override = await cdp("Emulation.setUserAgentOverride", { userAgent: ua }, targetId);
+      if (!override.ok) return override;
+      applied.push("ua");
+    }
+    return success(`emulate: ${applied.join(", ")}`);
+  }
+
   async function maybeSaveOut(res: InvokeResult, input: Json): Promise<InvokeResult> {
     const outPath = typeof input["out"] === "string" && input["out"].trim() !== "" ? input["out"].trim() : "";
     if (!outPath || !res.ok) return res;
@@ -1357,6 +1540,15 @@ export function createPageHelperHandler(
       case "wait":
       case "key":
         return act(action, input, targetId, quiet, browseTab);
+
+      case "hover":
+        return runHover(input, targetId, quiet, browseTab);
+
+      case "dialog":
+        return runDialog(input, targetId, browseTab);
+
+      case "emulate":
+        return runEmulate(input, targetId, browseTab);
 
       case "do": {
         const steps = parseSteps(input);
