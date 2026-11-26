@@ -637,6 +637,16 @@ describe("relay token files", () => {
     expect(JSON.parse(readFileSync(file, "utf8")).token).toBe(tokens[0]);
   });
 
+  test("a rotation lock left by a dead process is taken over", async () => {
+    const file = pjoin(mkdtempSync(pjoin(ptmp(), "bc-tok-")), "extension-relay.json");
+    writeFileSync(file, "{}", { mode: 0o600 });
+    require("node:fs").mkdirSync(`${file}.lock`);
+    writeFileSync(pjoin(`${file}.lock`, "pid"), "2147483646");
+    const token = await ensure(file);
+    expect(JSON.parse(readFileSync(file, "utf8")).token).toBe(token);
+    expect(require("node:fs").existsSync(`${file}.lock`)).toBe(false);
+  });
+
   test("a malformed private token file is replaced", async () => {
     const file = pjoin(mkdtempSync(pjoin(ptmp(), "bc-tok-")), "extension-relay.json");
     writeFileSync(file, "not json", { mode: 0o600 });

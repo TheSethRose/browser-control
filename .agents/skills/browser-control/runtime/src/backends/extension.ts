@@ -11,7 +11,7 @@
  */
 
 import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { link, mkdir, readFile, rename, rmdir, stat, unlink, writeFile } from "node:fs/promises";
+import { link, mkdir, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import type { Server, ServerWebSocket } from "bun";
@@ -123,27 +123,48 @@ async function publishPrivateFile(file: string, body: string, replace: boolean):
   }
 }
 
-const LOCK_STALE_MS = 10_000;
+const LOCK_WAIT_MS = 20_000;
 
-/** Run `fn` while holding `<file>.lock` (an atomic mkdir), so only one process rotates the token. */
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/** True when the lock's holder has exited (or never wrote its pid and the lock is old). */
+async function lockAbandoned(lock: string): Promise<boolean> {
+  const pid = Number(await readFile(join(lock, "pid"), "utf8").catch(() => ""));
+  if (Number.isInteger(pid) && pid > 0) return !processAlive(pid);
+  const age = await stat(lock).then((i) => Date.now() - i.mtimeMs, () => 0);
+  return age > LOCK_WAIT_MS;
+}
+
+/**
+ * Run `fn` while holding `<file>.lock` (an atomic mkdir holding the owner's pid), so only one
+ * process rotates the token. A lock is taken over only after its owner process has exited, so a
+ * paused holder can never be overtaken mid-write.
+ */
 async function withFileLock<T>(file: string, fn: () => Promise<T>): Promise<T> {
   const lock = `${file}.lock`;
   for (let waited = 0; ; waited += 25) {
     try {
       await mkdir(lock, { mode: 0o700 });
+      await writeFile(join(lock, "pid"), String(process.pid), { mode: 0o600 });
       break;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      const age = await stat(lock).then((i) => Date.now() - i.mtimeMs, () => 0);
-      if (age > LOCK_STALE_MS) await rmdir(lock).catch(() => {});
-      if (waited > LOCK_STALE_MS * 2) throw new Error(`EXECUTION_FAILED: relay token lock ${lock} is stuck`);
+      if (await lockAbandoned(lock)) await rm(lock, { recursive: true, force: true });
+      else if (waited > LOCK_WAIT_MS) throw new Error(`EXECUTION_FAILED: relay token lock ${lock} is held by a running process`);
       await new Promise((r) => setTimeout(r, 25));
     }
   }
   try {
     return await fn();
   } finally {
-    await rmdir(lock).catch(() => {});
+    await rm(lock, { recursive: true, force: true });
   }
 }
 
