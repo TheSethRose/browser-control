@@ -49,6 +49,7 @@ export type Invoker = (operation: string, input?: Json) => Promise<InvokeResult>
 const NEED_INSTALL = "__BC_NEED_INSTALL__";
 /** Input events never return while a JavaScript dialog is open, so don't wait the full CDP timeout. */
 const INPUT_TIMEOUT_MS = 10_000;
+const MAX_VIEWPORT_DIM = 10_000_000;
 const DIALOG_HINT = "the page stopped responding; a JavaScript dialog is probably open (references/dom-and-input.md)";
 
 const PAGE_ACTIONS = [
@@ -1312,15 +1313,13 @@ export function createPageHelperHandler(
     const accept = sub === "accept";
     const params: Json = { accept };
     if (accept && typeof text === "string" && text !== "") params["promptText"] = text;
-    // Chrome only tracks open dialogs while the Page domain is enabled.
-    const enabled = await cdp("Page.enable", {}, targetId);
-    if (!enabled.ok) return enabled;
+    // Page is enabled on attach (index.ts); a second Page.enable would block behind an open dialog.
     const res = await cdp("Page.handleJavaScriptDialog", params, targetId, INPUT_TIMEOUT_MS);
     if (!res.ok) {
       if (/no dialog|not showing|not open/i.test(messageOf(res))) {
         return failure(
           "EXECUTION_FAILED",
-          `NO_MATCH: no JavaScript dialog is open (Page.handleJavaScriptDialog said: ${messageOf(res)})`,
+          "NO_MATCH: no JavaScript dialog is open\nremedy: open the alert, confirm, or prompt first, then run dialog again",
         );
       }
       return res;
@@ -1328,6 +1327,8 @@ export function createPageHelperHandler(
     if (accept) return success(typeof params["promptText"] === "string" ? `dialog accept: accepted with prompt text ${js(params["promptText"])}` : "dialog accept: accepted");
     return success("dialog dismiss: dismissed");
   }
+
+  const mediaByTarget = new Map<string, Map<string, string>>();
 
   /** Device, media, network, and user-agent emulation. Reset uses Chrome's double-clear race fix. */
   async function runEmulate(input: Json, targetId: string | undefined, browseTab: number | undefined): Promise<InvokeResult> {
@@ -1348,6 +1349,10 @@ export function createPageHelperHandler(
       scale = match[3] !== undefined ? Number(match[3]) : undefined;
       if (width <= 0 || height <= 0 || (scale !== undefined && !(scale > 0))) {
         return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: viewport width, height, and scale must be greater than zero");
+      }
+      // Chrome's Emulation.setDeviceMetricsOverride limit.
+      if (width > MAX_VIEWPORT_DIM || height > MAX_VIEWPORT_DIM || (scale !== undefined && !Number.isFinite(scale))) {
+        return failure("INPUT_VALIDATION_FAILED", `INPUT_INVALID: viewport width and height must be at most ${MAX_VIEWPORT_DIM}`);
       }
     }
     const mobile = input["mobile"];
@@ -1394,6 +1399,7 @@ export function createPageHelperHandler(
       if (!touchOff.ok) return touchOff;
       const media = await cdp("Emulation.setEmulatedMedia", { features: [] }, targetId);
       if (!media.ok) return media;
+      mediaByTarget.delete(targetId ?? "");
       const online = await cdp("Network.emulateNetworkConditions", {
         offline: false,
         latency: 0,
@@ -1417,13 +1423,15 @@ export function createPageHelperHandler(
       applied.push("mobile");
     }
     if (colorScheme !== undefined || reducedMotion !== undefined) {
-      const features: Json[] = [];
-      if (colorScheme !== undefined) features.push({ name: "prefers-color-scheme", value: colorScheme });
-      if (reducedMotion !== undefined) {
-        features.push({ name: "prefers-reduced-motion", value: reducedMotion === true ? "reduce" : "no-preference" });
-      }
+      // setEmulatedMedia replaces every feature, so merge with what this tab already has.
+      const key = targetId ?? "";
+      const kept = new Map(mediaByTarget.get(key) ?? []);
+      if (colorScheme !== undefined) kept.set("prefers-color-scheme", colorScheme);
+      if (reducedMotion !== undefined) kept.set("prefers-reduced-motion", reducedMotion === true ? "reduce" : "no-preference");
+      const features: Json[] = [...kept].map(([name, value]) => ({ name, value }));
       const media = await cdp("Emulation.setEmulatedMedia", { features }, targetId);
       if (!media.ok) return media;
+      mediaByTarget.set(key, kept);
       if (colorScheme !== undefined) applied.push(`color-scheme ${colorScheme}`);
       if (reducedMotion !== undefined) applied.push(`reduced-motion ${reducedMotion === true ? "reduce" : "no-preference"}`);
     }

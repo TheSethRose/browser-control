@@ -104,8 +104,8 @@ describe("dialog", () => {
     const res = await handle("dialog", { sub: "accept", text: "Ada Lovelace" });
     expect(res.ok).toBe(true);
     expect(text(res)).toBe('dialog accept: accepted with prompt text "Ada Lovelace"');
-    expect(cdpCalls().map((c) => c.method)).toEqual(["Page.enable", "Page.handleJavaScriptDialog"]);
-    expect(cdpCalls()[1]!.params).toEqual({ accept: true, promptText: "Ada Lovelace" });
+    expect(cdpCalls().map((c) => c.method)).toEqual(["Page.handleJavaScriptDialog"]);
+    expect(cdpCalls()[0]!.params).toEqual({ accept: true, promptText: "Ada Lovelace" });
   });
 
   test("dialog dismiss sends accept false without prompt text", async () => {
@@ -115,8 +115,8 @@ describe("dialog", () => {
     const res = await handle("dialog", { sub: "dismiss" });
     expect(res.ok).toBe(true);
     expect(text(res)).toBe("dialog dismiss: dismissed");
-    expect(cdpCalls().map((c) => c.method)).toEqual(["Page.enable", "Page.handleJavaScriptDialog"]);
-    expect(cdpCalls()[1]!.params).toEqual({ accept: false });
+    expect(cdpCalls().map((c) => c.method)).toEqual(["Page.handleJavaScriptDialog"]);
+    expect(cdpCalls()[0]!.params).toEqual({ accept: false });
   });
 
   test("dialog with no open dialog returns a clean NO_MATCH instead of the raw CDP error", async () => {
@@ -127,7 +127,8 @@ describe("dialog", () => {
     expect(res.ok).toBe(false);
     const message = res.ok ? "" : res.error.message;
     expect(message.startsWith("NO_MATCH: no JavaScript dialog is open")).toBe(true);
-    expect(message.startsWith("CDP")).toBe(false);
+    expect(message).not.toContain("CDP");
+    expect(message).not.toContain("run: snap");
   });
 
   test("dialog rejects an unknown subcommand", async () => {
@@ -241,6 +242,32 @@ describe("emulate", () => {
       { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 },
       { userAgent: "" },
     ]);
+  });
+
+  test("setting one media feature keeps the other", async () => {
+    const { invoke, cdpCalls } = makeFakeInvoker();
+    const handle = createPageHelperHandler(invoke);
+
+    await handle("emulate", { colorScheme: "dark" });
+    await handle("emulate", { reducedMotion: true });
+    expect(cdpCalls().at(-1)?.params).toEqual({
+      features: [
+        { name: "prefers-color-scheme", value: "dark" },
+        { name: "prefers-reduced-motion", value: "reduce" },
+      ],
+    });
+    await handle("emulate", { reset: true });
+    await handle("emulate", { reducedMotion: false });
+    expect(cdpCalls().at(-1)?.params).toEqual({ features: [{ name: "prefers-reduced-motion", value: "no-preference" }] });
+  });
+
+  test("viewport over Chrome's limit is rejected before reset runs", async () => {
+    const { invoke, cdpCalls } = makeFakeInvoker();
+    const handle = createPageHelperHandler(invoke);
+
+    const res = await handle("emulate", { reset: true, viewport: "10000001x800" });
+    expect(res.ok ? "" : res.error.code).toBe("INPUT_VALIDATION_FAILED");
+    expect(cdpCalls()).toHaveLength(0);
   });
 
   test("bad viewport is rejected before any CDP call", async () => {
