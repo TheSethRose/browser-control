@@ -18,6 +18,28 @@ const agentTabs = new Set();
 const attachedTabs = new Map(); // tabId -> { timer, isolatedContextId? }
 let keepaliveTimer = null;
 let reconnectTimer = null;
+let connecting = false;
+const BACKOFF_MIN_MS = 3_000;
+const BACKOFF_MAX_MS = 60_000;
+let backoffMs = BACKOFF_MIN_MS;
+const WAITING = "Waiting for relay";
+
+function nextBackoff() {
+  const ms = backoffMs;
+  backoffMs = Math.min(backoffMs * 2, BACKOFF_MAX_MS);
+  return ms;
+}
+
+// A missing relay is normal. Chrome lists every refused WebSocket on chrome://extensions,
+// so probe with a caught fetch first; any HTTP answer (even 404) means something is listening.
+async function relayUp(port) {
+  try {
+    await fetch(`http://127.0.0.1:${port}/version`, { cache: "no-store", signal: AbortSignal.timeout(800) });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 function isBlockedCdp(method) {
   return method === "Browser.close" || /^[A-Za-z0-9_]+\.crash/i.test(String(method || ""));
@@ -480,6 +502,16 @@ function scheduleReconnect(delayMs = 3000) {
 }
 
 async function connect() {
+  if (connecting) return;
+  connecting = true;
+  try {
+    await connectOnce();
+  } finally {
+    connecting = false;
+  }
+}
+
+async function connectOnce() {
   await loadConfig();
   if (!config.token) {
     connected = false;
@@ -489,12 +521,20 @@ async function connect() {
   }
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
 
+  if (!(await relayUp(config.port))) {
+    connected = false;
+    lastError = WAITING;
+    updateBadge();
+    scheduleReconnect(nextBackoff());
+    return;
+  }
+
   const url = `ws://127.0.0.1:${config.port}/extension`;
   try {
     ws = new WebSocket(url);
   } catch (err) {
     lastError = String(err?.message || err);
-    scheduleReconnect(5000);
+    scheduleReconnect(nextBackoff());
     return;
   }
 
@@ -512,6 +552,7 @@ async function connect() {
     if (msg.type === "welcome") {
       connected = true;
       lastError = "";
+      backoffMs = BACKOFF_MIN_MS;
       updateBadge();
       if (keepaliveTimer) clearInterval(keepaliveTimer);
       keepaliveTimer = setInterval(() => sendJson({ type: "ping" }), KEEPALIVE_MS);
@@ -533,13 +574,13 @@ async function connect() {
     connected = false;
     ws = null;
     if (keepaliveTimer) { clearInterval(keepaliveTimer); keepaliveTimer = null; }
-    lastError = ev.reason || "Daemon not running";
+    lastError = ev.reason || WAITING;
     updateBadge();
-    scheduleReconnect(3000);
+    scheduleReconnect(nextBackoff());
   });
 
   ws.addEventListener("error", () => {
-    lastError = `Cannot reach 127.0.0.1:${config.port}`;
+    lastError = WAITING;
   });
 }
 

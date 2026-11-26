@@ -14,11 +14,11 @@ let currentTabId = null;
 async function refresh() {
   const s = await chrome.runtime.sendMessage({ type: "status" });
   currentTabId = s.activeTabId;
-  statusEl.textContent = s.connected ? "Connected" : "Offline";
+  statusEl.textContent = s.connected ? "Connected" : s.hasToken ? "Waiting for relay" : "Not paired";
   statusEl.className = `pill ${s.connected ? "on" : "off"}`;
   infoEl.textContent = s.connected
     ? `Paired on 127.0.0.1:${s.port}. ${s.attachedCount} tab(s) with debugger attached.`
-    : (s.lastError || `Waiting for daemon on 127.0.0.1:${s.port}`);
+    : (s.lastError && s.lastError !== "Waiting for relay" ? s.lastError : `Waiting for relay on 127.0.0.1:${s.port}`);
   modeAll.className = s.mode === "all" ? "primary" : "";
   modeLent.className = s.mode === "lent" ? "primary" : "";
   lendBtn.style.display = s.mode === "lent" ? "block" : "none";
