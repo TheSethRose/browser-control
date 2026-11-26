@@ -7,10 +7,11 @@ import { unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { recognizeText, type Recognizer } from "./ocr";
+import type { HelperCall } from "./page-helpers";
 
 type Json = Record<string, unknown>;
 type Invoker = (operation: string, input?: Json) => Promise<InvokeResult>;
-type EvalHelper = (callExpr: string, targetId?: string, timeoutMs?: number) => Promise<InvokeResult>;
+type EvalHelper = (call: HelperCall, targetId?: string, timeoutMs?: number) => Promise<InvokeResult>;
 
 const failure = (code: string, message: string): InvokeResult =>
   ({ ok: false, error: { code, message } }) as InvokeResult;
@@ -59,10 +60,11 @@ export function createPictureTracker(
   /** Text last recognized on each picture page, to report what an action changed. */
   const seenText = new Map<string, Map<string, string>>();
 
-  const isPicture = async (targetId?: string) => valueOf(await evalHelper("__bc.surface()", targetId)) === "picture";
+  const isPicture = async (targetId?: string) =>
+    valueOf(await evalHelper({ kind: "bc", method: "surface" }, targetId)) === "picture";
 
   async function canvasHash(targetId?: string): Promise<string> {
-    const res = await evalHelper("__bc.canvasHash()", targetId, 2_000);
+    const res = await evalHelper({ kind: "bc", method: "canvasHash" }, targetId, 2_000);
     return res.ok ? valueOf(res) : "";
   }
 
@@ -87,7 +89,7 @@ export function createPictureTracker(
   async function readPicture(
     targetId?: string,
   ): Promise<{ ok: true; lines: Map<string, string> } | { ok: false; res: InvokeResult }> {
-    const box = await evalHelper("__bc.viewport()", targetId);
+    const box = await evalHelper({ kind: "bc", method: "viewport" }, targetId);
     if (!box.ok) return { ok: false, res: box };
     const v = JSON.parse(valueOf(box)) as { width: number; height: number };
     const path = join(tmpdir(), `bc-ocr-${randomUUID()}.png`);

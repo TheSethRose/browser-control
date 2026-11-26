@@ -595,6 +595,9 @@ export class CdpConnection {
       sessionId: string;
     };
     this.sessionByTarget.set(targetId, result.sessionId);
+    // Chrome only reports dialogs to sessions that enabled Page before the dialog opened.
+    // Not awaited: Page.enable waits behind a dialog that is already open.
+    this.send("Page.enable", {}, result.sessionId, this.callTimeoutMs).catch(() => undefined);
     return result.sessionId;
   }
 
