@@ -38,6 +38,14 @@ typecheck, and tests on every PR into `v2` and `main`.
   worktree: `ln -s ~/Developer/tools/agent-software ../agent-software`.
 - Check `bun install` succeeds in a new worktree before writing code.
 
+### Launching browsers (tests, E2E, probes)
+
+- Every Chrome / Chrome for Testing / Chromium launch passes `--use-mock-keychain` and
+  `--password-store=basic`, plus a throwaway `--user-data-dir`. Without them macOS shows
+  Keychain password prompts to the user. This applies to `tests/e2e/`, every launcher helper,
+  and one-off probes. Never launch a browser without both flags.
+- Never launch or drive the user's own Chrome profile from tests.
+
 ### File ownership for parallel slices
 
 - Each slice owns an explicit list of files, named in its brief and its PR description.

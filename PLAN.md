@@ -2,7 +2,7 @@
 
 > **Where v2 lives:** the `v2` branch of `github.com/TheSethRose/browser-control` (branched from `main` at `7ee11c9`). Work happens in git worktrees; the v1 `main` checkout at `/Users/sethrose/Developer/tools/browser-control` is never edited.
 > v1 (`main`) stays untouched until Seth approves the cutover. Agents are using it.
-> **Status:** plan final, updated 2026-11-26 after auditing **both** Ardia (`ardia-browser/ardia`) and OpenCode Browse (`anomalyco/browse`, MIT) against v1 `HEAD` `7ee11c9`. The extension is scaffolded and syntax-checked, not yet run in a browser. Next step is Phase 0.
+> **Status:** plan final, updated 2026-11-26 after auditing **both** Ardia (`ardia-browser/ardia`) and OpenCode Browse (`anomalyco/browse`, MIT) against v1 `HEAD` `7ee11c9`. The extension is scaffolded and syntax-checked, not yet run in a browser. Phase 0 done 2026-11-26 (results in section 9). Next step is Phase 1.
 
 ---
 
@@ -165,6 +165,29 @@ browser-control/   (v2 branch)
 - The extension probes candidate ports via `/version` (rate-limited, 800 ms timeout) before opening a WebSocket, so it **never** sends a handshake or token to an unrelated local server. It keeps one authenticated socket per live `browser-control` daemon in `49222–49229`. A ninth daemon gets `BACKEND_UNAVAILABLE: no free relay port` and falls back to `cdp`.
 - Each daemon keeps its own selected tab, as today. Agents do not share tab state.
 
+### Sandbox evidence (Phase 0 check 1, 2026-11-26) and hub decision
+
+Tested on macOS with Bun 1.4.4, a listener on `127.0.0.1:49222–49225` and a `0600` file in `~/.config/browser-control/`:
+
+| Sandbox | Bind in range | Outside client → sandboxed listener | Sandbox → outside loopback TCP / Unix socket | Read `~/.config/browser-control/*.json` |
+|---|---|---|---|---|
+| None (plain shell) | yes | yes | yes / yes | yes |
+| Codex seatbelt, `workspace-write` (network off) | yes | yes | yes / yes | yes |
+| Codex seatbelt, `workspace-write` + `network_access=true` (Seth's config) | yes | yes | yes / yes | yes |
+| Claude Code `srt`, defaults | **no** (bind fails) | n/a | **no** / **no** | yes |
+| Claude Code `srt`, `allowLocalBinding: true` + `allowUnixSockets` | yes | yes | yes / yes | yes |
+| OpenCode 2.4.2 | no bash sandbox found (no flag or config) | | | |
+
+- A first run reported Codex blocking inbound connections. That was a test bug: `codex sandbox` strips environment variables, so the probe's hold time was unset and it exited before the client connected. Re-run with arguments instead of env: inbound works.
+- Claude Code's sandbox with default settings already blocks v1 (its Unix-socket daemon). The same two settings (`allowLocalBinding`, `allowUnixSockets` for the daemon socket dir) make v2 work. Seth's Claude Code does not enable the sandbox today. `SKILL.md` must document both settings.
+
+**Decision: keep the port range `49222–49229` (no hub).** Every sandbox that can run v1 can also bind and accept on the relay port. Hub options evaluated:
+
+- **(a) Native Messaging host** (Chrome launches it outside any agent sandbox; daemons connect out to it). Tested in Chrome for Testing 158: Chrome started the host, Codex-sandboxed clients reached it over a Unix socket and loopback TCP, and an open `connectNative` port kept the service worker alive 49 s with no idle restart. Works, but adds a native-host manifest install per browser (a different path per Chromium brand) and a second process. **Kept as the fallback** if a future sandbox blocks inbound loopback, and as a possible keepalive improvement later.
+- **(b) launchd LaunchAgent hub:** always-on and macOS-only; conflicts with "no always-on relay process". Rejected.
+- **(c) First unsandboxed daemon becomes hub:** needs leader election and handoff when it exits. Least preferred. Rejected.
+- A hub spawned from inside a sandbox inherits that sandbox, so it gains nothing over the daemon listening directly.
+
 ### Multi-browser & multi-profile identity (`BrowserLinks`)
 
 - Each extension instance generates and persists a random `profileId` in `chrome.storage.local`, detects its browser brand (`Chrome`, `Brave`, `Edge`, `Opera`, `Chromium` via `navigator.userAgentData`), and supports an optional user-chosen name in the popup.
@@ -231,6 +254,7 @@ These real-world Chromium edge cases must be built into the extension from day o
 9. **Optional collapsed Agent Tab Group (`chrome.tabGroups`):** Put agent-opened tabs in a shared `"Agents · N"` group placed right after pinned tabs, auto-collapsed whenever the user switches to another tab, and auto-expanded during `handoff`. User dragging a tab out of the group or pinning it claims it as theirs (stops idle cleanup and unmutes it). Configurable in the popup (`Shared group` / `None`, `Auto-collapse` on/off, `Idle cleanup` minutes or `Never`).
 10. **Human handoff overlay (`content-overlay.js`):** Injected *only* on tabs agents touch (never on user browsing). Adds **zero DOM** until `handoff` is active. When waiting for the user, renders a subtle blue edge + closed-shadow-root top-layer popover ("Your turn" + page origin + message + `event.isTrusted`-gated "Continue" button) with a MutationObserver/top-layer guard so page modals can't hide it, while leaving password-manager popovers unobstructed. Also supports completing the handoff via the toolbar button or Chrome notification.
 11. **Device metrics clear race:** `emulate --reset` sends `Emulation.clearDeviceMetricsOverride` twice, 100 ms apart (Chrome silently drops ~25% of single clears while layout settles).
+12. **Quiet reconnect, never an error (Phase 0 finding):** Chrome adds every failed `new WebSocket()` (`ERR_CONNECTION_REFUSED`) to the extension's Errors page in `chrome://extensions`, and the scaffold retried every 3 s, so a stopped daemon filled the page with red errors. A missing relay is a normal state, not an error: probe `/version` with a caught `fetch` and open the WebSocket only after it answers, back off quietly, and show "Waiting for relay" in the popup. Phase 2 must confirm a missing daemon leaves the Errors page empty; if a refused `fetch` still logs there, slow the idle probe rate further.
 
 ---
 
@@ -257,16 +281,15 @@ Refs (`e12`) live inside whichever JS world loaded `__bc`. Two worlds would desy
 
 The debugger needs a CDP `nodeId` / `objectId` for a ref minted in the extension's silent world:
 
-- **Primary:** After attach, enable `Runtime`, locate the extension's content-script execution context from `Runtime.executionContextCreated` (matching our extension's `origin`), and run `Runtime.evaluate` with `returnByValue: false` (`__bc.el(ref)`). Works inside shadow roots without touching the DOM.
-- **Fallback:** One-shot `data-bc-resolve` attribute stamp + `DOM.querySelector` (already implemented in `extension/background.js`). Does not pierce closed/open shadow roots.
-- Phase 0 test #2 verifies the primary path.
+- **Primary (verified in Phase 0):** After attach, enable `Runtime`, locate the extension's content-script execution context from `Runtime.executionContextCreated` and run `Runtime.evaluate` with `returnByValue: false` (`__bc.el(ref)`). Works inside shadow roots without touching the DOM. Match the context by **exact** `origin === "chrome-extension://" + chrome.runtime.id` (and `auxData.frameId` for child frames), never by `auxData.type === "isolated"` alone: real profiles carry many other extensions' isolated worlds (Phase 0 saw 8). Re-resolve after `Page.frameNavigated` and on `Runtime.executionContextDestroyed`.
+- **Fallback:** One-shot `data-bc-resolve` attribute stamp + `DOM.querySelector` (already implemented in `extension/background.js`). Does not pierce open or closed shadow roots (confirmed in Phase 0), so it is used only when the primary context lookup fails.
 
 ### Frames, dialogs, navigation, screenshots, and CDP fallback
 
 - **Frames:** `list_frames` returns Chrome's `webNavigation.getAllFrames` list; `bc_call` accepts `frameId`. Map frame index (`f1:e3`) by URL + order (tested with duplicate-URL iframes). Top-level trusted clicks reach child frames by coordinate; cross-origin `upload` uses child debugger `sessionId` (`Target.setAutoAttach({ autoAttach: true, waitForDebuggerOnStart: false, flatten: true })`).
 - **Dialogs:** Open `alert`/`confirm`/`beforeunload` freezes `chrome.scripting`. On `bc_call` timeout (30 s), attach the debugger, check for an open dialog, and report it with a `remedy: run dialog accept|dismiss` hint. First-class `dialog` command calls `Page.handleJavaScriptDialog`.
 - **Navigation:** Compare URLs ignoring `#hash` so hash-only navigations return immediately instead of waiting for a `complete` status that never fires. Strip `#hash` on `about:blank#...`. After navigation settles, run the lightweight `src/challenges.ts` probe on short/suspicious pages to auto-wait brief non-interactive interstitials or report `CHALLENGE:` / `BLOCKED:`.
-- **Screenshots:** `captureVisibleTab` returns device pixels (~2 calls/s Chrome quota). Phase 0 measures Retina pixel scale vs `Page.captureScreenshot`; if scales differ, return `dpr` with the image or route `--marks`/`--xy`/`ocr` to `Page.captureScreenshot`. Full-page capture computes explicit `Page.getLayoutMetrics` clip as v1 does.
+- **Screenshots:** `captureVisibleTab` returns device pixels (~2 calls/s Chrome quota). Phase 0 confirmed it matches `Page.captureScreenshot` scale on Retina (both device px at `dpr` 2), so both paths are interchangeable; return `dpr` with every image. Full-page capture computes explicit `Page.getLayoutMetrics` clip as v1 does.
 - **Fallback to direct CDP:** `RESTRICTED_PAGE` from the extension maps to `BackendUnavailable`, letting the router fall back to `cdp`. Raw `call` with an unsupported CDP domain (e.g. `Browser.*`) routes to `cdp` if connected, else fails with a clear reason.
 
 ---
@@ -313,6 +336,15 @@ Small throwaway checks. Seth loads the extension once for items 2–5 (reload fr
 
 Done when: all 6 results are recorded and sections 5–7 are adjusted for any surprise.
 
+**Phase 0 results:**
+
+1. **Sandbox — PASS (port range kept).** See "Sandbox evidence" in section 5.
+2. **Element handle — PASS (primary path).** In Seth's Chrome, after `Runtime.enable` the tab reported 9 execution contexts: the page plus 8 extension `isolated` worlds (ours, Bitwarden, AdGuard, Tampermonkey, and others). Ours matched by exact `origin === chrome-extension://<our id>`. `Runtime.evaluate("__bc.el('e2')", { contextId, returnByValue: false })` returned an `objectId` for the button inside an open shadow root (`BUTTON#shadowbtn inShadow=true`); `DOM.describeNode` gave its `backendNodeId`. The `data-bc-resolve` fallback failed on the same ref (`NO_MATCH`), as predicted.
+3. **Cold start & keepalive — PASS.** Keepalive: connected 2 min 6 s with a 20 s WebSocket `ping` and no drop (6 pings, no close) before the relay was stopped on purpose. Cold start: with the relay down 90 s and 150 s, the extension reconnected 6.6 s and 6.3 s after the relay restarted, far under the 35 s budget. Caveat: the scaffold retries every 3 s, which may keep the worker from ever sleeping, so the true asleep-worker worst case is still bounded by the 30 s alarm, not measured. Phase 2 keeps the 35 s first-call wait.
+4. **Screenshot scale — PASS, no difference.** Retina, `devicePixelRatio` 2, viewport 1600×726 CSS px: `captureVisibleTab` and `Page.captureScreenshot` both returned 3200×1452 device px. No routing change; screenshots still return `dpr` so `--xy`/`--marks`/`ocr` can convert.
+5. **Background tab timing — PASS, silent tier is enough.** Background tab, local page with 6,000 rows (18,000 controls): silent `snapshot` 67 ms cold, then 10–11 ms; `text` 50 ms. With the debugger attached and `Emulation.setFocusEmulationEnabled`: 34 ms, then 7 ms. Reads stay far under 2 s without focus emulation; focus emulation stays a debugger-tier attach step only.
+6. **Automated browser — PASS.** Chrome for Testing 158.0.8127.88 (`@puppeteer/browsers install chrome@stable`) loads the unpacked `extension/` with `--load-extension` + `--disable-extensions-except` in `--headless=new`. Its service worker ("Browser Control Companion" 2.0.0) runs and has `chrome.debugger` and `chrome.scripting`. Every launch must pass `--use-mock-keychain --password-store=basic` and a throwaway `--user-data-dir` (without them macOS shows Keychain prompts).
+
 ### Phase 1 — Scaffold, structured helper calls, and challenge detector (CDP only)
 
 - The `v2` branch already holds v1 `HEAD` (configs, `capability.json`, `cli.ts`, `mcp.ts`, `daemon.ts`, `src/`, `tests/`, `.agents/skills/browser-control/`); no copy step.
@@ -344,6 +376,11 @@ Done when: every command in section 3 runs cleanly on an extension tab against t
 - Add `extension setup|pair|status|browsers|revoke|diagnostics|enable|disable`, `handoff`, `dialog`, `hover`, `emulate`, and `--browser` to `scripts/browser-control-daemon`.
 - Update `SKILL.md`, the reference guides, `README.md`, `AGENTS.md`, and `LICENSE` (including MIT attribution notice for `anomalyco/browse`).
 - Add `tests/e2e/`: Chrome for Testing run against a local fixture page with shadow DOM, two duplicate-URL cross-origin iframes, a file input, a `target="_blank"` popup, an `alert`/`confirm`, a hash link, a simulated Cloudflare/Turnstile challenge page, and a `handoff` flow.
+- **UI pass (its own slice and PR; starts only after the Phase 3 gate passes; needs a delegate that can load skills, not pi-inkling):**
+  - Redesign `popup.html`/`popup.js`, `onboarding.html`, and the `handoff` card with the `studio` skill (ui-ux job), then run `ui-ux-audit` on the result and fix its findings.
+  - Inline SVG icons only: no emoji, no text badges like "B ON". Replace the toolbar text badge with icon states.
+  - One color theme as CSS tokens with light and dark modes; status colors pass WCAG AA.
+  - Extension icon PNGs (16/32/48/128, transparent background) generated with the `codex-imagegen` skill from an SVG-style brief.
 - Live verification with Seth in his real browser:
   1. 3-click unpacked install pairs automatically with zero typing.
   2. `snap`, `text`, `form`, `query`, `read-urls` show **zero** yellow banner.
