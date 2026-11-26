@@ -30,7 +30,12 @@ import {
   PAGE_HELPERS_SOURCE,
   PAGE_HELPERS_VERSION,
   PAYMENT_FIELD,
+  normalizeHelperCall,
   parseLocator,
+  renderElementStep,
+  renderSteps,
+  type ElementStep,
+  type HelperCall,
   type Locator,
 } from "./page-helpers";
 import { createPictureTracker, imageWidth, resizeImage } from "./picture";
@@ -203,8 +208,18 @@ export function createPageHelperHandler(
   /** Non-secret typed values remembered per tab for `flow save` parameterization. */
   const recentTyped = new Map<string, Record<string, string>>();
 
-  async function evalHelper(callExpr: string, targetId?: string, timeoutMs?: number): Promise<InvokeResult> {
+  async function evalHelper(call: HelperCall, targetId?: string, timeoutMs?: number): Promise<InvokeResult> {
+    const normalized = normalizeHelperCall(call);
+    const callExpr = renderSteps(normalized);
     const extra = { isolated: true, ...(targetId ? { targetId } : {}), ...(timeoutMs ? { timeoutMs } : {}) };
+    if (!normalized.steps.some((s) => s.kind === "bc")) {
+      const res = await invoke("evaluate", { expression: callExpr, ...extra });
+      if (res.ok) {
+        const ctx = (res.data as Json)["contextId"];
+        if (typeof ctx === "number") contextIds.set(targetId ?? "", ctx);
+      }
+      return helperError(res);
+    }
     const probe = `globalThis.__bc && globalThis.__bc.v === ${PAGE_HELPERS_VERSION} ? (${callExpr}) : "${NEED_INSTALL}"`;
     const first = await invoke("evaluate", { expression: probe, ...extra });
     if (!first.ok) return helperError(first);
@@ -311,11 +326,12 @@ export function createPageHelperHandler(
     });
   }
 
-  /** Resolve a JS expression into a CDP RemoteObjectId in the same world where `__bc` lives. */
+  /** Resolve a structured element target into a CDP RemoteObjectId in the same world where `__bc` lives. */
   async function resolveObject(
-    expr: string,
+    target: ElementStep,
     targetId?: string,
   ): Promise<{ ok: true; objectId: string } | { ok: false; res: InvokeResult }> {
+    const expr = renderElementStep(target);
     const ctxId = contextIds.get(targetId ?? "");
     const evalObj = await cdp(
       "Runtime.evaluate",
@@ -369,10 +385,10 @@ export function createPageHelperHandler(
     }
     if (loc.kind !== "label") {
       if (loc.kind === "dom") {
-        const ver = await evalHelper(`__bc.verifyRef(${js(loc.ref)})`, targetId);
+        const ver = await evalHelper({ kind: "bc", method: "verifyRef", args: [loc.ref] }, targetId);
         if (!ver.ok) {
           if (healInBatch && messageOf(ver).startsWith("STALE_REF")) {
-            const healed = await evalHelper(`__bc.healRef(${js(loc.ref)})`, targetId);
+            const healed = await evalHelper({ kind: "bc", method: "healRef", args: [loc.ref] }, targetId);
             if (healed.ok && /^e\d+$/.test(valueOf(healed))) {
               return { ok: true, loc: { kind: "dom", ref: valueOf(healed) }, healedFrom: loc.ref };
             }
@@ -382,7 +398,7 @@ export function createPageHelperHandler(
       }
       return { ok: true, loc };
     }
-    const found = await evalHelper(`__bc.locate(${js(loc.label)}, ${js(kind)})`, targetId);
+    const found = await evalHelper({ kind: "bc", method: "locate", args: [loc.label, kind] }, targetId);
     if (!found.ok) return { ok: false, res: found };
     return { ok: true, loc: { kind: "dom", ref: valueOf(found) } };
   }
@@ -402,7 +418,7 @@ export function createPageHelperHandler(
   ): Promise<{ ok: true; pt: Point } | { ok: false; res: InvokeResult }> {
     const bad = (res: InvokeResult) => ({ ok: false as const, res });
     if (loc.kind === "ax") {
-      const before = baseline ? await evalHelper("__bc.baseline()", targetId) : undefined;
+      const before = baseline ? await evalHelper({ kind: "bc", method: "baseline" }, targetId) : undefined;
       await cdp("DOM.scrollIntoViewIfNeeded", { backendNodeId: loc.node }, targetId);
       const quads = await cdp("DOM.getContentQuads", { backendNodeId: loc.node }, targetId);
       if (!quads.ok) return bad(quads);
@@ -424,11 +440,11 @@ export function createPageHelperHandler(
     if (loc.kind === "frame" && !where) {
       return bad(failure("EXECUTION_FAILED", `STALE_REF: iframe f${loc.frame} is not known for this tab. Run snap again.`));
     }
-    const before = baseline && loc.kind === "frame" ? await evalHelper("__bc.baseline()", targetId) : undefined;
-    const expr = baseline && loc.kind === "dom"
-      ? `[__bc.baseline(), await __bc.point(${js(loc.ref)})].join(" ")`
-      : `await __bc.point(${js(loc.ref)})`;
-    const res = await evalHelper(expr, where);
+    const before = baseline && loc.kind === "frame" ? await evalHelper({ kind: "bc", method: "baseline" }, targetId) : undefined;
+    const call: HelperCall = baseline && loc.kind === "dom"
+      ? { steps: [{ kind: "bc", method: "baseline" }, { kind: "bc", method: "point", args: [loc.ref] }], join: " " }
+      : { kind: "bc", method: "point", args: [loc.ref] };
+    const res = await evalHelper(call, where);
     if (!res.ok) return bad(res);
     const parts = valueOf(res).split(" ");
     const href = baseline && loc.kind === "dom" ? parts.shift() : before?.ok ? valueOf(before) : undefined;
@@ -438,7 +454,7 @@ export function createPageHelperHandler(
       return bad(failure("EXECUTION_FAILED", `unexpected point output: ${valueOf(res)}`));
     }
     if (loc.kind === "frame") {
-      const off = await evalHelper(`__bc.frameOffset(${loc.frame})`, targetId);
+      const off = await evalHelper({ kind: "bc", method: "frameOffset", args: [loc.frame] }, targetId);
       if (!off.ok) return bad(off);
       const [ox, oy] = valueOf(off).split(" ").map(Number);
       x = Math.round(x + (ox ?? 0));
@@ -457,7 +473,7 @@ export function createPageHelperHandler(
 
   /** Arm isolated-world event probe and read back trusted event counts after input. */
   async function readProbe(targetId?: string): Promise<Record<string, number> | undefined> {
-    const res = await evalHelper("__bc.readInputProbe()", targetId, 2_000);
+    const res = await evalHelper({ kind: "bc", method: "readInputProbe" }, targetId, 2_000);
     if (!res.ok) return undefined;
     try {
       const parsed = JSON.parse(valueOf(res)) as Record<string, number>;
@@ -542,23 +558,21 @@ export function createPageHelperHandler(
 
   async function waitParsed(targetId?: string): Promise<void> {
     for (let i = 0; i < 40; i++) {
-      const ready = await invoke("evaluate", {
-        expression: "document.readyState",
-        ...(targetId ? { targetId } : {}),
-        timeoutMs: 2_000,
-      });
+      const ready = await evalHelper({ kind: "readyState" }, targetId, 2_000);
       if (ready.ok && valueOf(ready) !== "loading") return;
       await sleep(125);
     }
   }
 
   async function changes(before: string | undefined, targetId?: string): Promise<string> {
-    const expr = `(await __bc.settle(), __bc.diff(${js({ from: before ?? "" })}))`;
-    let res = await evalHelper(expr, targetId, 8_000);
+    const call: HelperCall = {
+      steps: [{ kind: "bc", method: "settle" }, { kind: "bc", method: "diff", args: [{ from: before ?? "" }] }],
+    };
+    let res = await evalHelper(call, targetId, 8_000);
     if (!res.ok && messageOf(res).startsWith("CDP_TIMEOUT")) return `# ${DIALOG_HINT}`;
     if (!res.ok) {
       await waitParsed(targetId);
-      res = await evalHelper(expr, targetId, 8_000);
+      res = await evalHelper(call, targetId, 8_000);
     }
     return res.ok ? valueOf(res) : `# could not read what changed: ${messageOf(res).slice(0, 160)}`;
   }
@@ -570,7 +584,7 @@ export function createPageHelperHandler(
     messageOf(res).startsWith("CDP_TIMEOUT") ? success(`${what}: delivered_unverified (${DIALOG_HINT})`) : res;
 
   async function snapFrames(opts: Json, targetId?: string): Promise<string[]> {
-    const listed = await evalHelper("__bc.frames()", targetId);
+    const listed = await evalHelper({ kind: "bc", method: "frames" }, targetId);
     if (!listed.ok) return [];
     let frames: Array<{ i: number; src: string; title: string }>;
     try {
@@ -611,7 +625,11 @@ export function createPageHelperHandler(
         continue;
       }
       ids[f.i - 1] = t.targetId;
-      const inner = await evalHelper(`__bc.snapshot(${js({ all: opts["all"] === true, find: opts["find"] })})`, t.targetId, 5_000);
+      const inner = await evalHelper(
+        { kind: "bc", method: "snapshot", args: [{ all: opts["all"] === true, find: opts["find"] }] },
+        t.targetId,
+        5_000,
+      );
       const lines = inner.ok ? valueOf(inner).split("\n").filter((l) => l.startsWith("- ")) : [];
       out.push(`# iframe ${label}: ${lines.length} control(s)`);
       out.push(...lines.map((l) => l.replace(/\[e(\d+)\]/, `[f${f.i}:e$1]`)));
@@ -692,7 +710,7 @@ export function createPageHelperHandler(
     const deadline = started + timeoutMs;
     let lastWall = "";
     for (;;) {
-      const check = await evalHelper(`__bc.checkWait(${js(opts)})`, targetId, 5_000);
+      const check = await evalHelper({ kind: "bc", method: "checkWait", args: [opts] }, targetId, 5_000);
       if (!check.ok) {
         if (messageOf(check).startsWith("INPUT_INVALID")) return check;
       } else {
@@ -742,9 +760,12 @@ export function createPageHelperHandler(
     if (fromLoc.loc.kind !== "dom" || toLoc.loc.kind !== "dom") {
       return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: drag requires DOM refs or labels on the main page");
     }
-    const before = quiet ? undefined : await evalHelper("__bc.baseline()", targetId);
+    const before = quiet ? undefined : await evalHelper({ kind: "bc", method: "baseline" }, targetId);
     const side = input["side"] === "before" || input["side"] === "after" ? input["side"] : "";
-    const infoRes = await evalHelper(`__bc.dragInfo(${js(fromLoc.loc.ref)}, ${js(toLoc.loc.ref)}, ${js(side)})`, targetId);
+    const infoRes = await evalHelper(
+      { kind: "bc", method: "dragInfo", args: [fromLoc.loc.ref, toLoc.loc.ref, side] },
+      targetId,
+    );
     if (!infoRes.ok) return infoRes;
     const info = JSON.parse(valueOf(infoRes)) as {
       sx: number; sy: number; dx: number; dy: number; draggable: boolean; listMeta: Json | null;
@@ -792,7 +813,9 @@ export function createPageHelperHandler(
       }
     }
 
-    const posRes = info.listMeta ? await evalHelper(`__bc.listPosition(${js(info.listMeta)})`, targetId) : undefined;
+    const posRes = info.listMeta
+      ? await evalHelper({ kind: "bc", method: "listPosition", args: [info.listMeta] }, targetId)
+      : undefined;
     const posNote = posRes?.ok && valueOf(posRes) ? ` (${valueOf(posRes)})` : "";
     const mode = info.draggable ? (html5Dropped ? "HTML5 drag and drop" : "mouse drag fallback") : "mouse drag";
     return withChanges(
@@ -819,7 +842,10 @@ export function createPageHelperHandler(
             return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: --xy takes x,y in CSS pixels");
           }
           if (browseTab !== undefined) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: --xy needs a DevTools tab");
-          const hit = await evalHelper(`[__bc.baseline(), __bc.hit(${x}, ${y})].join("\\n")`, targetId);
+          const hit = await evalHelper(
+            { steps: [{ kind: "bc", method: "baseline" }, { kind: "bc", method: "hit", args: [x!, y!] }], join: "\n" },
+            targetId,
+          );
           if (!hit.ok) return hit;
           const [before, what] = valueOf(hit).split("\n");
           const isCanvas = !quiet && /^hit: canvas/.test(what ?? "");
@@ -839,7 +865,7 @@ export function createPageHelperHandler(
         if (!found.ok) return found.res;
         const at = await pointOf(found.loc, targetId, !quiet);
         if (!at.ok) return at.res;
-        if (found.loc.kind === "dom") await evalHelper("__bc.armInputProbe()", targetId, 2_000).catch(() => {});
+        if (found.loc.kind === "dom") await evalHelper({ kind: "bc", method: "armInputProbe" }, targetId, 2_000).catch(() => {});
         const clicked = await clickAt(at.pt, targetId);
         if (!clicked.ok) return inputFailed(clicked, `click ${nameOf(found.loc)}`);
         const probe = found.loc.kind === "dom" ? await readProbe(targetId) : undefined;
@@ -869,11 +895,11 @@ export function createPageHelperHandler(
           return res.ok && !quiet ? browseDelta(res, browseTab) : res;
         }
         if (input["focused"] === true) {
-          const g = await evalHelper("__bc.guardFocused()", targetId);
+          const g = await evalHelper({ kind: "bc", method: "guardFocused" }, targetId);
           if (!g.ok) return g;
           const isPic = !quiet && (await picture.isPicture(targetId));
           const beforeHash = isPic ? await picture.canvasHash(targetId) : "";
-          const before = quiet || isPic ? undefined : await evalHelper("__bc.baseline()", targetId);
+          const before = quiet || isPic ? undefined : await evalHelper({ kind: "bc", method: "baseline" }, targetId);
           const sent = await dispatchText(text, mode, targetId, { focused: true });
           if (!sent.ok) return inputFailed(sent, "type --focused");
           const line = "type --focused: sent to whatever has focus (not read back)";
@@ -888,47 +914,47 @@ export function createPageHelperHandler(
         const fieldTarget = loc.kind === "frame" ? frameTarget(loc.frame, targetId) : targetId;
 
         if (loc.kind !== "ax") {
-          const g = await evalHelper(`__bc.guard(${js(loc.ref)})`, fieldTarget);
+          const g = await evalHelper({ kind: "bc", method: "guard", args: [loc.ref] }, fieldTarget);
           if (!g.ok) return g;
 
           // Native date/time/month/week/color/range inputs set .value cleanly without segmented key quirks.
-          const typedCheck = await evalHelper(`__bc.setTypedValue(${js(loc.ref)}, ${js(text)})`, fieldTarget);
+          const typedCheck = await evalHelper({ kind: "bc", method: "setTypedValue", args: [loc.ref, text] }, fieldTarget);
           if (!typedCheck.ok) return typedCheck;
           if (valueOf(typedCheck).startsWith('{"typed":true')) {
             const parsed = JSON.parse(valueOf(typedCheck)) as { type: string; value: string; matched: boolean };
-            const before = quiet ? undefined : await evalHelper("__bc.baseline()", targetId);
+            const before = quiet ? undefined : await evalHelper({ kind: "bc", method: "baseline" }, targetId);
             const note = parsed.matched ? "read back matches" : `normalized to "${parsed.value}"`;
             return withChanges(`${healPrefix}type ${name} (${parsed.type}): delivered (${note})`, before?.ok ? valueOf(before) : undefined, quiet, targetId);
           }
 
           // Spreadsheet / ARIA grid cell editing: double-click or Enter, fill editor, Enter to commit.
-          const cellCheck = await evalHelper(`__bc.cellInfo(${js(loc.ref)})`, fieldTarget);
+          const cellCheck = await evalHelper({ kind: "bc", method: "cellInfo", args: [loc.ref] }, fieldTarget);
           if (cellCheck.ok && valueOf(cellCheck).startsWith('{"cell":true')) {
             const cInfo = JSON.parse(valueOf(cellCheck)) as { before: string; editorRef: string | null };
-            const before = quiet ? undefined : await evalHelper("__bc.baseline()", targetId);
+            const before = quiet ? undefined : await evalHelper({ kind: "bc", method: "baseline" }, targetId);
             let editorRef = cInfo.editorRef;
             if (!editorRef) {
               const pt = await pointOf(loc, targetId, false);
               if (!pt.ok) return pt.res;
               await clickAt(pt.pt, targetId, 2);
               await sleep(150);
-              const ed = await evalHelper("__bc.cellEditor()", fieldTarget);
+              const ed = await evalHelper({ kind: "bc", method: "cellEditor" }, fieldTarget);
               editorRef = ed.ok && /^e\d+$/.test(valueOf(ed)) ? valueOf(ed) : null;
               if (!editorRef) {
                 await pressKey("Enter", targetId);
                 await sleep(150);
-                const ed2 = await evalHelper("__bc.cellEditor()", fieldTarget);
+                const ed2 = await evalHelper({ kind: "bc", method: "cellEditor" }, fieldTarget);
                 editorRef = ed2.ok && /^e\d+$/.test(valueOf(ed2)) ? valueOf(ed2) : null;
               }
             }
             if (editorRef) {
-              await evalHelper(`__bc.focusForType(${js(editorRef)})`, fieldTarget);
+              await evalHelper({ kind: "bc", method: "focusForType", args: [editorRef] }, fieldTarget);
             }
             const sent = await dispatchText(text, mode, targetId);
             if (!sent.ok) return inputFailed(sent, `type ${name}`);
             await pressKey("Enter", targetId);
             await sleep(150);
-            const afterRes = await evalHelper(`__bc.cellRead(${js(loc.ref)}, ${js(cInfo.before)})`, fieldTarget);
+            const afterRes = await evalHelper({ kind: "bc", method: "cellRead", args: [loc.ref, cInfo.before] }, fieldTarget);
             if (afterRes.ok) {
               const after = JSON.parse(valueOf(afterRes)) as { after: string; before: string; error: string };
               if (after.error) {
@@ -952,7 +978,7 @@ export function createPageHelperHandler(
         let activeRef = loc.kind === "ax" ? "" : loc.ref;
         let retargetNote = "";
         if (loc.kind !== "ax") {
-          const st = await evalHelper(`__bc.focusForType(${js(loc.ref)})`, fieldTarget);
+          const st = await evalHelper({ kind: "bc", method: "focusForType", args: [loc.ref] }, fieldTarget);
           if (!st.ok) return st;
           const stVal = valueOf(st);
           if (stVal.startsWith("retargeted:")) {
@@ -968,7 +994,7 @@ export function createPageHelperHandler(
         if (loc.kind === "ax") {
           return withChanges(`${healPrefix}type ${name}: delivered_unverified (accessibility ref, not read back)`, at.pt.before, quiet, targetId);
         }
-        const readback = await evalHelper(`__bc.value(${js(activeRef)})`, fieldTarget);
+        const readback = await evalHelper({ kind: "bc", method: "value", args: [activeRef] }, fieldTarget);
         const got = readback.ok ? valueOf(readback) : "__unknown__";
         if (got !== "__secure__" && typeof input["ref"] === "string" && text.length >= 2) {
           const key = input["ref"].replace(/^@/, "").replace(/[^a-zA-Z0-9_]/g, "_").toLowerCase().slice(0, 20) || "q";
@@ -1002,8 +1028,8 @@ export function createPageHelperHandler(
         if (loc.kind === "frame" && !fieldTarget) {
           return failure("EXECUTION_FAILED", `STALE_REF: iframe f${loc.frame} is not known for this tab. Run snap again.`);
         }
-        const before = quiet ? undefined : await evalHelper("__bc.baseline()", targetId);
-        const native = await evalHelper(`__bc.select(${js(loc.ref)}, ${js(option)})`, fieldTarget);
+        const before = quiet ? undefined : await evalHelper({ kind: "bc", method: "baseline" }, targetId);
+        const native = await evalHelper({ kind: "bc", method: "select", args: [loc.ref, option] }, fieldTarget);
         if (!native.ok) return native;
         if (valueOf(native) !== "__not_native__") {
           return withChanges(
@@ -1017,8 +1043,8 @@ export function createPageHelperHandler(
         if (!at.ok) return at.res;
         const opened = await clickAt(at.pt, targetId);
         if (!opened.ok) return inputFailed(opened, `select ${nameOf(loc)}`);
-        await evalHelper("await __bc.settle(300, 80)", fieldTarget, 4_000);
-        const optRef = await evalHelper(`__bc.locateOption(${js(option)})`, fieldTarget);
+        await evalHelper({ kind: "bc", method: "settle", args: [300, 80] }, fieldTarget, 4_000);
+        const optRef = await evalHelper({ kind: "bc", method: "locateOption", args: [option] }, fieldTarget);
         if (!optRef.ok) return optRef;
         const optLoc: Exclude<Locator, { kind: "label" }> =
           loc.kind === "frame"
@@ -1056,11 +1082,14 @@ export function createPageHelperHandler(
         if (frame && !fieldTarget) {
           return failure("EXECUTION_FAILED", `STALE_REF: iframe f${frame[1]} is not known for this tab. Run snap again.`);
         }
-        const before = quiet ? undefined : await evalHelper("__bc.baseline()", targetId);
-        const located = await evalHelper(`__bc.locateFile(${js(frame ? frame[2]! : refInput)})`, fieldTarget);
+        const before = quiet ? undefined : await evalHelper({ kind: "bc", method: "baseline" }, targetId);
+        const located = await evalHelper(
+          { kind: "bc", method: "locateFile", args: [frame ? frame[2]! : refInput] },
+          fieldTarget,
+        );
         if (!located.ok) return located;
         const fileRef = valueOf(located);
-        const objRes = await resolveObject(`__bc.el(${js(fileRef)})`, fieldTarget);
+        const objRes = await resolveObject({ kind: "bc", method: "el", args: [fileRef] }, fieldTarget);
         if (!objRes.ok) return objRes.res;
         try {
           const set = await cdp("DOM.setFileInputFiles", { objectId: objRes.objectId, files: [filePath] }, fieldTarget);
@@ -1091,7 +1120,7 @@ export function createPageHelperHandler(
         }
         const isPic = !quiet && (await picture.isPicture(targetId));
         const beforeHash = isPic ? await picture.canvasHash(targetId) : "";
-        const before = quiet || isPic ? undefined : await evalHelper("__bc.baseline()", targetId);
+        const before = quiet || isPic ? undefined : await evalHelper({ kind: "bc", method: "baseline" }, targetId);
         const res = await pressKey(keyName, targetId);
         if (!res.ok) return inputFailed(res, `key ${keyName}`);
         if (isPic) return success(`key ${keyName}: sent\n${await picture.pictureChanges(targetId, beforeHash)}`);
@@ -1105,7 +1134,7 @@ export function createPageHelperHandler(
 
   /** Capture recent first-party 2xx GET JSON responses from buffered CDP Network events. */
   async function captureRecordedGets(targetId?: string): Promise<RecordedGet[]> {
-    const hrefRes = await invoke("evaluate", { expression: "location.origin", isolated: true, ...(targetId ? { targetId } : {}) });
+    const hrefRes = await evalHelper({ kind: "origin" }, targetId);
     const pageOrigin = hrefRes.ok ? valueOf(hrefRes) : "";
     const evRes = await invoke("read_events", { method: "Network.responseReceived", limit: 200, clear: false, ...(targetId ? { targetId } : {}) });
     if (!evRes.ok) return [];
@@ -1139,7 +1168,7 @@ export function createPageHelperHandler(
     let site = typeof input["site"] === "string" && input["site"].trim() !== "" ? input["site"].trim() : "";
     if (sub === "list") return success(await listNotes(options.notesDir));
     if (!site) {
-      const urlRes = await invoke("evaluate", { expression: "location.host", isolated: true, ...(targetId ? { targetId } : {}) });
+      const urlRes = await evalHelper({ kind: "host" }, targetId);
       if (!urlRes.ok || !valueOf(urlRes)) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: pass a site host or select a tab");
       site = valueOf(urlRes);
     }
@@ -1266,7 +1295,7 @@ export function createPageHelperHandler(
           ...(find ? { find } : {}),
           ...(within ? { within } : {}),
         };
-        const res = await evalHelper(`__bc.snapshot(${js(opts)})`, targetId);
+        const res = await evalHelper({ kind: "bc", method: "snapshot", args: [opts] }, targetId);
         if (!res.ok) return res;
         let out = valueOf(res);
         // Attach per-site agent notes if present for the page's origin.
@@ -1289,7 +1318,7 @@ export function createPageHelperHandler(
       case "form": {
         if (browseTab !== undefined) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: form needs a DevTools tab");
         const opts: Json = typeof input["within"] === "string" && input["within"] !== "" ? { within: input["within"] } : {};
-        return maybeSaveOut(await evalHelper(`__bc.form(${js(opts)})`, targetId), input);
+        return maybeSaveOut(await evalHelper({ kind: "bc", method: "form", args: [opts] }, targetId), input);
       }
 
       case "query": {
@@ -1300,7 +1329,7 @@ export function createPageHelperHandler(
           ...(Number(input["limit"]) > 0 ? { limit: Number(input["limit"]) } : {}),
           ...(input["all"] === true ? { all: true } : {}),
         };
-        return maybeSaveOut(await evalHelper(`__bc.query(${js(opts)})`, targetId), input);
+        return maybeSaveOut(await evalHelper({ kind: "bc", method: "query", args: [opts] }, targetId), input);
       }
 
       case "read-urls": {
@@ -1311,7 +1340,7 @@ export function createPageHelperHandler(
           ...(Number(input["timeoutMs"]) > 0 ? { timeoutMs: Number(input["timeoutMs"]) } : {}),
           ...(Number(input["maxChars"]) > 0 ? { maxChars: Number(input["maxChars"]) } : {}),
         };
-        return maybeSaveOut(await evalHelper(`await __bc.readUrls(${js(opts)})`, targetId, 75_000), input);
+        return maybeSaveOut(await evalHelper({ kind: "bc", method: "readUrls", args: [opts] }, targetId, 75_000), input);
       }
 
       case "click":
@@ -1328,8 +1357,8 @@ export function createPageHelperHandler(
         if (typeof steps === "string") return failure("INPUT_VALIDATION_FAILED", `INPUT_INVALID: ${steps}`);
         if (steps.length === 0) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: no steps given");
         const start = browseTab === undefined
-          ? await evalHelper("__bc.baseline()", targetId)
-          : await invoke("evaluate", { expression: "location.href", ...(targetId ? { targetId } : {}) });
+          ? await evalHelper({ kind: "bc", method: "baseline" }, targetId)
+          : await evalHelper({ kind: "href" }, targetId);
         if (browseTab === undefined && start && !start.ok) return start;
         const startUrl = start?.ok ? valueOf(start) : "";
         const out: string[] = [];
@@ -1354,7 +1383,14 @@ export function createPageHelperHandler(
           }
           if (i === steps.length - 1) continue;
           const state = await evalHelper(
-            '(await __bc.settle(), [location.href, __bc.wall() || ""].join("\\n"))',
+            {
+              steps: [
+                { kind: "bc", method: "settle", discard: true },
+                { kind: "href" },
+                { kind: "bc", method: "wall", fallback: "" },
+              ],
+              join: "\n",
+            },
             targetId,
             8_000,
           );
@@ -1363,7 +1399,11 @@ export function createPageHelperHandler(
           if (state.ok) [url = "", wall = ""] = valueOf(state).split("\n");
           else {
             await waitParsed(targetId);
-            const again = await evalHelper('[location.href, __bc.wall() || ""].join("\\n")', targetId, 8_000);
+            const again = await evalHelper(
+              { steps: [{ kind: "href" }, { kind: "bc", method: "wall", fallback: "" }], join: "\n" },
+              targetId,
+              8_000,
+            );
             if (again.ok) [url = "", wall = ""] = valueOf(again).split("\n");
           }
           if (wall) stopped = `the page is a ${wall} wall after step ${i + 1}`;
@@ -1403,7 +1443,7 @@ export function createPageHelperHandler(
         if (found.loc.kind === "frame" && !where) {
           return failure("EXECUTION_FAILED", `STALE_REF: iframe f${found.loc.frame} is not known for this tab. Run snap again.`);
         }
-        return evalHelper(`__bc.value(${js(found.loc.ref)})`, where);
+        return evalHelper({ kind: "bc", method: "value", args: [found.loc.ref] }, where);
       }
 
       case "text": {
@@ -1415,13 +1455,13 @@ export function createPageHelperHandler(
             ...(Number(input["limit"]) > 0 ? { limit: Number(input["limit"]) } : {}),
             ...(Number(input["timeoutMs"]) > 0 ? { timeoutMs: Number(input["timeoutMs"]) } : {}),
           };
-          return maybeSaveOut(await evalHelper(`await __bc.scrollRead(${js(opts)})`, targetId, 65_000), input);
+          return maybeSaveOut(await evalHelper({ kind: "bc", method: "scrollRead", args: [opts] }, targetId, 65_000), input);
         }
         const opts: Json = {};
         if (typeof input["within"] === "string" && input["within"] !== "") opts["within"] = input["within"];
         if (input["all"] === true) opts["all"] = true;
         if (Number(input["max"]) > 0) opts["max"] = Number(input["max"]);
-        return maybeSaveOut(await evalHelper(`__bc.text(${js(opts)})`, targetId), input);
+        return maybeSaveOut(await evalHelper({ kind: "bc", method: "text", args: [opts] }, targetId), input);
       }
 
       case "ocr": {
@@ -1461,9 +1501,9 @@ export function createPageHelperHandler(
           const found = await locate(input["ref"], "read", targetId);
           if (!found.ok) return found.res;
           if (found.loc.kind !== "dom") return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: shot --ref needs a page ref like e12");
-          box = await evalHelper(`__bc.rect(${js(found.loc.ref)})`, targetId);
+          box = await evalHelper({ kind: "bc", method: "rect", args: [found.loc.ref] }, targetId);
         } else {
-          box = await evalHelper("__bc.viewport()", targetId);
+          box = await evalHelper({ kind: "bc", method: "viewport" }, targetId);
         }
         if (!box.ok) return box;
         const r = JSON.parse(valueOf(box)) as { x: number; y: number; width: number; height: number; dpr: number };
@@ -1471,7 +1511,7 @@ export function createPageHelperHandler(
         let nativeBoxes: { boxes: MarkBox[]; legend: string } | undefined;
         let domMarksLegend: string | undefined;
         if (wantMarks && !hasRef) {
-          const mb = await evalHelper("__bc.markBoxes()", targetId);
+          const mb = await evalHelper({ kind: "bc", method: "markBoxes" }, targetId);
           if (mb.ok) {
             try {
               const parsed = JSON.parse(valueOf(mb)) as { boxes: MarkBox[]; legend: string };
@@ -1481,7 +1521,7 @@ export function createPageHelperHandler(
         }
         let domMarksActive = false;
         if (wantMarks && !nativeBoxes) {
-          const dm = await evalHelper("__bc.marks(true)", targetId);
+          const dm = await evalHelper({ kind: "bc", method: "marks", args: [true] }, targetId);
           if (!dm.ok) return dm;
           domMarksLegend = valueOf(dm);
           domMarksActive = true;
@@ -1495,7 +1535,7 @@ export function createPageHelperHandler(
         const clearDomMarks = async () => {
           if (domMarksActive) {
             domMarksActive = false;
-            await evalHelper("__bc.marks(false)", targetId);
+            await evalHelper({ kind: "bc", method: "marks", args: [false] }, targetId);
           }
         };
         try {
@@ -1529,7 +1569,7 @@ export function createPageHelperHandler(
             marksLegend = nativeBoxes.legend;
           } else {
             // Non-macOS or swiftc absent: fall back to temporary DOM badges so --marks still works.
-            const dm = await evalHelper("__bc.marks(true)", targetId);
+            const dm = await evalHelper({ kind: "bc", method: "marks", args: [true] }, targetId);
             if (dm.ok) {
               try {
                 await invoke("capture_screenshot", { ...base, path: outPath });
@@ -1537,7 +1577,7 @@ export function createPageHelperHandler(
                 if (got !== undefined && got > width * 1.1) await resizeImage(outPath, width, height);
                 marksLegend = valueOf(dm);
               } finally {
-                await evalHelper("__bc.marks(false)", targetId).catch(() => {});
+                await evalHelper({ kind: "bc", method: "marks", args: [false] }, targetId).catch(() => {});
               }
             }
           }
@@ -1560,7 +1600,18 @@ export function createPageHelperHandler(
         const onBrowse = browseTabNumber(tab) !== undefined || (tab === undefined && browseTab !== undefined);
         const lines = [JSON.stringify(data)];
         if (!onBrowse) {
-          const state = await evalHelper('(await __bc.settle(), [location.href, __bc.wall() || ""].join("\\n"))', tab, 8_000);
+          const state = await evalHelper(
+            {
+              steps: [
+                { kind: "bc", method: "settle", discard: true },
+                { kind: "href" },
+                { kind: "bc", method: "wall", fallback: "" },
+              ],
+              join: "\n",
+            },
+            tab,
+            8_000,
+          );
           if (state.ok) {
             const [final = "", wall = ""] = valueOf(state).split("\n");
             if (final && final !== url) lines.push(`# url: ${final}`);
@@ -1601,10 +1652,10 @@ export function createPageHelperHandler(
         return runScript(input, targetId);
 
       case "verdict":
-        return evalHelper("__bc.verdict()", targetId);
+        return evalHelper({ kind: "bc", method: "verdict" }, targetId);
 
       case "health":
-        return evalHelper("__bc.health()", targetId);
+        return evalHelper({ kind: "bc", method: "health" }, targetId);
 
       default: {
         const hint = didYouMean(action, PAGE_ACTIONS);

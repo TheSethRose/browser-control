@@ -5,10 +5,11 @@
  * - perf: Tracing.start/end with FCP, LCP, CLS (worst session window), TBT, and top long tasks
  */
 import type { InvokeResult } from "@agent-software/core";
+import type { ElementStep } from "./page-helpers";
 
 type Json = Record<string, unknown>;
 type Invoker = (operation: string, input?: Json) => Promise<InvokeResult>;
-type EvalObj = (expr: string, targetId?: string) => Promise<{ ok: true; objectId: string } | { ok: false; res: InvokeResult }>;
+type EvalObj = (target: ElementStep, targetId?: string) => Promise<{ ok: true; objectId: string } | { ok: false; res: InvokeResult }>;
 
 const failure = (code: string, message: string): InvokeResult =>
   ({ ok: false, error: { code, message } }) as InvokeResult;
@@ -51,10 +52,10 @@ export async function inspectStyles(
 
   await cdp("DOM.enable");
   await cdp("CSS.enable");
-  const expr = /^@?e\d+$/.test(target)
-    ? `__bc.el(${JSON.stringify(target)})`
-    : `document.querySelector(${JSON.stringify(target)})`;
-  const objRes = await resolveObject(expr, targetId);
+  const targetStep: ElementStep = /^@?e\d+$/.test(target)
+    ? { kind: "bc", method: "el", args: [target] }
+    : { kind: "querySelector", selector: target };
+  const objRes = await resolveObject(targetStep, targetId);
   if (!objRes.ok) return objRes.res;
   let nodeId: number | undefined;
   try {
