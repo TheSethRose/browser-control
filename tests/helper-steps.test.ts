@@ -613,3 +613,71 @@ describe("page-runner emits byte-identical CDP evaluate and Runtime.evaluate exp
     }
   });
 });
+
+describe("page-runner property reads keep their pre-refactor options and context", () => {
+  test("readyState, origin, host, and href each run with base options and never replace the helper context", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "bc-props-"));
+    try {
+      const calls: Record<string, unknown>[] = [];
+      const runtimeContexts: unknown[] = [];
+      let diffCalls = 0;
+      const invoke = async (op: string, input: Record<string, unknown> = {}): Promise<InvokeResult> => {
+        if (op === "get_browser_status") return { ok: true, data: { connected: true } };
+        if (op === "evaluate") {
+          const expr = String(input["expression"] ?? "");
+          calls.push(input);
+          if (/^(?:location\.(?:host|origin|href)|document\.readyState)$/.test(expr)) {
+            const value = expr === "document.readyState" ? "complete" : expr === "location.host" ? "a.test" : "https://a.test";
+            return { ok: true, data: { value, contextId: 99 } };
+          }
+          // First settle+diff fails so changes() falls back to waitParsed (the readyState read).
+          if (expr.includes("__bc.diff") && diffCalls++ === 0) {
+            return { ok: false, error: { code: "EXECUTION_FAILED", message: "JS_EXCEPTION: boom" } };
+          }
+          if (expr.includes("__bc.locate")) return { ok: true, data: { value: "e7", contextId: 7 } };
+          if (expr.includes("__bc.point")) return { ok: true, data: { value: "https://a.test/ 10 20 visible", contextId: 7 } };
+          return { ok: true, data: { value: "ok", contextId: 7 } };
+        }
+        if (op === "execute_cdp") {
+          if (input["method"] === "Runtime.evaluate") {
+            runtimeContexts.push((input["params"] as Record<string, unknown>)["contextId"]);
+            return { ok: true, data: { result: { result: { objectId: "obj-1" } } } };
+          }
+          if (input["method"] === "DOM.requestNode") return { ok: true, data: { result: { nodeId: 10 } } };
+          if (input["method"] === "CSS.getMatchedStylesForNode") return { ok: true, data: { result: {} } };
+          if (input["method"] === "CSS.getComputedStyleForNode") return { ok: true, data: { result: { computedStyle: [] } } };
+          return { ok: true, data: { result: {} } };
+        }
+        return { ok: true, data: {} };
+      };
+      const browse = async () => ({ code: 0, stdout: "{}", stderr: "" });
+      const handle = createPageHelperHandler(invoke, browse as never, async () => [], {
+        notesDir: dir,
+        flowsDir: dir,
+        sleep: async () => {},
+        rng: () => 0.5,
+      });
+
+      await handle("snap", {}); // primes the helper context (7)
+      await handle("click", { ref: "Ok" }); // diff fails once -> waitParsed -> document.readyState
+      await handle("flow", { sub: "save", name: "x" }); // captureRecordedGets -> location.origin
+      await handle("notes", { sub: "get" }); // location.host
+      await handle("do", { steps: [{ key: "Tab" }] }, "browse:7"); // browse-tab start URL -> location.href
+      await handle("styles", { ref: "e12" }); // must still use helper context 7, not 99
+
+      const opts = (expr: string) =>
+        calls.filter((c) => c["expression"] === expr).map(({ expression: _e, ...rest }) => rest);
+      expect(opts("document.readyState")).toContainEqual({ timeoutMs: 2_000 });
+      for (const o of opts("document.readyState")) expect(o).toEqual({ timeoutMs: 2_000 });
+      expect(opts("location.origin").length).toBeGreaterThan(0);
+      for (const o of opts("location.origin")) expect(o).toEqual({ isolated: true });
+      expect(opts("location.host").length).toBeGreaterThan(0);
+      for (const o of opts("location.host")) expect(o).toEqual({ isolated: true });
+      expect(opts("location.href")).toContainEqual({ targetId: "browse:7" });
+      for (const o of opts("location.href")) expect(o).toEqual({ targetId: "browse:7" });
+      expect(runtimeContexts).toEqual([7]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
