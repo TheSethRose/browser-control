@@ -44,7 +44,7 @@ export const KEYS: Record<string, KeySpec> = {
 /** Where a `<ref>` argument points: a page ref, a ref inside iframe n, an accessibility node, or a label. */
 export type Locator =
   | { kind: "dom"; ref: string }
-  | { kind: "frame"; frame: number; ref: string }
+  | { kind: "frame"; frame: number; ref: string; target?: string }
   | { kind: "ax"; node: number }
   | { kind: "label"; label: string };
 

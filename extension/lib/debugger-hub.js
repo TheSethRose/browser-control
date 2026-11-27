@@ -96,6 +96,8 @@ export function createDebuggerHub({
       postAttachTimedOut: false,
       mainFrameId: undefined,
       extensionContexts: new Map(), // uniqueId -> { id, uniqueId, origin, frameId, type, isDefault }
+      childSessions: new Map(), // sessionId -> { targetId, type, url } for auto-attached OOPIF targets
+      autoAttached: false,
     };
   }
 
@@ -668,6 +670,20 @@ export function createDebuggerHub({
     if (typeof source?.tabId !== "number") return;
     const entry = attachedTabs.get(source.tabId);
     if (!source.sessionId && entry) {
+      if (method === "Target.attachedToTarget" && typeof params?.sessionId === "string") {
+        const info = params.targetInfo || {};
+        entry.childSessions.set(params.sessionId, {
+          targetId: String(info.targetId || ""),
+          type: String(info.type || ""),
+          url: String(info.url || ""),
+        });
+      } else if (method === "Target.detachedFromTarget" && typeof params?.sessionId === "string") {
+        entry.childSessions.delete(params.sessionId);
+      } else if (method === "Target.targetInfoChanged" && params?.targetInfo) {
+        for (const child of entry.childSessions.values()) {
+          if (child.targetId === params.targetInfo.targetId) child.url = String(params.targetInfo.url || "");
+        }
+      }
       if (method === "Runtime.executionContextCreated") {
         const ctx = params?.context;
         const uniqueId = typeof ctx?.uniqueId === "string" ? ctx.uniqueId : "";
@@ -780,9 +796,75 @@ export function createDebuggerHub({
     onBadgeChange();
   }
 
+  /**
+   * CDP sessionId of the out-of-process iframe whose document is `frameUrl`. Turns on flattened
+   * Target.setAutoAttach once per attachment, then matches child targets by URL (exact, then
+   * origin + path, then origin). When several children tie (same-URL siblings), `choose(sessionIds)`
+   * picks the right one; a tie it cannot settle throws instead of guessing. Returns undefined when
+   * no child target matches (same-process frame).
+   */
+  async function frameSession(tabId, frameUrl, timeoutMs = 1_500, choose, label = frameUrl) {
+    const entry = await ensureAttached(tabId);
+    if (!entry.autoAttached) {
+      await chromeApi.debugger.sendCommand({ tabId }, "Target.setAutoAttach", {
+        autoAttach: true,
+        waitForDebuggerOnStart: false,
+        flatten: true,
+      });
+      entry.autoAttached = true;
+    }
+    const parts = (u) => {
+      try {
+        const p = new URL(u);
+        return { origin: p.origin, path: p.origin + p.pathname };
+      } catch {
+        return { origin: u, path: u };
+      }
+    };
+    const want = parts(String(frameUrl || ""));
+    const tiers = [
+      (c) => c.url === frameUrl,
+      (c) => parts(c.url).path === want.path,
+      (c) => parts(c.url).origin === want.origin,
+    ];
+    const pick = () => {
+      const kids = [...entry.childSessions.entries()].filter(([, c]) => c.type === "iframe");
+      for (const tier of tiers) {
+        const ids = kids.filter(([, c]) => tier(c)).map(([id]) => id);
+        if (ids.length) return ids;
+      }
+      return [];
+    };
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const ids = pick();
+      if (ids.length > 1) {
+        const chosen = typeof choose === "function" ? await choose(ids).catch(() => undefined) : undefined;
+        if (chosen && ids.includes(chosen)) return chosen;
+        throw new Error(`EXECUTION_FAILED: could not identify iframe session for frame ${label}: ${ids.length} frames share its URL. Run snap again.`);
+      }
+      if (ids.length || Date.now() >= deadline) return ids[0];
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  }
+
+  /**
+   * CDP session for extension frame `frameId`: undefined for the main frame and same-process frames.
+   * Throws STALE_REF when an explicit frameId no longer exists, so commands never fall back to the top page.
+   */
+  async function sessionForFrame(tabId, frameId, getFrame, choose) {
+    if (typeof frameId !== "number" || frameId === 0) return undefined;
+    const frame = await Promise.resolve(getFrame(tabId, frameId)).catch(() => null);
+    if (!frame) throw new Error(`STALE_REF: frame ${frameId} is gone. Run snap again.`);
+    if (!frame.url) return undefined;
+    return frameSession(tabId, frame.url, undefined, choose ? (ids) => choose(ids, frameId) : undefined, frameId);
+  }
+
   return {
     attachedTabs,
     ensureAttached,
+    frameSession,
+    sessionForFrame,
     detachTab,
     detachAll,
     holdDebugger,

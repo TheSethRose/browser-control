@@ -697,10 +697,23 @@ export function combineStepValues(call: NormalizedHelperCall, values: readonly u
   return kept.map((v) => (v === null || v === undefined ? "" : String(v))).join(join);
 }
 
-/** Parse `extension:<tabId>` or `extension:<slug>:<tabId>`. */
-export function parseExtensionTargetId(targetId: unknown): { slug?: string; tabId: number } | undefined {
+/**
+ * Parse `extension:<tabId>` or `extension:<slug>:<tabId>`, optionally followed by `@<frameId>`
+ * (a chrome.webNavigation frame id) to address a child frame of that tab.
+ */
+export function parseExtensionTargetId(
+  targetId: unknown,
+): { slug?: string; tabId: number; frameId?: number } | undefined {
   if (prefixOf(targetId) !== NAME) return undefined;
-  const rest = (targetId as string).slice(NAME.length + 1);
+  let rest = (targetId as string).slice(NAME.length + 1);
+  const at = rest.lastIndexOf("@");
+  if (at !== -1) {
+    const framePart = rest.slice(at + 1);
+    if (!DIGITS_RE.test(framePart)) return undefined;
+    const frameId = Number(framePart);
+    const base = parseExtensionTargetId(`${NAME}:${rest.slice(0, at)}`);
+    return base && Number.isSafeInteger(frameId) ? { ...base, frameId } : undefined;
+  }
   if (!rest) return undefined;
   const colon = rest.indexOf(":");
   if (colon === -1) {
@@ -717,6 +730,18 @@ export function parseExtensionTargetId(targetId: unknown): { slug?: string; tabI
 
 export function extensionTabOf(targetId: unknown): number | undefined {
   return parseExtensionTargetId(targetId)?.tabId;
+}
+
+/** The child frame id a frame target (`extension:…:<tabId>@<frameId>`) addresses, if any. */
+export function extensionFrameOf(targetId: unknown): number | undefined {
+  return parseExtensionTargetId(targetId)?.frameId;
+}
+
+/** Address child frame `frameId` of extension tab target `targetId`. */
+export function extensionFrameTarget(targetId: string, frameId: number): string {
+  const at = targetId.lastIndexOf("@");
+  const base = at !== -1 && extensionFrameOf(targetId) !== undefined ? targetId.slice(0, at) : targetId;
+  return `${base}@${frameId}`;
 }
 
 export type BcCallInput = {
@@ -741,7 +766,7 @@ export function registerExtensionBcCall(fn: BcCallFn | undefined): void {
 }
 
 const EXTENSION_REQUEST_SYMBOL = Symbol.for("browser-control.extension-request");
-const TARGET_REQUEST_OPS = new Set(["handoff_start", "handoff_clear", "resolve_bc_node"]);
+const TARGET_REQUEST_OPS = new Set(["handoff_start", "handoff_clear", "resolve_bc_node", "list_frames"]);
 
 export type ExtensionRequestFn = (
   op: string,
@@ -757,6 +782,9 @@ function registerExtensionRequest(fn: ExtensionRequestFn | undefined): void {
     delete holder[EXTENSION_REQUEST_SYMBOL];
   }
 }
+
+const frameParam = (frameId: number | undefined): { frameId?: number } =>
+  typeof frameId === "number" ? { frameId } : {};
 
 export function getRegisteredExtensionBcCall(): BcCallFn | undefined {
   return (globalThis as Record<symbol, unknown>)[BC_CALL_SYMBOL] as BcCallFn | undefined;
@@ -1461,7 +1489,12 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
     if (!resolved) {
       throw new BackendUnavailable(NAME, "no extension tab selected");
     }
-    return requestOnLink(resolved.link, op, { ...rest, tabId: resolved.tabId }, timeoutMs);
+    return requestOnLink(
+      resolved.link,
+      op,
+      { ...frameParam(extensionFrameOf(targetId)), ...rest, tabId: resolved.tabId },
+      timeoutMs,
+    );
   }
 
   // An explicit target must never widen into "all events" while no browser is connected.
@@ -1484,7 +1517,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
       {
         tabId: resolved.tabId,
         steps: input.steps,
-        ...(typeof input.frameId === "number" ? { frameId: input.frameId } : {}),
+        ...frameParam(input.frameId ?? extensionFrameOf(input.targetId)),
         ...(typeof input.timeoutMs === "number" ? { timeoutMs: input.timeoutMs } : {}),
       },
       reqTimeout,
@@ -1684,7 +1717,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
               tabId: resolved.tabId,
               method,
               params,
-              ...(sessionId ? { sessionId } : {}),
+              ...(sessionId ? { sessionId } : frameParam(extensionFrameOf(input["targetId"]))),
             },
             timeoutMs ?? DEFAULT_REQ_TIMEOUT_MS,
           )) as { result?: unknown };

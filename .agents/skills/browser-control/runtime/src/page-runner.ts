@@ -11,7 +11,7 @@ import { existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { runBrowse, type Runner } from "./backends/browse";
 import { backendOrder } from "./backends/router";
-import { extensionTabOf, getRegisteredExtensionBcCall, type BcCallFn } from "./backends/extension";
+import { extensionFrameTarget, extensionTabOf, getRegisteredExtensionBcCall, type BcCallFn } from "./backends/extension";
 import {
   SHORT_PAGE_CHARS,
   buildChallengeProbeExpression,
@@ -533,7 +533,13 @@ export function createPageHelperHandler(
       return { ok: true, loc };
     }
     const found = await evalHelper({ kind: "bc", method: "locate", args: [loc.label, kind] }, targetId);
-    if (!found.ok) return { ok: false, res: found };
+    if (!found.ok) {
+      if (messageOf(found).includes("NO_MATCH:")) {
+        const hit = await locateInFrames("locate", [loc.label, kind], targetId);
+        if (hit) return { ok: true, loc: { kind: "frame", frame: hit.frame, ref: hit.ref, target: hit.target } };
+      }
+      return { ok: false, res: found };
+    }
     return { ok: true, loc: { kind: "dom", ref: valueOf(found) } };
   }
 
@@ -570,7 +576,7 @@ export function createPageHelperHandler(
         },
       };
     }
-    const where = loc.kind === "frame" ? frameTarget(loc.frame, targetId) : targetId;
+    const where = loc.kind === "frame" ? (loc.target ?? frameTarget(loc.frame, targetId)) : targetId;
     if (loc.kind === "frame" && !where) {
       return bad(failure("EXECUTION_FAILED", `STALE_REF: iframe f${loc.frame} is not known for this tab. Run snap again.`));
     }
@@ -588,7 +594,12 @@ export function createPageHelperHandler(
       return bad(failure("EXECUTION_FAILED", `unexpected point output: ${valueOf(res)}`));
     }
     if (loc.kind === "frame") {
-      const off = await evalHelper({ kind: "bc", method: "frameOffset", args: [loc.frame] }, targetId);
+      // Offset the iframe element that hosts the frame the point came from, not whatever sits in slot f<n> now.
+      const slot = (await crossFrames(targetId)).find((f) => f.target === where)?.i;
+      if (slot === undefined) {
+        return bad(failure("EXECUTION_FAILED", `STALE_REF: iframe f${loc.frame} is gone. Run snap again.`));
+      }
+      const off = await evalHelper({ kind: "bc", method: "frameOffset", args: [slot] }, targetId);
       if (!off.ok) return bad(off);
       const [ox, oy] = valueOf(off).split(" ").map(Number);
       x = Math.round(x + (ox ?? 0));
@@ -717,7 +728,54 @@ export function createPageHelperHandler(
   const inputFailed = (res: InvokeResult, what: string): InvokeResult =>
     messageOf(res).startsWith("CDP_TIMEOUT") ? success(`${what}: delivered_unverified (${DIALOG_HINT})`) : res;
 
-  async function snapFrames(opts: Json, targetId?: string): Promise<string[]> {
+  /** Targets that can run helpers inside a child frame: OOPIF targets on CDP, frame ids on extension tabs. */
+  async function frameTargetPool(targetId?: string): Promise<Array<{ targetId: string; url: string }>> {
+    if (extensionTabOf(targetId) !== undefined) {
+      const extRequest =
+        options.extensionRequest ??
+        ((globalThis as Record<symbol, unknown>)[EXTENSION_REQUEST_SYMBOL] as ExtensionRequestFn | undefined);
+      if (!extRequest) return [];
+      try {
+        const res = (await extRequest("list_frames", { targetId })) as
+          | { frames?: Array<{ frameId: number; url: string }> }
+          | undefined;
+        return (res?.frames ?? [])
+          .filter((fr) => typeof fr.frameId === "number" && fr.frameId !== 0)
+          .map((fr) => ({ targetId: extensionFrameTarget(targetId!, fr.frameId), url: fr.url }));
+      } catch {
+        return [];
+      }
+    }
+    const targets = await invoke("list_targets", { types: ["iframe"] });
+    if (!targets.ok) return [];
+    const all = ((targets.data as Json)["targets"] as Array<{ targetId: string; url: string; parentFrameId?: string }>) ?? [];
+    // list_targets covers every tab: keep only iframes whose parent chain reaches this tab's frame tree.
+    const tree = await cdp("Page.getFrameTree", {}, targetId);
+    if (!tree.ok) return [];
+    const mine = new Set<string>();
+    const walk = (node: Json | undefined) => {
+      const id = (node?.["frame"] as Json | undefined)?.["id"];
+      if (typeof id === "string") mine.add(id);
+      for (const child of (node?.["childFrames"] as Json[] | undefined) ?? []) walk(child);
+    };
+    walk(((tree.data as Json)["result"] as Json | undefined)?.["frameTree"] as Json | undefined);
+    const pool: Array<{ targetId: string; url: string }> = [];
+    for (let grew = true; grew; ) {
+      grew = false;
+      for (const t of all) {
+        if (mine.has(t.targetId) || !t.parentFrameId || !mine.has(t.parentFrameId)) continue;
+        mine.add(t.targetId);
+        pool.push({ targetId: t.targetId, url: t.url });
+        grew = true;
+      }
+    }
+    return pool;
+  }
+
+  /** The top page's cross-origin iframes (first 8), each matched to a helper target when one is reachable. */
+  async function crossFrames(
+    targetId?: string,
+  ): Promise<Array<{ i: number; src: string; title: string; target?: string }>> {
     const listed = await evalHelper({ kind: "bc", method: "frames" }, targetId);
     if (!listed.ok) return [];
     let frames: Array<{ i: number; src: string; title: string }>;
@@ -727,48 +785,95 @@ export function createPageHelperHandler(
       return [];
     }
     if (frames.length === 0) return [];
-    const targets = await invoke("list_targets", { types: ["iframe"] });
-    const pool = targets.ok ? [...(((targets.data as Json)["targets"] as Array<{ targetId: string; url: string }>) ?? [])] : [];
-    const path = (u: string) => {
-      try {
-        const p = new URL(u);
-        return p.origin + p.pathname;
-      } catch {
-        return u;
-      }
-    };
-    const origin = (u: string) => {
-      try {
-        return new URL(u).origin;
-      } catch {
-        return u;
-      }
-    };
-    const take = (test: (t: { url: string }) => boolean) => {
-      const at = pool.findIndex(test);
-      return at === -1 ? undefined : pool.splice(at, 1)[0];
-    };
-    const ids: string[] = [];
+    const first8 = frames.slice(0, 8);
+    const pool = await frameTargetPool(targetId);
+    if (pool.length === 0) return first8;
+    // Pair each <iframe> with the frame it really hosts: post a random tag into every iframe, then ask
+    // each frame which tag it got. URLs can't do this (a frame may have navigated to a sibling's src),
+    // so an iframe whose frame doesn't report its tag stays unbound instead of guessed.
+    const readTags = async (mine?: string[]) =>
+      new Map(
+        (
+          await Promise.all(
+            pool.map(async (t) => {
+              const r = await evalHelper({ kind: "bc", method: "frameTag", ...(mine ? { args: [mine] } : {}) }, t.targetId, 2_000);
+              return [r.ok ? valueOf(r) : "", t.targetId] as const;
+            }),
+          )
+        ).filter(([tag]) => tag !== ""),
+      );
+    await readTags(); // loads the helper (and its message listener) in every candidate frame
+    const tags = first8.map(() => randomUUID().replaceAll("-", ""));
+    const sent = await evalHelper({ kind: "bc", method: "tagFrames", args: [tags, first8.map((f) => f.src)] }, targetId);
+    if (!sent.ok) return first8;
+    let owners = await readTags(tags);
+    if (tags.some((t) => !owners.has(t))) {
+      await new Promise((r) => setTimeout(r, 50));
+      owners = await readTags(tags);
+    }
+    return first8.map((f, k) => {
+      const target = owners.get(tags[k]!);
+      return { ...f, ...(target ? { target } : {}) };
+    });
+  }
+
+  /**
+   * Number frames by identity: a frame target keeps its `f<n>` for the life of the tab and numbers
+   * are never reused, so a saved `f<n>:e<m>` ref can't silently move to another frame after a reorder.
+   */
+  function frameNumbers(frames: Array<{ target?: string }>, targetId?: string): Map<string, number> {
+    const ids = frameTargets.get(targetId ?? "") ?? [];
+    const nums = new Map<string, number>();
+    for (const f of frames) {
+      if (!f.target) continue;
+      let at = ids.indexOf(f.target);
+      if (at === -1) at = ids.push(f.target) - 1;
+      nums.set(f.target, at + 1);
+    }
+    frameTargets.set(targetId ?? "", ids);
+    return nums;
+  }
+
+  /** Run a label lookup helper inside each reachable cross-origin iframe; first hit wins. */
+  async function locateInFrames(
+    method: "locate" | "locateFile",
+    args: string[],
+    targetId?: string,
+  ): Promise<{ frame: number; ref: string; target: string } | undefined> {
+    const frames = await crossFrames(targetId);
+    if (frames.length === 0) return undefined;
+    const nums = frameNumbers(frames, targetId);
+    for (const f of frames) {
+      if (!f.target) continue;
+      const hit = await evalHelper({ kind: "bc", method, args }, f.target, 5_000);
+      if (hit.ok && /^e\d+$/.test(valueOf(hit))) return { frame: nums.get(f.target)!, ref: valueOf(hit), target: f.target };
+    }
+    return undefined;
+  }
+
+  async function snapFrames(opts: Json, targetId?: string): Promise<string[]> {
+    const frames = await crossFrames(targetId);
+    if (frames.length === 0) return [];
     const out: string[] = [];
-    for (const f of frames.slice(0, 8)) {
-      const t = take((x) => x.url === f.src) ?? take((x) => path(x.url) === path(f.src)) ?? take((x) => origin(x.url) === origin(f.src));
-      const label = `f${f.i}${f.title ? ` "${f.title}"` : ""} ${hostOf(f.src)}`;
-      if (!t) {
-        ids[f.i - 1] = "";
+    const nums = frameNumbers(frames, targetId);
+    for (const f of frames) {
+      const n = f.target ? nums.get(f.target)! : undefined;
+      const label = `${n === undefined ? `#${f.i}` : `f${n}`}${f.title ? ` "${f.title}"` : ""} ${hostOf(f.src)}`;
+      if (!f.target) {
         out.push(`# iframe ${label}: not reachable; click by coordinates (click --xy) or see references/dom-and-input.md`);
         continue;
       }
-      ids[f.i - 1] = t.targetId;
       const inner = await evalHelper(
-        { kind: "bc", method: "snapshot", args: [{ all: opts["all"] === true, find: opts["find"] }] },
-        t.targetId,
+        { kind: "bc", method: "snapshot", args: [{ all: opts["all"] === true, find: opts["find"], ...(opts["full"] === true ? { full: true } : {}) }] },
+        f.target,
         5_000,
       );
-      const lines = inner.ok ? valueOf(inner).split("\n").filter((l) => l.startsWith("- ")) : [];
-      out.push(`# iframe ${label}: ${lines.length} control(s)`);
-      out.push(...lines.map((l) => l.replace(/\[e(\d+)\]/, `[f${f.i}:e$1]`)));
+      const text = inner.ok ? valueOf(inner) : "";
+      const lines = text.split("\n").filter((l) => /^[-+~] /.test(l));
+      const diff = /^# snap diff .*$/m.exec(text)?.[0];
+      out.push(`# iframe ${label}: ${lines.length} control(s)${diff ? ` changed; ${diff.slice(2)}` : ""}`);
+      out.push(...lines.map((l) => l.replace(/\[e(\d+)\]/, `[f${n}:e$1]`)));
     }
-    frameTargets.set(targetId ?? "", ids);
     return out;
   }
 
@@ -1045,7 +1150,7 @@ export function createPageHelperHandler(
         const loc = found.loc;
         let name = nameOf(loc);
         const healPrefix = found.healedFrom ? `↻ ${found.healedFrom}->${name} ` : "";
-        const fieldTarget = loc.kind === "frame" ? frameTarget(loc.frame, targetId) : targetId;
+        const fieldTarget = loc.kind === "frame" ? (loc.target ?? frameTarget(loc.frame, targetId)) : targetId;
 
         if (loc.kind !== "ax") {
           const g = await evalHelper({ kind: "bc", method: "guard", args: [loc.ref] }, fieldTarget);
@@ -1158,7 +1263,7 @@ export function createPageHelperHandler(
         if (loc.kind === "ax") {
           return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: select needs a DOM ref or label, not an accessibility ref");
         }
-        const fieldTarget = loc.kind === "frame" ? frameTarget(loc.frame, targetId) : targetId;
+        const fieldTarget = loc.kind === "frame" ? (loc.target ?? frameTarget(loc.frame, targetId)) : targetId;
         if (loc.kind === "frame" && !fieldTarget) {
           return failure("EXECUTION_FAILED", `STALE_REF: iframe f${loc.frame} is not known for this tab. Run snap again.`);
         }
@@ -1182,7 +1287,7 @@ export function createPageHelperHandler(
         if (!optRef.ok) return optRef;
         const optLoc: Exclude<Locator, { kind: "label" }> =
           loc.kind === "frame"
-            ? { kind: "frame", frame: loc.frame, ref: valueOf(optRef) }
+            ? { kind: "frame", frame: loc.frame, ref: valueOf(optRef), ...(loc.target ? { target: loc.target } : {}) }
             : { kind: "dom", ref: valueOf(optRef) };
         const optAt = await pointOf(optLoc, targetId, false);
         if (!optAt.ok) return optAt.res;
@@ -1212,7 +1317,8 @@ export function createPageHelperHandler(
           return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: a file input ref, label, or CSS selector is required");
         }
         const frame = /^@?f([0-9]+):(e[0-9]+)$/.exec(refInput);
-        const fieldTarget = frame ? frameTarget(Number(frame[1]), targetId) : targetId;
+        let fileFrame = frame ? Number(frame[1]) : undefined;
+        let fieldTarget = frame ? frameTarget(Number(frame[1]), targetId) : targetId;
         if (frame && !fieldTarget) {
           return failure("EXECUTION_FAILED", `STALE_REF: iframe f${frame[1]} is not known for this tab. Run snap again.`);
         }
@@ -1221,8 +1327,18 @@ export function createPageHelperHandler(
           { kind: "bc", method: "locateFile", args: [frame ? frame[2]! : refInput] },
           fieldTarget,
         );
-        if (!located.ok) return located;
-        const fileRef = valueOf(located);
+        let fileRef: string;
+        if (located.ok) {
+          fileRef = valueOf(located);
+        } else {
+          const hit = !frame && messageOf(located).includes("NO_MATCH:")
+            ? await locateInFrames("locateFile", [refInput], targetId)
+            : undefined;
+          if (!hit) return located;
+          fileRef = hit.ref;
+          fileFrame = hit.frame;
+          fieldTarget = hit.target;
+        }
         const objRes = await resolveObject({ kind: "bc", method: "el", args: [fileRef] }, fieldTarget);
         if (!objRes.ok) return objRes.res;
         try {
@@ -1231,7 +1347,7 @@ export function createPageHelperHandler(
         } finally {
           await cdp("Runtime.releaseObject", { objectId: objRes.objectId }, fieldTarget).catch(() => {});
         }
-        const label = frame ? `f${frame[1]}:${fileRef}` : fileRef;
+        const label = fileFrame !== undefined ? `f${fileFrame}:${fileRef}` : fileRef;
         return withChanges(`upload ${label} <- ${filePath}: delivered`, before?.ok ? valueOf(before) : undefined, quiet, targetId);
       }
 
@@ -2220,7 +2336,7 @@ export function createPageHelperHandler(
         if (found.loc.kind === "ax") {
           return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: value needs a DOM ref (e12 or f2:e5), not an accessibility ref");
         }
-        const where = found.loc.kind === "frame" ? frameTarget(found.loc.frame, targetId) : targetId;
+        const where = found.loc.kind === "frame" ? (found.loc.target ?? frameTarget(found.loc.frame, targetId)) : targetId;
         if (found.loc.kind === "frame" && !where) {
           return failure("EXECUTION_FAILED", `STALE_REF: iframe f${found.loc.frame} is not known for this tab. Run snap again.`);
         }
