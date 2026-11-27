@@ -5,6 +5,7 @@ import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, m
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Glob } from "bun";
+import { E2E_PORT_END, E2E_PORT_START, patchExtensionPorts, pickRelayPort, RELAY_PORTS_ENV } from "./relay-port";
 import { runStaleExtensionCheck } from "./stale-extension";
 
 const REPO = resolve(import.meta.dir, "../..");
@@ -188,6 +189,14 @@ async function main(): Promise<number> {
     return 1;
   }
 
+  // Isolated relay port: the daemon binds it and the copied extension probes only it, so this run
+  // can never touch 49222-49229 where the user's live daemon listens.
+  const relayPort = await pickRelayPort();
+  if (relayPort === undefined) {
+    record("e2e-relay-port", false, `no free port in ${E2E_PORT_START}-${E2E_PORT_END} for the isolated test relay`);
+    return 1;
+  }
+
   const tmp = mkdtempSync(join(tmpdir(), "bc-e2e-"));
   const profile = join(tmp, "profile");
   const ext = join(tmp, "ext");
@@ -205,6 +214,7 @@ async function main(): Promise<number> {
     XDG_CONFIG_HOME: xdg,
     BROWSER_CONTROL_BACKENDS: "extension",
     BROWSER_CONTROL_DAEMON_DIR: daemonDir,
+    [RELAY_PORTS_ENV]: `${relayPort}-${relayPort}`,
   };
 
   const bc = async (args: string[], timeoutMs = 45_000): Promise<string> => {
@@ -274,6 +284,9 @@ async function main(): Promise<number> {
 
     // Unpacked extension copy, paired with this run's private config dir.
     cpSync(join(REPO, "extension"), ext, { recursive: true, filter: (p) => !p.endsWith("pairing.json") });
+    const portPatch = patchExtensionPorts(ext, relayPort);
+    record("e2e-port-patch", portPatch.ok, portPatch.detail);
+    if (!portPatch.ok) return 1;
     const setup = spawn(["bun", "./cli.ts", "extension-setup", ext], { cwd: REPO, env, stdout: "ignore", stderr: "pipe" });
     if ((await setup.exited) !== 0) {
       record("setup", false, `extension-setup failed: ${(await new Response(setup.stderr).text()).slice(0, 200)}`);
@@ -315,6 +328,12 @@ async function main(): Promise<number> {
     }
     record("connect", /extension:/.test(tabs), tabs);
     if (!/extension:/.test(tabs)) return 1;
+    const relayStatus = await bc(["extension", "status"]);
+    record(
+      "e2e-relay-port",
+      new RegExp(`"port":\\s*${relayPort}\\b`).test(relayStatus) && !/"port":\s*4922[2-9]\b/.test(relayStatus),
+      relayStatus,
+    );
 
     await check("nav", ["nav", `${base}/`], /E2E Fixture/);
     await checkEval("nav-title", "document.title", /E2E Fixture/);
