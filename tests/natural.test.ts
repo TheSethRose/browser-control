@@ -543,9 +543,9 @@ describe("page-runner natural motion integration", () => {
       expect(far.elapsedMs).toBeLessThan(8_000);
 
       // A click whose release opens an alert reports the dialog within a few seconds.
+      // A refused release may have landed, so it reads as unverified, and the click returns at once.
       const alert = await run(true, true);
-      expect(alert.res.ok).toBe(false);
-      expect(alert.res.ok ? "" : alert.res.error.message).toMatch(/^DIALOG_OPEN:/);
+      expect(alert.res.ok ? String((alert.res.data as { value?: unknown }).value) : "").toMatch(/release: delivery unverified \(a dialog opened\)/);
       expect(alert.elapsedMs).toBeLessThan(3_000);
     });
   });
@@ -713,7 +713,7 @@ describe("page-runner natural motion integration", () => {
   });
 
   const DIALOG_MSG = "DIALOG_OPEN: a JavaScript alert dialog is open on tab 5";
-  /** `opener` opens a dialog as it is delivered; while open, input is refused before dispatch. */
+  /** `opener` opens a dialog as it is delivered; while open, input is refused before dispatch. Every attempt is counted. */
   function dialogWrap(opener: string, sent: Array<{ type: string; targetId?: string }>) {
     let open = false;
     return (next: Invoke): Invoke => async (op, inp = {}) => {
@@ -721,8 +721,8 @@ describe("page-runner natural motion integration", () => {
       const type = String((inp["params"] as Record<string, unknown> | undefined)?.["type"] ?? "");
       if (op === "execute_cdp" && method === "Page.handleJavaScriptDialog") open = false;
       else if (op === "execute_cdp" && method.startsWith("Input.dispatch")) {
-        if (open) return { ok: false, error: { code: "EXECUTION_FAILED", message: DIALOG_MSG } };
         sent.push({ type, targetId: inp["targetId"] as string | undefined });
+        if (open) return { ok: false, error: { code: "EXECUTION_FAILED", message: DIALOG_MSG } };
         if (type === opener) {
           open = true;
           return { ok: false, error: { code: "EXECUTION_FAILED", message: DIALOG_MSG } };
@@ -734,39 +734,233 @@ describe("page-runner natural motion integration", () => {
   const releaseCount = (sent: Array<{ type: string }>, t: string) => sent.filter((e) => e.type === t).length;
   const textOf = (res: InvokeResult): string => (res.ok ? String((res.data as { value: unknown }).value) : res.error.message);
 
-  test("E1: a dialog-blocked release is never re-sent, and dialog accept reports what is still held", async () => {
+  test("E1: a dialog-refused press sends nothing more; a refused release is unverified", async () => {
     await withNaturalOn(async () => {
-      for (const [action, input, release, held] of [
-        ["drag", { from: "e1", to: "e2", quiet: true }, "mouseReleased", "# HELD: mouse left button still down"],
-        ["key", { key: "Tab", quiet: true }, "keyUp", "# HELD: key Tab still down"],
+      const keyTab = { key: "Tab", quiet: true };
+      const drag = { from: "e1", to: "e2", quiet: true };
+      // The dialog opens as the press is delivered: the press may have landed, so the input reads as possibly down,
+      // but nothing more is sent into the open dialog.
+      for (const [action, input, press, release, held] of [
+        ["key", keyTab, "rawKeyDown", "keyUp", "# HELD: key Tab may still be down"],
+        ["drag", drag, "mousePressed", "mouseReleased", "# HELD: mouse left button may still be down"],
+      ] as const) {
+        const sent: Array<{ type: string }> = [];
+        const h = makeNaturalMock({ inView: true }).handler(5, dialogWrap(press, sent));
+        const res = await h(action, input);
+        expect(res.ok).toBe(false);
+        expect(textOf(res)).toContain("may still be down");
+        // No release and no further input event: the refused press is the last thing the page sees.
+        expect(releaseCount(sent, release)).toBe(0);
+        expect(sent.at(-1)?.type).toBe(press);
+        const accepted = textOf(await h("dialog", { sub: "accept" }));
+        expect([accepted.includes(held), accepted.includes("was not sent again")]).toEqual([true, true]);
+      }
+      // The release itself opens the dialog: the press landed and the release may have too, so it is unverified.
+      for (const [action, input, release] of [
+        ["key", keyTab, "keyUp"],
+        ["drag", drag, "mouseReleased"],
       ] as const) {
         const sent: Array<{ type: string }> = [];
         const h = makeNaturalMock({ inView: true }).handler(5, dialogWrap(release, sent));
-        expect((await h(action, input)).ok).toBe(false);
-        expect(releaseCount(sent, release)).toBe(1);
-        const accepted = await h("dialog", { sub: "accept" });
-        expect(accepted.ok).toBe(true);
-        expect(textOf(accepted)).toContain(held);
-        expect(textOf(accepted)).toContain("the caller decides what to do next");
+        expect(textOf(await h(action, input))).toContain("release: delivery unverified (a dialog opened)");
+        expect(textOf(await h("dialog", { sub: "accept" }))).not.toContain("# HELD");
         expect(releaseCount(sent, release)).toBe(1);
       }
     });
   });
 
-  test("E2: the command whose release the dialog blocked reports the held input", async () => {
+  test("E4: a click whose release the dialog refused returns at once and reads nothing after it", async () => {
+    await withNaturalOn(async () => {
+      const log: string[] = [];
+      const m = makeNaturalMock({ inView: true });
+      const inv: Invoke = async (op, inp = {}) => {
+        const method = String(inp["method"] ?? "");
+        const type = String((inp["params"] as Record<string, unknown> | undefined)?.["type"] ?? "");
+        log.push(op === "execute_cdp" ? `${method}:${type}` : op);
+        if (op === "execute_cdp" && method === "Input.dispatchMouseEvent" && type === "mouseReleased") {
+          return { ok: false, error: { code: "EXECUTION_FAILED", message: DIALOG_MSG } };
+        }
+        return m.invoke(op, inp);
+      };
+      const out = textOf(await m.handler(5, () => inv)("click", { ref: "e1" }));
+      expect(out).toContain("release: delivery unverified (a dialog opened)");
+      // Nothing at all after the refused release: no second release, no probe, no page read.
+      expect(log.slice(log.indexOf("Input.dispatchMouseEvent:mouseReleased") + 1)).toEqual([]);
+    });
+  });
+
+  test("E5: a click that opens a dialog reports it after one probe and reads nothing more", async () => {
+    await withNaturalOn(async () => {
+      const log: string[] = [];
+      const m = makeNaturalMock({ inView: true });
+      let dialogOpen = false;
+      const inv: Invoke = async (op, inp = {}) => {
+        const method = String(inp["method"] ?? "");
+        const type = String((inp["params"] as Record<string, unknown> | undefined)?.["type"] ?? "");
+        log.push(op === "execute_cdp" ? `${method}:${type}` : op);
+        if (op === "execute_cdp" && method === "Input.dispatchMouseEvent" && type === "mouseReleased") {
+          dialogOpen = true;
+          return { ok: true, data: { result: {} } };
+        }
+        // While the dialog is open the page refuses every read, as the extension does.
+        if (dialogOpen && (op === "evaluate" || op === "execute_cdp")) {
+          return { ok: false, error: { code: "EXECUTION_FAILED", message: DIALOG_MSG } };
+        }
+        return m.invoke(op, inp);
+      };
+      const out = textOf(await m.handler(5, () => inv)("click", { ref: "e1" }));
+      expect(out).toContain("a dialog opened");
+      const after = log.slice(log.indexOf("Input.dispatchMouseEvent:mouseReleased") + 1);
+      expect(after.filter((e) => e.startsWith("Input."))).toEqual([]);
+      expect(after).toEqual(["evaluate"]);
+      expect(after.length).toBeLessThanOrEqual(2);
+    });
+  });
+
+  test("E6: a timed-out press whose release the dialog refused keeps its HELD line", async () => {
     await withNaturalOn(async () => {
       const sent: Array<{ type: string }> = [];
-      const h = makeNaturalMock({ inView: true }).handler(5, dialogWrap("keyUp", sent));
-      const res = await h("key", { key: "Tab", quiet: true });
-      expect(res.ok).toBe(false);
-      expect(textOf(res)).toContain(DIALOG_MSG);
-      expect(textOf(res)).toContain("# HELD: key Tab still down");
+      const base = makeNaturalMock({ inView: true });
+      const inv: Invoke = async (op, inp = {}) => {
+        const method = String(inp["method"] ?? "");
+        const type = String((inp["params"] as Record<string, unknown> | undefined)?.["type"] ?? "");
+        if (op === "execute_cdp" && method.startsWith("Input.dispatch")) {
+          sent.push({ type });
+          if (type === "rawKeyDown") return { ok: false, error: { code: "EXECUTION_FAILED", message: "CDP_TIMEOUT: no reply" } };
+          if (type === "keyUp") return { ok: false, error: { code: "EXECUTION_FAILED", message: DIALOG_MSG } };
+        }
+        return base.invoke(op, inp);
+      };
+      const h = createPageHelperHandler(inv, undefined, undefined, {
+        sleep: async () => {}, rng: createSeededRng(5), now: () => 0,
+        bcCall: async () => ({ value: "https://a.test/\nhit: button#ok" }),
+      });
+      const out = textOf(await h("key", { key: "Tab", quiet: true }));
+      expect(sent.filter((e) => e.type === "keyUp")).toHaveLength(1);
+      expect(out).toContain("delivered_unverified");
+      expect(out).toContain("# HELD: key Tab may still be down");
+    });
+  });
 
-      const dragged: Array<{ type: string }> = [];
-      const hd = makeNaturalMock({ inView: true }).handler(5, dialogWrap("mouseReleased", dragged));
-      const dragRes = await hd("drag", { from: "e1", to: "e2", quiet: true });
-      expect(dragRes.ok).toBe(false);
-      expect(textOf(dragRes)).toContain("# HELD: mouse left button still down");
+  const POINT_DETAIL = JSON.stringify({
+    x: 350, y: 220, hidden: false, inView: true,
+    box: { left: 250, top: 200, width: 200, height: 40 },
+    rect: { left: 250, top: 200, width: 200, height: 40 },
+    viewport: { width: 1280, height: 800 }, stickyTop: 0, stickyBottom: 0,
+    scroller: { kind: "document", box: { left: 0, top: 0, width: 1280, height: 800 }, point: { x: 640, y: 400 } },
+  });
+  /**
+   * A page whose `refused` CDP event the open dialog refuses, with one visible button at 350,220. Every call is
+   * logged, so a test can prove nothing was sent or read after the refusal.
+   */
+  function refuseMock(
+    refused: { method: string; type: string },
+    helpers: Record<string, string> = {},
+    opts: { dragIntercepted?: Record<string, unknown> } = {},
+  ) {
+    const log: string[] = [];
+    const invoke: Invoke = async (op, input = {}) => {
+      if (op === "get_browser_status") return { ok: true, data: { connected: true } };
+      if (op === "wait_for_event" && opts.dragIntercepted) {
+        log.push(op);
+        return { ok: true, data: { found: true, event: { params: { data: opts.dragIntercepted } } } };
+      }
+      const method = String(input["method"] ?? "");
+      const params = (input["params"] ?? {}) as Record<string, unknown>;
+      const type = String(params["type"] ?? "");
+      if (op === "evaluate") {
+        const expr = String(input["expression"] ?? "");
+        log.push(`eval:${/__bc\.([A-Za-z]+)/.exec(expr)?.[1] ?? "expr"}`);
+        const named = Object.entries(helpers).find(([name]) => expr.includes(`__bc.${name}`));
+        if (named) return val(named[1]);
+        if (expr.includes("__bc.point")) {
+          const detail = expr.includes("detail");
+          const body = detail ? POINT_DETAIL : "350 220 visible";
+          return val(expr.includes("__bc.baseline") && detail ? `https://a.test/\n${body}` : expr.includes("__bc.baseline") ? `https://a.test/ ${body}` : body);
+        }
+        if (expr.includes("__bc.readInputProbe")) return val('{"mousedown":1,"mouseup":1}');
+        if (expr.includes("__bc.hitCheck")) return val('{"ok":true}');
+        if (expr.includes("__bc.verifyRef")) return val("e5");
+        if (expr.includes("__bc.value")) return val("hello");
+        return val("ok");
+      }
+      if (op === "execute_cdp") {
+        log.push(`cdp:${method}:${type}`);
+        if (method === refused.method && type === refused.type) {
+          return { ok: false, error: { code: "EXECUTION_FAILED", message: DIALOG_MSG } };
+        }
+        if (method === "DOM.getContentQuads") {
+          return { ok: true, data: { result: { quads: [[350, 220, 550, 220, 350, 260, 550, 260]] } } };
+        }
+        return { ok: true, data: { result: {} } };
+      }
+      log.push(op);
+      return { ok: true, data: {} };
+    };
+    const handler = createPageHelperHandler(invoke, undefined, undefined, {
+      sleep: async () => {}, rng: createSeededRng(7), now: () => 0,
+      bcCall: async () => ({ value: "https://a.test/\nhit: button#ok" }),
+    });
+    const refusedAt = () => log.indexOf(`cdp:${refused.method}:${refused.type}`);
+    return { log, handler, refusedAt };
+  }
+
+  test("E7: type with an accessibility ref sends no text into a dialog that refused the click's release", async () => {
+    await withNaturalOn(async () => {
+      const m = refuseMock({ method: "Input.dispatchMouseEvent", type: "mouseReleased" });
+      const out = textOf(await m.handler("type", { ref: "a41", text: "hi", quiet: true }));
+      expect(out).toContain("release: delivery unverified (a dialog opened)");
+      // The refused release is the last thing the page sees: no focus, no typing, no read back.
+      expect(m.refusedAt()).toBeGreaterThan(-1);
+      expect(m.log.slice(m.refusedAt() + 1)).toEqual([]);
+      expect(m.log.filter((e) => e.startsWith("cdp:Input.insertText") || e.startsWith("cdp:Input.dispatchKeyEvent"))).toEqual([]);
+    });
+  });
+
+  test("E8: select sends no option lookup or second click into a dialog that refused the click's release", async () => {
+    await withNaturalOn(async () => {
+      const m = refuseMock({ method: "Input.dispatchMouseEvent", type: "mouseReleased" }, { select: "__not_native__" });
+      const out = textOf(await m.handler("select", { ref: "e5", option: "Blue", quiet: true }));
+      expect(out).toContain("release: delivery unverified (a dialog opened)");
+      expect(m.refusedAt()).toBeGreaterThan(-1);
+      expect(m.log.slice(m.refusedAt() + 1)).toEqual([]);
+      expect(m.log).not.toContain("eval:locateOption");
+      expect(m.log.filter((e) => e === "cdp:Input.dispatchMouseEvent:mousePressed")).toHaveLength(1);
+    });
+  });
+
+  test("E9: a grid cell sends no Enter or typing into a dialog that refused the double-click's release", async () => {
+    await withNaturalOn(async () => {
+      const m = refuseMock({ method: "Input.dispatchMouseEvent", type: "mouseReleased" }, {
+        cellInfo: '{"cell":true,"before":"","editorRef":null}',
+        cellEditor: "__none__",
+        cellRead: '{"after":"hi","before":"","error":""}',
+        setTypedValue: "__not_typed__",
+      });
+      const out = textOf(await m.handler("type", { ref: "e5", text: "hi", quiet: true }));
+      expect(out).toContain("release: delivery unverified (a dialog opened)");
+      expect(m.refusedAt()).toBeGreaterThan(-1);
+      expect(m.log.slice(m.refusedAt() + 1)).toEqual([]);
+      expect(m.log).not.toContain("eval:cellEditor");
+      expect(m.log.filter((e) => e.startsWith("cdp:Input.dispatchKeyEvent") || e.startsWith("cdp:Input.insertText"))).toEqual([]);
+    });
+  });
+
+
+  test("E10: an HTML5 drag the dialog refused at dragEnter sends no drop, dragCancel or release", async () => {
+    await withNaturalOn(async () => {
+      const m = refuseMock(
+        { method: "Input.dispatchDragEvent", type: "dragEnter" },
+        { dragInfo: JSON.stringify({ sx: 120, sy: 200, dx: 520, dy: 460, draggable: true, listMeta: null }) },
+        { dragIntercepted: { items: [], dragOperationsMask: 1 } },
+      );
+      const out = textOf(await m.handler("drag", { from: "e1", to: "e2", quiet: true }));
+      expect(out).toContain("may still be down");
+      expect(m.refusedAt()).toBeGreaterThan(-1);
+      // Nothing more goes into the open dialog: no drop, no dragCancel, no release. Only the intercept is switched off.
+      const after = m.log.slice(m.refusedAt() + 1);
+      expect(after.filter((e) => e.startsWith("cdp:Input.dispatch"))).toEqual([]);
+      expect(after).toEqual(["cdp:Input.setInterceptDrags:"]);
     });
   });
 
@@ -779,10 +973,10 @@ describe("page-runner natural motion integration", () => {
             ? "extension:edge-bbb222:5"
             : undefined;
       const sent: Array<{ type: string }> = [];
-      const h = makeNaturalMock({ inView: true }).handler(5, dialogWrap("keyUp", sent), { extensionResolveKey: resolveKey });
+      const h = makeNaturalMock({ inView: true }).handler(5, dialogWrap("rawKeyDown", sent), { extensionResolveKey: resolveKey });
       await h("key", { key: "Tab", quiet: true }, "extension:5");
       const same = await h("dialog", { sub: "accept" }, "extension:chrome-aaa111:5");
-      expect(textOf(same)).toContain("# HELD: key Tab still down");
+      expect(textOf(same)).toContain("# HELD: key Tab may still be down");
       const other = await h("dialog", { sub: "accept" }, "extension:edge-bbb222:5");
       expect(other.ok).toBe(true);
       expect(textOf(other)).not.toContain("# HELD");
