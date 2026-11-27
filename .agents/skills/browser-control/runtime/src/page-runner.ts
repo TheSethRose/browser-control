@@ -16,7 +16,7 @@ import {
   isBackendUnavailable,
   isExtensionOnlyOrder,
 } from "./backends/router";
-import { extensionFrameTarget, extensionTabOf, getRegisteredExtensionBackend, getRegisteredExtensionBcCall, parseExtensionTargetId, type BcCallFn } from "./backends/extension";
+import { extensionFrameTarget, extensionTabOf, getRegisteredExtensionBackend, getRegisteredExtensionBcCall, parseExtensionTargetId, sessionKeyOf, type BcCallFn } from "./backends/extension";
 import {
   SHORT_PAGE_CHARS,
   buildChallengeProbeExpression,
@@ -3476,12 +3476,19 @@ export function createPageHelperHandler(
       case "nav": {
         const url = typeof input["url"] === "string" ? input["url"] : "";
         const until = input["until"] === "load" ? "load" : "domcontentloaded";
+        const sessionKey = sessionKeyOf(input["sessionKey"]);
+        const forceNewTab = input["newTab"] === true && rawTargetId === undefined;
+        // The implicit extension tab is the daemon-wide selection; a session or --new-tab picks its own.
+        const implicitExtension = rawTargetId === undefined && (targetId === undefined || extensionTabOf(targetId) !== undefined);
+        const navTarget = implicitExtension && (sessionKey || forceNewTab) ? undefined : targetId;
         const nav = await invoke("navigate", {
           url,
           until,
-          ...(targetId ? { targetId } : {}),
+          ...(navTarget ? { targetId: navTarget } : {}),
           ...(input["newWindow"] === true ? { newWindow: true } : {}),
           ...(input["keepOpen"] === true ? { keepOpen: true } : {}),
+          ...(forceNewTab ? { newTab: true } : {}),
+          ...(sessionKey ? { sessionKey } : {}),
         });
         if (!nav.ok) return nav;
         const data = nav.data as Json;
@@ -3494,6 +3501,7 @@ export function createPageHelperHandler(
             : undefined;
         const onBrowse = browseTabNumber(tab) !== undefined || (tab === undefined && browseTab !== undefined);
         const lines = [JSON.stringify(data)];
+        if (data["reused"] === true && tab) lines.push(`# reused this session's tab ${tab}; --new-tab opens another`);
         if (!onBrowse) {
           const state = await evalHelper(
             {

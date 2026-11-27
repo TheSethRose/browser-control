@@ -19,6 +19,7 @@ import {
   relayProofMessage,
   verifyHmacHex,
 } from "./lib/pairing.js";
+import { createSessionTabs, validSessionKey } from "./lib/session-tabs.js";
 import { createTabCleanup } from "./lib/tab-cleanup.js";
 import { createWindowGroups, normalizeNavigateUrl } from "./lib/window-groups.js";
 
@@ -52,6 +53,7 @@ let lastError = "";
 const lentTabs = new Set();
 const agentTabs = new Set();
 const handoffTabs = new Map(); // tabId -> { handoffId, message, origin, notifId }
+const busyTabs = new Map(); // tabId -> in-flight request count
 const connections = new Map(); // port -> { port, ws, state, extNonce, instanceId, keepaliveTimer, touchedTabs }
 
 let scanTimer = null;
@@ -338,6 +340,7 @@ const windowGroups = createWindowGroups({
   isTabInHandoff: (tabId) => handoffTabs.has(tabId),
   stateReady: () => tabSetsReady,
   onUserClaimTab: async (tabId) => {
+    sessionTabs.forget(tabId).catch(() => {});
     if (agentTabs.delete(tabId)) {
       await saveTabSets().catch(() => {});
     }
@@ -382,12 +385,27 @@ const tabCleanup = createTabCleanup({
     }
     debuggerHub.forgetTab(tabId);
     windowGroups.handleTabRemoved(tabId);
+    sessionTabs.forget(tabId).catch(() => {});
     for (const conn of connections.values()) {
       conn.touchedTabs.delete(tabId);
     }
     updateBadge();
   },
 });
+
+const sessionTabs = createSessionTabs({
+  chrome,
+  isAgentTab: (tabId) => agentTabs.has(tabId),
+  isTabInHandoff: (tabId) => handoffTabs.has(tabId),
+  isTabBusy: (tabId) => (busyTabs.get(tabId) ?? 0) > 0,
+});
+
+function markBusy(tabId, delta) {
+  if (typeof tabId !== "number" || Number.isNaN(tabId)) return;
+  const n = (busyTabs.get(tabId) ?? 0) + delta;
+  if (n > 0) busyTabs.set(tabId, n);
+  else busyTabs.delete(tabId);
+}
 
 // Tab ids are reused after a browser restart, so lent/agent tab sets and idle metadata live in session storage only.
 const tabSetsReady = tabCleanup.stateReady;
@@ -1316,6 +1334,7 @@ async function handleRequest(msg) {
       });
       if (typeof tab?.id === "number") {
         await trackNewAgentTab(tab.id, { keepOpen: params.keepOpen === true });
+        await sessionTabs.remember(params.sessionKey, tab.id);
       }
       return { tabId: tab?.id, url: tab?.url || url, title: tab?.title || "" };
     }
@@ -1360,10 +1379,22 @@ async function handleRequest(msg) {
 
     case "navigate": {
       const timeoutMs = Number(params.timeoutMs) || 30_000;
-      return await navigateTab(tabId, params.url, params.until, timeoutMs, {
-        newWindow: params.newWindow === true,
-        keepOpen: params.keepOpen === true,
-      });
+      const sessionKey = validSessionKey(params.sessionKey);
+      const forceNew = params.newTab === true || params.newWindow === true;
+      const reusedTab = tabId === undefined && sessionKey && !forceNew ? await sessionTabs.reusableTab(sessionKey) : undefined;
+      const target = tabId ?? reusedTab;
+      if (reusedTab !== undefined) tabCleanup.touchTab(reusedTab);
+      markBusy(reusedTab, 1);
+      try {
+        const res = await navigateTab(target, params.url, params.until, timeoutMs, {
+          newWindow: params.newWindow === true,
+          keepOpen: params.keepOpen === true,
+        });
+        if (sessionKey && typeof res?.tabId === "number") await sessionTabs.remember(sessionKey, res.tabId);
+        return reusedTab !== undefined ? { ...res, reused: true } : res;
+      } finally {
+        markBusy(reusedTab, -1);
+      }
     }
 
     case "bc_call": {
@@ -1689,10 +1720,17 @@ async function openRelaySocket(port, versionInfo) {
     if (entry.state === "ready" && msg.type === "req" && msg.id !== undefined) {
       try {
         await tabSetsReady;
-        if (msg.params && msg.params.tabId !== undefined) {
-          entry.touchedTabs.add(Number(msg.params.tabId));
+        const reqTabId = msg.params && msg.params.tabId !== undefined ? Number(msg.params.tabId) : undefined;
+        if (reqTabId !== undefined) {
+          entry.touchedTabs.add(reqTabId);
         }
-        const result = await handleRequest(msg);
+        markBusy(reqTabId, 1);
+        let result;
+        try {
+          result = await handleRequest(msg);
+        } finally {
+          markBusy(reqTabId, -1);
+        }
         if (result && typeof result.tabId === "number") {
           entry.touchedTabs.add(result.tabId);
         }
@@ -1773,6 +1811,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 
 chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
   tabCleanup.handleTabReplaced(addedTabId, removedTabId);
+  sessionTabs.replace(addedTabId, removedTabId).catch(() => {});
 });
 
 chrome.tabs.onActivated.addListener((activeInfo) => {

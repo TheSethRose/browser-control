@@ -723,6 +723,11 @@ export function parseExtensionTargetId(
   return Number.isSafeInteger(n) ? { slug: slug.toLowerCase(), tabId: n } : undefined;
 }
 
+/** A CLI-made session key (short sha256 hex prefix), or undefined. Raw session ids never pass. */
+export function sessionKeyOf(raw: unknown): string | undefined {
+  return typeof raw === "string" && /^[0-9a-f]{8,64}$/.test(raw) ? raw : undefined;
+}
+
 export function extensionTabOf(targetId: unknown): number | undefined {
   return parseExtensionTargetId(targetId)?.tabId;
 }
@@ -1993,6 +1998,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
               ? input["browser"].trim()
               : undefined;
 
+          const sessionKey = sessionKeyOf(input["sessionKey"]);
           await waitForConnection();
 
           let targetLink: BrowserLink;
@@ -2032,7 +2038,8 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
             const resolved = resolveTarget(undefined);
             if (resolved) {
               targetLink = resolved.link;
-              tabId = resolved.tabId;
+              // A session key asks the extension for that session's own tab, not the daemon-wide one.
+              tabId = sessionKey ? undefined : resolved.tabId;
             } else {
               const fallback = defaultLink();
               if (!fallback) throw new BackendUnavailable(NAME, "extension is not connected");
@@ -2043,8 +2050,9 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
 
           const newWindow = input["newWindow"] === true;
           const keepOpen = input["keepOpen"] === true;
-          // A new window always means a new tab, so the resolved tab only picks the browser.
-          if (newWindow) tabId = undefined;
+          const newTab = input["newTab"] === true && input["targetId"] === undefined;
+          // A new window or --new-tab always means a new tab, so the resolved tab only picks the browser.
+          if (newWindow || newTab) tabId = undefined;
           const createdNewTab = tabId === undefined;
 
           const res = (await requestOnLink(
@@ -2056,17 +2064,22 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
               until,
               ...(newWindow ? { newWindow: true } : {}),
               ...(keepOpen ? { keepOpen: true } : {}),
+              ...(newTab ? { newTab: true } : {}),
+              ...(sessionKey ? { sessionKey } : {}),
               ...(timeoutMs !== undefined ? { timeoutMs } : {}),
             },
             (timeoutMs ?? 30_000) + 10_000,
-          )) as { tabId?: number; loaded?: boolean; url?: string; title?: string; created?: boolean };
+          )) as { tabId?: number; loaded?: boolean; url?: string; title?: string; created?: boolean; reused?: boolean };
           const tid = typeof res?.tabId === "number" ? res.tabId : tabId;
           if (tid !== undefined) {
             activeTab = { profileId: targetLink.profileId, slug: targetLink.slug, tabId: tid };
           }
           // Created only when the extension returned a tab id other than the one we passed in.
           const created =
-            typeof res?.tabId === "number" && res.tabId !== tabId && (res?.created === true || createdNewTab);
+            typeof res?.tabId === "number" &&
+            res.tabId !== tabId &&
+            res?.reused !== true &&
+            (res?.created === true || createdNewTab);
           return {
             loaded: res?.loaded !== false,
             targetId: tid === undefined ? null : formatTargetId(targetLink, tid),
@@ -2075,6 +2088,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
             browser: targetLink.slug,
             backend: NAME,
             ...(created ? { created: true } : {}),
+            ...(res?.reused === true && !created ? { reused: true } : {}),
           };
         }
 

@@ -8,6 +8,8 @@
 #                                     --browser <slug> opens it in that browser
 #                                     extension tabs only: --new-window opens it in a new
 #                                     window; --keep-open keeps the tab past idle cleanup
+#                                     Without a targetId it reuses this agent session's last tab;
+#                                     --new-tab opens a new one. BROWSER_CONTROL_SESSION names the session
 #   close [targetId]                  close an agent-opened extension tab (active tab if omitted)
 #   eval '<js>'                       run JavaScript, print its value ('-' reads stdin)
 #   call <op> ['<json>']              any operation, JSON in and out
@@ -200,12 +202,22 @@ check_update() {
   fi
 }
 
+# Agent session key: a short sha256 prefix, so raw session ids never leave this script.
+session_key() {
+  local id="${BROWSER_CONTROL_SESSION:-${CLAUDE_CODE_SESSION_ID:-${T3CODE_THREAD_ID:-${CODEX_THREAD_ID:-${CODEX_SESSION_ID:-}}}}}"
+  [[ -n "$id" ]] || return 0
+  if command -v shasum >/dev/null 2>&1; then printf '%s' "$id" | shasum -a 256 | cut -c1-16
+  elif command -v sha256sum >/dev/null 2>&1; then printf '%s' "$id" | sha256sum | cut -c1-16
+  fi
+}
+
 req() {
   local rc=0 mt=""
   # A long-running call (handoff) sets max_time so curl gives up just after the server would.
   [[ -z "${max_time:-}" ]] || mt="--max-time $max_time"
   resolve_natural
-  printf '%s' "${3:-}" | curl -sS --fail-with-body ${mt} -H "x-bc-natural: $nat_val" --unix-socket "$sock" -X "$1" \
+  [[ -n "${sess_key+x}" ]] || sess_key="$(session_key)"
+  printf '%s' "${3:-}" | curl -sS --fail-with-body ${mt} -H "x-bc-natural: $nat_val" -H "x-bc-session: $sess_key" --unix-socket "$sock" -X "$1" \
     --data-binary @- "http://daemon/$2" 2>/dev/null || rc=$?
   case $rc in 0) ;; 22) return 1 ;; 7) return 7 ;; *) return 9 ;; esac
 }
@@ -270,7 +282,7 @@ find=""; within=""; max=""; until=""; xy=""; ref_flag=""; to=""; out_path=""
 wait_text=""; wait_selector=""; wait_url=""; timeout=""
 filter=""; limit=""; fields=""; concurrency=""; side=""; duration=""; kind=""; properties=""; site=""
 browser=""; viewport=""; color_scheme=""; ua=""; mobile=false; reduced_motion=false; offline=false; reset_flag=false
-max_time=""; new_window=""; keep_open=""
+max_time=""; new_window=""; keep_open=""; new_tab=""
 params_list=(); where_list=()
 args=()
 case "$cmd" in snap | text | form | query | read-urls | ocr | click | hover | type | select | upload | drag | wait | key | value | shot | nav | eval | close | fill | do | verdict | health | styles | issues | perf | dialog | emulate | handoff | solve_captcha | notes | flow | script)
@@ -321,9 +333,9 @@ case "$cmd" in snap | text | form | query | read-urls | ocr | click | hover | ty
       --reduced-motion) reduced_motion=true; shift ;;
       --offline) offline=true; shift ;;
       --reset) reset_flag=true; shift ;;
-      --new-window | --keep-open)
+      --new-window | --keep-open | --new-tab)
         [[ "$cmd" == nav ]] || fail INPUT_INVALID "unknown flag: $1 ($1 works only with nav)"
-        if [[ "$1" == --new-window ]]; then new_window=1; else keep_open=1; fi
+        case "$1" in --new-window) new_window=1 ;; --new-tab) new_tab=1 ;; *) keep_open=1 ;; esac
         shift ;;
       --param) params_list+=("${2:?--param needs key=value}"); shift 2 ;;
       --where) where_list+=("${2:?--where needs field=value}"); shift 2 ;;
@@ -381,11 +393,12 @@ case "$cmd" in
     run POST "eval$(query "$(arg 1)")" "$(body "$(arg 0)")"
     ;;
   nav)
-    [[ -n "$(arg 0)" ]] || fail INPUT_INVALID "usage: browser-control-daemon nav <url> [targetId] [--snap] [--until load] [--new-window] [--keep-open] [--fast]"
+    [[ -n "$(arg 0)" ]] || fail INPUT_INVALID "usage: browser-control-daemon nav <url> [targetId] [--snap] [--until load] [--new-window] [--new-tab] [--keep-open] [--fast]"
     extra=""; [[ -z "$snap" ]] || extra="snap=1"
     [[ "$until" != "load" ]] || extra="${extra:+$extra&}until=load"
     [[ -z "$new_window" ]] || extra="${extra:+$extra&}new_window=1"
     [[ -z "$keep_open" ]] || extra="${extra:+$extra&}keep_open=1"
+    [[ -z "$new_tab" ]] || extra="${extra:+$extra&}new_tab=1"
     [[ "$fast" != true ]] || extra="${extra:+$extra&}fast=1"
     run POST "nav$(query "$(arg 1)" "$extra")" "$(arg 0)"
     ;;
