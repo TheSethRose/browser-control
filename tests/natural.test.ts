@@ -12,6 +12,7 @@ import {
   planWheelScroll,
   synthesizeStartPoint,
 } from "../src/natural";
+import { PAGE_HELPERS_SOURCE, PAGE_HELPERS_VERSION } from "../src/page-helpers";
 
 const tempDirs: string[] = [];
 afterEach(async () => {
@@ -356,6 +357,262 @@ describe("isNaturalEnabled switch precedence", () => {
       if (prevEnv === undefined) delete process.env["BROWSER_CONTROL_NATURAL"];
       else process.env["BROWSER_CONTROL_NATURAL"] = prevEnv;
     }
+  });
+});
+
+describe("page-helpers v10 — point detail/noScroll, hitCheck, pageScrollPoint", () => {
+  test("VERSION is 10 and new helpers work in isolated DOM", async () => {
+    expect(PAGE_HELPERS_VERSION).toBe(10);
+
+    const btn: any = {
+      nodeType: 1,
+      tagName: "BUTTON",
+      localName: "button",
+      id: "go",
+      className: "",
+      disabled: false,
+      isConnected: true,
+      innerText: "Go",
+      textContent: "Go",
+      labels: [],
+      scrolled: false,
+      rect: { x: 100, y: 1200, left: 100, top: 1200, right: 260, bottom: 1240, width: 160, height: 40 },
+      scrollIntoView() {
+        this.scrolled = true;
+        this.rect = { x: 100, y: 380, left: 100, top: 380, right: 260, bottom: 420, width: 160, height: 40 };
+      },
+      getBoundingClientRect() { return this.rect; },
+      getClientRects() { return [this.rect]; },
+      getRootNode() { return doc; },
+      getAttribute: () => null,
+      closest: () => null,
+      matches: () => true,
+      contains(other: any) { return other === btn; },
+      querySelectorAll: () => [],
+      querySelector: () => null,
+      parentElement: null,
+    };
+    const sidebar: any = {
+      nodeType: 1,
+      tagName: "DIV",
+      localName: "div",
+      scrollHeight: 2000,
+      clientHeight: 400,
+      scrollWidth: 200,
+      clientWidth: 200,
+      parentElement: null,
+    };
+    const mainBg: any = { nodeType: 1, tagName: "MAIN", localName: "main", parentElement: null };
+    const doc: any = {
+      title: "V10",
+      hidden: true,
+      body: { innerText: "Go", querySelectorAll: () => [] },
+      documentElement: { lang: "en", scrollTop: 0, scrollLeft: 0, scrollHeight: 2400, clientHeight: 800 },
+      scrollingElement: { scrollTop: 0, scrollLeft: 0, scrollHeight: 2400, clientHeight: 800 },
+      images: [],
+      querySelectorAll: (sel: string) => (sel.includes("button") ? [btn] : []),
+      querySelector: () => null,
+      createTreeWalker: () => ({ nextNode: () => null }),
+      elementFromPoint(x: number, y: number) {
+        if (x === 500 && y === 400) return sidebar; // center hits nested scroller
+        if (x >= btn.rect.left && x <= btn.rect.right && y >= btn.rect.top && y <= btn.rect.bottom) return btn;
+        return mainBg;
+      },
+    };
+    btn.ownerDocument = doc;
+    sidebar.parentElement = doc.body;
+    mainBg.parentElement = doc.body;
+
+    const prev: Record<string, any> = {};
+    const keys = ["__bc", "document", "location", "getComputedStyle", "innerWidth", "innerHeight", "scrollX", "scrollY", "NodeFilter"];
+    for (const k of keys) prev[k] = (globalThis as any)[k];
+
+    try {
+      delete (globalThis as any).__bc;
+      (globalThis as any).document = doc;
+      (globalThis as any).location = { href: "https://v10.test/", origin: "https://v10.test", pathname: "/", hostname: "v10.test" };
+      (globalThis as any).getComputedStyle = (el: any) =>
+        el === sidebar
+          ? { display: "block", visibility: "visible", opacity: "1", position: "static", overflowY: "auto", overflowX: "hidden" }
+          : { display: "block", visibility: "visible", opacity: "1", position: "static", overflowY: "visible", overflowX: "visible" };
+      (globalThis as any).innerWidth = 1000;
+      (globalThis as any).innerHeight = 800;
+      (globalThis as any).scrollX = 0;
+      (globalThis as any).scrollY = 0;
+      (globalThis as any).NodeFilter = { SHOW_ELEMENT: 1 };
+
+      new Function(PAGE_HELPERS_SOURCE)();
+      const bc = (globalThis as any).__bc;
+      expect(bc.v).toBe(10);
+      bc.snapshot();
+
+      // noScroll reports inView: false without calling scrollIntoView.
+      const off = JSON.parse(await bc.point("e1", { noScroll: true, detail: true }));
+      expect(off.inView).toBe(false);
+      expect(btn.scrolled).toBe(false);
+      expect(off.viewport).toEqual({ width: 1000, height: 800 });
+      expect(off.scroller.kind).toBe("document");
+      // pageScrollPoint skips center (500,400) because it hits nested scroller `sidebar`.
+      const sp = JSON.parse(bc.pageScrollPoint());
+      expect(sp).not.toBeNull();
+      expect(sp).not.toEqual({ x: 500, y: 400 });
+
+      // Default point() scrolls into view and returns legacy string for existing callers.
+      const legacy = await bc.point("e1");
+      expect(btn.scrolled).toBe(true);
+      expect(legacy).toBe("180 400 hidden");
+
+      // hitCheck matches inside button and reports miss outside.
+      expect(JSON.parse(bc.hitCheck("e1", 180, 400))).toEqual({ ok: true });
+      expect(JSON.parse(bc.hitCheck("e1", 10, 10)).ok).toBe(false);
+    } finally {
+      delete (globalThis as any).__bc;
+      for (const k of keys) {
+        if (prev[k] === undefined) delete (globalThis as any)[k];
+        else (globalThis as any)[k] = prev[k];
+      }
+    }
+  });
+
+  const baseStyle = { display: "block", visibility: "visible", opacity: "1", position: "static", overflowY: "visible", overflowX: "visible" };
+  const mkRect = (l: number, t: number, w: number, h: number) => ({ x: l, y: t, left: l, top: t, right: l + w, bottom: t + h, width: w, height: h });
+  const mkEl = (over: Record<string, any> = {}) => {
+    const rect = over.rect ?? mkRect(0, 0, 100, 40);
+    const el: any = {
+      nodeType: 1, tagName: "BUTTON", localName: "button", id: "", className: "", disabled: false, isConnected: true,
+      innerText: "Act", textContent: "Act", labels: [], rect, scrollIntoView() {},
+      getBoundingClientRect() { return this.rect; }, getClientRects() { return this.rects ?? [this.rect]; },
+      getRootNode() { return this.rootNode ?? this.ownerDocument; },
+      getAttribute: () => null, closest: () => null, matches: () => true,
+      contains(o: any) { return o === el; }, querySelectorAll: () => [], querySelector: () => null, parentElement: null, ...over,
+    };
+    return el;
+  };
+  const mkDoc = (over: Record<string, any> = {}) => ({
+    title: "V10", hidden: true, body: { innerText: "", querySelectorAll: () => [] },
+    documentElement: { scrollTop: 0, scrollLeft: 0, scrollHeight: 800, clientHeight: 800 },
+    scrollingElement: { scrollTop: 0, scrollLeft: 0, scrollHeight: 800, clientHeight: 800 },
+    images: [], querySelectorAll: () => [], querySelector: () => null, createTreeWalker: () => ({ nextNode: () => null }),
+    ...over,
+  });
+  async function withV10(doc: any, styleOf: (el: any) => any, run: (bc: any) => Promise<void> | void) {
+    const keys = ["__bc", "document", "location", "getComputedStyle", "innerWidth", "innerHeight", "scrollX", "scrollY", "NodeFilter"];
+    const prev: Record<string, any> = Object.fromEntries(keys.map((k) => [k, (globalThis as any)[k]]));
+    try {
+      delete (globalThis as any).__bc;
+      Object.assign(globalThis, {
+        document: doc, getComputedStyle: styleOf, innerWidth: 1000, innerHeight: 800, scrollX: 0, scrollY: 0,
+        location: { href: "https://v10.test/", origin: "https://v10.test", pathname: "/", hostname: "v10.test" },
+        NodeFilter: { SHOW_ELEMENT: 1 },
+      });
+      new Function(PAGE_HELPERS_SOURCE)();
+      await run((globalThis as any).__bc);
+    } finally {
+      delete (globalThis as any).__bc;
+      for (const k of keys) prev[k] === undefined ? delete (globalThis as any)[k] : ((globalThis as any)[k] = prev[k]);
+    }
+  }
+
+  test("S1: clips box against overflow:hidden wrappers, outer scrollers, and client areas", async () => {
+    const outer = mkEl({ tagName: "DIV", localName: "div", rect: mkRect(50, 50, 200, 200), clientLeft: 10, clientTop: 10, clientWidth: 160, clientHeight: 160, scrollHeight: 800, scrollWidth: 160, scrollTop: 0, scrollLeft: 0 });
+    const clipWrap = mkEl({ tagName: "DIV", localName: "div", rect: mkRect(60, 60, 160, 120), clientLeft: 0, clientTop: 0, clientWidth: 160, clientHeight: 120, parentElement: outer });
+    const inner = mkEl({ tagName: "DIV", localName: "div", rect: mkRect(60, 60, 160, 300), clientLeft: 0, clientTop: 0, clientWidth: 160, clientHeight: 300, scrollHeight: 900, scrollWidth: 160, scrollTop: 0, scrollLeft: 0, parentElement: clipWrap });
+    const hiddenBtn = mkEl({ id: "hid", rect: mkRect(80, 190, 100, 40), parentElement: inner });
+    const partialBtn = mkEl({ id: "part", rect: mkRect(80, 165, 160, 40), parentElement: inner });
+    const doc = mkDoc({ querySelectorAll: (s: string) => (s.includes("button") ? [hiddenBtn, partialBtn] : []), elementFromPoint: () => partialBtn });
+    for (const e of [outer, clipWrap, inner, hiddenBtn, partialBtn]) e.ownerDocument = doc;
+    outer.parentElement = doc.body;
+    const styleOf = (el: any) => el === outer || el === inner ? { ...baseStyle, overflowY: "auto", overflowX: "auto" }
+      : el === clipWrap ? { ...baseStyle, overflowY: "hidden", overflowX: "hidden" } : baseStyle;
+    await withV10(doc, styleOf, async (bc) => {
+      bc.snapshot();
+      const r1 = JSON.parse(await bc.point("e1", { noScroll: true, detail: true }));
+      expect(r1.inView).toBe(false);
+      expect(r1.box.height).toBe(0);
+      const r2 = JSON.parse(await bc.point("e2", { noScroll: true, detail: true }));
+      expect(r2.inView).toBe(false);
+      expect(r2.box).toEqual({ left: 80, top: 165, width: 140, height: 15 });
+    });
+  });
+
+  test("S2: detail point hit-tests clipped visible fragment; legacy keeps bbox center", async () => {
+    const wrapped = mkEl({ tagName: "A", localName: "a", id: "wrap", rect: mkRect(0, 100, 600, 40), rects: [mkRect(400, 100, 200, 20), mkRect(0, 120, 200, 20)] });
+    const tall = mkEl({ id: "tall", rect: mkRect(100, -300, 200, 500) });
+    const bg = mkEl({ tagName: "DIV", localName: "div", id: "bg" });
+    const doc = mkDoc({
+      querySelectorAll: (s: string) => (s.includes("button") ? [wrapped, tall] : []),
+      elementFromPoint: (x: number, y: number) =>
+        x >= 400 && x <= 600 && y >= 100 && y <= 120 ? wrapped : x >= 100 && x <= 300 && y >= 0 && y <= 200 ? tall : y < 0 ? null : bg,
+    });
+    for (const e of [wrapped, tall, bg]) e.ownerDocument = doc;
+    await withV10(doc, () => baseStyle, async (bc) => {
+      bc.snapshot();
+      const dWrap = JSON.parse(await bc.point("e1", { detail: true }));
+      expect({ inView: dWrap.inView, x: dWrap.x, y: dWrap.y, box: dWrap.box }).toEqual({ inView: true, x: 500, y: 110, box: { left: 400, top: 100, width: 200, height: 20 } });
+      await expect(bc.point("e1")).rejects.toThrow(/NOT_ACTIONABLE/);
+      const dTall = JSON.parse(await bc.point("e2", { noScroll: true, detail: true }));
+      expect({ inView: dTall.inView, x: dTall.x, y: dTall.y, box: dTall.box }).toEqual({ inView: true, x: 200, y: 100, box: { left: 100, top: 0, width: 200, height: 200 } });
+    });
+  });
+
+  test("S3 & S4: same-origin iframe hitCheck verifies parent and findScroller keeps frame box/offsets aligned", async () => {
+    const modal = mkEl({ tagName: "DIALOG", localName: "dialog", id: "ov" });
+    let covered = true;
+    const iframeEl: any = mkEl({ tagName: "IFRAME", localName: "iframe", id: "f1", rect: mkRect(100, 50, 400, 300), clientLeft: 2, clientTop: 2 });
+    const childBtn = mkEl({ id: "cbtn", rect: mkRect(20, 500, 100, 40) });
+    const cRoot = { scrollTop: 40, scrollLeft: 0, scrollHeight: 1200, clientHeight: 296, scrollWidth: 396, clientWidth: 396 };
+    const childDoc: any = mkDoc({
+      defaultView: { innerWidth: 396, innerHeight: 296, frameElement: iframeEl, parent: globalThis },
+      documentElement: cRoot, scrollingElement: cRoot,
+      querySelectorAll: (s: string) => (s.includes("button") ? [childBtn] : []),
+      elementFromPoint: (x: number, y: number) => (x >= 20 && x <= 120 && y >= 500 && y <= 540 ? childBtn : null),
+    });
+    childBtn.ownerDocument = childDoc;
+    iframeEl.contentDocument = childDoc;
+    let walked = false;
+    const topDoc = mkDoc({
+      createTreeWalker: () => ({ nextNode: () => (walked ? null : ((walked = true), iframeEl)) }),
+      elementFromPoint: () => (covered ? modal : iframeEl),
+    });
+    iframeEl.ownerDocument = modal.ownerDocument = topDoc;
+    await withV10(topDoc, () => baseStyle, async (bc) => {
+      bc.snapshot();
+      expect(JSON.parse(bc.hitCheck("e1", 172, 572)).ok).toBe(false);
+      covered = false;
+      expect(JSON.parse(bc.hitCheck("e1", 172, 572))).toEqual({ ok: true });
+      const off = JSON.parse(await bc.point("e1", { noScroll: true, detail: true }));
+      expect(off.inView).toBe(false);
+      expect(off.scroller).toMatchObject({ kind: "element", box: { left: 102, top: 52, width: 396, height: 296 }, scrollTop: 40 });
+    });
+  });
+
+  test("S5: shadow DOM deep hit in pageScrollPoint and composed parent in findScroller", async () => {
+    const outerScroll = mkEl({ tagName: "DIV", localName: "div", rect: mkRect(0, 0, 400, 400), clientWidth: 400, clientHeight: 400, scrollHeight: 1500, scrollWidth: 400, scrollTop: 10, scrollLeft: 0 });
+    const host = mkEl({ tagName: "DIV", localName: "div", parentElement: outerScroll });
+    const shadowScroller = mkEl({ tagName: "DIV", localName: "div", scrollHeight: 1000, clientHeight: 200, scrollWidth: 200, clientWidth: 200 });
+    const shadowBtn = mkEl({ id: "sbtn", rect: mkRect(20, 600, 100, 40) });
+    const sr: any = { host, querySelectorAll: (s: string) => (s.includes("button") ? [shadowBtn] : []), elementFromPoint: (x: number, y: number) => (x === 500 && y === 400 ? shadowScroller : shadowBtn) };
+    host.shadowRoot = sr;
+    shadowScroller.rootNode = shadowBtn.rootNode = sr;
+    const bg = mkEl({ tagName: "MAIN", localName: "main" });
+    let walked = false;
+    const doc = mkDoc({
+      documentElement: { scrollTop: 0, scrollLeft: 0, scrollHeight: 2000, clientHeight: 800 },
+      scrollingElement: { scrollTop: 0, scrollLeft: 0, scrollHeight: 2000, clientHeight: 800 },
+      createTreeWalker: () => ({ nextNode: () => (walked ? null : ((walked = true), host)) }),
+      elementFromPoint: (x: number, y: number) => (x === 500 && y === 400 ? host : bg),
+    });
+    for (const e of [outerScroll, host, shadowScroller, shadowBtn, bg, sr]) e.ownerDocument = doc;
+    outerScroll.parentElement = bg.parentElement = doc.body;
+    await withV10(doc, (el) => (el === outerScroll || el === shadowScroller ? { ...baseStyle, overflowY: "auto" } : baseStyle), async (bc) => {
+      bc.snapshot();
+      const sp = JSON.parse(bc.pageScrollPoint());
+      expect(sp).not.toBeNull();
+      expect(sp).not.toEqual({ x: 500, y: 400 });
+      const off = JSON.parse(await bc.point("e1", { noScroll: true, detail: true }));
+      expect(off.inView).toBe(false);
+      expect(off.scroller).toMatchObject({ kind: "element", scrollTop: 10 });
+    });
   });
 });
 

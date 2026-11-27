@@ -1676,7 +1676,7 @@ describe("relay handshake tracking, fix lines, and timeout", () => {
     const backend = createExtensionBackend({
       ...allocPortWindow(),
       token,
-      helpersVersion: 9,
+      helpersVersion: 10,
       waitConnectMs: 80,
       listTargetsWaitMs: 80,
     });
@@ -1686,13 +1686,13 @@ describe("relay handshake tracking, fix lines, and timeout", () => {
 
     const closed = await sendPairedHelpersMismatch(port, token, { profileId: "p-old", helpersVersion: 8 });
     expect(closed.code).toBe(CLOSE_VERSION_MISMATCH);
-    expect(closed.reason).toContain("helpers=9");
+    expect(closed.reason).toContain("helpers=10");
 
-    const expectedFix = "Extension connected but uses helpers v8 (need v9): reload Browser Control at chrome://extensions.";
+    const expectedFix = "Extension connected but uses helpers v8 (need v10): reload Browser Control at chrome://extensions.";
 
     const st = await extensionStatusReport(backend, ["extension"], undefined, 0);
     expect(st["browsers"]).toBe(0);
-    expect(st["helpersVersion"]).toBe(9);
+    expect(st["helpersVersion"]).toBe(10);
     expect(st["fix"]).toBe(expectedFix);
     expect(st["handshakes"]).toHaveLength(1);
     expect((st["handshakes"] as RelayHandshakeRecord[])[0]).toMatchObject({
@@ -1731,7 +1731,7 @@ describe("relay handshake tracking, fix lines, and timeout", () => {
     const backend = createExtensionBackend({
       ...allocPortWindow(),
       token,
-      helpersVersion: 9,
+      helpersVersion: 10,
       waitConnectMs: 80,
       listTargetsWaitMs: 80,
     });
@@ -1764,7 +1764,7 @@ describe("relay handshake tracking, fix lines, and timeout", () => {
         profileId: "p-bad-pair",
         browser: "Chrome",
         version: "2.0.0",
-        helpersVersion: 9,
+        helpersVersion: 10,
         protocolVersion: PROTOCOL_VERSION,
         nonce: randomBytes(16).toString("hex"),
       }),
@@ -1802,7 +1802,7 @@ describe("relay handshake tracking, fix lines, and timeout", () => {
         profileId: "p-proto",
         browser: "Chrome",
         version: "2.0.0",
-        helpersVersion: 9,
+        helpersVersion: 10,
         protocolVersion: PROTOCOL_VERSION + 1,
         nonce: randomBytes(16).toString("hex"),
       }),
@@ -1872,7 +1872,7 @@ describe("relay handshake tracking, fix lines, and timeout", () => {
     const backend = createExtensionBackend({
       ...allocPortWindow(),
       token,
-      helpersVersion: 9,
+      helpersVersion: 10,
       waitConnectMs: 80,
       listTargetsWaitMs: 80,
     });
@@ -1880,7 +1880,7 @@ describe("relay handshake tracking, fix lines, and timeout", () => {
     await backend.start!();
     const port = backend.getPort()!;
 
-    // 1. Paired stale extension gets 4003 (helpers v8 vs v9).
+    // 1. Paired stale extension gets 4003 (helpers v8 vs v10).
     const pairedClosed = await sendPairedHelpersMismatch(port, token, { profileId: "p-stale", helpersVersion: 8 });
     expect(pairedClosed.code).toBe(CLOSE_VERSION_MISMATCH);
 
@@ -1898,7 +1898,7 @@ describe("relay handshake tracking, fix lines, and timeout", () => {
         profileId: "p-other-2",
         browser: "Chrome",
         version: "2.0.0",
-        helpersVersion: 9,
+        helpersVersion: 10,
         protocolVersion: PROTOCOL_VERSION,
         nonce: randomBytes(16).toString("hex"),
       }),
@@ -1908,7 +1908,7 @@ describe("relay handshake tracking, fix lines, and timeout", () => {
     await waitClose(wsPeer);
     await new Promise((r) => setTimeout(r, 30));
 
-    const expectedFix = "Extension connected but uses helpers v8 (need v9): reload Browser Control at chrome://extensions.";
+    const expectedFix = "Extension connected but uses helpers v8 (need v10): reload Browser Control at chrome://extensions.";
     const st = await extensionStatusReport(backend, ["extension"], undefined, 0);
     expect(st["fix"]).toBe(expectedFix);
 
@@ -1925,7 +1925,7 @@ describe("relay handshake tracking, fix lines, and timeout", () => {
 
   test("S8: eight newer unpaired rejections neither hide nor evict the paired reload advice", async () => {
     const token = randomBytes(32).toString("hex");
-    const backend = createExtensionBackend({ ...allocPortWindow(), token, helpersVersion: 9, waitConnectMs: 80, listTargetsWaitMs: 80 });
+    const backend = createExtensionBackend({ ...allocPortWindow(), token, helpersVersion: 10, waitConnectMs: 80, listTargetsWaitMs: 80 });
     disposables.push(backend);
     await backend.start!();
     const port = backend.getPort()!;
@@ -1946,14 +1946,14 @@ describe("relay handshake tracking, fix lines, and timeout", () => {
     await new Promise((r) => setTimeout(r, 20));
 
     const st = await extensionStatusReport(backend, ["extension"], undefined, 0);
-    expect(st["fix"]).toBe("Extension connected but uses helpers v8 (need v9): reload Browser Control at chrome://extensions.");
+    expect(st["fix"]).toBe("Extension connected but uses helpers v8 (need v10): reload Browser Control at chrome://extensions.");
     expect((st["handshakes"] as unknown[]).length).toBeLessThanOrEqual(8);
     pending.close();
   });
 
   test("S13: a reserved mismatch from before a successful connect never displaces a newer rejection", async () => {
     const token = randomBytes(32).toString("hex");
-    const backend = createExtensionBackend({ ...allocPortWindow(), token, helpersVersion: 9, waitConnectMs: 80, listTargetsWaitMs: 80 });
+    const backend = createExtensionBackend({ ...allocPortWindow(), token, helpersVersion: 10, waitConnectMs: 80, listTargetsWaitMs: 80 });
     disposables.push(backend);
     await backend.start!();
     const port = backend.getPort()!;
@@ -2248,9 +2248,9 @@ describe("relay handshake tracking, fix lines, and timeout", () => {
             timestamp: 1,
           },
         ],
-        { protocolVersion: 1, helpersVersion: 9 },
+        { protocolVersion: 1, helpersVersion: 10 },
       ),
-    ).toBe("Extension connected but uses helpers v8 (need v9): reload Browser Control at chrome://extensions.");
+    ).toBe("Extension connected but uses helpers v8 (need v10): reload Browser Control at chrome://extensions.");
     expect(
       formatHandshakeFix(
         [
@@ -2260,12 +2260,12 @@ describe("relay handshake tracking, fix lines, and timeout", () => {
             failureKind: "version_mismatch",
             paired: "unknown",
             closeCode: 4003,
-            helpersVersion: 9,
+            helpersVersion: 10,
             protocolVersion: 2,
             timestamp: 1,
           },
         ],
-        { protocolVersion: 1, helpersVersion: 9 },
+        { protocolVersion: 1, helpersVersion: 10 },
       ),
     ).toBe("Rejected handshake from other client (not your paired extension): uses protocol v2 (need v1).");
     expect(
@@ -2317,9 +2317,9 @@ describe("relay handshake tracking, fix lines, and timeout", () => {
             timestamp: 20,
           },
         ],
-        { protocolVersion: 1, helpersVersion: 9 },
+        { protocolVersion: 1, helpersVersion: 10 },
       ),
-    ).toBe("Extension connected but uses helpers v8 (need v9): reload Browser Control at chrome://extensions.");
+    ).toBe("Extension connected but uses helpers v8 (need v10): reload Browser Control at chrome://extensions.");
     expect(
       formatHandshakeFix([
         {
