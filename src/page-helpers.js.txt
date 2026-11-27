@@ -1,5 +1,5 @@
 (() => {
-  const VERSION = 12;
+  const VERSION = 13;
   if (globalThis.__bc && globalThis.__bc.v === VERSION) return;
 
   const INTERACTIVE = [
@@ -583,11 +583,21 @@
     return location.href;
   }
 
+  // A background tab under focus emulation reports visible but keeps its background timer throttling (a 40 ms
+  // timer fires after ~250 ms on macOS, ~1 s on Linux) while its frames run at full rate, so tick on whichever
+  // comes first: otherwise every settle in a background agent tab costs a throttled timer.
+  const settleTick = () => new Promise((r) => {
+    let raf = 0;
+    const done = () => { clearTimeout(t); if (raf && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(raf); r(); };
+    const t = setTimeout(done, 40);
+    if (typeof requestAnimationFrame === 'function') raf = requestAnimationFrame(done);
+  });
+
   async function settle(maxMs = 400, quietMs = 120) {
     if (document.hidden) return 'hidden';
     const start = performance.now();
     for (;;) {
-      await new Promise((r) => setTimeout(r, 40));
+      await settleTick();
       const now = performance.now();
       const limit = leaving ? 5000 : maxMs;
       if (now - start >= limit) return 'timeout';
