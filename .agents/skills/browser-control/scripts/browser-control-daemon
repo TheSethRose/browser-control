@@ -6,8 +6,8 @@
 #   tabs                              list tabs; * marks the selected one
 #   nav <url> [--snap] [--until load] navigate; --snap also lists the controls.
 #                                     --browser <slug> opens it in that browser
-#                                     --new-window opens it in a new window; --keep-open
-#                                     keeps the tab past idle cleanup
+#                                     extension tabs only: --new-window opens it in a new
+#                                     window; --keep-open keeps the tab past idle cleanup
 #   eval '<js>'                       run JavaScript, print its value ('-' reads stdin)
 #   call <op> ['<json>']              any operation, JSON in and out
 #   start [browser]                   switch browser by name (chrome, beta, brave, ardia); opens it
