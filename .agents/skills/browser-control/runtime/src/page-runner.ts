@@ -3116,8 +3116,9 @@ export function createPageHelperHandler(
       case "nav": {
         const url = typeof input["url"] === "string" ? input["url"] : "";
         const until = input["until"] === "load" ? "load" : "domcontentloaded";
+        const paced = isNatural(input);
         // Pagination belongs to nav, so the minimum gap lands between the two navigations.
-        if (isNatural(input)) await pacePagination(targetId, url);
+        if (paced) await pacePagination(targetId, url);
         // Stamp the clock at dispatch, so a slow load never eats into the pagination gap.
         const navAt = now();
         const nav = await invoke("navigate", {
@@ -3144,7 +3145,8 @@ export function createPageHelperHandler(
               steps: [
                 { kind: "bc", method: "settle", discard: true },
                 { kind: "href" },
-                { kind: "bc", method: "chars", fallback: "" },
+                // Only ask for the body length when this call pays a reading dwell.
+                ...(paced ? [{ kind: "bc" as const, method: "chars", fallback: "" as const }] : []),
                 { kind: "bc", method: "wall", fallback: "" },
               ],
               join: "\n",
@@ -3156,11 +3158,11 @@ export function createPageHelperHandler(
           let chars = 0;
           let wall = "";
           if (state.ok) {
-            // Body length rides in the same attach-free probe, so no read ever asks for a debugger.
+            // Body length rides in the same attach-free probe, and only when this nav pays a dwell.
             const [href = "", count = "", wallHint = ""] = valueOf(state).split("\n");
             final = href;
-            chars = Number(count) > 0 ? Number(count) : 0;
-            wall = wallHint;
+            chars = paced && Number(count) > 0 ? Number(count) : 0;
+            wall = paced ? wallHint : count;
           } else if (messageOf(state).startsWith("EXTENSION_ONLY:") || messageOf(state).includes("RESTRICTED_PAGE:")) {
             if (newTab !== undefined && messageOf(state).includes("RESTRICTED_PAGE:")) {
               const closed = await invoke("close_target", { targetId: newTab }).catch((e: unknown) =>
@@ -3236,7 +3238,7 @@ export function createPageHelperHandler(
             lines.push(`# WALL: ${wall}. Stop and hand this tab to the user; do not solve or bypass it.`);
           }
           // Remember the dwell (and any pagination gap) to pay before the next input on this tab.
-          if (!wall && isNatural(input)) recordNavPace(tab, final || url, navAt, chars);
+          if (!wall && paced) recordNavPace(tab, final || url, navAt, chars);
         }
         if (input["snap"] === true) {
           const snap = await handlePage("snap", { _skipChallengeCheck: !onBrowse }, tab);

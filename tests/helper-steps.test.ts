@@ -584,7 +584,8 @@ describe("page-runner emits byte-identical CDP evaluate and Runtime.evaluate exp
       expect(evalExprs).toContain(probeOf('__bc.dragInfo("e2", "e5", "before")'));
       expect(evalExprs).toContain(probeOf('__bc.listPosition({"i":1})'));
       expect(evalExprs).toContain(probeOf('__bc.checkWait({"text":"Saved"})'));
-      expect(evalExprs).toContain(probeOf('(await __bc.settle(), [location.href, __bc.chars() || "", __bc.wall() || ""].join("\\n"))'));
+      // Natural pacing is off in tests, so nav skips the body-length read and keeps the wall probe.
+      expect(evalExprs).toContain(probeOf('(await __bc.settle(), [location.href, __bc.wall() || ""].join("\\n"))'));
       expect(evalExprs).toContain(probeOf("__bc.form({})"));
       expect(evalExprs).toContain(probeOf('__bc.query({"selector":"a"})'));
       expect(evalExprs).toContain(probeOf('await __bc.readUrls({"urls":["https://a.test/1"]})'));
