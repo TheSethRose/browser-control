@@ -32,6 +32,23 @@ export const PROTOCOL_VERSION = 1;
 export const PORT_RANGE_START = 49222;
 export const PORT_RANGE_END = 49229;
 
+/** Test-only relay port override: `BROWSER_CONTROL_RELAY_PORTS=<start>-<end>`. */
+export const RELAY_PORTS_ENV = "BROWSER_CONTROL_RELAY_PORTS";
+const PORT_MIN = 1024;
+const PORT_MAX = 65535;
+
+/** Parse `RELAY_PORTS_ENV`; a malformed or out-of-range value is ignored so the default range stands. */
+export function relayPortRangeFromEnv(
+  env: Record<string, string | undefined> = process.env,
+): { start: number; end: number } | undefined {
+  const match = /^(\d{1,5})-(\d{1,5})$/.exec((env[RELAY_PORTS_ENV] ?? "").trim());
+  if (!match) return undefined;
+  const start = Number(match[1]);
+  const end = Number(match[2]);
+  const valid = (n: number) => Number.isInteger(n) && n >= PORT_MIN && n <= PORT_MAX;
+  return valid(start) && valid(end) && start <= end ? { start, end } : undefined;
+}
+
 export const PRE_AUTH_MAX_BYTES = 64 * 1024;
 export const TRANSPORT_MAX_PAYLOAD_BYTES = 1024 * 1024;
 export const CHUNK_MAX_DATA_BYTES = 512 * 1024;
@@ -148,7 +165,7 @@ export async function setupExtensionPairing(
   options: { tokenFile?: string; port?: number } = {},
 ): Promise<{ tokenFile: string; pairingFile: string; port: number }> {
   const tokenFile = options.tokenFile ?? defaultTokenFilePath();
-  const port = options.port ?? PORT_RANGE_START;
+  const port = options.port ?? relayPortRangeFromEnv()?.start ?? PORT_RANGE_START;
   const token = await repairRelayToken(tokenFile);
   const resolvedDir = resolvePath(extensionDir);
   await mkdir(resolvedDir, { recursive: true });
@@ -1048,8 +1065,9 @@ async function writeArtifact(
 }
 
 export function createExtensionBackend(options: ExtensionBackendOptions = {}): ExtensionBackend {
-  const portStart = options.portStart ?? PORT_RANGE_START;
-  const portEnd = options.portEnd ?? PORT_RANGE_END;
+  const envRange = relayPortRangeFromEnv();
+  const portStart = options.portStart ?? envRange?.start ?? PORT_RANGE_START;
+  const portEnd = options.portEnd ?? envRange?.end ?? PORT_RANGE_END;
   const expectedOrigin = options.expectedOrigin ?? EXTENSION_ORIGIN;
   const handshakeTimeoutMs = options.handshakeTimeoutMs ?? HANDSHAKE_TIMEOUT_MS;
   const waitConnectMs = options.waitConnectMs ?? DEFAULT_WAIT_CONNECT_MS;
