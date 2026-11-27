@@ -77,6 +77,8 @@ export function route(
   const enabledBackends = () => enabled().flatMap((n) => (n === CDP ? [] : [byName.get(n)!]));
 
   async function runOp(op: string, input: OpInput): Promise<unknown> {
+    // A backend removed from the order (`extension disable`) no longer owns untargeted calls.
+    if (active !== undefined && !enabled().includes(active)) active = undefined;
     // `nav --browser <slug>` names an extension browser, whatever the backend order or target.
     if (op === "navigate" && typeof input["browser"] === "string") {
       const ext = enabled().includes(EXTENSION) ? byName.get(EXTENSION) : undefined;

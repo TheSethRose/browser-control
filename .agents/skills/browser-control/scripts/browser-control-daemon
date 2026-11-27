@@ -66,7 +66,7 @@ sock="$dir/sock"; log="$dir/daemon.log"; lock="$dir/starting"; build_file="$sock
 repo_url="https://github.com/TheSethRose/browser-control"
 raw_manifest_url="https://raw.githubusercontent.com/TheSethRose/browser-control/main/capability.json"
 
-fail() { echo '{"ok":false,"error":{"code":"'"$1"'","message":"'"$2"'"}}'; exit 1; }
+fail() { echo '{"ok":false,"error":{"code":"'"$1"'","message":'"$(json_str "$2")"'}}'; exit 1; }
 
 cli_build() {
   local f="$here/../runtime/cli.js"
@@ -580,13 +580,13 @@ case "$cmd" in
         ext_dir="$(cd "$ext_dir" && pwd)"
         command -v bun >/dev/null 2>&1 || { echo "browser-control-daemon: bun is required (https://bun.sh)" >&2; exit 127; }
         bun "$here/../runtime/cli.js" extension-setup "$ext_dir" >/dev/null || fail EXECUTION_FAILED "pairing setup failed; see the error above"
-        mkdir -p "$dir"; chmod 700 "$dir"; printf '%s\n' "extension,cdp" >"$dir/backends"
+        mkdir -p "$dir"; chmod 700 "$dir"; printf '%s\n' "extension,cdp" >"$dir/backends.$$" && mv -f "$dir/backends.$$" "$dir/backends"
         echo '{"ok":true,"data":{"paired":true,"backends":"extension,cdp","extensionDir":'"$(json_str "$ext_dir")"',"next":"In Chrome open chrome://extensions, turn on Developer mode, click Load unpacked, and pick extensionDir. Then run: browser-control-daemon extension browsers"}}'
         ;;
       status | browsers | diagnostics) run GET "extension/$sub" ;;
       enable | disable)
         order="cdp"; [[ "$sub" == disable ]] || order="extension,cdp"
-        mkdir -p "$dir"; chmod 700 "$dir"; printf '%s\n' "$order" >"$dir/backends"
+        mkdir -p "$dir"; chmod 700 "$dir"; printf '%s\n' "$order" >"$dir/backends.$$" && mv -f "$dir/backends.$$" "$dir/backends"
         echo '{"ok":true,"data":{"backends":"'"$order"'"}}'
         ;;
       pair | revoke) fail INPUT_INVALID "extension $sub is not available yet: it ships with the Web Store build. Use: browser-control-daemon extension setup" ;;
