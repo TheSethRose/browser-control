@@ -2395,6 +2395,7 @@ describe("relay handshake tracking, fix lines, and timeout", () => {
         }
         if (op === "close_tab") {
           if (Number(params["tabId"]) === 93) throw new Error("REFUSED: cleanup refused for test");
+          if (Number(params["tabId"]) === 94) return { ok: true, closed: false };
           closedTabIds.push(Number(params["tabId"]));
           return { ok: true, closed: true };
         }
@@ -2447,9 +2448,16 @@ describe("relay handshake tracking, fix lines, and timeout", () => {
       expect(refusedRes.ok).toBe(false);
       if (!refusedRes.ok) {
         expect(refusedRes.error.message).toMatch(/EXTENSION_ONLY: RESTRICTED_PAGE:/);
-        expect(refusedRes.error.message).toContain("The tab this nav opened (extension:93) is still open: REFUSED: cleanup refused for test");
+        expect(refusedRes.error.message).toContain(
+          "The tab this nav opened (extension:93) may still be open (closing it could not be confirmed): REFUSED: cleanup refused for test.",
+        );
       }
       expect(closedTabIds).toEqual([91, 92]);
+
+      // 6. Cleanup reports closed:false -> the error says the tab is still open.
+      const notClosedRes = await handlePage("nav", { url: "chrome://gpu", newWindow: true });
+      expect(notClosedRes.ok).toBe(false);
+      if (!notClosedRes.ok) expect(notClosedRes.error.message).toContain("The tab this nav opened (extension:94) is still open.");
       expect(cdpLog).toEqual([]);
     } finally {
       if (savedBackends === undefined) delete process.env["BROWSER_CONTROL_BACKENDS"];

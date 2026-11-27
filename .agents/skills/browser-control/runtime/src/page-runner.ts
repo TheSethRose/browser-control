@@ -2580,10 +2580,15 @@ export function createPageHelperHandler(
               const closed = await invoke("close_target", { targetId: newTab }).catch((e: unknown) =>
                 failure("EXECUTION_FAILED", e instanceof Error ? e.message : String(e)),
               );
-              if (!closed.ok) {
+              const note = !closed.ok
+                ? `may still be open (closing it could not be confirmed): ${messageOf(closed)}`
+                : (closed.data as Json | undefined)?.["closed"] === false
+                  ? "is still open"
+                  : undefined;
+              if (note !== undefined) {
                 return failure(
                   state.ok ? "EXECUTION_FAILED" : state.error.code,
-                  `${messageOf(state)}\nThe tab this nav opened (${newTab}) is still open: ${messageOf(closed)}`,
+                  `${messageOf(state)}\nThe tab this nav opened (${newTab}) ${note}.`,
                 );
               }
             }

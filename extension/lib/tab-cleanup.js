@@ -74,6 +74,7 @@ export function closeTabSafely(tabId, { beforeUngroup, afterUngroup, onlyIf } = 
     if (!tab) return { closed: false, replacement: null };
 
     const { created } = await leaveLastWindowOpen(tab, chromeApi);
+    if (onlyIf && !onlyIf()) return { closed: false, replacement: created };
 
     if (typeof tab.groupId === "number" && tab.groupId !== TAB_GROUP_ID_NONE && typeof chromeApi.tabs?.ungroup === "function") {
       beforeUngroup?.(tabId);
