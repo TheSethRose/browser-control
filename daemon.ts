@@ -247,17 +247,12 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
       }
       case "eval":
         return text(await invoke("evaluate", { expression: body, targetId }), (data) => data.value, wrap);
-      case "close": {
-        const closed = await invoke("close_target", targetId ? { targetId } : {});
-        const done = closed.ok ? (closed.data as { closed?: unknown; targetId?: unknown }) : undefined;
-        const closedId = done?.targetId;
-        if (done && done.closed !== false) handlePage.forgetTab(typeof closedId === "string" ? closedId : targetId);
+      case "close":
         return text(
-          closed,
+          await invoke("close_target", targetId ? { targetId } : {}),
           (data) => (data.closed === false ? `not closed ${data.targetId ?? ""}` : `closed ${data.targetId ?? ""}`).trim(),
           false,
         );
-      }
       case "nav": {
         const browser = url.searchParams.get("browser")?.trim() || undefined;
         const navScope = browser ? { browser, explicitTargetId: targetId } : undefined;
