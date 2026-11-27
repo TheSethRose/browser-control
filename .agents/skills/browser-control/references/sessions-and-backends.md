@@ -44,7 +44,7 @@ Other `extension` subcommands:
 If the extension doesn't connect:
 
 - The first call after a fresh daemon start can wait up to 35 s while Chrome wakes the extension. The daemon prints why it is waiting. Later calls are instant.
-- Run `extension status`. If no browser is connected, check its `fix` line (for example a helper version mismatch or pairing mismatch); otherwise ask the user to check that the extension is loaded and turned on in `chrome://extensions`.
+- Run `extension status`. If no browser is connected, check its `fix` line (for example a helper version mismatch from your paired extension, or a rejected handshake from another client); otherwise ask the user to check that the extension is loaded and turned on in `chrome://extensions`.
 - In Claude Code's sandbox, the relay needs `allowLocalBinding: true`. The daemon socket folder needs `allowUnixSockets`. Without them the relay can't open its port.
 
 ## 3. Browsers and profiles

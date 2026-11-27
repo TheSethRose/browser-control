@@ -1,12 +1,12 @@
 // Live Chrome for Testing check against the pre-PR #10 (b8b976f) extension build.
 // Verifies that an outdated extension is never invisible:
-//   1. extension status & diagnostics show browsers: 0, the 4003 handshake record, and the reload fix line,
+//   1. extension status & diagnostics show browsers: 0, the 4003 handshake record (paired: true), and the reload fix line,
 //   2. EXTENSION_ONLY errors use that same reload fix line instead of bare "did not connect within",
-//   3. the relay closes both the rejected WebSocket (4003) and the /version probe socket (no lingering ESTABLISHED socket).
+//   3. the relay closes both the rejected WebSocket (4003) and the /version HTTP keep-alive socket immediately (no lingering ESTABLISHED probe socket).
 //
 // Run standalone: BC_E2E_CHROME=<path> bun tests/e2e/stale-extension.ts
 import { spawn, type Subprocess } from "bun";
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { OperationHandler } from "@agent-software/core";
@@ -81,6 +81,39 @@ export async function runStaleExtensionCheck(
     const port = backend.getPort()!;
     await setupExtensionPairing(oldExt, { tokenFile, port });
 
+    // Patch the archived temp copy's background.js so it scans only the isolated test port
+    // and never touches the default 49222-49229 range where a live daemon may be listening.
+    const bgPath = join(oldExt, "background.js");
+    const origBg = readFileSync(bgPath, "utf8");
+    let patchedBg = origBg;
+    const patchRules: Array<[RegExp, string]> = [
+      [/\bconst DEFAULT_PORT = 49222;/, `const DEFAULT_PORT = ${port};`],
+      [/\bconst PORT_RANGE_START = 49222;/, `const PORT_RANGE_START = ${port};`],
+      [/\bconst PORT_RANGE_END = 49229;/, `const PORT_RANGE_END = ${port};`],
+    ];
+    const missingPatches: string[] = [];
+    for (const [re, rep] of patchRules) {
+      if (!re.test(patchedBg)) missingPatches.push(re.source);
+      else patchedBg = patchedBg.replace(re, rep);
+    }
+    const nonCommentBg = patchedBg.replace(/\/\/[^\n]*/g, "");
+    const leakedDefaultPort = /\b4922[2-9]\b/.test(nonCommentBg);
+    const patchOk =
+      missingPatches.length === 0 &&
+      !leakedDefaultPort &&
+      patchedBg.includes(`const DEFAULT_PORT = ${port};`) &&
+      patchedBg.includes(`const PORT_RANGE_START = ${port};`) &&
+      patchedBg.includes(`const PORT_RANGE_END = ${port};`);
+    check(
+      "stale-port-patch",
+      patchOk,
+      patchOk
+        ? `patched background.js to port ${port} only`
+        : `failed to isolate port range (missing=${missingPatches.join(",")}, leaked=${leakedDefaultPort})`,
+    );
+    if (!patchOk) return false;
+    writeFileSync(bgPath, patchedBg, "utf8");
+
     browser = spawn(
       [
         chrome,
@@ -97,7 +130,7 @@ export async function runStaleExtensionCheck(
       { stdout: "ignore", stderr: "ignore" },
     );
 
-    // Wait for the b8b976f extension to probe /version and get rejected with 4003.
+    // Wait for the b8b976f extension to probe /version, prove pairing, and get rejected with 4003.
     let status: Record<string, unknown> = {};
     for (let i = 0; i < 40; i++) {
       status = await extensionStatusReport(backend, ["extension"], tokenFile, 0);
@@ -112,7 +145,13 @@ export async function runStaleExtensionCheck(
       "stale-status-fix",
       status["browsers"] === 0 &&
         /Extension connected but uses helpers v\d+ \(need v\d+\): reload Browser Control at chrome:\/\/extensions\./.test(fix) &&
-        handshakes.some((h) => h.stage === "rejected" && h.closeCode === CLOSE_VERSION_MISMATCH && typeof h.helpersVersion === "number"),
+        handshakes.some(
+          (h) =>
+            h.stage === "rejected" &&
+            h.closeCode === CLOSE_VERSION_MISMATCH &&
+            h.paired === true &&
+            typeof h.helpersVersion === "number",
+        ),
       JSON.stringify({ browsers: status["browsers"], fix, handshakes }),
     );
 
