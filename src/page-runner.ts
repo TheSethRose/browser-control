@@ -320,7 +320,7 @@ export function createPageHelperHandler(
     }
     return st;
   };
-  /** What the page still has down because its release never reached it: one record per browser and tab. */
+  /** What the page still has down because its release never reached it: one record per browser, tab and kind. */
   type HeldInput = { kind: "key" | "mouse"; label: string };
   const heldByTab = new Map<string, HeldInput>();
   /** Held state is keyed by browser (profile) and tab, never by a bare tab number two browsers can share. */
@@ -346,10 +346,13 @@ export function createPageHelperHandler(
       : res.ok
         ? success(`${valueOf(res)}\n${heldLine(held)}`)
         : failure(res.error.code, `${messageOf(res)}\n${heldLine(held)}`);
-  /** Navigation and tab close start a new document, so pointer and held-input state for the old one are dropped. */
+  const HELD_KINDS = ["key", "mouse"] as const;
+  /** A held key and a held mouse button on one tab are separate records. */
+  const heldSlot = (targetId: string | undefined, kind: HeldInput["kind"]): string => `${heldKeyOf(targetId)}#${kind}`;
+  /** Navigation starts a new document, so pointer and held-input state for the old one are dropped. */
   const resetMotion = (targetId?: string): void => {
     motionByTab.delete(tabKeyOf(targetId));
-    heldByTab.delete(heldKeyOf(targetId));
+    for (const kind of HELD_KINDS) heldByTab.delete(heldSlot(targetId, kind));
   };
   /** Cross-origin iframe targets from the last snap of each tab: f1 is index 0. */
   const frameTargets = new Map<string, string[]>();
@@ -1194,7 +1197,10 @@ export function createPageHelperHandler(
   const inputFailed = (res: InvokeResult, what: string): InvokeResult =>
     messageOf(res).startsWith("CDP_TIMEOUT") ? success(`${what}: delivered_unverified (${DIALOG_HINT})`) : res;
 
-  /** Send a release to its pinned tab; a release that fails is recorded as held, never retried. */
+  /**
+   * Send a release to its pinned tab; it is never retried. A timeout may have reached the page, so it reads as
+   * delivered_unverified, not held; any other failure (a dialog refusal included) never reached it and is held.
+   */
   async function sendRelease(
     method: string,
     params: Json,
@@ -1203,12 +1209,12 @@ export function createPageHelperHandler(
     timeoutMs = 2_000,
   ): Promise<InvokeResult> {
     const res = await cdp(method, params, target, timeoutMs).catch((err: unknown) => failure("EXECUTION_FAILED", String(err)));
-    const key = heldKeyOf(target);
-    if (res.ok) {
-      if (heldByTab.get(key)?.kind === held.kind) heldByTab.delete(key);
-    } else {
-      heldByTab.set(key, held);
-    }
+    const slot = heldSlot(target, held.kind);
+    if (res.ok) heldByTab.delete(slot);
+    else if (messageOf(res).startsWith("CDP_TIMEOUT")) {
+      heldByTab.delete(slot);
+      return inputFailed(res, `${held.label.replace(/ still down$/, "")} release`);
+    } else heldByTab.set(slot, held);
     return res;
   }
 
@@ -2152,11 +2158,11 @@ export function createPageHelperHandler(
       return res;
     }
     // Nothing is re-sent automatically: the release a dialog blocked is reported as still held.
-    const held = heldByTab.get(heldKeyOf(targetId));
+    const held = HELD_KINDS.flatMap((kind) => heldByTab.get(heldSlot(targetId, kind)) ?? []);
     const head = accept
       ? typeof params["promptText"] === "string" ? `dialog accept: accepted with prompt text ${js(params["promptText"])}` : "dialog accept: accepted"
       : "dialog dismiss: dismissed";
-    return success([head, ...(held ? [heldLine(held)] : [])].join("\n"));
+    return success([head, ...held.map(heldLine)].join("\n"));
   }
 
   const mediaByTarget = new Map<string, Map<string, string>>();
