@@ -258,7 +258,8 @@ describe("p3 frames review fixes", () => {
     order = [{ i: 1, src: "http://ads.test/x", title: "" }, { i: 2, src: CROSS_SRC, title: "" }];
     frames = [{ frameId: 9, url: "http://ads.test/x" }, { frameId: 7, url: CROSS_SRC }];
     const relabeled = await handle("hover", { ref: "Cross input" }, TOP);
-    expect(JSON.stringify(relabeled)).toContain("f2:e1");
+    // fN follows frame identity, so frame 7 stays f1 after the reorder.
+    expect(JSON.stringify(relabeled)).toContain("f1:e1");
     ran.length = 0;
     expect((await handle("hover", { ref: "f1:e1" }, TOP)).ok).toBe(true);
     expect(ran.find((r) => r.method === "point")?.targetId).toBe(FRAME);
@@ -288,6 +289,42 @@ describe("p3 frames review fixes", () => {
     moves.length = 0;
     expect((await handle("hover", { ref: "f1:e1" }, TOP)).ok).toBe(true);
     expect(moves[0]).toMatchObject({ x: 101, y: 2 });
+  });
+
+  test("S2: same-URL sibling iframes are never bound to a guessed target", async () => {
+    const order = [{ i: 1, src: CROSS_SRC, title: "" }, { i: 2, src: CROSS_SRC, title: "" }];
+    const { handle, ran } = stubHandler({
+      listFrames: () => [{ frameId: 7, url: CROSS_SRC }, { frameId: 9, url: CROSS_SRC }],
+      bc: (method, input) =>
+        method === "frames"
+          ? { value: input.targetId === TOP ? JSON.stringify(order) : "[]" }
+          : pointOrMiss(method, input, { [FRAME]: "e1" }),
+    });
+    const res = await handle("hover", { ref: "Cross input" }, TOP);
+    expect(res.ok).toBe(false);
+    expect(ran.some((r) => r.method === "locate" && r.targetId !== TOP)).toBe(false);
+  });
+
+  test("S6: a repeat snap after a reorder keeps f1 on the same frame", async () => {
+    let order = [{ i: 1, src: CROSS_SRC, title: "" }];
+    let frames = [{ frameId: 7, url: CROSS_SRC }];
+    const { handle } = stubHandler({
+      listFrames: () => frames,
+      bc: (method, input) => {
+        if (method === "frames") return { value: input.targetId === TOP ? JSON.stringify(order) : "[]" };
+        if (method !== "snapshot") return { value: "" };
+        if (input.targetId === TOP) return { value: `# page | http://127.0.0.1:49260/\n# ${order.length} cross-origin iframe(s): listed below\n- button "Top" [e1]` };
+        return { value: `# frame\n- textbox "In ${input.targetId}" [e1]` };
+      },
+    });
+    const first = JSON.stringify(await handle("snap", {}, TOP));
+    expect(first).toContain("[f1:e1]");
+    order = [{ i: 1, src: "http://ads.test/x", title: "" }, { i: 2, src: CROSS_SRC, title: "" }];
+    frames = [{ frameId: 9, url: "http://ads.test/x" }, { frameId: 7, url: CROSS_SRC }];
+    const second = JSON.stringify(await handle("snap", {}, TOP));
+    expect(second).toContain(`In ${FRAME}\\" [f1:e1]`);
+    expect(second).toContain("[f2:e1]");
+    expect(second).not.toContain(`In ${FRAME}\\" [f2:e1]`);
   });
 
   test("S6: a diff-mode snap keeps child-frame added, updated and removed rows with frame refs", async () => {

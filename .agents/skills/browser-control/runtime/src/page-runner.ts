@@ -801,21 +801,42 @@ export function createPageHelperHandler(
         return u;
       }
     };
-    const take = (test: (t: { url: string }) => boolean) => {
-      const at = pool.findIndex(test);
-      return at === -1 ? undefined : pool.splice(at, 1)[0];
+    const first8 = frames.slice(0, 8);
+    const all = [...pool];
+    // Bind an iframe element to a target only when its URL picks exactly one target and no sibling
+    // shares that URL; a guess between look-alike iframes could act on the wrong one.
+    const pick = (f: { src: string }) => {
+      for (const key of [(u: string) => u, path, origin]) {
+        const k = key(f.src);
+        const targets = all.filter((t) => key(t.url) === k);
+        if (targets.length === 0) continue;
+        if (targets.length > 1 || first8.filter((o) => key(o.src) === k).length > 1) return undefined;
+        const at = pool.indexOf(targets[0]!);
+        return at === -1 ? undefined : pool.splice(at, 1)[0];
+      }
+      return undefined;
     };
-    return frames.slice(0, 8).map((f) => {
-      const t = take((x) => x.url === f.src) ?? take((x) => path(x.url) === path(f.src)) ?? take((x) => origin(x.url) === origin(f.src));
+    return first8.map((f) => {
+      const t = pick(f);
       return { ...f, ...(t ? { target: t.targetId } : {}) };
     });
   }
 
-  /** Record which target serves each `f<n>` frame ref for this tab. */
-  function rememberFrames(frames: Array<{ i: number; target?: string }>, targetId?: string): void {
-    const ids: string[] = [];
-    for (const f of frames) ids[f.i - 1] = f.target ?? "";
+  /**
+   * Number frames by identity: a frame target keeps its `f<n>` for the life of the tab and numbers
+   * are never reused, so a saved `f<n>:e<m>` ref can't silently move to another frame after a reorder.
+   */
+  function frameNumbers(frames: Array<{ target?: string }>, targetId?: string): Map<string, number> {
+    const ids = frameTargets.get(targetId ?? "") ?? [];
+    const nums = new Map<string, number>();
+    for (const f of frames) {
+      if (!f.target) continue;
+      let at = ids.indexOf(f.target);
+      if (at === -1) at = ids.push(f.target) - 1;
+      nums.set(f.target, at + 1);
+    }
     frameTargets.set(targetId ?? "", ids);
+    return nums;
   }
 
   /** Run a label lookup helper inside each reachable cross-origin iframe; first hit wins. */
@@ -826,12 +847,11 @@ export function createPageHelperHandler(
   ): Promise<{ frame: number; ref: string; target: string } | undefined> {
     const frames = await crossFrames(targetId);
     if (frames.length === 0) return undefined;
-    // A label lookup never rebinds f<n> refs a snap handed out; only bind when this tab has none yet.
-    if (!frameTargets.has(targetId ?? "")) rememberFrames(frames, targetId);
+    const nums = frameNumbers(frames, targetId);
     for (const f of frames) {
       if (!f.target) continue;
       const hit = await evalHelper({ kind: "bc", method, args }, f.target, 5_000);
-      if (hit.ok && /^e\d+$/.test(valueOf(hit))) return { frame: f.i, ref: valueOf(hit), target: f.target };
+      if (hit.ok && /^e\d+$/.test(valueOf(hit))) return { frame: nums.get(f.target)!, ref: valueOf(hit), target: f.target };
     }
     return undefined;
   }
@@ -840,8 +860,10 @@ export function createPageHelperHandler(
     const frames = await crossFrames(targetId);
     if (frames.length === 0) return [];
     const out: string[] = [];
+    const nums = frameNumbers(frames, targetId);
     for (const f of frames) {
-      const label = `f${f.i}${f.title ? ` "${f.title}"` : ""} ${hostOf(f.src)}`;
+      const n = f.target ? nums.get(f.target)! : undefined;
+      const label = `${n === undefined ? `#${f.i}` : `f${n}`}${f.title ? ` "${f.title}"` : ""} ${hostOf(f.src)}`;
       if (!f.target) {
         out.push(`# iframe ${label}: not reachable; click by coordinates (click --xy) or see references/dom-and-input.md`);
         continue;
@@ -855,9 +877,8 @@ export function createPageHelperHandler(
       const lines = text.split("\n").filter((l) => /^[-+~] /.test(l));
       const diff = /^# snap diff .*$/m.exec(text)?.[0];
       out.push(`# iframe ${label}: ${lines.length} control(s)${diff ? ` changed; ${diff.slice(2)}` : ""}`);
-      out.push(...lines.map((l) => l.replace(/\[e(\d+)\]/, `[f${f.i}:e$1]`)));
+      out.push(...lines.map((l) => l.replace(/\[e(\d+)\]/, `[f${n}:e$1]`)));
     }
-    rememberFrames(frames, targetId);
     return out;
   }
 
