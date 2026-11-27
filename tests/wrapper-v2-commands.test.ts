@@ -80,11 +80,57 @@ describe("wrapper v2 page commands", () => {
     const req = await call("dialog", "accept", "Ada");
     expect(req.path).toBe("/page/dialog");
     expect(JSON.parse(req.body)).toEqual({ sub: "accept", text: "Ada" });
+    expect(req.query).toBe("");
+  });
+
+  test("dialog accept sends prompt text and a trailing targetId", async () => {
+    const req = await call("dialog", "accept", "Ada", "extension:42");
+    expect(req.path).toBe("/page/dialog");
+    expect(JSON.parse(req.body)).toEqual({ sub: "accept", text: "Ada" });
+    expect(new URLSearchParams(req.query).get("t")).toBe("extension:42");
+  });
+
+  test("dialog accept treats a lone targetId as the target, never prompt text", async () => {
+    for (const target of ["extension:528879684", "browse:7", "A".repeat(32), "extension:chrome-1a2b3c:42", "extension:42@3"]) {
+      const req = await call("dialog", "accept", target);
+      expect(req.path).toBe("/page/dialog");
+      expect(JSON.parse(req.body)).toEqual({ sub: "accept" });
+      expect(new URLSearchParams(req.query).get("t")).toBe(target);
+    }
+  });
+
+  test("dialog accept sends text that looks like a targetId when a real target follows", async () => {
+    const req = await call("dialog", "accept", "extension:42", "extension:43");
+    expect(JSON.parse(req.body)).toEqual({ sub: "accept", text: "extension:42" });
+    expect(new URLSearchParams(req.query).get("t")).toBe("extension:43");
+  });
+
+  test("dialog accept keeps text that only looks similar to a targetId", async () => {
+    for (const text of ["extension:", "extension:4x", "browse:", "example.com"]) {
+      const req = await call("dialog", "accept", text);
+      expect(JSON.parse(req.body)).toEqual({ sub: "accept", text });
+      expect(req.query).toBe("");
+    }
+  });
+
+  test("dialog accept reads --match for tab matching", async () => {
+    const req = await call("dialog", "accept", "--match", "example.com");
+    expect(JSON.parse(req.body)).toEqual({ sub: "accept" });
+    expect(new URLSearchParams(req.query).get("m")).toBe("example.com");
   });
 
   test("dialog dismiss sends only sub", async () => {
     const req = await call("dialog", "dismiss");
     expect(JSON.parse(req.body)).toEqual({ sub: "dismiss" });
+    expect(req.query).toBe("");
+  });
+
+  test("dialog dismiss with a target or --match", async () => {
+    const targeted = await call("dialog", "dismiss", "extension:42");
+    expect(JSON.parse(targeted.body)).toEqual({ sub: "dismiss" });
+    expect(new URLSearchParams(targeted.query).get("t")).toBe("extension:42");
+    const matched = await call("dialog", "dismiss", "--match", "example.com");
+    expect(new URLSearchParams(matched.query).get("m")).toBe("example.com");
   });
 
   test("dialog rejects an unknown subcommand", async () => {

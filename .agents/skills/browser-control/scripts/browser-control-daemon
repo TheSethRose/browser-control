@@ -43,7 +43,10 @@
 # Act on it (each prints what changed; --quiet leaves that out; --no-boundaries omits markers):
 #   click <ref|label> | click --xy <x,y>
 #   hover <ref|label> | hover --xy <x,y>         move the pointer, no button press
-#   dialog accept [promptText] | dialog dismiss  answer an open alert/confirm/prompt
+#   dialog accept [promptText] [targetId] | dialog dismiss [targetId]
+#                                     answer an open alert/confirm/prompt. A trailing token that
+#                                     looks like a targetId is the target, never prompt text; to
+#                                     send text that looks like one, put the real targetId after it.
 #   emulate [--viewport WxH[@scale]] [--mobile] [--color-scheme dark|light]
 #           [--reduced-motion] [--offline] [--ua <str>] [--reset]
 #   handoff <message> [--timeout <s>]            overlay for the user, wait, then continue
@@ -78,6 +81,25 @@ write_backends() {
   rm -f "$t" 2>/dev/null || true
   fail EXECUTION_FAILED "could not write $f"
 }
+# True when `$1` has the shape of a targetId: extension:<n>, extension:<slug>:<n>, browse:<n>,
+# optionally with @<frameId>, or a 32-hex DevTools id. Used where a trailing token could be either
+# a target or literal text (dialog prompt text).
+is_target_id() {
+  local s="${1:-}"
+  [[ "$s" =~ ^(extension:[A-Za-z0-9][A-Za-z0-9-]*:[0-9]+|extension:[0-9]+|browse:[0-9]+)(@[0-9]+)?$ ]] && return 0
+  [[ "$s" =~ ^[0-9A-Fa-f]{32}$ ]]
+}
+
+# True when a one-line backend order value names the extension. Stays bash 3.2 clean.
+order_has_extension() {
+  local tok
+  for tok in ${1//,/ }; do
+    tok="$(printf '%s' "$tok" | tr '[:upper:]' '[:lower:]')"
+    [[ "$tok" == extension ]] && return 0
+  done
+  return 1
+}
+
 cli_build() {
   local f="$here/../runtime/cli.js"
   [[ -f "$f" ]] || return 0
@@ -410,8 +432,15 @@ case "$cmd" in
     if [[ "$sub" == dismiss ]]; then
       run POST "page/dialog$(query "$(arg 1)")" "$input}"
     else
-      [[ -z "${args[1]:-}" ]] || input+=',"text":'"$(json_str "${args[1]}")"
-      run POST "page/dialog$(query "$(arg 2)")" "$input}"
+      text=""; target=""
+      if [[ ${#args[@]} -ge 3 ]]; then
+        text="${args[1]}"; target="${args[2]}"
+      elif [[ ${#args[@]} -eq 2 ]]; then
+        # A trailing token that is a targetId is always the target, never prompt text.
+        if is_target_id "${args[1]}"; then target="${args[1]}"; else text="${args[1]}"; fi
+      fi
+      [[ -z "$text" ]] || input+=',"text":'"$(json_str "$text")"
+      run POST "page/dialog$(query "$target")" "$input}"
     fi
     ;;
   emulate)
@@ -594,7 +623,42 @@ case "$cmd" in
         command -v bun >/dev/null 2>&1 || { echo "browser-control-daemon: bun is required (https://bun.sh)" >&2; exit 127; }
         bun "$here/../runtime/cli.js" extension-setup "$ext_dir" >/dev/null || fail EXECUTION_FAILED "pairing setup failed; see the error above"
         rm -f "$dir/backends" 2>/dev/null || fail EXECUTION_FAILED "could not remove $dir/backends"
-        printf '%s\n' '{"ok":true,"data":{"paired":true,"orderFile":"removed","extensionDir":'"$(json_str "$ext_dir")"',"next":"In Chrome open chrome://extensions, turn on Developer mode, click Load unpacked, and pick extensionDir. Then run: browser-control-daemon extension browsers"}}'
+        # A leftover global order file (~/.config/browser-control/backends) outranks the paired
+        # default; if it leaves the extension out, back it up and rewrite it to extension alone.
+        extra=""
+        gpath="${XDG_CONFIG_HOME:-$HOME/.config}/browser-control/backends"
+        if [[ -f "$gpath" ]]; then
+          # Parse exactly like the router (backendOrder): whole file, split on /[\s,]+/, lowercased.
+          # Prints the normalized order on line 1 and 1/0 (has extension) on line 2.
+          gparsed="$(bun -e 'const n=require("fs").readFileSync(process.argv[1],"utf8").split(/[\s,]+/).map((x)=>x.trim().toLowerCase()).filter(Boolean);process.stdout.write(n.join(",")+"\n"+(n.includes("extension")?1:0))' "$gpath" 2>/dev/null || true)"
+          gorder="${gparsed%%$'\n'*}" ghas="${gparsed##*$'\n'}"
+          if [[ -n "$gorder" && "$ghas" == 0 ]]; then
+            # Create the backup exclusively (noclobber), taking the next -N suffix if one exists.
+            gbase="$gpath.bak-$(date +%Y-%m-%d)" gbackup="" n=1
+            while [[ $n -lt 100 ]]; do
+              cand="$gbase"; [[ $n -gt 1 ]] && cand="$gbase-$n"
+              if (set -C; cat "$gpath" >"$cand") 2>/dev/null; then gbackup="$cand"; break; fi
+              [[ -e "$cand" ]] || fail EXECUTION_FAILED "could not back up $gpath to $cand"
+              n=$((n + 1))
+            done
+            [[ -n "$gbackup" ]] || fail EXECUTION_FAILED "could not back up $gpath"
+            # Write a same-directory temp copy (keeps the file mode), then rename it into place.
+            gtmp="$gpath.tmp.$$"
+            # GNU stat first (BSD stat rejects -c); accept only a plain octal mode.
+            gmode="$(stat -c %a "$gpath" 2>/dev/null || true)"
+            [[ "$gmode" =~ ^[0-7]{3,4}$ ]] || gmode="$(stat -f %Lp "$gpath" 2>/dev/null || true)"
+            [[ "$gmode" =~ ^[0-7]{3,4}$ ]] || gmode=600
+            if ! { cp -p "$gpath" "$gtmp" && chmod "$gmode" "$gbackup" && printf 'extension\n' >"$gtmp" && mv -f "$gtmp" "$gpath"; }; then
+              rm -f "$gtmp" 2>/dev/null || true
+              fail EXECUTION_FAILED "could not write $gpath"
+            fi
+            extra=',"globalOrder":{"was":'"$(json_str "$gorder")"',"now":"extension","backup":'"$(json_str "$gbackup")"'}'
+          fi
+        fi
+        if [[ -n "${BROWSER_CONTROL_BACKENDS:-}" ]] && ! order_has_extension "$BROWSER_CONTROL_BACKENDS"; then
+          extra+=',"overriddenBy":'"$(json_str "env BROWSER_CONTROL_BACKENDS=$BROWSER_CONTROL_BACKENDS")"
+        fi
+        printf '%s\n' '{"ok":true,"data":{"paired":true,"orderFile":"removed","extensionDir":'"$(json_str "$ext_dir")$extra"',"next":"In Chrome open chrome://extensions, turn on Developer mode, click Load unpacked, and pick extensionDir. Then run: browser-control-daemon extension browsers"}}'
         ;;
       status | browsers | diagnostics) run GET "extension/$sub" ;;
       enable)
