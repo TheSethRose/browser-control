@@ -788,6 +788,128 @@ describe("page-runner natural motion integration", () => {
     });
   });
 
+  const POINT_DETAIL = JSON.stringify({
+    x: 350, y: 220, hidden: false, inView: true,
+    box: { left: 250, top: 200, width: 200, height: 40 },
+    rect: { left: 250, top: 200, width: 200, height: 40 },
+    viewport: { width: 1280, height: 800 }, stickyTop: 0, stickyBottom: 0,
+    scroller: { kind: "document", box: { left: 0, top: 0, width: 1280, height: 800 }, point: { x: 640, y: 400 } },
+  });
+  /**
+   * A page whose `refused` CDP event the open dialog refuses, with one visible button at 350,220. Every call is
+   * logged, so a test can prove nothing was sent or read after the refusal.
+   */
+  function refuseMock(
+    refused: { method: string; type: string },
+    helpers: Record<string, string> = {},
+    opts: { dragIntercepted?: Record<string, unknown> } = {},
+  ) {
+    const log: string[] = [];
+    const invoke: Invoke = async (op, input = {}) => {
+      if (op === "get_browser_status") return { ok: true, data: { connected: true } };
+      if (op === "wait_for_event" && opts.dragIntercepted) {
+        log.push(op);
+        return { ok: true, data: { found: true, event: { params: { data: opts.dragIntercepted } } } };
+      }
+      const method = String(input["method"] ?? "");
+      const params = (input["params"] ?? {}) as Record<string, unknown>;
+      const type = String(params["type"] ?? "");
+      if (op === "evaluate") {
+        const expr = String(input["expression"] ?? "");
+        log.push(`eval:${/__bc\.([A-Za-z]+)/.exec(expr)?.[1] ?? "expr"}`);
+        const named = Object.entries(helpers).find(([name]) => expr.includes(`__bc.${name}`));
+        if (named) return val(named[1]);
+        if (expr.includes("__bc.point")) {
+          const detail = expr.includes("detail");
+          const body = detail ? POINT_DETAIL : "350 220 visible";
+          return val(expr.includes("__bc.baseline") && detail ? `https://a.test/\n${body}` : expr.includes("__bc.baseline") ? `https://a.test/ ${body}` : body);
+        }
+        if (expr.includes("__bc.readInputProbe")) return val('{"mousedown":1,"mouseup":1}');
+        if (expr.includes("__bc.hitCheck")) return val('{"ok":true}');
+        if (expr.includes("__bc.verifyRef")) return val("e5");
+        if (expr.includes("__bc.value")) return val("hello");
+        return val("ok");
+      }
+      if (op === "execute_cdp") {
+        log.push(`cdp:${method}:${type}`);
+        if (method === refused.method && type === refused.type) {
+          return { ok: false, error: { code: "EXECUTION_FAILED", message: DIALOG_MSG } };
+        }
+        if (method === "DOM.getContentQuads") {
+          return { ok: true, data: { result: { quads: [[350, 220, 550, 220, 350, 260, 550, 260]] } } };
+        }
+        return { ok: true, data: { result: {} } };
+      }
+      log.push(op);
+      return { ok: true, data: {} };
+    };
+    const handler = createPageHelperHandler(invoke, undefined, undefined, {
+      sleep: async () => {}, rng: createSeededRng(7), now: () => 0,
+      bcCall: async () => ({ value: "https://a.test/\nhit: button#ok" }),
+    });
+    const refusedAt = () => log.indexOf(`cdp:${refused.method}:${refused.type}`);
+    return { log, handler, refusedAt };
+  }
+
+  test("E7: type with an accessibility ref sends no text into a dialog that refused the click's release", async () => {
+    await withNaturalOn(async () => {
+      const m = refuseMock({ method: "Input.dispatchMouseEvent", type: "mouseReleased" });
+      const out = textOf(await m.handler("type", { ref: "a41", text: "hi", quiet: true }));
+      expect(out).toContain("release: delivery unverified (a dialog opened)");
+      // The refused release is the last thing the page sees: no focus, no typing, no read back.
+      expect(m.refusedAt()).toBeGreaterThan(-1);
+      expect(m.log.slice(m.refusedAt() + 1)).toEqual([]);
+      expect(m.log.filter((e) => e.startsWith("cdp:Input.insertText") || e.startsWith("cdp:Input.dispatchKeyEvent"))).toEqual([]);
+    });
+  });
+
+  test("E8: select sends no option lookup or second click into a dialog that refused the click's release", async () => {
+    await withNaturalOn(async () => {
+      const m = refuseMock({ method: "Input.dispatchMouseEvent", type: "mouseReleased" }, { select: "__not_native__" });
+      const out = textOf(await m.handler("select", { ref: "e5", option: "Blue", quiet: true }));
+      expect(out).toContain("release: delivery unverified (a dialog opened)");
+      expect(m.refusedAt()).toBeGreaterThan(-1);
+      expect(m.log.slice(m.refusedAt() + 1)).toEqual([]);
+      expect(m.log).not.toContain("eval:locateOption");
+      expect(m.log.filter((e) => e === "cdp:Input.dispatchMouseEvent:mousePressed")).toHaveLength(1);
+    });
+  });
+
+  test("E9: a grid cell sends no Enter or typing into a dialog that refused the double-click's release", async () => {
+    await withNaturalOn(async () => {
+      const m = refuseMock({ method: "Input.dispatchMouseEvent", type: "mouseReleased" }, {
+        cellInfo: '{"cell":true,"before":"","editorRef":null}',
+        cellEditor: "__none__",
+        cellRead: '{"after":"hi","before":"","error":""}',
+        setTypedValue: "__not_typed__",
+      });
+      const out = textOf(await m.handler("type", { ref: "e5", text: "hi", quiet: true }));
+      expect(out).toContain("release: delivery unverified (a dialog opened)");
+      expect(m.refusedAt()).toBeGreaterThan(-1);
+      expect(m.log.slice(m.refusedAt() + 1)).toEqual([]);
+      expect(m.log).not.toContain("eval:cellEditor");
+      expect(m.log.filter((e) => e.startsWith("cdp:Input.dispatchKeyEvent") || e.startsWith("cdp:Input.insertText"))).toEqual([]);
+    });
+  });
+
+
+  test("E10: an HTML5 drag the dialog refused at dragEnter sends no drop, dragCancel or release", async () => {
+    await withNaturalOn(async () => {
+      const m = refuseMock(
+        { method: "Input.dispatchDragEvent", type: "dragEnter" },
+        { dragInfo: JSON.stringify({ sx: 120, sy: 200, dx: 520, dy: 460, draggable: true, listMeta: null }) },
+        { dragIntercepted: { items: [], dragOperationsMask: 1 } },
+      );
+      const out = textOf(await m.handler("drag", { from: "e1", to: "e2", quiet: true }));
+      expect(out).toContain("may still be down");
+      expect(m.refusedAt()).toBeGreaterThan(-1);
+      // Nothing more goes into the open dialog: no drop, no dragCancel, no release. Only the intercept is switched off.
+      const after = m.log.slice(m.refusedAt() + 1);
+      expect(after.filter((e) => e.startsWith("cdp:Input.dispatch"))).toEqual([]);
+      expect(after).toEqual(["cdp:Input.setInterceptDrags:"]);
+    });
+  });
+
   test("E3: held input is keyed by browser and tab, so a short id and its qualified id share one record", async () => {
     await withNaturalOn(async () => {
       const resolveKey = (id: string): string | undefined =>
