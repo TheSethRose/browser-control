@@ -1,5 +1,5 @@
 (() => {
-  const VERSION = 10;
+  const VERSION = 11;
   if (globalThis.__bc && globalThis.__bc.v === VERSION) return;
 
   const INTERACTIVE = [
@@ -1111,6 +1111,16 @@
     return JSON.stringify({ typed: true, type: t, value: el.value, matched: el.value === val });
   }
 
+  // Live type, protection flags and label of the focused field, for the natural-typing typo policy.
+  function typingField() {
+    const el = deepActive();
+    if (!el || !(isTextControl(el) || el.isContentEditable)) return '';
+    const flags = flagsOf(el);
+    if (/cc-/i.test(el.getAttribute?.('autocomplete') || '')) flags.push('cc');
+    const type = el.isContentEditable ? 'contenteditable' : String(el.type || el.tagName).toLowerCase();
+    return JSON.stringify({ type, flags, hint: clean(hayOf(el), 80) });
+  }
+
   // Focus a field for typing; if clicking swapped it for a replacement input (e.g. search bar), follow focus safely.
   function focusForType(ref) {
     const id = String(ref || '').replace(/^@/, '');
@@ -1884,7 +1894,7 @@
 
   Object.defineProperty(globalThis, '__bc', {
     value: {
-      v: VERSION, snapshot, wall, surface, canvasHash, point, hitCheck, pageScrollPoint, guard, guardFocused, focusForType,
+      v: VERSION, snapshot, wall, surface, canvasHash, point, hitCheck, pageScrollPoint, guard, guardFocused, focusForType, typingField,
       setTypedValue, verifyRef, healRef, armInputProbe, readInputProbe, cellInfo, cellEditor, cellRead,
       dragInfo, listPosition, select, locateOption, locateFile, el: resolve, checkWait, value,
       verdict, health, frames, tagFrames, frameTag, frameOffset, baseline, settle, diff, locate, hit, rect, viewport,

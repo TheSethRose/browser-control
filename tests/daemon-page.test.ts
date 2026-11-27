@@ -6,7 +6,7 @@ import { join, resolve } from "node:path";
 import { buildHash, createPageHelperHandler, formatAxTree, matchTab } from "../daemon";
 import { PAGE_HELPERS_SOURCE, PAGE_HELPERS_VERSION, parseLocator } from "../src/page-helpers";
 import { parseBrowseSnapshot } from "../src/page-runner";
-import { buildHumanKeystrokes, QWERTY_NEIGHBORS } from "../src/typing";
+import { createSeededRng } from "../src/natural";
 import type { Runner } from "../src/backends/browse";
 import { parseBoxes } from "../src/ocr";
 
@@ -31,6 +31,8 @@ function makeFakeInvoker(options: {
   locateFile?: string;
   waitSequence?: Array<{ matched: boolean; url?: string; wall?: string }>;
   canvasHashes?: string[];
+  field?: string;
+  onCdp?: (method: string, params: Record<string, unknown>) => InvokeResult | undefined;
 } = {}) {
   const calls: Call[] = [];
   let installed = false;
@@ -96,6 +98,7 @@ function makeFakeInvoker(options: {
         const seq = options.canvasHashes ?? ["h1", "h2"];
         return ok(seq[Math.min(hashIdx++, seq.length - 1)]!);
       }
+      if (expr.includes("__bc.typingField")) return ok(options.field ?? "");
       if (expr.includes("__bc.hitCheck")) return ok('{"ok":true}');
       if (expr.includes("__bc.hit")) return ok("https://a.test/x\nhit: canvas#c");
       if (expr.includes("__bc.diff")) return ok('+ button "Extra" [e9]');
@@ -114,6 +117,8 @@ function makeFakeInvoker(options: {
       return ok("ok");
     }
     if (op === "execute_cdp") {
+      const hooked = options.onCdp?.(String(input["method"]), (input["params"] ?? {}) as Record<string, unknown>);
+      if (hooked) return hooked;
       if (input["method"] === "Runtime.evaluate") {
         return { ok: true, data: { result: { result: { objectId: "obj-file-1" } } } };
       }
@@ -264,39 +269,95 @@ describe("daemon page helpers", () => {
     expect(keyEvents).toHaveLength(4);
   });
 
-  test("buildHumanKeystrokes emits QWERTY neighbor typos + Backspace and always reconstructs text", () => {
-    // Low rng triggers typo on interior lowercase letters
-    let seq = 0;
-    const lowRng = () => {
-      const vals = [0.01, 0.2, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5];
-      return vals[seq++ % vals.length]!;
-    };
-    const input = "search query! 🚀";
-    const plan = buildHumanKeystrokes(input, { rng: lowRng, typoRate: 0.5, maxTypos: 2 });
-
-    let buf = "";
-    let backspaces = 0;
-    for (let i = 0; i < plan.length; i++) {
-      const step = plan[i]!;
-      if (step.kind === "backspace") {
-        buf = buf.slice(0, -1);
-        backspaces++;
-      } else if (step.kind === "insert") {
-        buf += step.text;
-      } else {
-        buf += step.ch;
-        if (plan[i + 1]?.kind === "backspace") {
-          const intended = plan[i + 2];
-          if (intended?.kind === "char") {
-            expect(QWERTY_NEIGHBORS[intended.ch]).toContain(step.ch);
-          }
-        }
-      }
+  test("natural typing: live field policy, key text for emoji, no key left down, steady clock", async () => {
+    const keys = (calls: Call[]) =>
+      calls.filter((c) => c.input["method"] === "Input.dispatchKeyEvent").map((c) => c.input["params"] as Record<string, unknown>);
+    const quick = { sleep: async () => {} };
+    // Fixed rng below: a random typo or key rollover would change which keys are sent or held.
+    const live = (type: string, flags = "") => `{"type":"${type}","flags":[${flags}]}`;
+    for (const [field, typos] of [["", false], [live("number"), false], [live("text", '"payment"'), false], [live("text"), true]] as const) {
+      const m = makeFakeInvoker({ field });
+      await createPageHelperHandler(m.invoke, undefined, undefined, { ...quick, rng: () => 0 })("type", { _natural: true, ref: "e2", text: "123e45 and more", quiet: true });
+      expect(keys(m.calls).some((k) => k["key"] === "Backspace")).toBe(typos);
     }
-    expect(buf).toBe(input);
-    expect(backspaces).toBeGreaterThanOrEqual(1);
-    expect(backspaces).toBeLessThanOrEqual(2);
-    expect(plan.at(-1)!.pauseAfterMs).toBe(0);
+
+    const emoji = makeFakeInvoker({ field: live("text") });
+    await createPageHelperHandler(emoji.invoke, undefined, undefined, { ...quick, rng: () => 0.5 })("type", { _natural: true, ref: "e2", text: "go 🚀", quiet: true });
+    expect(cdpMethods(emoji.calls)).not.toContain("Input.insertText");
+    expect(keys(emoji.calls).filter((k) => k["key"] === "🚀").map((k) => [k["type"], k["text"]])).toEqual([["keyDown", "🚀"], ["keyUp", undefined]]);
+
+    // A keyUp a dialog refused may have landed: it reads as unverified, is never re-sent, and is not held.
+    const refused = { ok: false as const, error: { code: "EXECUTION_FAILED" as const, message: "DIALOG_OPEN: alert" } };
+    let ups = 0;
+    const blocked = makeFakeInvoker({ onCdp: (m, p) => (m === "Input.dispatchKeyEvent" && p["type"] === "keyUp" && ups++ === 0 ? refused : undefined) });
+    const blockedHandle = createPageHelperHandler(blocked.invoke, undefined, undefined, { ...quick, rng: () => 0.5 });
+    expect(text(await blockedHandle("type", { _natural: true, ref: "e2", text: "hi", quiet: true }))).toContain("release: delivery unverified (a dialog opened)");
+    const sent = keys(blocked.calls);
+    expect(text(await blockedHandle("dialog", { sub: "accept" }))).not.toContain("# HELD");
+    expect([sent.filter((k) => k["type"] === "keyUp" && k["key"] === "h").length, keys(blocked.calls).length]).toEqual([1, sent.length]);
+
+    // Events run against elapsed time, so 8 ms per CDP round trip doesn't slow the typing,
+    // and after one 500 ms stall the later gaps keep their planned length.
+    const line = "She packed her bag before dawn, then walked to the station. Nobody spoke on the train.";
+    const dispatchTimes = async (latency: number, stallAt = -1) => {
+      let clock = 0;
+      const at: number[] = [];
+      const m = makeFakeInvoker({
+        field: live("text"),
+        onCdp: (method) => {
+          if (method === "Input.dispatchKeyEvent") at.push((clock += at.length === stallAt ? 500 : latency));
+          return undefined;
+        },
+      });
+      const opts = { rng: createSeededRng(7), now: () => clock, sleep: async (ms: number) => void (clock += ms) };
+      await createPageHelperHandler(m.invoke, undefined, undefined, opts)("type", { _natural: true, ref: "e2", text: line, quiet: true });
+      return at;
+    };
+    const steps = (at: number[]) => at.slice(1).map((t, i) => t - at[i]!);
+    expect(steps(await dispatchTimes(0, 20)).slice(21)).toEqual(steps(await dispatchTimes(0)).slice(21));
+    const wpmOf = (at: number[]) => (line.length / 5) / ((at.at(-1)! - at[0]!) / 60000);
+    const [ideal, slow] = [wpmOf(await dispatchTimes(0)), wpmOf(await dispatchTimes(8))];
+    expect(Math.abs(slow - ideal) / ideal).toBeLessThan(0.01);
+    // One line is a single sample of the 75-95 wpm band at speed 0.85-1.15, so allow 5% noise.
+    expect(slow).toBeGreaterThanOrEqual(75 * 0.85 * 0.95);
+    expect(slow).toBeLessThanOrEqual(95 * 1.15 * 1.05);
+  });
+
+  test("natural typing: a keyUp timeout still reports the Shift it left down", async () => {
+    const timeout = { ok: false as const, error: { code: "EXECUTION_FAILED" as const, message: "CDP_TIMEOUT: no reply" } };
+    let timedOut = false;
+    const lost = makeFakeInvoker({
+      field: '{"type":"text","flags":[]}',
+      onCdp: (m, p) => (m === "Input.dispatchKeyEvent" && p["type"] === "keyUp" && p["key"] === "H" && !timedOut ? (timedOut = true, timeout) : undefined),
+    });
+    const handle = createPageHelperHandler(lost.invoke, undefined, undefined, { sleep: async () => {} });
+    const out = text(await handle("type", { _natural: true, ref: "e2", text: "Hi", quiet: true }));
+    expect(timedOut).toBe(true);
+    expect(out).toContain("delivered_unverified");
+    expect(out).toContain("# HELD: key Shift still down");
+  });
+
+  test("natural typing: an oversleeping pause shifts the schedule instead of eating the next hold", async () => {
+    let clock = 0;
+    const holds: number[] = [];
+    const downAt = new Map<string, number>();
+    const m = makeFakeInvoker({
+      field: '{"type":"text","flags":[]}',
+      onCdp: (method, params) => {
+        if (method !== "Input.dispatchKeyEvent") return undefined;
+        const key = String(params["key"]);
+        if (params["type"] !== "keyUp") downAt.set(key, clock);
+        else if (downAt.has(key)) {
+          holds.push(clock - downAt.get(key)!);
+          downAt.delete(key);
+        }
+        return undefined;
+      },
+    });
+    const opts = { rng: createSeededRng(7), now: () => clock, sleep: async (ms: number) => void (clock += ms + 80) };
+    await createPageHelperHandler(m.invoke, undefined, undefined, opts)("type", { _natural: true, ref: "e2", text: "hold still", quiet: true });
+    expect(holds.length).toBeGreaterThan(5);
+    expect(Math.min(...holds)).toBeGreaterThanOrEqual(40);
   });
 
   test("select handles native <select> and custom ARIA comboboxes", async () => {
