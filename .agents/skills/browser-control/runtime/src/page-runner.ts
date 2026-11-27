@@ -785,40 +785,35 @@ export function createPageHelperHandler(
       return [];
     }
     if (frames.length === 0) return [];
-    const pool = await frameTargetPool(targetId);
-    const path = (u: string) => {
-      try {
-        const p = new URL(u);
-        return p.origin + p.pathname;
-      } catch {
-        return u;
-      }
-    };
-    const origin = (u: string) => {
-      try {
-        return new URL(u).origin;
-      } catch {
-        return u;
-      }
-    };
     const first8 = frames.slice(0, 8);
-    const all = [...pool];
-    // Bind an iframe element to a target only when its URL picks exactly one target and no sibling
-    // shares that URL; a guess between look-alike iframes could act on the wrong one.
-    const pick = (f: { src: string }) => {
-      for (const key of [(u: string) => u, path, origin]) {
-        const k = key(f.src);
-        const targets = all.filter((t) => key(t.url) === k);
-        if (targets.length === 0) continue;
-        if (targets.length > 1 || first8.filter((o) => key(o.src) === k).length > 1) return undefined;
-        const at = pool.indexOf(targets[0]!);
-        return at === -1 ? undefined : pool.splice(at, 1)[0];
-      }
-      return undefined;
-    };
-    return first8.map((f) => {
-      const t = pick(f);
-      return { ...f, ...(t ? { target: t.targetId } : {}) };
+    const pool = await frameTargetPool(targetId);
+    if (pool.length === 0) return first8;
+    // Pair each <iframe> with the frame it really hosts: post a random tag into every iframe, then ask
+    // each frame which tag it got. URLs can't do this (a frame may have navigated to a sibling's src),
+    // so an iframe whose frame doesn't report its tag stays unbound instead of guessed.
+    const readTags = async () =>
+      new Map(
+        (
+          await Promise.all(
+            pool.map(async (t) => {
+              const r = await evalHelper({ kind: "bc", method: "frameTag" }, t.targetId, 2_000);
+              return [r.ok ? valueOf(r) : "", t.targetId] as const;
+            }),
+          )
+        ).filter(([tag]) => tag !== ""),
+      );
+    await readTags(); // loads the helper (and its message listener) in every candidate frame
+    const tags = first8.map(() => randomUUID().replaceAll("-", ""));
+    const sent = await evalHelper({ kind: "bc", method: "tagFrames", args: [tags, first8.map((f) => f.src)] }, targetId);
+    if (!sent.ok) return first8;
+    let owners = await readTags();
+    if (tags.some((t) => !owners.has(t))) {
+      await new Promise((r) => setTimeout(r, 50));
+      owners = await readTags();
+    }
+    return first8.map((f, k) => {
+      const target = owners.get(tags[k]!);
+      return { ...f, ...(target ? { target } : {}) };
     });
   }
 

@@ -1,5 +1,5 @@
 (() => {
-  const VERSION = 7;
+  const VERSION = 8;
   if (globalThis.__bc && globalThis.__bc.v === VERSION) return;
 
   const INTERACTIVE = [
@@ -526,6 +526,30 @@
 
   function frames() {
     return JSON.stringify(crossOriginFrames().map((f, i) => ({ i: i + 1, src: f.src, title: clean(f.title || f.name, 40) })));
+  }
+
+  // Frame ownership: the parent posts a random tag into each cross-origin <iframe>; the helper in the
+  // frame keeps the last tag its parent sent, so the caller can pair each element with the frame it hosts.
+  let ownerTag = '';
+  const win = globalThis;
+  if (win.parent && win.parent !== win && typeof win.addEventListener === 'function') {
+    win.addEventListener('message', (e) => {
+      const d = e.data;
+      if (e.source === win.parent && d && typeof d === 'object' && typeof d.__bcFrameTag === 'string') {
+        ownerTag = d.__bcFrameTag.slice(0, 64);
+      }
+    });
+  }
+
+  function tagFrames(tags, srcs) {
+    crossOriginFrames().forEach((f, i) => {
+      if (typeof tags[i] === 'string' && f.src === srcs[i]) f.contentWindow?.postMessage({ __bcFrameTag: tags[i] }, '*');
+    });
+    return String(frameEls.length);
+  }
+
+  function frameTag() {
+    return ownerTag;
   }
 
   function frameOffset(i) {
@@ -1607,7 +1631,7 @@
       v: VERSION, snapshot, wall, surface, canvasHash, point, guard, guardFocused, focusForType,
       setTypedValue, verifyRef, healRef, armInputProbe, readInputProbe, cellInfo, cellEditor, cellRead,
       dragInfo, listPosition, select, locateOption, locateFile, el: resolve, checkWait, value,
-      verdict, health, frames, frameOffset, baseline, settle, diff, locate, hit, rect, viewport,
+      verdict, health, frames, tagFrames, frameTag, frameOffset, baseline, settle, diff, locate, hit, rect, viewport,
       markBoxes, marks, form, query, readUrls, scrollRead, text,
     },
     configurable: true, enumerable: false,

@@ -28,10 +28,16 @@ function harness() {
     }
     return { ok: true, data: { result: {} } };
   };
+  let tag = "";
   const bcCall = async (input: { targetId?: string; steps: readonly Step[] }) => {
     const last = input.steps.at(-1)!;
     const inFrame = input.targetId === FRAME;
     switch (last.method) {
+      case "tagFrames":
+        tag = String((last.args?.[0] as string[])[0]);
+        return { value: "1" };
+      case "frameTag":
+        return { value: inFrame ? tag : "" };
       case "frames":
         return { value: inFrame ? "[]" : JSON.stringify([{ i: 1, src: CROSS_SRC, title: "" }]) };
       case "locate":
@@ -173,8 +179,34 @@ function stubHandler(opts: {
   cdp?: (method: string, targetId?: string, params?: Record<string, unknown>) => unknown;
   targets?: unknown[];
   listFrames?: () => unknown[];
+  /** Which target answers each iframe slot's tag (1-based slot -> targetId). Default: first unclaimed target whose URL equals the slot's src. */
+  owners?: () => Record<number, string>;
 }) {
   const ran: Array<{ method?: string; targetId?: string; args?: readonly unknown[] }> = [];
+  // Emulate frame ownership tags: tagFrames posts tags[k] into slot k+1; frameTag returns what that frame got.
+  let got = new Map<string, string>();
+  const urlOf = (targetId?: string): string | undefined => {
+    const fr = (opts.listFrames?.() ?? []) as Array<{ frameId: number; url: string }>;
+    const hit = fr.find((f) => targetId === `extension:5@${f.frameId}`);
+    if (hit) return hit.url;
+    return ((opts.targets ?? []) as Array<{ targetId: string; url: string }>).find((t) => t.targetId === targetId)?.url;
+  };
+  const candidates = (): string[] => [
+    ...((opts.listFrames?.() ?? []) as Array<{ frameId: number }>).map((f) => `extension:5@${f.frameId}`),
+    ...((opts.targets ?? []) as Array<{ targetId: string }>).map((t) => t.targetId),
+  ];
+  const tagging = (method: string | undefined, input: BcInput): { value: string } | undefined => {
+    if (method === "frameTag") return { value: (input.targetId && got.get(input.targetId)) || "" };
+    if (method !== "tagFrames") return undefined;
+    const [tags, srcs] = (input.steps.at(-1)?.args ?? []) as [string[], string[]];
+    got = new Map();
+    const fixed = opts.owners?.();
+    tags.forEach((tag, k) => {
+      const owner = fixed ? fixed[k + 1] : candidates().find((t) => !got.has(t) && urlOf(t) === srcs[k]);
+      if (owner) got.set(owner, tag);
+    });
+    return { value: String(tags.length) };
+  };
   const invoke = async (op: string, input: Record<string, unknown> = {}): Promise<InvokeResult> => {
     if (op === "list_targets") return { ok: true, data: { targets: opts.targets ?? [] } };
     if (op === "evaluate") {
@@ -186,7 +218,8 @@ function stubHandler(opts: {
       const targetId = input["targetId"] as string | undefined;
       ran.push({ method: step.method, targetId, args });
       try {
-        return { ok: true, data: opts.bc(step.method, { targetId, steps: calls.map(() => step) }) };
+        const bcInput = { targetId, steps: calls.map(() => step) };
+        return { ok: true, data: tagging(step.method, bcInput) ?? opts.bc(step.method, bcInput) };
       } catch (error) {
         return { ok: false, error: { code: "EXECUTION_FAILED", message: `JS_EXCEPTION: ${String(error)}` } } as InvokeResult;
       }
@@ -200,7 +233,7 @@ function stubHandler(opts: {
   const bcCall = async (input: BcInput) => {
     const last = input.steps.at(-1)!;
     ran.push({ method: last.method, targetId: input.targetId, args: last.args });
-    return opts.bc(last.method, input);
+    return tagging(last.method, input) ?? opts.bc(last.method, input);
   };
   const extensionRequest = async (op: string) => {
     if (op === "list_frames") return { frames: opts.listFrames?.() ?? [] };
@@ -237,6 +270,7 @@ describe("p3 frames review fixes", () => {
           : method === "frames"
             ? { value: "[]" }
             : pointOrMiss(method, input, { "IF-OTHER": "e1", "IF-MINE": "e1" }),
+      owners: () => ({ 1: "IF-MINE" }),
     });
     const res = await handle("hover", { ref: "Cross input" }, "TAB-A");
     expect(res.ok).toBe(true);
@@ -291,18 +325,39 @@ describe("p3 frames review fixes", () => {
     expect(moves[0]).toMatchObject({ x: 101, y: 2 });
   });
 
-  test("S2: same-URL sibling iframes are never bound to a guessed target", async () => {
-    const order = [{ i: 1, src: CROSS_SRC, title: "" }, { i: 2, src: CROSS_SRC, title: "" }];
+  test("S2: an iframe is paired with the frame that reports its tag, not a frame whose URL matches its src", async () => {
+    // Slot 1's frame (7) navigated to slot 2's src; slot 2's frame (9) navigated elsewhere.
+    const order = [{ i: 1, src: "http://localhost:49261/start", title: "" }, { i: 2, src: CROSS_SRC, title: "" }];
+    const moves: Array<Record<string, unknown>> = [];
+    const offsets: Record<number, string> = { 1: "100 0", 2: "500 0" };
+    const { handle } = stubHandler({
+      listFrames: () => [{ frameId: 7, url: CROSS_SRC }, { frameId: 9, url: "http://localhost:49261/later" }],
+      owners: () => ({ 1: FRAME, 2: "extension:5@9" }),
+      cdp: (method, _t, params) => {
+        if (method === "Input.dispatchMouseEvent" && params?.["type"] === "mouseMoved") moves.push(params);
+        return {};
+      },
+      bc: (method, input) => {
+        if (method === "frames") return { value: input.targetId === TOP ? JSON.stringify(order) : "[]" };
+        if (method === "frameOffset") return { value: offsets[Number(input.steps.at(-1)?.args?.[0])]! };
+        return pointOrMiss(method, input, { [FRAME]: "e1" });
+      },
+    });
+    expect((await handle("hover", { ref: "Cross input" }, TOP)).ok).toBe(true);
+    expect(moves[0]).toMatchObject({ x: 101, y: 2 });
+  });
+
+  test("S2: an iframe whose frame never reports its tag stays unbound", async () => {
     const { handle, ran } = stubHandler({
-      listFrames: () => [{ frameId: 7, url: CROSS_SRC }, { frameId: 9, url: CROSS_SRC }],
+      listFrames: () => [{ frameId: 7, url: CROSS_SRC }],
+      owners: () => ({}),
       bc: (method, input) =>
         method === "frames"
-          ? { value: input.targetId === TOP ? JSON.stringify(order) : "[]" }
+          ? { value: input.targetId === TOP ? JSON.stringify([{ i: 1, src: CROSS_SRC, title: "" }]) : "[]" }
           : pointOrMiss(method, input, { [FRAME]: "e1" }),
     });
-    const res = await handle("hover", { ref: "Cross input" }, TOP);
-    expect(res.ok).toBe(false);
-    expect(ran.some((r) => r.method === "locate" && r.targetId !== TOP)).toBe(false);
+    expect((await handle("hover", { ref: "Cross input" }, TOP)).ok).toBe(false);
+    expect(ran.some((r) => r.method === "locate" && r.targetId === FRAME)).toBe(false);
   });
 
   test("S6: a repeat snap after a reorder keeps f1 on the same frame", async () => {
@@ -443,4 +498,10 @@ describe("debugger hub frame session review fixes", () => {
     expect(await hub.sessionForFrame(5, 0, async () => null)).toBeUndefined();
     expect(await hub.sessionForFrame(5, 7, async () => ({ url: CROSS_SRC }))).toBe("S-CROSS");
   });
+});
+
+test("the extension pins the same page-helpers VERSION the relay expects", async () => {
+  const { PAGE_HELPERS_VERSION } = await import("../src/page-helpers");
+  const bg = await Bun.file(new URL("../extension/background.js", import.meta.url)).text();
+  expect(Number(/^const PAGE_HELPERS_VERSION = (\d+);$/m.exec(bg)?.[1])).toBe(PAGE_HELPERS_VERSION);
 });
