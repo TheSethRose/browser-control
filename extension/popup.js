@@ -18,6 +18,7 @@ const pairBtn = document.getElementById("pairBtn");
 
 let currentTabId = null;
 let activeHandoffTabId = null;
+let activeHandoffId;
 
 function setIdleSelectValue(minutes) {
   const val = String(minutes === 0 ? 0 : minutes || 30);
@@ -50,6 +51,7 @@ async function refresh() {
   const handoff = handoffs.find((h) => h.tabId === currentTabId) || handoffs[0] || null;
   if (handoff) {
     activeHandoffTabId = handoff.tabId;
+    activeHandoffId = handoff.handoffId;
     handoffMsg.textContent = handoff.message || "Complete this step, then click Continue.";
     handoffBox.classList.add("active");
   } else {
@@ -86,8 +88,8 @@ lendBtn.addEventListener("click", async () => {
 });
 
 handoffDoneBtn.addEventListener("click", async () => {
-  if (typeof activeHandoffTabId !== "number") return;
-  await chrome.runtime.sendMessage({ type: "completeHandoff", tabId: activeHandoffTabId });
+  if (typeof activeHandoffTabId !== "number" || typeof activeHandoffId !== "string") return;
+  await chrome.runtime.sendMessage({ type: "completeHandoff", tabId: activeHandoffTabId, handoffId: activeHandoffId });
   await refresh();
 });
 

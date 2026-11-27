@@ -387,7 +387,9 @@ export function createWindowGroups({
     if (changeInfo && "groupId" in changeInfo && !internalGroupOps.has(tabId)) {
       await knownGroupsReady;
       const nextGroupId = changeInfo.groupId;
-      if (groupedAgentTabs.has(tabId) && !knownGroupIds.has(nextGroupId)) {
+      // Membership in groupedAgentTabs is lost on a worker restart, so any user move of an agent
+      // tab out of (or outside) our own groups claims it.
+      if (!knownGroupIds.has(nextGroupId)) {
         groupedAgentTabs.delete(tabId);
         await onUserClaimTab(tabId);
         if (typeof tab?.windowId === "number") {

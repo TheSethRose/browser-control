@@ -1231,11 +1231,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       scheduleIdleSweepTimer();
       sendResponse({ ok: true, settings: { ...settings } });
     } else if (msg.type === "completeHandoff" && typeof msg.tabId === "number") {
-      const expectedId =
-        typeof msg.handoffId === "string" && msg.handoffId !== ""
-          ? msg.handoffId
-          : handoffTabs.get(msg.tabId)?.handoffId;
-      const res = await completeHandoff(msg.tabId, expectedId);
+      // The popup must name the handoff it showed, so a stale popup cannot finish a newer one.
+      const res = await completeHandoff(msg.tabId, typeof msg.handoffId === "string" ? msg.handoffId : "");
       sendResponse(res);
     } else if (msg.type === "toggleLend" && typeof msg.tabId === "number") {
       if (lentTabs.has(msg.tabId)) {

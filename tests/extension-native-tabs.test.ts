@@ -489,6 +489,35 @@ describe("window-groups", () => {
     expect(fake.groupMap.get(99)?.title).toBe("Agents");
   });
 
+  test("after a worker restart, dragging a restored agent tab out of the group still claims it", async () => {
+    const fake = makeFakeChrome({
+      windows: [{ id: 1, type: "normal", state: "normal", focused: true }],
+      tabs: [
+        { id: 1, windowId: 1, url: "https://user.test", active: true, index: 0, groupId: -1 },
+        { id: 2, windowId: 1, url: "https://agent.test", active: false, index: 1, groupId: -1 },
+      ],
+    });
+    const agentTabs = new Set([2]);
+    const wg1 = createWindowGroups({
+      chrome: fake.chrome,
+      getSettings: () => ({ tabGroupMode: "shared", autoCollapse: true }),
+      isAgentTab: (id: number) => agentTabs.has(id),
+    });
+    await wg1.addTabToAgentGroup(2);
+
+    const claimed: number[] = [];
+    const wg2 = createWindowGroups({
+      chrome: fake.chrome,
+      getSettings: () => ({ tabGroupMode: "shared", autoCollapse: true }),
+      isAgentTab: (id: number) => agentTabs.has(id),
+      onUserClaimTab: (id: number) => {
+        claimed.push(id);
+      },
+    });
+    await wg2.handleTabUpdated(2, { groupId: -1 }, fake.tabMap.get(2)!);
+    expect(claimed).toEqual([2]);
+  });
+
   test("skips popup adoption while opener tab is in handoff", async () => {
     const fake = makeFakeChrome({
       windows: [{ id: 1, type: "normal", state: "normal", focused: true }],
