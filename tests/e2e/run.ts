@@ -5,6 +5,7 @@ import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, m
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Glob } from "bun";
+import { runStaleExtensionCheck } from "./stale-extension";
 
 const REPO = resolve(import.meta.dir, "../..");
 const FIXTURES = join(import.meta.dir, "fixtures");
@@ -358,6 +359,7 @@ async function main(): Promise<number> {
     await check("enable", ["extension", "enable"], /"orderFile":"removed"/);
     record("enable-deleted-file", !existsSync(backendsFile), backendsFile);
     await check("enabled-works", ["eval", "document.title", tid], /E2E Fixture/);
+    await runStaleExtensionCheck(chrome, record);
     return results.some((r) => !r.ok) ? 1 : 0;
   } catch (error) {
     record("runner", false, String(error instanceof Error ? error.stack : error));

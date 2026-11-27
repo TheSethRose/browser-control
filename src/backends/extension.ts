@@ -39,7 +39,8 @@ export const POST_AUTH_MAX_BYTES = 64 * 1024 * 1024;
 export const MAX_CONCURRENT_CHUNK_STREAMS = 16;
 export const CHUNK_STREAM_TIMEOUT_MS = 30_000;
 export const MAX_ABORTED_CHUNK_STREAMS = 64;
-export const HANDSHAKE_TIMEOUT_MS = 10_000;
+export const HANDSHAKE_TIMEOUT_MS = 5_000;
+export const MAX_TRACKED_HANDSHAKES = 8;
 
 export const CLOSE_REPLACED = 4001;
 export const CLOSE_BAD_HELLO = 4002;
@@ -771,10 +772,35 @@ export function getRegisteredExtensionBcCall(): BcCallFn | undefined {
 // Relay WebSocket server & BrowserLinks
 // ---------------------------------------------------------------------------
 
+export type HandshakeStage = "opened" | "hello_received" | "challenge_sent" | "rejected";
+
+export type HandshakeFailureKind =
+  | "version_mismatch"
+  | "pairing_mismatch"
+  | "handshake_timeout"
+  | "bad_hello"
+  | "handshake_failed";
+
+export type RelayHandshakeRecord = {
+  remotePort: number | null;
+  stage: HandshakeStage;
+  lastStage?: Exclude<HandshakeStage, "rejected">;
+  failureKind?: HandshakeFailureKind;
+  closeCode?: number;
+  reason?: string;
+  protocolVersion?: number;
+  helpersVersion?: number;
+  browser?: string;
+  extensionVersion?: string;
+  timestamp: number;
+};
+
 type WsState = {
   stage: "awaiting_hello" | "awaiting_response" | "ready";
   authenticated: boolean;
   closed: boolean;
+  remotePort: number | null;
+  rejectionRecorded?: boolean;
   handshakeTimer?: ReturnType<typeof setTimeout>;
   extNonce?: string;
   relayNonce?: string;
@@ -849,9 +875,75 @@ export interface ExtensionBackend extends Backend {
   getPort(): number | undefined;
   isConnected(): boolean;
   getConnectedBrowsers(): ConnectedBrowserInfo[];
+  getHandshakeRecords(): RelayHandshakeRecord[];
   request(op: string, params?: Record<string, unknown>, timeoutMs?: number, browserSlug?: string): Promise<unknown>;
   bcCall(input: BcCallInput): Promise<{ value: unknown }>;
   waitForConnection(timeoutMs?: number): Promise<void>;
+}
+
+/** Format one plain fix line from tracked pending/rejected extension handshakes, if any. */
+export function formatHandshakeFix(
+  records: readonly RelayHandshakeRecord[],
+  options: { protocolVersion?: number; helpersVersion?: number; now?: number } = {},
+): string | undefined {
+  if (records.length === 0) return undefined;
+  const expProto = options.protocolVersion ?? PROTOCOL_VERSION;
+  const expHelpers = options.helpersVersion ?? PAGE_HELPERS_VERSION;
+  const nowMs = options.now ?? Date.now();
+
+  let lastRejected: RelayHandshakeRecord | undefined;
+  let lastPending: RelayHandshakeRecord | undefined;
+  for (const r of records) {
+    if (r.stage === "rejected") {
+      if (!lastRejected || r.timestamp >= lastRejected.timestamp) lastRejected = r;
+    } else {
+      if (!lastPending || r.timestamp >= lastPending.timestamp) lastPending = r;
+    }
+  }
+
+  let chosen: RelayHandshakeRecord | undefined;
+  if (!lastRejected) {
+    chosen = lastPending;
+  } else if (!lastPending) {
+    chosen = lastRejected;
+  } else if (lastPending.timestamp > lastRejected.timestamp && nowMs - lastPending.timestamp >= 1_000) {
+    chosen = lastPending;
+  } else {
+    chosen = lastRejected;
+  }
+  if (!chosen) return undefined;
+
+  if (chosen.stage !== "rejected") {
+    return `Extension handshake hung at ${chosen.stage}: reload Browser Control at chrome://extensions.`;
+  }
+
+  const kind = chosen.failureKind;
+  if (kind === "version_mismatch" || chosen.closeCode === CLOSE_VERSION_MISMATCH) {
+    if (chosen.helpersVersion !== undefined && chosen.helpersVersion !== expHelpers) {
+      return `Extension connected but uses helpers v${chosen.helpersVersion} (need v${expHelpers}): reload Browser Control at chrome://extensions.`;
+    }
+    if (chosen.protocolVersion !== undefined && chosen.protocolVersion !== expProto) {
+      return `Extension connected but uses protocol v${chosen.protocolVersion} (need v${expProto}): reload Browser Control at chrome://extensions.`;
+    }
+    return `Extension connected with mismatched version (need protocol v${expProto}, helpers v${expHelpers}): reload Browser Control at chrome://extensions.`;
+  }
+
+  if (kind === "pairing_mismatch") {
+    return "Extension connected but pairing doesn't match: run extension setup, then reload Browser Control at chrome://extensions.";
+  }
+
+  if (kind === "handshake_timeout") {
+    const stagePart = chosen.lastStage ? ` (${chosen.lastStage})` : "";
+    return `Extension handshake timed out${stagePart}: reload Browser Control at chrome://extensions.`;
+  }
+
+  if (kind === "bad_hello" || chosen.closeCode === CLOSE_BAD_HELLO) {
+    const detail = chosen.reason ? ` (${chosen.reason})` : "";
+    return `Extension sent an invalid handshake${detail}: reload Browser Control at chrome://extensions.`;
+  }
+
+  const detail = chosen.reason || (chosen.closeCode ? `code ${chosen.closeCode}` : "closed early");
+  return `Extension handshake failed (${detail}): reload Browser Control at chrome://extensions.`;
 }
 
 function defaultArtifactDir(): string {
@@ -904,6 +996,9 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
 
   // BrowserLinks: profileId -> live authenticated BrowserLink
   const links = new Map<string, BrowserLink>();
+  // Pre-auth sockets currently in handshake, plus a bounded history of recent rejections.
+  const pendingHandshakes = new Map<ServerWebSocket<WsState>, RelayHandshakeRecord>();
+  const recentRejections: RelayHandshakeRecord[] = [];
   // Short target id (`extension:<tabId>`) -> profileId that it was issued for
   const shortTargetOwners = new Map<number, string>();
   let activeTab: ActiveTabRef | undefined;
@@ -959,6 +1054,99 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
       clearTimeout(ws.data.handshakeTimer);
       ws.data.handshakeTimer = undefined;
     }
+  }
+
+  function recordPending(ws: ServerWebSocket<WsState>): void {
+    pendingHandshakes.set(ws, {
+      remotePort: ws.data.remotePort,
+      stage: "opened",
+      timestamp: now(),
+    });
+  }
+
+  function updatePending(
+    ws: ServerWebSocket<WsState>,
+    patch: Partial<Omit<RelayHandshakeRecord, "remotePort" | "timestamp">>,
+  ): void {
+    const existing = pendingHandshakes.get(ws);
+    if (!existing) return;
+    Object.assign(existing, patch);
+    existing.timestamp = now();
+  }
+
+  function recordRejection(
+    ws: ServerWebSocket<WsState>,
+    code: number,
+    reason: string,
+    failureKind: HandshakeFailureKind,
+  ): void {
+    const existing = pendingHandshakes.get(ws);
+    pendingHandshakes.delete(ws);
+    if (ws.data.rejectionRecorded) return;
+    ws.data.rejectionRecorded = true;
+    const lastStage: Exclude<HandshakeStage, "rejected"> =
+      existing && existing.stage !== "rejected"
+        ? existing.stage
+        : ws.data.stage === "awaiting_response"
+          ? "challenge_sent"
+          : "opened";
+    const record: RelayHandshakeRecord = {
+      remotePort: existing?.remotePort ?? ws.data.remotePort ?? null,
+      stage: "rejected",
+      lastStage,
+      failureKind,
+      closeCode: code,
+      reason,
+      ...(existing?.protocolVersion !== undefined ? { protocolVersion: existing.protocolVersion } : {}),
+      ...(existing?.helpersVersion !== undefined ? { helpersVersion: existing.helpersVersion } : {}),
+      ...(existing?.browser !== undefined ? { browser: existing.browser } : {}),
+      ...(existing?.extensionVersion !== undefined ? { extensionVersion: existing.extensionVersion } : {}),
+      timestamp: now(),
+    };
+    recentRejections.push(record);
+    while (recentRejections.length > MAX_TRACKED_HANDSHAKES) {
+      recentRejections.shift();
+    }
+  }
+
+  function closeRejected(
+    ws: ServerWebSocket<WsState>,
+    code: number,
+    reason: string,
+    failureKind: HandshakeFailureKind,
+  ): void {
+    clearHandshakeTimer(ws);
+    ws.data.closed = true;
+    recordRejection(ws, code, reason, failureKind);
+    try {
+      ws.close(code, reason);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function getHandshakeRecords(): RelayHandshakeRecord[] {
+    const pending = [...pendingHandshakes.values()].map((r) => ({ ...r }));
+    const rejectedBudget = Math.max(0, MAX_TRACKED_HANDSHAKES - pending.length);
+    const rejected = rejectedBudget > 0 ? recentRejections.slice(-rejectedBudget).map((r) => ({ ...r })) : [];
+    return [...rejected, ...pending].slice(-MAX_TRACKED_HANDSHAKES);
+  }
+
+  function currentConnectionFix(): string | undefined {
+    return formatHandshakeFix(getHandshakeRecords(), {
+      protocolVersion: PROTOCOL_VERSION,
+      helpersVersion: expectedHelpersVersion,
+      now: now(),
+    });
+  }
+
+  function connectionFailureMessage(timeoutMs?: number): string {
+    const fix = currentConnectionFix();
+    if (fix) return fix;
+    if (timeoutMs !== undefined) {
+      return `extension did not connect within ${timeoutMs}ms (relay listening on 127.0.0.1:${boundPort})`;
+    }
+    return "extension is not connected";
   }
 
   function failLinkPending(link: BrowserLink, reason: string): void {
@@ -1023,6 +1211,13 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
     const slug = browserSlugFor(browser, profileId);
 
     clearHandshakeTimer(ws);
+    pendingHandshakes.delete(ws);
+    for (let i = recentRejections.length - 1; i >= 0; i--) {
+      const r = recentRejections[i]!;
+      if (r.browser === undefined || r.browser === browser) {
+        recentRejections.splice(i, 1);
+      }
+    }
     data.stage = "ready";
     data.authenticated = true;
     data.slug = slug;
@@ -1118,9 +1313,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
 
     const byteLen = typeof raw === "string" ? Buffer.byteLength(raw, "utf8") : raw.byteLength;
     if (!data.authenticated && byteLen > PRE_AUTH_MAX_BYTES) {
-      clearHandshakeTimer(ws);
-      data.closed = true;
-      ws.close(1009, "pre-auth message too large");
+      closeRejected(ws, 1009, "pre-auth message too large", "bad_hello");
       return;
     }
 
@@ -1134,16 +1327,14 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
       msg = parsed as Record<string, unknown>;
     } catch {
       if (!data.authenticated) {
-        clearHandshakeTimer(ws);
-        ws.close(CLOSE_BAD_HELLO, "bad hello: invalid JSON");
+        closeRejected(ws, CLOSE_BAD_HELLO, "bad hello: invalid JSON", "bad_hello");
       }
       return;
     }
 
     if (data.stage === "awaiting_hello") {
       if (msg["type"] !== "hello") {
-        clearHandshakeTimer(ws);
-        ws.close(CLOSE_BAD_HELLO, "bad hello: expected hello");
+        closeRejected(ws, CLOSE_BAD_HELLO, "bad hello: expected hello", "bad_hello");
         return;
       }
 
@@ -1154,6 +1345,14 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
       const protocolVersion = msg["protocolVersion"];
       const nonce = msg["nonce"];
 
+      updatePending(ws, {
+        stage: "hello_received",
+        ...(typeof protocolVersion === "number" && Number.isInteger(protocolVersion) ? { protocolVersion } : {}),
+        ...(typeof helpersVersion === "number" && Number.isInteger(helpersVersion) ? { helpersVersion } : {}),
+        ...(typeof browser === "string" && browser.trim() !== "" ? { browser: browser.trim() } : {}),
+        ...(typeof version === "string" && version.trim() !== "" ? { extensionVersion: version.trim() } : {}),
+      });
+
       if (
         typeof profileId !== "string" || profileId.trim() === "" ||
         typeof browser !== "string" || browser.trim() === "" ||
@@ -1162,15 +1361,15 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
         typeof protocolVersion !== "number" || !Number.isInteger(protocolVersion) ||
         typeof nonce !== "string" || !HEX_32_RE.test(nonce)
       ) {
-        clearHandshakeTimer(ws);
-        ws.close(CLOSE_BAD_HELLO, "bad hello: missing or malformed fields");
+        closeRejected(ws, CLOSE_BAD_HELLO, "bad hello: missing or malformed fields", "bad_hello");
         return;
       }
       if (protocolVersion !== PROTOCOL_VERSION || helpersVersion !== expectedHelpersVersion) {
-        clearHandshakeTimer(ws);
-        ws.close(
+        closeRejected(
+          ws,
           CLOSE_VERSION_MISMATCH,
-          `version mismatch: expected protocol=${PROTOCOL_VERSION} helpers=${expectedHelpersVersion}`,
+          `version mismatch: expected protocol=${PROTOCOL_VERSION} helpers=${expectedHelpersVersion} (got protocol=${protocolVersion} helpers=${helpersVersion})`,
+          "version_mismatch",
         );
         return;
       }
@@ -1183,6 +1382,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
       data.browser = browser;
       data.extensionVersion = version;
       data.stage = "awaiting_response";
+      updatePending(ws, { stage: "challenge_sent" });
 
       const proof = hmacHex(relayToken!, relayProofMessage(boundPort!, extNonce, relayNonce));
       ws.send(JSON.stringify({ type: "auth.challenge", nonce: relayNonce, proof }));
@@ -1191,8 +1391,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
 
     if (data.stage === "awaiting_response") {
       if (msg["type"] !== "auth.response") {
-        clearHandshakeTimer(ws);
-        ws.close(CLOSE_BAD_HELLO, "expected auth.response");
+        closeRejected(ws, CLOSE_BAD_HELLO, "expected auth.response", "bad_hello");
         return;
       }
       const expectedProof = hmacHex(
@@ -1200,8 +1399,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
         extProofMessage(boundPort!, data.relayNonce!, data.extNonce!),
       );
       if (!safeEqualHex(expectedProof, msg["proof"])) {
-        clearHandshakeTimer(ws);
-        ws.close(CLOSE_AUTH_REFUSED, "auth refused");
+        closeRejected(ws, CLOSE_AUTH_REFUSED, "auth refused", "pairing_mismatch");
         return;
       }
 
@@ -1261,6 +1459,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
                     headers: {
                       "content-type": "application/json",
                       "cache-control": "no-store",
+                      connection: "close",
                     },
                   },
                 );
@@ -1270,11 +1469,13 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
                 if (origin !== expectedOrigin) {
                   return new Response("Forbidden", { status: 403 });
                 }
+                const remotePort = s.requestIP(request)?.port ?? null;
                 const upgraded = s.upgrade(request, {
                   data: {
                     stage: "awaiting_hello",
                     authenticated: false,
                     closed: false,
+                    remotePort,
                   },
                 });
                 if (upgraded) return undefined;
@@ -1287,9 +1488,11 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
               perMessageDeflate: false,
               ...(options.backpressureLimit !== undefined ? { backpressureLimit: options.backpressureLimit } : {}),
               open(ws) {
+                recordPending(ws);
                 ws.data.handshakeTimer = setTimeout(() => {
-                  if (!ws.data.authenticated) {
-                    ws.close(CLOSE_AUTH_REFUSED, "handshake timeout");
+                  if (!ws.data.authenticated && !ws.data.closed) {
+                    const waitingFor = ws.data.stage === "awaiting_response" ? "auth.response" : "hello";
+                    closeRejected(ws, CLOSE_AUTH_REFUSED, `handshake timeout waiting for ${waitingFor}`, "handshake_timeout");
                   }
                 }, handshakeTimeoutMs);
               },
@@ -1304,9 +1507,28 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
                   link.outbound.drain();
                 }
               },
-              close(ws) {
+              close(ws, code, reason) {
                 ws.data.closed = true;
                 clearHandshakeTimer(ws);
+                if (!ws.data.authenticated && !ws.data.rejectionRecorded) {
+                  const textReason = typeof reason === "string" ? reason.trim() : "";
+                  const kind: HandshakeFailureKind =
+                    code === CLOSE_VERSION_MISMATCH
+                      ? "version_mismatch"
+                      : code === CLOSE_AUTH_REFUSED || /invalid relay proof|auth/i.test(textReason)
+                        ? "pairing_mismatch"
+                        : code === CLOSE_BAD_HELLO
+                          ? "bad_hello"
+                          : "handshake_failed";
+                  const cleanReason =
+                    textReason ||
+                    (typeof code === "number" && code > 0
+                      ? `closed by extension (code ${code})`
+                      : "closed before completing handshake");
+                  recordRejection(ws, typeof code === "number" ? code : 1006, cleanReason, kind);
+                } else {
+                  pendingHandshakes.delete(ws);
+                }
                 const profileId = ws.data.profileId;
                 if (profileId) {
                   const link = links.get(profileId);
@@ -1341,7 +1563,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
     await start();
     if (links.size > 0) return;
     if (timeoutMs <= 0) {
-      throw new BackendUnavailable(NAME, "extension is not connected");
+      throw new BackendUnavailable(NAME, connectionFailureMessage());
     }
     return new Promise<void>((resolve, reject) => {
       const entry = {
@@ -1349,12 +1571,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
         reject,
         timer: setTimeout(() => {
           connectWaiters.delete(entry);
-          reject(
-            new BackendUnavailable(
-              NAME,
-              `extension did not connect within ${timeoutMs}ms (relay listening on 127.0.0.1:${boundPort})`,
-            ),
-          );
+          reject(new BackendUnavailable(NAME, connectionFailureMessage(timeoutMs)));
         }, timeoutMs),
       };
       connectWaiters.add(entry);
@@ -1483,7 +1700,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
   // An explicit target must never widen into "all events" while no browser is connected.
   function eventTarget(targetId: unknown): { link: BrowserLink; tabId: number } | undefined {
     if (links.size > 0) return resolveTarget(targetId);
-    if (targetId !== undefined) throw new BackendUnavailable(NAME, "extension is not connected");
+    if (targetId !== undefined) throw new BackendUnavailable(NAME, connectionFailureMessage());
     return undefined;
   }
 
@@ -1532,6 +1749,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
     },
 
     getConnectedBrowsers,
+    getHandshakeRecords,
 
     start,
     waitForConnection,
@@ -1908,12 +2126,15 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
       const connected = links.size > 0;
       const primary = defaultLink();
       const browsers = getConnectedBrowsers();
+      const handshakes = getHandshakeRecords();
+      const fix = currentConnectionFix();
       return {
         available: connected,
         listening: Boolean(server),
         port: boundPort ?? null,
         instanceId,
         protocolVersion: PROTOCOL_VERSION,
+        helpersVersion: expectedHelpersVersion,
         browsers,
         ...(connected && primary
           ? {
@@ -1924,6 +2145,8 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
             }
           : {}),
         ...(startError ? { reason: startError } : {}),
+        ...(handshakes.length > 0 ? { handshakes } : {}),
+        ...(fix ? { fix } : {}),
         activeTargetId:
           activeTab && links.has(activeTab.profileId)
             ? formatTargetId(activeTab, activeTab.tabId)
@@ -1941,6 +2164,18 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
         registerExtensionRequest(undefined);
       }
       failConnectWaiters("relay disposed");
+      for (const ws of [...pendingHandshakes.keys()]) {
+        clearHandshakeTimer(ws);
+        ws.data.closed = true;
+        ws.data.rejectionRecorded = true;
+        try {
+          ws.close(1001, "relay shutting down");
+        } catch {
+          /* ignore */
+        }
+      }
+      pendingHandshakes.clear();
+      recentRejections.length = 0;
       for (const link of [...links.values()]) {
         failLinkPending(link, "relay disposed");
         clearHandshakeTimer(link.ws);
@@ -2039,14 +2274,19 @@ export async function extensionStatusReport(
     await backend.waitForConnection(waitMs).catch(() => {});
     s = (await backend.status()) as Record<string, unknown>;
   }
+  const handshakes = Array.isArray(s["handshakes"]) ? (redactSecrets(s["handshakes"]) as RelayHandshakeRecord[]) : [];
+  const fix = typeof s["fix"] === "string" ? (redactSecrets(s["fix"]) as string) : undefined;
   return {
     ...base,
     listening: Boolean(s["listening"]),
     port: s["port"] ?? null,
     protocolVersion: s["protocolVersion"] ?? PROTOCOL_VERSION,
+    helpersVersion: s["helpersVersion"] ?? PAGE_HELPERS_VERSION,
     relayVersion: RELAY_VERSION,
     browsers: Array.isArray(s["browsers"]) ? s["browsers"].length : 0,
     ...(typeof s["reason"] === "string" ? { reason: s["reason"] } : {}),
+    ...(handshakes.length > 0 ? { handshakes } : {}),
+    ...(fix ? { fix } : {}),
   };
 }
 
@@ -2075,9 +2315,12 @@ export async function extensionDiagnosticsReport(
   order: string[],
   options: { tokenFile?: string; timeoutMs?: number; waitMs?: number } = {},
 ): Promise<unknown> {
-  const daemon = await extensionStatusReport(backend, order, options.tokenFile, options.waitMs ?? 2000);
+  let daemon = await extensionStatusReport(backend, order, options.tokenFile, options.waitMs ?? 2000);
   if (!daemon["enabled"] || !backend) return redactSecrets({ daemon, browsers: [] });
   const rows = await extensionBrowsersReport(backend, order, options.waitMs ?? 3000);
+  if (rows.length === 0) {
+    daemon = await extensionStatusReport(backend, order, options.tokenFile, 0);
+  }
   const browsers = await Promise.all(
     rows.map(async (row) => {
       try {
