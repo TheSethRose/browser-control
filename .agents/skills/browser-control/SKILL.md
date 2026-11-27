@@ -45,7 +45,7 @@ Page commands take `[targetId]` last, `--match <text>`, `--quiet`, and `--no-bou
 | Command | Action |
 | --- | --- |
 | `tabs` / `start <browser>` / `default [browser]` | List tabs / switch browser (`chrome`, `beta`, `brave`, `ardia`, …) / get or set default browser. |
-| `nav <url> [--snap] [--until load]` | Navigate until parsed & quiet (`--until load` waits all resources). Flags `# REDIRECTED:` / `# WALL:`. |
+| `nav <url> [--snap] [--until load] [--browser <slug>]` | Navigate until parsed & quiet (`--until load` waits all resources; `--browser brave` opens the tab in that browser). Flags `# REDIRECTED:` / `# WALL:`. |
 | `snap [--all] [--full] [--find <t>] [--within <r\|css>] [--ax] [--out <p>]` | Controls with refs (`e12`, `f2:e5` iframe, `a41` AX). Diffs repeats on same page, folds disabled runs, auto-scopes modals, shows site notes. Flags: `disabled`, `checked`, `required`, `secure`, `trap`, `payment`. |
 | `text [--all] [--within <r\|css>] [--max <n>] [--scroll] [--filter <t>] [--limit <n>] [--out <p>]` | Readable markdown (folds nav/filter sidebars unless `--all`; `--scroll` reads virtualized/infinite lists). |
 | `form [--within <r\|css>] [--out <p>]` | List visible form fields with values, required/invalid errors, `<select>` options, live refs, and submit buttons. |
@@ -53,6 +53,10 @@ Page commands take `[targetId]` last, `--match <text>`, `--quiet`, and `--no-bou
 | `read-urls <u1> [u2 ...] [--concurrency <n>] [--timeout <ms>] [--out <p>]` | Parallel logged-in `fetch()` for up to 50 same-site URLs inside the tab without navigating. |
 | `value <ref\|label>` | Control value (never reads secure fields; masks card numbers). |
 | `click <ref\|label>` / `click --xy <x,y>` | Checked click (verifies ref drift, waits up to 1.5 s for disabled targets, reports blocker & dismiss refs, confirms input delivery). |
+| `hover <ref\|label>` / `hover --xy <x,y>` | Move the pointer onto a control or point without pressing; reports what is under it and new tooltip text. |
+| `dialog accept [promptText]` / `dialog dismiss` | Answer an open JavaScript alert, confirm, prompt, or beforeunload. |
+| `emulate [--viewport WxH[@scale]] [--mobile] [--color-scheme dark\|light] [--reduced-motion] [--offline] [--ua <str>] [--reset]` | Device, media, network, and user-agent emulation for one tab; `--reset` clears all of it. |
+| `handoff <message> [--timeout <s>]` | Show a "your turn" overlay in the tab, wait for the user (default 10 min), then continue. |
 | `type [--fast] [--keys] <ref\|label> <text>` / `--focused [--fast] <t>` | Click, replace text with natural human typing (cadence, hold times, occasional self-corrected typos; `--fast` for instant insert + real last key; `--keys` for fast raw key events; handles `date`/`time`/`range`/`color`, grid cells, focus swaps), read back. Refuses `trap` & `payment`. |
 | `select <ref\|label> <option>` | Choose option in native `<select>` (no OS menu) or ARIA combobox. |
 | `upload <ref\|label> <path>` | Attach file to `<input type="file">` without OS picker. |

@@ -4,7 +4,8 @@
 # Every command re-uses that process and starts it only if it is not running.
 #
 #   tabs                              list tabs; * marks the selected one
-#   nav <url> [--snap] [--until load] navigate; --snap also lists the controls
+#   nav <url> [--snap] [--until load] navigate; --snap also lists the controls.
+#                                     --browser <slug> opens it in that browser
 #   eval '<js>'                       run JavaScript, print its value ('-' reads stdin)
 #   call <op> ['<json>']              any operation, JSON in and out
 #   start [browser]                   switch browser by name (chrome, beta, brave, ardia); opens it
@@ -28,6 +29,11 @@
 #
 # Act on it (each prints what changed; --quiet leaves that out; --no-boundaries omits markers):
 #   click <ref|label> | click --xy <x,y>
+#   hover <ref|label> | hover --xy <x,y>         move the pointer, no button press
+#   dialog accept [promptText] | dialog dismiss  answer an open alert/confirm/prompt
+#   emulate [--viewport WxH[@scale]] [--mobile] [--color-scheme dark|light]
+#           [--reduced-motion] [--offline] [--ua <str>] [--reset]
+#   handoff <message> [--timeout <s>]            overlay for the user, wait, then continue
 #   type [--fast] [--keys] <ref|label> <text> | type --focused [--fast] <text>
 #   select <ref|label> <option>       native <select> or ARIA combobox
 #   upload <ref|label> <path>         <input type="file"> (never opens OS picker)
@@ -121,8 +127,10 @@ check_update() {
 }
 
 req() {
-  local rc=0
-  printf '%s' "${3:-}" | curl -sS --fail-with-body --unix-socket "$sock" -X "$1" \
+  local rc=0 mt=""
+  # A long-running call (handoff) sets max_time so curl gives up just after the server would.
+  [[ -z "${max_time:-}" ]] || mt="--max-time $max_time"
+  printf '%s' "${3:-}" | curl -sS --fail-with-body ${mt} --unix-socket "$sock" -X "$1" \
     --data-binary @- "http://daemon/$2" 2>/dev/null || rc=$?
   case $rc in 0) ;; 22) return 1 ;; 7) return 7 ;; *) return 9 ;; esac
 }
@@ -175,7 +183,7 @@ urlencode() {
   printf '%s' "$out"
 }
 body() { if [[ "$1" == "-" ]]; then cat; else printf '%s' "$1"; fi; }
-usage() { sed -n '2,44p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,49p' "$0" | sed 's/^# \{0,1\}//'; }
 
 cmd="${1:-}"; [[ $# -gt 0 ]] && shift
 
@@ -185,9 +193,11 @@ scroll=false; reload=false; clear_flag=false
 find=""; within=""; max=""; until=""; xy=""; ref_flag=""; to=""; out_path=""
 wait_text=""; wait_selector=""; wait_url=""; timeout=""
 filter=""; limit=""; fields=""; concurrency=""; side=""; duration=""; kind=""; properties=""; site=""
+browser=""; viewport=""; color_scheme=""; ua=""; mobile=false; reduced_motion=false; offline=false; reset_flag=false
+max_time=""
 params_list=(); where_list=()
 args=()
-case "$cmd" in snap | text | form | query | read-urls | ocr | click | type | select | upload | drag | wait | key | value | shot | nav | eval | fill | do | verdict | health | styles | issues | perf | notes | flow | script)
+case "$cmd" in snap | text | form | query | read-urls | ocr | click | hover | type | select | upload | drag | wait | key | value | shot | nav | eval | fill | do | verdict | health | styles | issues | perf | dialog | emulate | handoff | notes | flow | script)
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --match) match="${2:?--match needs text from the tab url or title}"; shift 2 ;;
@@ -226,6 +236,14 @@ case "$cmd" in snap | text | form | query | read-urls | ocr | click | type | sel
       --kind) kind="${2:?--kind needs an issue kind}"; shift 2 ;;
       --properties) properties="${2:?--properties needs comma-separated CSS properties}"; shift 2 ;;
       --site) site="${2:?--site needs a site host}"; shift 2 ;;
+      --browser) browser="${2:?--browser needs a browser name such as chrome or brave}"; shift 2 ;;
+      --viewport) viewport="${2:?--viewport needs WxH or WxH@scale}"; shift 2 ;;
+      --color-scheme) color_scheme="${2:?--color-scheme needs dark or light}"; shift 2 ;;
+      --ua) ua="${2:?--ua needs a user-agent string}"; shift 2 ;;
+      --mobile) mobile=true; shift ;;
+      --reduced-motion) reduced_motion=true; shift ;;
+      --offline) offline=true; shift ;;
+      --reset) reset_flag=true; shift ;;
       --param) params_list+=("${2:?--param needs key=value}"); shift 2 ;;
       --where) where_list+=("${2:?--where needs field=value}"); shift 2 ;;
       --) shift; while [[ $# -gt 0 ]]; do args+=("$1"); shift; done ;;
@@ -241,6 +259,7 @@ query() {
   local q=""
   [[ -z "${1:-}" ]] || q+="&t=$(urlencode "$1")"
   [[ -z "$match" ]] || q+="&m=$(urlencode "$match")"
+  [[ -z "$browser" ]] || q+="&browser=$(urlencode "$browser")"
   [[ -z "$quiet" ]] || q+="&q=1"
   [[ -z "$raw" ]] || q+="&raw=1"
   [[ -z "${2:-}" ]] || q+="&$2"
@@ -341,6 +360,54 @@ case "$cmd" in
       [[ -n "$(arg 0)" ]] || fail INPUT_INVALID "usage: browser-control-daemon click <ref|label> [targetId]"
       run POST "page/click$(query "$(arg 1)")" '{"ref":'"$(json_str "$(arg 0)")"'}'
     fi
+    ;;
+  hover)
+    if [[ -n "$xy" ]]; then
+      [[ "$xy" =~ ^[0-9.]+,[0-9.]+$ ]] || fail INPUT_INVALID "--xy takes x,y in CSS pixels, e.g. --xy 120,240"
+      run POST "page/hover$(query "$(arg 0)")" '{"xy":['"$xy"']}'
+    else
+      [[ -n "$(arg 0)" ]] || fail INPUT_INVALID "usage: browser-control-daemon hover <ref|label> [targetId] | hover --xy x,y [targetId]"
+      run POST "page/hover$(query "$(arg 1)")" '{"ref":'"$(json_str "$(arg 0)")"'}'
+    fi
+    ;;
+  dialog)
+    sub="$(arg 0)"
+    case "$sub" in
+      accept | dismiss) ;;
+      *) fail INPUT_INVALID "usage: browser-control-daemon dialog accept [promptText] [targetId] | dialog dismiss [targetId]" ;;
+    esac
+    input='{"sub":'"$(json_str "$sub")"
+    [[ -z "$(arg 1)" ]] || input+=',"text":'"$(json_str "$(body "$(arg 1)")")"
+    run POST "page/dialog$(query "$(arg 2)")" "$input}"
+    ;;
+  emulate)
+    [[ -z "$color_scheme" || "$color_scheme" == dark || "$color_scheme" == light ]] || fail INPUT_INVALID "--color-scheme takes dark or light"
+    input='{'; sep=''
+    if [[ -n "$viewport" ]]; then
+      [[ "$viewport" =~ ^[0-9]+x[0-9]+(@[0-9]+(\.[0-9]+)?)?$ ]] || fail INPUT_INVALID "--viewport takes WxH or WxH@scale, e.g. 390x844 or 390x844@3"
+      input+="${sep}\"viewport\":$(json_str "$viewport")"; sep=','
+    fi
+    if [[ -n "$color_scheme" ]]; then input+="${sep}\"colorScheme\":$(json_str "$color_scheme")"; sep=','; fi
+    if [[ -n "$ua" ]]; then input+="${sep}\"ua\":$(json_str "$ua")"; sep=','; fi
+    if [[ "$mobile" == true ]]; then input+="${sep}\"mobile\":true"; sep=','; fi
+    if [[ "$reduced_motion" == true ]]; then input+="${sep}\"reducedMotion\":true"; sep=','; fi
+    if [[ "$offline" == true ]]; then input+="${sep}\"offline\":true"; sep=','; fi
+    if [[ "$reset_flag" == true ]]; then input+="${sep}\"reset\":true"; sep=','; fi
+    [[ -n "$sep" ]] || fail INPUT_INVALID "usage: browser-control-daemon emulate [--viewport WxH[@scale]] [--mobile] [--color-scheme dark|light] [--reduced-motion] [--offline] [--ua <str>] [--reset] [targetId]"
+    run POST "page/emulate$(query "$(arg 0)")" "$input}"
+    ;;
+  handoff)
+    secs=600
+    if [[ -n "$timeout" ]]; then
+      [[ "$timeout" =~ ^[0-9]+$ ]] || fail INPUT_INVALID "--timeout takes whole seconds, e.g. --timeout 120"
+      secs="$timeout"
+    fi
+    # The call blocks until the user finishes or the server times out, so curl must wait longer.
+    max_time=$((secs + 30))
+    input='{'; sep=''
+    if [[ -n "$(arg 0)" ]]; then input+="${sep}\"message\":$(json_str "$(body "$(arg 0)")")"; sep=','; fi
+    if [[ -n "$timeout" ]]; then input+="${sep}\"timeout\":$secs"; sep=','; fi
+    run POST "page/handoff$(query "$(arg 1)")" "$input}"
     ;;
   ocr)
     input='{'; [[ -z "$find" ]] || input+='"find":'"$(json_str "$find")"
