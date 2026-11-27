@@ -303,6 +303,10 @@ describe("post-nav dwell and pagination gap", () => {
     clock.advance(300);
     expect((await handle("nav", { url: "https://b.test/1" })).ok).toBe(true);
     expect(clock.sleeps).toHaveLength(0);
+    // The cross-host page still owes its full reading dwell before the first input.
+    expect((await handle("key", { key: "Tab", quiet: true })).ok).toBe(true);
+    expect(clock.sleeps.at(0)).toBe(548);
+    clock.sleeps.length = 0;
     clock.advance(4_500);
     expect((await handle("nav", { url: "https://b.test/2" })).ok).toBe(true);
     expect(clock.sleeps).toHaveLength(0);
