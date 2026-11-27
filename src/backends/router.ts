@@ -87,8 +87,9 @@ export function route(
         if (op === "select_target") active = CDP;
         return handler(input);
       }
-      // A selected DevTools tab keeps untargeted calls (`nav <url>`) on that tab.
-      if (active === CDP && input["targetId"] === undefined) continue;
+      // A selected DevTools tab keeps untargeted calls (`nav <url>`) on that tab,
+      // unless the call names a browser (`nav --browser <slug>`).
+      if (active === CDP && input["targetId"] === undefined && input["browser"] === undefined) continue;
       const backend = byName.get(name)!;
       if (!backend.handles(op, input, active === name)) continue;
       try {

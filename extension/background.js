@@ -7,7 +7,7 @@
 // anomalyco/browse (MIT License).
 
 import { createDebuggerHub } from "./lib/debugger-hub.js";
-import { createFrameDecoder, encodeMessage } from "./lib/frames.js";
+import { createFrameDecoder, encodeMessage, TRANSPORT_MAX_PAYLOAD_BYTES } from "./lib/frames.js";
 import {
   PROTOCOL_VERSION,
   detectBrowserBrand,
@@ -962,9 +962,15 @@ async function openRelaySocket(port, versionInfo) {
 
   ws.addEventListener("message", async (ev) => {
     if (connections.get(port) !== entry) return;
+    const raw = String(ev.data);
+    // Daemon frames are at most 1 MiB of UTF-8, so more UTF-16 units than that is never legitimate.
+    if (raw.length > TRANSPORT_MAX_PAYLOAD_BYTES) {
+      ws.close(1009, "message too big");
+      return;
+    }
     let msg;
     try {
-      msg = JSON.parse(String(ev.data));
+      msg = JSON.parse(raw);
     } catch {
       return;
     }

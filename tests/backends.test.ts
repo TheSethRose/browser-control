@@ -147,3 +147,26 @@ describe("router with browse first", () => {
     expect(status.backends["browse"]).toEqual({ available: true, tabs: 0, activeTargetId: null });
   });
 });
+
+describe("router with extension first", () => {
+  test("a navigate that names a browser skips the selected CDP tab", async () => {
+    const log: string[] = [];
+    const extCalls: string[] = [];
+    const ext = {
+      name: "extension",
+      handles: (op: string) => op === "navigate",
+      invoke: async (op: string, input: Record<string, unknown>) => {
+        extCalls.push(`${op}:${String(input["browser"] ?? "")}`);
+        return { targetId: "extension:5" };
+      },
+      listTargets: async () => [],
+      clearActive: () => {},
+      status: () => ({}),
+    };
+    const ops = route(fakeCdp(log), [ext as never], () => ["extension", "cdp"]);
+    await ops["select_target"]!({ targetId: "ABC" });
+    await ops["navigate"]!({ url: "https://x", browser: "chrome-abc123" });
+    expect(extCalls).toEqual(["navigate:chrome-abc123"]);
+    expect(log).toEqual(["select_target:ABC"]);
+  });
+});

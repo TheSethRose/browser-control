@@ -425,6 +425,10 @@ function numericReqIdOf(rawId: unknown, explicitReqId?: unknown): number | undef
   return undefined;
 }
 
+// Bounds per-chunk bookkeeping so tiny or empty chunks can't outgrow the byte budget.
+const MAX_CHUNKS_PER_STREAM = 4096;
+const MAX_STREAM_ID_LENGTH = 128;
+
 export class ChunkReassembler {
   private readonly maxDataBytes: number;
   private readonly maxTotalBytes: number;
@@ -510,7 +514,7 @@ export class ChunkReassembler {
 
     const rawId = msg["id"];
     const validId =
-      (typeof rawId === "string" && rawId.trim() !== "") ||
+      (typeof rawId === "string" && rawId.trim() !== "" && rawId.length <= MAX_STREAM_ID_LENGTH) ||
       (typeof rawId === "number" && Number.isInteger(rawId));
     const seq = msg["seq"];
     const last = msg["last"];
@@ -581,6 +585,16 @@ export class ChunkReassembler {
         id,
         reqId,
         error: `EXECUTION_FAILED: chunked frame out of order (stream ${id}: expected seq ${stream.nextSeq}, got ${seq})`,
+      };
+    }
+
+    if (stream.parts.length >= MAX_CHUNKS_PER_STREAM) {
+      this.abort(id, last);
+      return {
+        kind: "error",
+        id,
+        reqId,
+        error: `EXECUTION_FAILED: too many chunks in stream ${id} (limit ${MAX_CHUNKS_PER_STREAM})`,
       };
     }
 
@@ -895,7 +909,10 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
   }
 
   function formatTargetId(link: { profileId: string; slug: string }, tabId: number): string {
-    if (links.size > 1) return `${NAME}:${link.slug}:${tabId}`;
+    const owner = shortTargetOwners.get(tabId);
+    if (links.size > 1 || (owner !== undefined && owner !== link.profileId)) {
+      return `${NAME}:${link.slug}:${tabId}`;
+    }
     rememberShortTarget(tabId, link.profileId);
     return `${NAME}:${tabId}`;
   }

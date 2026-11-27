@@ -918,10 +918,14 @@ describe("Phase 2 slice B: BrowserLinks and chunked frames", () => {
     ).rejects.toThrow("NO_ACTIVE_TARGET: tab extension:42 belonged to a browser that disconnected; list tabs again");
     expect(browserB.receivedReqs.filter((r) => r.op === "eval")).toHaveLength(0);
 
-    // After listing tabs again, `extension:42` is freshly issued for Browser B and works
+    // Listing tabs again issues Browser B a qualified id; A's stale `extension:42` stays rejected
+    const slugB = browserSlugFor("Brave", "profile-b");
     const tabsB = await backend.listTargets();
-    expect(tabsB.map((t) => t.targetId)).toEqual(["extension:42"]);
-    const resB = (await backend.invoke("evaluate", { expression: "1", targetId: "extension:42" })) as {
+    expect(tabsB.map((t) => t.targetId)).toEqual([`extension:${slugB}:42`]);
+    await expect(
+      backend.invoke("evaluate", { expression: "1", targetId: "extension:42" }),
+    ).rejects.toThrow("NO_ACTIVE_TARGET");
+    const resB = (await backend.invoke("evaluate", { expression: "1", targetId: `extension:${slugB}:42` })) as {
       value: string;
     };
     expect(resB.value).toBe("from-B");

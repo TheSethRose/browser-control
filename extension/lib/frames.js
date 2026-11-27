@@ -8,6 +8,9 @@ export const POST_AUTH_MAX_BYTES = 64 * 1024 * 1024;
 export const MAX_CONCURRENT_STREAMS = 16;
 export const STREAM_TIMEOUT_MS = 30_000;
 export const MAX_ABORTED_STREAMS = 64;
+// Bounds per-chunk bookkeeping so tiny or empty chunks can't outgrow the byte budget.
+export const MAX_CHUNKS_PER_STREAM = 4096;
+export const MAX_STREAM_ID_LENGTH = 128;
 
 // Leave comfortable headroom below 1 MiB for JSON envelope keys and quote/backslash escaping.
 const DEFAULT_MAX_FRAME_BYTES = 900 * 1024;
@@ -198,7 +201,7 @@ export function createFrameDecoder(options = {}) {
 
       const rawId = msg.id;
       const validId =
-        (typeof rawId === "string" && rawId.trim() !== "") ||
+        (typeof rawId === "string" && rawId.trim() !== "" && rawId.length <= MAX_STREAM_ID_LENGTH) ||
         (typeof rawId === "number" && Number.isInteger(rawId));
       const seq = msg.seq;
       const last = msg.last;
@@ -271,6 +274,16 @@ export function createFrameDecoder(options = {}) {
           id,
           reqId,
           error: `EXECUTION_FAILED: chunked frame out of order (stream ${id}: expected seq ${entry.nextSeq}, got ${seq})`,
+        };
+      }
+
+      if (entry.parts.length >= MAX_CHUNKS_PER_STREAM) {
+        abortStream(id, last);
+        return {
+          kind: "error",
+          id,
+          reqId,
+          error: `EXECUTION_FAILED: too many chunks in stream ${id} (limit ${MAX_CHUNKS_PER_STREAM})`,
         };
       }
 
