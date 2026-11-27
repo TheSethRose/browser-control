@@ -66,8 +66,10 @@ export async function leaveLastWindowOpen(tab, chromeApi = globalThis.chrome) {
 }
 
 /** Safely close a tab: preserve the last open window, ungroup first, then remove. */
-export function closeTabSafely(tabId, { beforeUngroup, afterUngroup } = {}, chromeApi = globalThis.chrome) {
+export function closeTabSafely(tabId, { beforeUngroup, afterUngroup, onlyIf } = {}, chromeApi = globalThis.chrome) {
   return enqueueClose(async () => {
+    // `onlyIf` is rechecked inside the queue: a tab the user claimed while this close waited stays open.
+    if (onlyIf && !onlyIf()) return { closed: false, replacement: null };
     const tab = await chromeApi.tabs.get(tabId).catch(() => null);
     if (!tab) return { closed: false, replacement: null };
 
@@ -82,6 +84,7 @@ export function closeTabSafely(tabId, { beforeUngroup, afterUngroup } = {}, chro
       }
     }
 
+    if (onlyIf && !onlyIf()) return { closed: false, replacement: created };
     await chromeApi.tabs.remove(tabId);
     return { closed: true, replacement: created };
   });
@@ -117,9 +120,10 @@ export async function sweepIdleAgentTabs({
     }
     const last = lastUsedAt.get(tabId);
     if (now - last >= thresholdMs) {
+      const stillIdle = () => agentTabs.has(tabId) && !keepOpenTabs.has(tabId) && !isTabInHandoff(tabId);
       try {
-        await closeTab(tabId);
-        closed.push(tabId);
+        const res = await closeTab(tabId, { onlyIf: stillIdle });
+        if (res?.closed !== false) closed.push(tabId);
       } catch {
         /* tab may already be closed */
       }
@@ -258,8 +262,8 @@ export function createTabCleanup({
     return releaseAgentTab(tabId, chromeApi);
   }
 
-  async function closeSafely(tabId) {
-    return closeTabSafely(tabId, { beforeUngroup, afterUngroup }, chromeApi);
+  async function closeSafely(tabId, { onlyIf } = {}) {
+    return closeTabSafely(tabId, { beforeUngroup, afterUngroup, onlyIf }, chromeApi);
   }
 
   function purge(tabId) {
@@ -292,13 +296,11 @@ export function createTabCleanup({
       lastUsedAt,
       idleCleanupMinutes: settings.idleCleanupMinutes,
       isTabInHandoff,
-      closeTab: async (tabId) => {
-        if (onCloseTab) {
-          await onCloseTab(tabId);
-        } else {
-          await closeSafely(tabId);
-          purge(tabId);
-        }
+      closeTab: async (tabId, opts) => {
+        if (onCloseTab) return onCloseTab(tabId, opts);
+        const res = await closeSafely(tabId, opts);
+        if (res.closed) purge(tabId);
+        return res;
       },
       now,
     });

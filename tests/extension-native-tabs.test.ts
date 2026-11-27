@@ -756,6 +756,36 @@ describe("tab-cleanup", () => {
     expect(remaining.windowId).toBe(1);
   });
 
+  test("an idle close queued before the user claims the tab leaves it open", async () => {
+    const fake = makeFakeChrome({
+      windows: [{ id: 1, type: "normal", state: "normal", focused: true }],
+      tabs: [
+        { id: 20, windowId: 1, url: "https://user.test", active: true, groupId: -1 },
+        { id: 21, windowId: 1, url: "https://busy.test", active: false, groupId: -1 },
+        { id: 22, windowId: 1, url: "https://agent.test", active: false, groupId: -1 },
+      ],
+    });
+    const origGetAll = fake.chrome.windows.getAll;
+    fake.chrome.windows.getAll = async (opts?: { populate?: boolean }) => {
+      await new Promise((r) => setTimeout(r, 15));
+      return origGetAll(opts);
+    };
+    const agentTabs = new Set([22]);
+    // Occupy the close queue, then queue the idle close, then the user claims the tab.
+    const blocker = closeTabSafely(21, {}, fake.chrome);
+    const swept = sweepIdleAgentTabs({
+      agentTabs,
+      lastUsedAt: new Map([[22, 0]]),
+      idleCleanupMinutes: 1,
+      now: 10 * 60_000,
+      closeTab: (tabId, opts) => closeTabSafely(tabId, opts, fake.chrome),
+    });
+    agentTabs.delete(22);
+    await Promise.all([blocker, swept]);
+    expect(await swept).toEqual([]);
+    expect(fake.tabMap.has(22)).toBe(true);
+  });
+
   test("persists and restores lastUsedAt and keepOpen across SW restart and treats unrestored tabs as fresh", async () => {
     const now = 20_000_000;
     const fake = makeFakeChrome({

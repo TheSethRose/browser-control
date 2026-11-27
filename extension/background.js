@@ -297,9 +297,7 @@ const tabCleanup = createTabCleanup({
   isTabInHandoff: (tabId) => handoffTabs.has(tabId),
   beforeUngroup: (tabId) => windowGroups.beginInternalGroupOp(tabId),
   afterUngroup: (tabId) => windowGroups.endInternalGroupOp(tabId),
-  onCloseTab: async (tabId) => {
-    await closeTabInternal(tabId);
-  },
+  onCloseTab: (tabId, opts) => closeTabInternal(tabId, opts),
   onPurgeTab: (tabId, { wasAgent, wasLent }) => {
     if (wasAgent || wasLent) saveTabSets().catch(() => {});
     const prevHandoff = handoffTabs.get(tabId);
@@ -325,15 +323,17 @@ function saveTabSets() {
 
 windowGroups.seedActiveTabs().catch(() => {});
 
-async function closeTabInternal(tabId) {
+async function closeTabInternal(tabId, { onlyIf } = {}) {
+  if (onlyIf && !onlyIf()) return { closed: false };
   await debuggerHub.detachTab(tabId);
   const prevHandoff = handoffTabs.get(tabId);
   handoffTabs.delete(tabId);
   if (prevHandoff?.notifId) {
     chrome.notifications?.clear?.(prevHandoff.notifId)?.catch?.(() => {});
   }
-  await tabCleanup.closeSafely(tabId);
-  tabCleanup.purge(tabId);
+  const res = await tabCleanup.closeSafely(tabId, { onlyIf });
+  if (res.closed || !onlyIf) tabCleanup.purge(tabId);
+  return res;
 }
 
 async function trackNewAgentTab(tabId, { keepOpen = false } = {}) {
