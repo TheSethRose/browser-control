@@ -24,7 +24,8 @@
 #   extension enable | disable        use the extension for this daemon dir, or CDP only
 #   extension pair | revoke           not available yet (Web Store build)
 #   stop --force                      ONLY when the user asks: drops every approved connection,
-#                                     so the user must click Allow again
+#                                     so remote debugging (cdp) asks the user to Allow again;
+#                                     the extension reconnects on its own
 #
 # Read the page:
 #   snap [--all] [--full] [--find <t>] [--within <r|css>] [--ax] [--out <p>]
@@ -92,7 +93,7 @@ warn_if_stale() {
   [[ -n "$want" && -S "$sock" ]] || return 0
   running="$(tr -d '[:space:]' <"$build_file" 2>/dev/null || true)"
   if [[ "$running" != "$want" ]]; then
-    echo "browser-control-daemon: running daemon is an older build than runtime/cli.js. Ask the user to run: browser-control-daemon stop --force (they will have to click Allow again)." >&2
+    echo "browser-control-daemon: running daemon is an older build than runtime/cli.js. Ask the user to run: browser-control-daemon stop --force (remote debugging connections will need Allow again; the extension reconnects on its own)." >&2
   fi
 }
 
@@ -179,7 +180,7 @@ run() {
     9) fail CONNECTION_LOST "the daemon dropped the connection mid-call; the action may have been delivered. Check the page before retrying." ;;
   esac
   if [[ "$out" == *"unknown page helper"* || "$out" == *"unknown daemon route"* ]]; then
-    echo "browser-control-daemon: the running daemon is an older build than this script. Ask the user to run: browser-control-daemon stop --force (they will have to click Allow again)." >&2
+    echo "browser-control-daemon: the running daemon is an older build than this script. Ask the user to run: browser-control-daemon stop --force (remote debugging connections will need Allow again; the extension reconnects on its own)." >&2
   fi
   exit 1
 }
@@ -572,7 +573,7 @@ case "$cmd" in
     fi
     ;;
   stop)
-    [[ "$(arg 0)" == "--force" ]] || fail STOP_REFUSED "stopping drops every approved browser connection and the user must click Allow again. Nothing is fixed by restarting. Only if the user asked: stop --force"
+    [[ "$(arg 0)" == "--force" ]] || fail STOP_REFUSED "stopping drops every browser connection; remote debugging (cdp) makes the user click Allow again. Nothing is fixed by restarting. Only if the user asked: stop --force"
     req POST stop >/dev/null || true; rm -f "$build_file" 2>/dev/null || true; echo '{"ok":true,"data":{"running":false}}'
     ;;
   extension)
