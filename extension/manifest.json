@@ -7,11 +7,13 @@
   "description": "Local-only companion for browser-control: silent isolated-world reads, on-demand tab CDP, and per-tab lending without remote-debugging flags.",
   "permissions": [
     "tabs",
+    "tabGroups",
     "scripting",
     "debugger",
     "storage",
     "alarms",
-    "webNavigation"
+    "webNavigation",
+    "notifications"
   ],
   "host_permissions": [
     "<all_urls>"

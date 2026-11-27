@@ -57,8 +57,12 @@ const DIALOG_HINT = "the page stopped responding; a JavaScript dialog is probabl
 const PAGE_ACTIONS = [
   "snap", "text", "form", "query", "read-urls", "ocr", "shot", "click", "hover", "type", "select",
   "upload", "drag", "wait", "key", "fill", "do", "value", "nav", "verdict", "health",
-  "styles", "issues", "perf", "dialog", "emulate", "notes", "flow", "script",
+  "styles", "issues", "perf", "dialog", "emulate", "handoff", "notes", "flow", "script",
 ] as const;
+
+const DEFAULT_HANDOFF_TIMEOUT_MS = 10 * 60 * 1000;
+const EXTENSION_REQUEST_SYMBOL = Symbol.for("browser-control.extension-request");
+type ExtensionRequestFn = (op: string, params?: Json, timeoutMs?: number) => Promise<unknown>;
 
 const failure = (code: string, message: string): InvokeResult =>
   ({ ok: false, error: { code, message } }) as InvokeResult;
@@ -198,6 +202,7 @@ export function createPageHelperHandler(
     sleep?: (ms: number) => Promise<void>;
     rng?: () => number;
     bcCall?: BcCallFn;
+    extensionRequest?: ExtensionRequestFn;
   } = {},
 ) {
   const daemonSessionId = options.sessionId ?? randomUUID().slice(0, 12);
@@ -1527,6 +1532,70 @@ export function createPageHelperHandler(
     }
   }
 
+  async function runHandoff(
+    input: Json,
+    targetId: string | undefined,
+    extensionTarget: string | undefined,
+  ): Promise<InvokeResult> {
+    const extTarget = extensionTabOf(targetId) !== undefined ? targetId : extensionTarget;
+    const extTabId = extensionTabOf(extTarget);
+    if (!extTarget || extTabId === undefined) {
+      return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: handoff requires an extension tab");
+    }
+
+    const message =
+      typeof input["message"] === "string" && input["message"].trim() !== ""
+        ? input["message"].trim()
+        : "Complete this step in the browser, then click Continue.";
+    const timeoutMs =
+      typeof input["timeoutMs"] === "number" && Number.isFinite(input["timeoutMs"]) && input["timeoutMs"] > 0
+        ? input["timeoutMs"]
+        : typeof input["timeout"] === "number" && Number.isFinite(input["timeout"]) && input["timeout"] > 0
+          ? Math.round(input["timeout"] * 1000)
+          : DEFAULT_HANDOFF_TIMEOUT_MS;
+
+    const extRequest =
+      options.extensionRequest ??
+      ((globalThis as Record<symbol, unknown>)[EXTENSION_REQUEST_SYMBOL] as ExtensionRequestFn | undefined);
+
+    const callExtensionHandoff = async (op: "handoff_start" | "handoff_clear", params: Json): Promise<InvokeResult> => {
+      if (extRequest) {
+        try {
+          const result = await extRequest(op, { tabId: extTabId, ...params });
+          return { ok: true, data: { result } };
+        } catch (err) {
+          return failure("EXECUTION_FAILED", (err as Error).message);
+        }
+      }
+      const method = op === "handoff_start" ? "bc.handoffStart" : "bc.handoffClear";
+      return invoke("execute_cdp", { method, params, targetId: extTarget });
+    };
+
+    // Drop any stale handoff completion events for this tab before showing the overlay.
+    await invoke("read_events", { method: "bc.handoffDone", targetId: extTarget, clear: true }).catch(() => {});
+
+    const started = await callExtensionHandoff("handoff_start", { message });
+    if (!started.ok) return started;
+
+    const waited = await invoke("wait_for_event", {
+      method: "bc.handoffDone",
+      targetId: extTarget,
+      timeoutMs,
+      consumeBuffer: true,
+    });
+    if (!waited.ok) {
+      await callExtensionHandoff("handoff_clear", {}).catch(() => {});
+      return waited;
+    }
+
+    const found = (waited.data as Json | undefined)?.["found"] === true;
+    if (found) return success("handoff: done");
+
+    await callExtensionHandoff("handoff_clear", {}).catch(() => {});
+    const secs = Math.max(1, Math.round(timeoutMs / 1000));
+    return failure("EXECUTION_FAILED", `HANDOFF_TIMEOUT: handoff timed out after ${secs}s`);
+  }
+
   async function handlePage(action: string, input: Json, rawTargetId?: string): Promise<InvokeResult> {
     const { browseTab, extensionTarget } = await resolveTargetBackend(rawTargetId);
     const targetId = rawTargetId ?? extensionTarget;
@@ -1620,6 +1689,9 @@ export function createPageHelperHandler(
 
       case "emulate":
         return runEmulate(input, targetId, browseTab);
+
+      case "handoff":
+        return runHandoff(input, targetId, extensionTarget);
 
       case "do": {
         const steps = parseSteps(input);
