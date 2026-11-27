@@ -233,6 +233,90 @@ describe("natural planners — seeded determinism and bounds", () => {
     expect(huge.flicks.length).toBe(4);
     expect(huge.totalDurationMs).toBeLessThanOrEqual(650);
   });
+
+  test("planPointerPath lands exactly on the supplied destination, even a fractional click point", () => {
+    const rng = createSeededRng(7070);
+    // A 0.02 x 0.02 px box around this point: rounding to (100, 50) would miss it.
+    const dest = { x: 100.0274, y: 50.0336 };
+    for (let i = 0; i < 50; i++) {
+      const plan = planPointerPath({ from: { x: 420, y: 300 }, to: dest, rng });
+      const last = plan.steps.at(-1)!;
+      expect(last.x).toBe(100.0274);
+      expect(last.y).toBe(50.0336);
+      expect(last.x).toBeGreaterThan(100.0174);
+      expect(last.x).toBeLessThan(100.0374);
+    }
+
+    // Short moves bypass the arc but still land on the exact destination.
+    const short = planPointerPath({ from: { x: 100, y: 50 }, to: dest, rng });
+    expect(short.steps).toHaveLength(1);
+    expect(short.steps[0]!.x).toBe(100.0274);
+    expect(short.steps[0]!.y).toBe(50.0336);
+  });
+
+  test("planPointerPath skips overshoot when viewport clamping leaves under 4 px of forward room", () => {
+    const rng = createSeededRng(8080);
+    for (let i = 0; i < 20; i++) {
+      const plan = planPointerPath({
+        from: { x: 100, y: 200 },
+        to: { x: 1279, y: 200 },
+        viewport: { width: 1280, height: 800 },
+        overshootProb: 1,
+        rng,
+      });
+      expect(plan.overshot).toBe(false);
+      expect(plan.overshootSteps).toBe(0);
+      expect(plan.overshootDurationMs).toBe(0);
+      expect(plan.steps.at(-1)!.x).toBe(1279);
+      expect(plan.steps.at(-1)!.y).toBe(200);
+    }
+
+    // With room along the approach, the same forced probability still overshoots.
+    const roomy = planPointerPath({
+      from: { x: 100, y: 200 },
+      to: { x: 700, y: 200 },
+      overshootProb: 1,
+      rng,
+    });
+    expect(roomy.overshot).toBe(true);
+    expect(roomy.overshootSteps).toBeGreaterThanOrEqual(3);
+  });
+
+  test("synthesizeStartPoint keeps the minimum offset when only one side has room", () => {
+    const rng = createSeededRng(9090);
+    const viewport = { width: 300, height: 220 };
+    for (let i = 0; i < 200; i++) {
+      const p = synthesizeStartPoint({ x: 170, y: 110 }, viewport, rng);
+      expect(Math.abs(p.x - 170)).toBeGreaterThanOrEqual(119.95);
+      expect(Math.abs(p.y - 110)).toBeGreaterThanOrEqual(79.95);
+      expect(p.x).toBeGreaterThanOrEqual(12);
+      expect(p.x).toBeLessThanOrEqual(288);
+      expect(p.x === 0 && p.y === 0).toBe(false);
+    }
+
+    // No side has room for the minimum: farthest in-viewport point on each axis.
+    const tight = synthesizeStartPoint({ x: 100, y: 60 }, { width: 200, height: 120 }, rng);
+    expect(tight.x).toBe(188);
+    expect(tight.y).toBe(108);
+  });
+
+  test("planWheelScroll never emits a zero-delta event for scrolls under 280 px", () => {
+    const rng = createSeededRng(6060);
+    for (const requested of [1, -1, 2, -7, 37, -120, 279]) {
+      for (let i = 0; i < 20; i++) {
+        const plan = planWheelScroll(requested, rng);
+        expect(plan.flicks).toHaveLength(1);
+        const flick = plan.flicks[0]!;
+        expect(flick.deltaY).toBe(requested);
+        expect(flick.events.length).toBeGreaterThanOrEqual(1);
+        for (const ev of flick.events) expect(ev.deltaY).not.toBe(0);
+        expect(flick.events.reduce((acc, ev) => acc + ev.deltaY, 0)).toBe(requested);
+        expect(flick.durationMs).toBe(flick.events.reduce((acc, ev) => acc + ev.delayMs, 0));
+        expect(plan.totalDeltaY).toBe(requested);
+        expect(plan.totalDurationMs).toBe(flick.durationMs);
+      }
+    }
+  });
 });
 
 describe("isNaturalEnabled switch precedence", () => {
@@ -274,4 +358,3 @@ describe("isNaturalEnabled switch precedence", () => {
     }
   });
 });
-
