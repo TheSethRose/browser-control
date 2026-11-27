@@ -93,7 +93,34 @@ export const probeSelectors = [
 ] as const;
 
 /** A short page is an interstitial or a wall, not an article. */
-const SHORT_PAGE_CHARS = 1_500;
+export const SHORT_PAGE_CHARS = 1_500;
+
+/** High-confidence vendor markers that warrant probing even on a longer page. */
+export const fastVendorSelectors = [
+  "#challenge-form",
+  "#challenge-running",
+  "#challenge-stage",
+  "#cf-challenge-running",
+  "#cf-error-details",
+  "#sec-if-cpt-container",
+  "#sec-cpt-if",
+  "#sec-text-if",
+  "#ddv1-captcha-container",
+  "#px-captcha",
+  "#px-captcha-wrapper",
+  "[id^='px-captcha']",
+  "#main-iframe[src*='_Incapsula_Resource']",
+  "awswaf-captcha",
+] as const;
+
+const DENIAL_TITLE_RE = /^(?:access denied|403 forbidden|forbidden|blocked|request blocked|you have been blocked)$/i;
+const SUSPICIOUS_TITLE_RE =
+  /^(?:access denied|403 forbidden|forbidden|blocked|request blocked|you have been blocked|just a moment\b|attention required! \| cloudflare|checking your browser|un instant|einen moment|pardon our interruption|security check|one more step|please wait\b)|\b(?:captcha|security check|bot (?:check|detection)|verify (?:that )?you are (?:a )?human|are you a robot)\b/i;
+const SUSPICIOUS_URL_RE = /^https?:\/\/www\.google\.[^/]+\/sorry\//i;
+
+export const isDenialTitle = (title: string): boolean => DENIAL_TITLE_RE.test(title.trim());
+export const isSuspiciousTitle = (title: string): boolean => SUSPICIOUS_TITLE_RE.test(title.trim());
+export const isSuspiciousUrl = (url: string): boolean => SUSPICIOUS_URL_RE.test(url.trim());
 
 const textLengthOf = (probe: ChallengeProbe): number => probe.textLength ?? probe.text.length;
 
@@ -289,10 +316,184 @@ export function describeChallenge(detection: ChallengeDetection, url: string): s
   })();
   const label = `${detection.vendor} ${detection.kind} challenge on ${where} (${detection.reason})`;
   if (detection.kind === "block") {
-    return `BLOCKED: ${where} refused the visit; ${detection.vendor} (${detection.reason}). Do not retry or reload in a loop: it makes the block worse for the user's IP. Stop and tell the user.`;
+    return `BLOCKED: ${detection.vendor} refused the visit on ${where} (${detection.reason}). Do not retry or reload in a loop: it makes the block worse for the user's IP. Stop and tell the user.`;
   }
   if (detection.kind === "interactive") {
     return `CHALLENGE: ${label}. A person has to answer it: call handoff("Solve the security check on ${where}, then continue"). Do not retry or reload in a loop.`;
   }
   return `CHALLENGE: ${label}. It should clear by itself: wait briefly, then re-read the page.`;
+}
+
+/**
+ * Format a `CHALLENGE:` / `BLOCKED:` output block with an actionable `remedy:` line when
+ * human handoff is needed.
+ */
+export function formatChallengeOutput(detection: ChallengeDetection, url: string): string {
+  const where = (() => {
+    try {
+      return new URL(url).origin;
+    } catch {
+      return url;
+    }
+  })();
+  if (detection.kind === "block") {
+    return `BLOCKED: ${detection.vendor} refused the visit on ${where} (${detection.reason}). Do not retry or reload in a loop: it makes the block worse for the user's IP. Stop and tell the user.`;
+  }
+  if (detection.kind === "interactive") {
+    const handoffMessage = `Solve the security check on ${where}, then continue`;
+    return `CHALLENGE: ${detection.vendor} interactive challenge on ${where} (${detection.reason}). A person has to answer it; do not retry or reload in a loop.\nremedy: run handoff ${JSON.stringify(handoffMessage)}`;
+  }
+  const handoffMessage = `Complete the security check on ${where}, then continue`;
+  return `CHALLENGE: ${detection.vendor} non-interactive challenge on ${where} (${detection.reason}). It did not clear automatically; re-read the page or hand off to the user.\nremedy: run handoff ${JSON.stringify(handoffMessage)}`;
+}
+
+/** True when a `snap` output looks like it might be a bot challenge or block page. */
+export function isSuspiciousSnapshot(snapText: string): boolean {
+  if (!snapText) return false;
+  if (snapText.includes("# snap diff") || snapText.includes("# PICTURE PAGE:")) return false;
+  if (snapText.includes("# WALL: captcha") || snapText.includes("# WALL: rate-limit")) return true;
+  const header = /^# ([^\n]*?) \| ([^\s\n]+)/.exec(snapText);
+  if (header) {
+    if (isSuspiciousTitle(header[1] ?? "")) return true;
+    if (isSuspiciousUrl(header[2] ?? "")) return true;
+  }
+  // No interactive DOM controls at all (e.g. blank interstitial or iframe-only challenge wall).
+  if (!snapText.includes("\n- ")) return true;
+  return false;
+}
+
+/**
+ * Self-contained page expression (no `__bc` references) that returns `{ skip: true, url }` on
+ * normal long pages without scanning all selectors/frames/scripts, or `{ skip: false, probe }`
+ * on short/suspicious pages.
+ */
+export function buildChallengeProbeExpression(forceFull = false): string {
+  const selectorsJson = JSON.stringify(probeSelectors);
+  const fastJson = JSON.stringify(fastVendorSelectors.join(","));
+  const titleRe = SUSPICIOUS_TITLE_RE.source;
+  const urlRe = SUSPICIOUS_URL_RE.source;
+  return `(() => {
+    const title = String(document.title || "").trim();
+    const rawText = (document.body && document.body.innerText) || "";
+    const textLength = rawText.length;
+    const url = String(location.href || "");
+    let status;
+    try {
+      const nav = performance.getEntriesByType && performance.getEntriesByType("navigation")[0];
+      if (nav && typeof nav.responseStatus === "number" && nav.responseStatus > 0) status = nav.responseStatus;
+    } catch {}
+    const fastHit = (() => { try { return Boolean(document.querySelector(${fastJson})); } catch { return false; } })();
+    const suspicious = ${forceFull ? "true" : "false"} || textLength < ${SHORT_PAGE_CHARS} || status === 403 || status === 451 || status === 202 || fastHit || new RegExp(${JSON.stringify(titleRe)}, "i").test(title) || new RegExp(${JSON.stringify(urlRe)}, "i").test(url);
+    if (!suspicious) return JSON.stringify({ skip: true, url });
+    const selectors = [];
+    const visibleSelectors = [];
+    const isShown = (el) => {
+      try {
+        const r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) return false;
+        const st = getComputedStyle(el);
+        return st.display !== "none" && st.visibility !== "hidden" && st.visibility !== "collapse";
+      } catch { return false; }
+    };
+    for (const sel of ${selectorsJson}) {
+      try {
+        const list = document.querySelectorAll(sel);
+        if (list.length > 0) {
+          selectors.push(sel);
+          for (const el of list) { if (isShown(el)) { visibleSelectors.push(sel); break; } }
+        }
+      } catch {}
+    }
+    const frameUrls = [];
+    try {
+      for (const f of document.querySelectorAll("iframe[src]")) {
+        if (f.src) frameUrls.push(String(f.src));
+        if (frameUrls.length >= 20) break;
+      }
+    } catch {}
+    const scriptSrcs = [];
+    try {
+      for (const s of document.querySelectorAll("script[src]")) {
+        if (s.src) scriptSrcs.push(String(s.src));
+        if (scriptSrcs.length >= 50) break;
+      }
+    } catch {}
+    const probe = { url, title, text: rawText.slice(0, 3000), textLength, frameUrls, scriptSrcs, selectors, visibleSelectors };
+    if (status !== undefined) probe.status = status;
+    return JSON.stringify({ skip: false, probe });
+  })()`;
+}
+
+/** Parse `__bc.text({ all: true, max: 3000 })` output into `{ text, textLength }`. */
+export function parseBcTextForProbe(raw: string): { text: string; textLength: number } {
+  const sep = raw.indexOf("\n\n");
+  let body = sep >= 0 ? raw.slice(sep + 2) : raw;
+  let textLength = body.length;
+  const trunc = /\n# \[truncated \d+ of (\d+) chars;[^\]]*\]$/.exec(body);
+  if (trunc) {
+    textLength = Number(trunc[1]);
+    body = body.slice(0, trunc.index);
+  }
+  return { text: body.slice(0, 3000), textLength };
+}
+
+/** Parse `__bc.query(...)` JSONL output into plain row objects. */
+export function parseBcQueryRows(raw: string): Array<Record<string, string | null>> {
+  const rows: Array<Record<string, string | null>> = [];
+  for (const line of raw.split("\n")) {
+    if (!line.startsWith("{")) continue;
+    try {
+      const parsed = JSON.parse(line) as Record<string, unknown>;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        const clean: Record<string, string | null> = {};
+        for (const [k, v] of Object.entries(parsed)) {
+          clean[k] = typeof v === "string" ? v : v === null ? null : String(v);
+        }
+        rows.push(clean);
+      }
+    } catch {
+      /* skip non-JSON lines */
+    }
+  }
+  return rows;
+}
+
+/** Reconstruct which `probeSelectors` matched from silent `__bc.query` attribute rows. */
+export function matchProbeSelectorsFromRows(
+  rows: ReadonlyArray<Record<string, string | null>>,
+  hasAwsWafCaptcha = false,
+): string[] {
+  const matched = new Set<string>();
+  for (const row of rows) {
+    const id = String(row["id"] ?? "").trim();
+    const classes = new Set(String(row["cls"] ?? "").trim().split(/\s+/).filter(Boolean));
+    const src = String(row["src"] ?? "");
+    const title = String(row["title"] ?? "");
+    if (id === "challenge-form") matched.add("#challenge-form");
+    if (id === "challenge-running") matched.add("#challenge-running");
+    if (id === "challenge-stage") matched.add("#challenge-stage");
+    if (id === "cf-challenge-running") matched.add("#cf-challenge-running");
+    if (classes.has("cf-turnstile")) matched.add(".cf-turnstile");
+    if (id === "cf-error-details") matched.add("#cf-error-details");
+    if (id === "sec-if-cpt-container") matched.add("#sec-if-cpt-container");
+    if (id === "sec-cpt-if") matched.add("#sec-cpt-if");
+    if (id === "sec-text-if") matched.add("#sec-text-if");
+    if (id === "ddv1-captcha-container") matched.add("#ddv1-captcha-container");
+    if (id === "px-captcha") matched.add("#px-captcha");
+    if (id === "px-captcha-wrapper") matched.add("#px-captcha-wrapper");
+    if (id.startsWith("px-captcha")) matched.add("[id^='px-captcha']");
+    if (id === "main-iframe" && src.includes("_Incapsula_Resource")) {
+      matched.add("#main-iframe[src*='_Incapsula_Resource']");
+    }
+    if (id === "challenge-container") matched.add("#challenge-container");
+    if (classes.has("g-recaptcha")) matched.add(".g-recaptcha");
+    if (src.includes("/recaptcha/") && title.includes("challenge")) {
+      matched.add("iframe[src*='/recaptcha/'][title*='challenge']");
+    }
+    if (classes.has("h-captcha")) matched.add(".h-captcha");
+  }
+  if (hasAwsWafCaptcha) {
+    matched.add("awswaf-captcha");
+  }
+  return [...matched];
 }

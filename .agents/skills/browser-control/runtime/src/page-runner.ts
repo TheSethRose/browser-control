@@ -12,6 +12,23 @@ import { isAbsolute } from "node:path";
 import { runBrowse, type Runner } from "./backends/browse";
 import { backendOrder } from "./backends/router";
 import { extensionTabOf, getRegisteredExtensionBcCall, type BcCallFn } from "./backends/extension";
+import {
+  SHORT_PAGE_CHARS,
+  buildChallengeProbeExpression,
+  classifyChallenge,
+  fastVendorSelectors,
+  formatChallengeOutput,
+  isDenialTitle,
+  isSuspiciousSnapshot,
+  isSuspiciousTitle,
+  isSuspiciousUrl,
+  matchProbeSelectorsFromRows,
+  parseBcQueryRows,
+  parseBcTextForProbe,
+  probeSelectors,
+  type ChallengeDetection,
+  type ChallengeProbe,
+} from "./challenges";
 import { inspectIssues, inspectPerf, inspectStyles } from "./devtools";
 import {
   buildFlow,
@@ -61,6 +78,12 @@ const PAGE_ACTIONS = [
 ] as const;
 
 const DEFAULT_HANDOFF_TIMEOUT_MS = 10 * 60 * 1000;
+const CHALLENGE_WAIT_MAX_MS = 8_000;
+const CHALLENGE_POLL_MS = 500;
+const CHALLENGE_PROBE_SEP = "\n__BC_CHALLENGE_SEP__\n";
+const CHALLENGE_PROBE_EXPR = buildChallengeProbeExpression(false);
+const FAST_VENDOR_CSS = fastVendorSelectors.join(",");
+const PROBE_SELECTORS_CSS = probeSelectors.join(",");
 const EXTENSION_REQUEST_SYMBOL = Symbol.for("browser-control.extension-request");
 type ExtensionRequestFn = (op: string, params?: Json, timeoutMs?: number) => Promise<unknown>;
 
@@ -77,6 +100,25 @@ function browseTabNumber(targetId: unknown): number | undefined {
   const n = Number(targetId.slice("browse:".length));
   return Number.isInteger(n) ? n : undefined;
 }
+
+function stripHash(url: string): string {
+  const idx = url.indexOf("#");
+  return idx >= 0 ? url.slice(0, idx) : url;
+}
+
+type ProbeReadResult =
+  | { kind: "skip"; url?: string }
+  | { kind: "probe"; probe: ChallengeProbe }
+  | { kind: "error" };
+
+type ChallengeCheckResult =
+  | { status: "clear"; waited: boolean; url?: string }
+  | {
+      status: "interactive" | "block" | "non-interactive-timeout";
+      detection: ChallengeDetection;
+      url: string;
+      waited: boolean;
+    };
 
 function hostOf(url: string): string {
   try {
@@ -1626,6 +1668,186 @@ export function createPageHelperHandler(
     }
   }
 
+  async function readChallengeProbeCdp(targetId: string | undefined): Promise<ProbeReadResult> {
+    const res = await invoke("evaluate", {
+      expression: CHALLENGE_PROBE_EXPR,
+      isolated: true,
+      ...(targetId ? { targetId } : {}),
+      timeoutMs: 4_000,
+    });
+    if (!res.ok) return { kind: "error" };
+    const raw = valueOf(res);
+    if (!raw || !raw.startsWith("{")) return { kind: "skip" };
+    try {
+      const parsed = JSON.parse(raw) as { skip?: boolean; url?: string; probe?: ChallengeProbe };
+      if (parsed.skip) return { kind: "skip", url: typeof parsed.url === "string" ? parsed.url : undefined };
+      if (parsed.probe && typeof parsed.probe === "object") return { kind: "probe", probe: parsed.probe };
+      return { kind: "skip" };
+    } catch {
+      return { kind: "skip" };
+    }
+  }
+
+  /**
+   * Read a lightweight bot-challenge probe for the current page.
+   * - On extension tabs: stays on the silent `evalHelper` (`bc_call`) tier so normal pages never attach `chrome.debugger`.
+   * - During a non-interactive interstitial wait, if a throttled/collapsed background extension tab stops answering
+   *   `bc_call`, falls back to `evaluate` (which enables focus emulation so the interstitial's timers can finish).
+   * - On CDP tabs: runs a single self-contained `evaluate` expression that exits early on normal long pages.
+   */
+  async function readChallengeProbe(
+    targetId: string | undefined,
+    opts: { wallHint?: string; reprobe?: boolean } = {},
+  ): Promise<ProbeReadResult> {
+    if (extensionTabOf(targetId) !== undefined) {
+      const stepTimeout = opts.reprobe ? 1_500 : 4_000;
+      const quick = await evalHelper(
+        {
+          steps: [
+            { kind: "href" },
+            { kind: "title" },
+            { kind: "bc", method: "text", args: [{ all: true, max: 3000 }] },
+            { kind: "bc", method: "query", args: [{ selector: FAST_VENDOR_CSS, fields: { id: "@id" }, limit: 1, all: true }] },
+          ],
+          join: CHALLENGE_PROBE_SEP,
+        },
+        targetId,
+        stepTimeout,
+      );
+      if (!quick.ok) {
+        return opts.reprobe ? readChallengeProbeCdp(targetId) : { kind: "error" };
+      }
+      const rawQuick = valueOf(quick);
+      if (!rawQuick.includes(CHALLENGE_PROBE_SEP)) return { kind: "skip" };
+      const [url = "", title = "", rawText = "", rawVendor = ""] = rawQuick.split(CHALLENGE_PROBE_SEP);
+      const { text, textLength } = parseBcTextForProbe(rawText);
+      const hasVendor = parseBcQueryRows(rawVendor).length > 0;
+      const suspicious =
+        opts.wallHint === "captcha" ||
+        opts.wallHint === "rate-limit" ||
+        textLength < SHORT_PAGE_CHARS ||
+        hasVendor ||
+        isSuspiciousTitle(title) ||
+        isSuspiciousUrl(url);
+      if (!suspicious) return { kind: "skip", url };
+
+      const markers = await evalHelper(
+        {
+          steps: [
+            { kind: "bc", method: "query", args: [{ selector: "iframe[src]", fields: { src: "@src" }, limit: 20, all: true }] },
+            { kind: "bc", method: "query", args: [{ selector: "script[src]", fields: { src: "@src" }, limit: 50, all: true }] },
+            {
+              kind: "bc",
+              method: "query",
+              args: [{ selector: PROBE_SELECTORS_CSS, fields: { id: "@id", cls: "@class", src: "@src", title: "@title" }, limit: 20, all: true }],
+            },
+            {
+              kind: "bc",
+              method: "query",
+              args: [{ selector: PROBE_SELECTORS_CSS, fields: { id: "@id", cls: "@class", src: "@src", title: "@title" }, limit: 20, all: false }],
+            },
+            { kind: "bc", method: "query", args: [{ selector: "awswaf-captcha", fields: { id: "@id" }, limit: 1, all: true }] },
+          ],
+          join: CHALLENGE_PROBE_SEP,
+        },
+        targetId,
+        stepTimeout,
+      );
+      const [rawFrames = "", rawScripts = "", rawSel = "", rawVis = "", rawAws = ""] = markers.ok
+        ? valueOf(markers).split(CHALLENGE_PROBE_SEP)
+        : [];
+      const frameUrls = parseBcQueryRows(rawFrames).map((r) => r["src"]).filter((s): s is string => Boolean(s));
+      const scriptSrcs = parseBcQueryRows(rawScripts).map((r) => r["src"]).filter((s): s is string => Boolean(s));
+      const hasAws = parseBcQueryRows(rawAws).length > 0;
+      const selectors = matchProbeSelectorsFromRows(parseBcQueryRows(rawSel), hasAws);
+      const visibleSelectors = matchProbeSelectorsFromRows(parseBcQueryRows(rawVis), false);
+      const probe: ChallengeProbe = {
+        url,
+        title: title.trim(),
+        text,
+        textLength,
+        frameUrls,
+        scriptSrcs,
+        selectors,
+        visibleSelectors,
+      };
+      // Only read HTTP navigation status if a long denial-titled page or short AWS WAF SDK page still needs status.
+      const needsStatus =
+        classifyChallenge(probe) === undefined &&
+        (isDenialTitle(title) || (textLength < SHORT_PAGE_CHARS && scriptSrcs.some((s) => /\.awswaf\.com\//.test(s))));
+      if (needsStatus) {
+        const statusRes = await invoke("evaluate", {
+          expression: '(() => { const n = performance.getEntriesByType && performance.getEntriesByType("navigation")[0]; return n && typeof n.responseStatus === "number" ? n.responseStatus : 0; })()',
+          isolated: true,
+          ...(targetId ? { targetId } : {}),
+          timeoutMs: 2_000,
+        });
+        const statusNum = statusRes.ok ? Number((statusRes.data as Json)["value"]) : 0;
+        if (Number.isInteger(statusNum) && statusNum > 0) {
+          return { kind: "probe", probe: { ...probe, status: statusNum } };
+        }
+      }
+      return { kind: "probe", probe };
+    }
+
+    return readChallengeProbeCdp(targetId);
+  }
+
+  /**
+   * Run the challenge classifier; auto-wait boundedly (~8 s) on `non-interactive` interstitials,
+   * and immediately report `interactive` or `block` without retrying.
+   */
+  async function checkChallenge(
+    targetId: string | undefined,
+    opts: { wallHint?: string; knownUrl?: string } = {},
+  ): Promise<ChallengeCheckResult> {
+    const first = await readChallengeProbe(targetId, { wallHint: opts.wallHint });
+    if (first.kind !== "probe") {
+      return { status: "clear", waited: false, url: first.kind === "skip" ? first.url : opts.knownUrl };
+    }
+    let lastProbe = first.probe;
+    let detection = classifyChallenge(lastProbe);
+    if (!detection) return { status: "clear", waited: false, url: lastProbe.url };
+    if (detection.kind === "block") {
+      return { status: "block", detection, url: lastProbe.url || opts.knownUrl || "", waited: false };
+    }
+    if (detection.kind === "interactive") {
+      return { status: "interactive", detection, url: lastProbe.url || opts.knownUrl || "", waited: false };
+    }
+
+    const started = Date.now();
+    let waitedMs = 0;
+    while (waitedMs < CHALLENGE_WAIT_MAX_MS && Date.now() - started < CHALLENGE_WAIT_MAX_MS) {
+      const step = Math.min(CHALLENGE_POLL_MS, CHALLENGE_WAIT_MAX_MS - waitedMs);
+      await pause(step);
+      waitedMs += step;
+      const next = await readChallengeProbe(targetId, { reprobe: true });
+      if (next.kind === "error") continue;
+      if (next.kind === "skip") {
+        return { status: "clear", waited: true, url: next.url || opts.knownUrl };
+      }
+      lastProbe = next.probe;
+      const nextDetection = classifyChallenge(lastProbe);
+      if (!nextDetection) {
+        return { status: "clear", waited: true, url: lastProbe.url };
+      }
+      detection = nextDetection;
+      if (detection.kind === "block") {
+        return { status: "block", detection, url: lastProbe.url || opts.knownUrl || "", waited: true };
+      }
+      if (detection.kind === "interactive") {
+        return { status: "interactive", detection, url: lastProbe.url || opts.knownUrl || "", waited: true };
+      }
+    }
+
+    return {
+      status: "non-interactive-timeout",
+      detection,
+      url: lastProbe.url || opts.knownUrl || "",
+      waited: true,
+    };
+  }
+
   async function handlePage(action: string, input: Json, rawTargetId?: string): Promise<InvokeResult> {
     const { browseTab, extensionTarget } = await resolveTargetBackend(rawTargetId);
     const targetId = rawTargetId ?? extensionTarget;
@@ -1657,6 +1879,21 @@ export function createPageHelperHandler(
         const res = await evalHelper({ kind: "bc", method: "snapshot", args: [opts] }, targetId);
         if (!res.ok) return res;
         let out = valueOf(res);
+        let challengePrefix = "";
+        if (!find && !within && input["_skipChallengeCheck"] !== true && isSuspiciousSnapshot(out)) {
+          const wallHint = out.includes("# WALL: captcha") ? "captcha" : out.includes("# WALL: rate-limit") ? "rate-limit" : undefined;
+          const snapUrl = /^# .* \| (https?:\/\/[^\s]+)/.exec(out)?.[1];
+          const challenge = await checkChallenge(targetId, { wallHint, knownUrl: snapUrl });
+          if (challenge.status === "block") {
+            return failure("EXECUTION_FAILED", formatChallengeOutput(challenge.detection, challenge.url || snapUrl || ""));
+          }
+          if (challenge.status === "interactive" || challenge.status === "non-interactive-timeout") {
+            challengePrefix = formatChallengeOutput(challenge.detection, challenge.url || snapUrl || "");
+          } else if (challenge.waited) {
+            const refreshed = await evalHelper({ kind: "bc", method: "snapshot", args: [opts] }, targetId);
+            if (refreshed.ok) out = valueOf(refreshed);
+          }
+        }
         // Attach per-site agent notes if present for the page's origin.
         const urlMatch = /^# .* \| (https?:\/\/[^\s]+)/.exec(out);
         if (urlMatch?.[1]) {
@@ -1667,10 +1904,11 @@ export function createPageHelperHandler(
           const frames = await snapFrames(opts, targetId);
           if (frames.length) out += `\n${frames.join("\n")}`;
         }
-        if (!find && !within && !out.includes("\n- ") && !out.includes("# WALL:") && !out.includes("# snap diff")) {
+        if (!challengePrefix && !find && !within && !out.includes("\n- ") && !out.includes("# WALL:") && !out.includes("# snap diff")) {
           const ax = await snapAx(undefined, targetId);
           if (ax.ok && valueOf(ax).includes("\n- ")) out += `\n# No controls found in the DOM.\n${valueOf(ax)}`;
         }
+        if (challengePrefix) out = `${challengePrefix}\n${out}`;
         return maybeSaveOut(success(out), input);
       }
 
@@ -1732,8 +1970,10 @@ export function createPageHelperHandler(
           : await readProperty("href", targetId);
         if (browseTab === undefined && start && !start.ok) return start;
         const startUrl = start?.ok ? valueOf(start) : "";
+        let prevUrl = startUrl;
         const out: string[] = [];
         let stopped: string | undefined;
+        let challengeReport: string | undefined;
         for (const [i, step] of steps.entries()) {
           const res = await act(step.action, { ...step.input, quiet: true }, targetId, true, browseTab, true);
           if (!res.ok) {
@@ -1777,11 +2017,73 @@ export function createPageHelperHandler(
             );
             if (again.ok) [url = "", wall = ""] = valueOf(again).split("\n");
           }
+          const navigated = Boolean(url && prevUrl && stripHash(url) !== stripHash(prevUrl));
+          const challengeWall = wall === "captcha" || wall === "rate-limit";
+          if (browseTab === undefined && (navigated || challengeWall)) {
+            const challenge = await checkChallenge(targetId, { wallHint: wall, knownUrl: url });
+            if (challenge.status === "block") {
+              challengeReport = formatChallengeOutput(challenge.detection, challenge.url || url);
+              stopped = `blocked by ${challenge.detection.vendor} after step ${i + 1}`;
+              break;
+            }
+            if (challenge.status === "interactive" || challenge.status === "non-interactive-timeout") {
+              challengeReport = formatChallengeOutput(challenge.detection, challenge.url || url);
+              stopped = `${challenge.detection.vendor} challenge after step ${i + 1}`;
+              break;
+            }
+            if (challenge.waited) {
+              const afterWait = await evalHelper(
+                { steps: [{ kind: "href" }, { kind: "bc", method: "wall", fallback: "" }], join: "\n" },
+                targetId,
+                4_000,
+              );
+              if (afterWait.ok) [url = "", wall = ""] = valueOf(afterWait).split("\n");
+              else if (challenge.url) url = challenge.url;
+            }
+          }
+          if (url) prevUrl = url;
           if (wall) stopped = `the page is a ${wall} wall after step ${i + 1}`;
           else if (url && startUrl && hostOf(url) !== hostOf(startUrl)) {
             stopped = `step ${i + 1} left ${hostOf(startUrl)} for ${hostOf(url)}`;
           }
           if (stopped) break;
+        }
+        let postDiff: string | undefined;
+        if (!stopped && browseTab === undefined) {
+          if (!quiet) {
+            postDiff = await changes(startUrl, targetId);
+            const urlDelta = /^# url: (\S+) -> (\S+)/m.exec(postDiff);
+            const lastNavigated = Boolean(urlDelta && stripHash(urlDelta[1]!) !== stripHash(urlDelta[2]!));
+            const lastWall = postDiff.includes("# WALL: captcha") ? "captcha" : postDiff.includes("# WALL: rate-limit") ? "rate-limit" : undefined;
+            if (lastNavigated || lastWall) {
+              const challenge = await checkChallenge(targetId, { wallHint: lastWall, knownUrl: urlDelta?.[2] || prevUrl });
+              if (challenge.status === "block") {
+                challengeReport = formatChallengeOutput(challenge.detection, challenge.url || urlDelta?.[2] || prevUrl);
+                stopped = `blocked by ${challenge.detection.vendor} after step ${steps.length}`;
+              } else if (challenge.status === "interactive" || challenge.status === "non-interactive-timeout") {
+                challengeReport = formatChallengeOutput(challenge.detection, challenge.url || urlDelta?.[2] || prevUrl);
+                stopped = `${challenge.detection.vendor} challenge after step ${steps.length}`;
+              } else if (challenge.waited) {
+                postDiff = await changes(startUrl, targetId);
+              }
+            }
+          } else {
+            const lastAction = steps[steps.length - 1]?.action;
+            if (lastAction === "click" || lastAction === "key") {
+              const curHref = await readProperty("href", targetId, { timeoutMs: 2_000 });
+              const finalUrl = curHref.ok ? valueOf(curHref) : "";
+              if (finalUrl && prevUrl && stripHash(finalUrl) !== stripHash(prevUrl)) {
+                const challenge = await checkChallenge(targetId, { knownUrl: finalUrl });
+                if (challenge.status === "block") {
+                  challengeReport = formatChallengeOutput(challenge.detection, challenge.url || finalUrl);
+                  stopped = `blocked by ${challenge.detection.vendor} after step ${steps.length}`;
+                } else if (challenge.status === "interactive" || challenge.status === "non-interactive-timeout") {
+                  challengeReport = formatChallengeOutput(challenge.detection, challenge.url || finalUrl);
+                  stopped = `${challenge.detection.vendor} challenge after step ${steps.length}`;
+                }
+              }
+            }
+          }
         }
         if (stopped) out.push(`# STOPPED: ${stopped}. ${steps.length - out.length} step(s) not run.`);
         if (!quiet) {
@@ -1791,10 +2093,13 @@ export function createPageHelperHandler(
               cacheBrowseSnapshot(browseTab, valueOf(delta));
               out.push(valueOf(delta));
             }
-          } else {
+          } else if (postDiff !== undefined && !challengeReport) {
+            out.push(postDiff);
+          } else if (!challengeReport) {
             out.push(await changes(startUrl, targetId));
           }
         }
+        if (challengeReport) out.unshift(challengeReport);
         return stopped ? failure("EXECUTION_FAILED", out.join("\n")) : success(out.join("\n"));
       }
 
@@ -1983,19 +2288,53 @@ export function createPageHelperHandler(
             tab,
             8_000,
           );
+          let final = "";
+          let wall = "";
           if (state.ok) {
-            const [final = "", wall = ""] = valueOf(state).split("\n");
+            [final = "", wall = ""] = valueOf(state).split("\n");
+          }
+          const challenge = await checkChallenge(tab, { wallHint: wall, knownUrl: final || url });
+          if (challenge.status === "block") {
+            return failure("EXECUTION_FAILED", formatChallengeOutput(challenge.detection, challenge.url || final || url));
+          }
+          if (challenge.status === "interactive" || challenge.status === "non-interactive-timeout") {
+            const targetUrl = challenge.url || final || url;
             if (final && final !== url) lines.push(`# url: ${final}`);
             if (final && hostOf(final) && hostOf(url) && hostOf(final) !== hostOf(url)) {
               lines.push(`# REDIRECTED: ${hostOf(url)} -> ${hostOf(final)}`);
             }
-            if (wall && input["snap"] !== true) {
-              lines.push(`# WALL: ${wall}. Stop and hand this tab to the user; do not solve or bypass it.`);
+            return success(`${formatChallengeOutput(challenge.detection, targetUrl)}\n${lines.join("\n")}`);
+          }
+          if (challenge.waited) {
+            const afterWait = await evalHelper(
+              {
+                steps: [
+                  { kind: "bc", method: "settle", discard: true },
+                  { kind: "href" },
+                  { kind: "bc", method: "wall", fallback: "" },
+                ],
+                join: "\n",
+              },
+              tab,
+              8_000,
+            );
+            if (afterWait.ok) {
+              [final = "", wall = ""] = valueOf(afterWait).split("\n");
+            } else if (challenge.url) {
+              final = challenge.url;
+              wall = "";
             }
+          }
+          if (final && final !== url) lines.push(`# url: ${final}`);
+          if (final && hostOf(final) && hostOf(url) && hostOf(final) !== hostOf(url)) {
+            lines.push(`# REDIRECTED: ${hostOf(url)} -> ${hostOf(final)}`);
+          }
+          if (wall && input["snap"] !== true) {
+            lines.push(`# WALL: ${wall}. Stop and hand this tab to the user; do not solve or bypass it.`);
           }
         }
         if (input["snap"] === true) {
-          const snap = await handlePage("snap", {}, tab);
+          const snap = await handlePage("snap", { _skipChallengeCheck: !onBrowse }, tab);
           lines.push(snap.ok ? valueOf(snap) : `# snap failed: ${messageOf(snap).slice(0, 200)}`);
         }
         return success(lines.join("\n"));
