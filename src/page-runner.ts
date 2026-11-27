@@ -2490,7 +2490,13 @@ export function createPageHelperHandler(
       case "nav": {
         const url = typeof input["url"] === "string" ? input["url"] : "";
         const until = input["until"] === "load" ? "load" : "domcontentloaded";
-        const nav = await invoke("navigate", { url, until, ...(targetId ? { targetId } : {}) });
+        const nav = await invoke("navigate", {
+          url,
+          until,
+          ...(targetId ? { targetId } : {}),
+          ...(input["newWindow"] === true ? { newWindow: true } : {}),
+          ...(input["keepOpen"] === true ? { keepOpen: true } : {}),
+        });
         if (!nav.ok) return nav;
         const data = nav.data as Json;
         const tab = typeof data["targetId"] === "string" ? (data["targetId"] as string) : targetId;

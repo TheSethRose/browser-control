@@ -6,6 +6,8 @@
 #   tabs                              list tabs; * marks the selected one
 #   nav <url> [--snap] [--until load] navigate; --snap also lists the controls.
 #                                     --browser <slug> opens it in that browser
+#                                     extension tabs only: --new-window opens it in a new
+#                                     window; --keep-open keeps the tab past idle cleanup
 #   eval '<js>'                       run JavaScript, print its value ('-' reads stdin)
 #   call <op> ['<json>']              any operation, JSON in and out
 #   start [browser]                   switch browser by name (chrome, beta, brave, ardia); opens it
@@ -194,7 +196,7 @@ find=""; within=""; max=""; until=""; xy=""; ref_flag=""; to=""; out_path=""
 wait_text=""; wait_selector=""; wait_url=""; timeout=""
 filter=""; limit=""; fields=""; concurrency=""; side=""; duration=""; kind=""; properties=""; site=""
 browser=""; viewport=""; color_scheme=""; ua=""; mobile=false; reduced_motion=false; offline=false; reset_flag=false
-max_time=""
+max_time=""; new_window=""; keep_open=""
 params_list=(); where_list=()
 args=()
 case "$cmd" in snap | text | form | query | read-urls | ocr | click | hover | type | select | upload | drag | wait | key | value | shot | nav | eval | fill | do | verdict | health | styles | issues | perf | dialog | emulate | handoff | notes | flow | script)
@@ -244,6 +246,8 @@ case "$cmd" in snap | text | form | query | read-urls | ocr | click | hover | ty
       --reduced-motion) reduced_motion=true; shift ;;
       --offline) offline=true; shift ;;
       --reset) reset_flag=true; shift ;;
+      --new-window) new_window=1; shift ;;
+      --keep-open) keep_open=1; shift ;;
       --param) params_list+=("${2:?--param needs key=value}"); shift 2 ;;
       --where) where_list+=("${2:?--where needs field=value}"); shift 2 ;;
       --) shift; while [[ $# -gt 0 ]]; do args+=("$1"); shift; done ;;
@@ -300,9 +304,11 @@ case "$cmd" in
     run POST "eval$(query "$(arg 1)")" "$(body "$(arg 0)")"
     ;;
   nav)
-    [[ -n "$(arg 0)" ]] || fail INPUT_INVALID "usage: browser-control-daemon nav <url> [targetId] [--snap] [--until load]"
+    [[ -n "$(arg 0)" ]] || fail INPUT_INVALID "usage: browser-control-daemon nav <url> [targetId] [--snap] [--until load] [--new-window] [--keep-open]"
     extra=""; [[ -z "$snap" ]] || extra="snap=1"
     [[ "$until" != "load" ]] || extra="${extra:+$extra&}until=load"
+    [[ -z "$new_window" ]] || extra="${extra:+$extra&}new_window=1"
+    [[ -z "$keep_open" ]] || extra="${extra:+$extra&}keep_open=1"
     run POST "nav$(query "$(arg 1)" "$extra")" "$(arg 0)"
     ;;
   tabs | ops) run GET "$cmd" ;;

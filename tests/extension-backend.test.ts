@@ -1051,6 +1051,47 @@ describe("Phase 2 slice B: BrowserLinks and chunked frames", () => {
     expect(browser2.receivedReqs.filter((r) => r.op === "navigate")).toHaveLength(1);
   });
 
+  test("nav newWindow/keepOpen reach the extension's navigate; newWindow opens a new tab", async () => {
+    const token = randomBytes(32).toString("hex");
+    const backend = createExtensionBackend({ ...allocPortWindow(), token, waitConnectMs: 1_000 });
+    disposables.push(backend);
+    await backend.start!();
+    const ext = await connectMockExtension(backend.getPort()!, token, (op, params) => {
+      if (op === "navigate") return { tabId: 77, loaded: true, url: String(params["url"]), title: "N" };
+      if (op === "bc_call") return { values: [undefined, String(params["url"] ?? ""), ""] };
+      return { ok: true };
+    });
+    const ops = route(fakeCdp([]), [backend], () => ["extension", "cdp"]);
+    const invoke = async (op: string, input: Record<string, unknown> = {}): Promise<InvokeResult> => {
+      try {
+        return { ok: true, data: await ops[op]!(input) };
+      } catch (err) {
+        return { ok: false, error: { code: "EXECUTION_FAILED", message: (err as Error).message } };
+      }
+    };
+    const handlePage = createPageHelperHandler(invoke, undefined, undefined, {
+      bcCall: (input) => backend.bcCall(input),
+      sleep: async () => {},
+      rng: () => 0.5,
+    });
+    await ops["select_target"]!({ targetId: "extension:5" });
+    const navs = () => ext.receivedReqs.filter((r) => r.op === "navigate");
+
+    expect((await handlePage("nav", { url: "https://a.test/", newWindow: true, keepOpen: true })).ok).toBe(true);
+    expect(navs().at(-1)!.params["newWindow"]).toBe(true);
+    expect(navs().at(-1)!.params["keepOpen"]).toBe(true);
+    expect(navs().at(-1)!.params["tabId"]).toBeUndefined();
+
+    await ops["select_target"]!({ targetId: "extension:5" });
+    expect((await handlePage("nav", { url: "https://b.test/", keepOpen: true })).ok).toBe(true);
+    expect(navs().at(-1)!.params["tabId"]).toBe(5);
+    expect(navs().at(-1)!.params["keepOpen"]).toBe(true);
+    expect(navs().at(-1)!.params["newWindow"]).toBeUndefined();
+
+    expect((await handlePage("nav", { url: "https://c.test/" })).ok).toBe(true);
+    expect(navs().at(-1)!.params["keepOpen"]).toBeUndefined();
+  });
+
   test("cancelUnsent drops a queued batch that never started sending", async () => {
     const sent: string[] = [];
     let blocked = true;
