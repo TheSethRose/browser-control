@@ -77,6 +77,7 @@ import {
 import { createPictureTracker, imageWidth, resizeImage } from "./picture";
 import { buildHumanKeystrokes } from "./typing";
 import { didYouMean, withRemedy, wrapUntrusted } from "./safety";
+import { formatCaptchaReport, type CaptchaStatus } from "./captcha";
 import { createScriptRunner, writeOutputFile } from "./script";
 
 type Json = Record<string, unknown>;
@@ -98,7 +99,7 @@ const DIALOG_HINT = "the page stopped responding; a JavaScript dialog is probabl
 const PAGE_ACTIONS = [
   "snap", "text", "form", "query", "read-urls", "ocr", "shot", "click", "hover", "type", "select",
   "upload", "drag", "wait", "key", "fill", "do", "value", "nav", "verdict", "health",
-  "styles", "issues", "perf", "dialog", "emulate", "handoff", "notes", "flow", "script",
+  "styles", "issues", "perf", "dialog", "emulate", "handoff", "notes", "flow", "script", "solve_captcha",
 ] as const;
 
 const DEFAULT_HANDOFF_TIMEOUT_MS = 10 * 60 * 1000;
@@ -115,6 +116,8 @@ const PRE_STEP_PROBE_BUDGET_MS = 1_500;
 const PRE_STEP_PROBE_ATTEMPT_MS = 700;
 const CHALLENGE_PROBE_SEP = "\n__BC_CHALLENGE_SEP__\n";
 const CHALLENGE_PROBE_EXPR = buildChallengeProbeExpression(false);
+/** Same probe for verify mode: never trust a fast-path skip. */
+const CHALLENGE_PROBE_EXPR_FULL = buildChallengeProbeExpression(true);
 const FAST_VENDOR_CSS = fastVendorSelectors.join(",");
 /** One cheap querySelector-style check for known challenge markers (`# N row(s)` header). */
 const VENDOR_MARKER_STEP = {
@@ -2639,17 +2642,42 @@ export function createPageHelperHandler(
     }
   }
 
+  /**
+   * Parse a readback of {@link CHALLENGE_PROBE_EXPR}: `{skip,url}` or `{skip:false,probe}`, else "skip".
+   * `strict` is for calls that must not report a page it could not read: a readback that cannot be
+   * parsed, or that arrives without the URL the classifier and the host boundary both need, is
+   * incomplete, so it reads as "error" (unknown) and never as "skip" (clear).
+   */
+  function parseProbeReadback(raw: string, strict = false): ProbeReadResult {
+    const bad = (): ProbeReadResult => (strict ? { kind: "error" } : { kind: "skip" });
+    if (!raw || !raw.startsWith("{")) return bad();
+    try {
+      const parsed = JSON.parse(raw) as { skip?: boolean; url?: string; probe?: ChallengeProbe };
+      if (parsed.skip === true) {
+        return typeof parsed.url === "string" && parsed.url !== "" ? { kind: "skip", url: parsed.url } : bad();
+      }
+      if (parsed.probe && typeof parsed.probe === "object") {
+        if (strict && !(typeof parsed.probe.url === "string" && parsed.probe.url !== "")) return { kind: "error" };
+        return { kind: "probe", probe: parsed.probe };
+      }
+      return bad();
+    } catch {
+      return bad();
+    }
+  }
+
   async function readChallengeProbeCdp(
     targetId: string | undefined,
     timeoutMs = 4_000,
     deadline?: number,
     strict = false,
+    forceFull = false,
   ): Promise<ProbeReadResult> {
     const budget = deadline !== undefined ? Math.min(timeoutMs, deadline - Date.now()) : timeoutMs;
     if (budget <= 0) return { kind: "error" };
     const res = await raceDeadline(
       invoke("evaluate", {
-        expression: CHALLENGE_PROBE_EXPR,
+        expression: forceFull ? CHALLENGE_PROBE_EXPR_FULL : CHALLENGE_PROBE_EXPR,
         isolated: true,
         ...(targetId ? { targetId } : {}),
         timeoutMs: Math.max(1, Math.floor(budget)),
@@ -2692,7 +2720,7 @@ export function createPageHelperHandler(
    */
   async function readChallengeProbe(
     targetId: string | undefined,
-    opts: { wallHint?: string; reprobe?: boolean; deadline?: number; strict?: boolean } = {},
+    opts: { wallHint?: string; reprobe?: boolean; deadline?: number; strict?: boolean; forceFull?: boolean } = {},
   ): Promise<ProbeReadResult> {
     const remaining = (cap: number): number =>
       opts.deadline !== undefined ? Math.min(cap, opts.deadline - Date.now()) : cap;
@@ -2725,7 +2753,7 @@ export function createPageHelperHandler(
         failure("EXECUTION_FAILED", "CHALLENGE_PROBE_TIMEOUT"),
       );
       if (!quick.ok) {
-        return opts.reprobe ? readChallengeProbeCdp(targetId, baseTimeout, opts.deadline, opts.strict) : { kind: "error" };
+        return opts.reprobe ? readChallengeProbeCdp(targetId, baseTimeout, opts.deadline, opts.strict, opts.forceFull) : { kind: "error" };
       }
       const rawQuick = valueOf(quick);
       if (!rawQuick.includes(CHALLENGE_PROBE_SEP)) return opts.strict === true ? { kind: "error" } : { kind: "skip" };
@@ -2736,6 +2764,7 @@ export function createPageHelperHandler(
       const { text, textLength } = parseBcTextForProbe(rawText);
       const hasVendor = parseBcQueryRows(rawVendor).length > 0;
       const suspicious =
+        opts.forceFull === true ||
         opts.wallHint === "captcha" ||
         opts.wallHint === "rate-limit" ||
         textLength < SHORT_PAGE_CHARS ||
@@ -2820,7 +2849,7 @@ export function createPageHelperHandler(
       return { kind: "probe", probe };
     }
 
-    return readChallengeProbeCdp(targetId, opts.reprobe ? 1_500 : 4_000, opts.deadline, opts.strict);
+    return readChallengeProbeCdp(targetId, opts.reprobe ? 1_500 : 4_000, opts.deadline, opts.strict, opts.forceFull);
   }
 
   /**
@@ -2831,10 +2860,10 @@ export function createPageHelperHandler(
    */
   async function checkChallenge(
     targetId: string | undefined,
-    opts: { wallHint?: string; knownUrl?: string; unknownOnError?: boolean; deadline?: number } = {},
+    opts: { wallHint?: string; knownUrl?: string; unknownOnError?: boolean; deadline?: number; forceFull?: boolean } = {},
   ): Promise<ChallengeCheckResult> {
     const strict = opts.unknownOnError === true;
-    const first = await readChallengeProbe(targetId, { wallHint: opts.wallHint, deadline: opts.deadline, strict });
+    const first = await readChallengeProbe(targetId, { wallHint: opts.wallHint, deadline: opts.deadline, strict, forceFull: opts.forceFull });
     if (first.kind !== "probe") {
       if (first.kind === "error" && strict) {
         return { status: "unknown", waited: false, url: opts.knownUrl };
@@ -2866,7 +2895,7 @@ export function createPageHelperHandler(
       await pause(step);
       waitedMs += step;
       if (deadline - Date.now() <= 0) break;
-      const next = await readChallengeProbe(targetId, { reprobe: true, deadline, strict });
+      const next = await readChallengeProbe(targetId, { reprobe: true, deadline, strict, forceFull: opts.forceFull });
       if (next.kind === "error") {
         // Strict reads must not poll past a page they cannot read: the deadline would end in
         // non-interactive-timeout, which reports a challenge that was never seen.
@@ -3049,6 +3078,54 @@ export function createPageHelperHandler(
 
       case "handoff":
         return runHandoff(input, targetId, resolved);
+
+      case "solve_captcha": {
+        const verify = input["verify"] === true;
+        // Same engine as nav/snap/do: detection is read-only; the agent acts, the tool never solves.
+        // A failed or incomplete read reports "unknown", never "clear": a read that failed did not
+        // read a clean page. The report proves detection evidence — what it does not prove is that
+        // the answer was accepted; that is what --verify is for.
+        if (verify) {
+          // One forced full read, not the fast-path skip: a long page still carrying a widget must
+          // not report clear. No wait loop — verify is a re-check after the agent answered.
+          const probe = await readChallengeProbe(targetId, { reprobe: true, strict: true, forceFull: true });
+          if (probe.kind === "error") {
+            return success(formatCaptchaReport({ status: "unknown", waited: false }, true));
+          }
+          if (probe.kind === "skip") {
+            return success(formatCaptchaReport({ status: "clear", waited: false, url: probe.url }, true));
+          }
+          const p = probe.probe;
+          const detection = classifyChallenge(p);
+          if (!detection) {
+            // The classifier ignores widgets on long pages (walls flag short pages only). A widget
+            // marker in the full probe still means the page is not a clean read: report still present.
+            const widgetSel = (p.selectors ?? [])[0];
+            const widgetFrame = (p.frameUrls ?? []).find((u) => /recaptcha|hcaptcha|turnstile/i.test(u));
+            if (widgetSel !== undefined || widgetFrame !== undefined) {
+              const reason = widgetSel !== undefined ? `widget marker ${widgetSel}` : `widget frame ${widgetFrame}`;
+              return success(
+                formatCaptchaReport(
+                  { status: "interactive", waited: false, url: p.url, detection: { vendor: "generic", kind: "interactive", reason } },
+                  true,
+                ),
+              );
+            }
+            return success(formatCaptchaReport({ status: "clear", waited: false, url: p.url }, true));
+          }
+          const status: "interactive" | "block" | "non-interactive-timeout" =
+            detection.kind === "interactive" ? "interactive" : detection.kind === "block" ? "block" : "non-interactive-timeout";
+          return success(formatCaptchaReport({ status, waited: false, url: p.url, detection }, true));
+        }
+        const res = await checkChallenge(targetId, { unknownOnError: true });
+        const report: CaptchaStatus =
+          res.status === "clear"
+            ? { status: "clear", waited: res.waited, url: res.url }
+            : res.status === "unknown"
+              ? { status: "unknown", waited: res.waited, url: res.url }
+              : { status: res.status, waited: res.waited, url: res.url, detection: res.detection };
+        return success(formatCaptchaReport(report, verify));
+      }
 
       case "do": {
         const steps = parseSteps(input);

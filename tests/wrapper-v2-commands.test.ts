@@ -171,6 +171,19 @@ describe("wrapper v2 page commands", () => {
     expect(res.stdout).toContain("INPUT_INVALID");
   });
 
+  test("solve_captcha sends an empty body with no target", async () => {
+    const req = await call("solve_captcha");
+    expect(req.path).toBe("/page/solve_captcha");
+    expect(JSON.parse(req.body)).toEqual({});
+  });
+
+  test("solve_captcha --verify sends verify and a trailing targetId", async () => {
+    const req = await call("solve_captcha", "--verify", "extension:42");
+    expect(req.path).toBe("/page/solve_captcha");
+    expect(JSON.parse(req.body)).toEqual({ verify: true });
+    expect(new URLSearchParams(req.query).get("t")).toBe("extension:42");
+  });
+
   test("handoff sends the message and the timeout in seconds", async () => {
     const req = await call("handoff", "Finish the captcha", "--timeout", "2");
     expect(req.path).toBe("/page/handoff");
@@ -267,6 +280,7 @@ describe("wrapper v2 page commands", () => {
       "dialog accept",
       "emulate [--viewport",
       "handoff <message>",
+      "solve_captcha [--verify]",
       "--browser <slug>",
       "extension setup [extensionDir]",
       "extension status",

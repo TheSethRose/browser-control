@@ -469,3 +469,21 @@ Scaffolded and syntax-verified (v0 prototype before Phase 2 modularization):
 - `pairing.json` precedence, `chrome.storage.session` tab sets, `bc_call` timeout + `frameId`, `reload`, `list_frames`, `hold_debugger`, `RESTRICTED_PAGE` error mapping, 30 s reconnect alarm, `minimum_chrome_version: "125"`.
 
 To be upgraded/modularized in Phase 2: mutual HMAC + ECDH pairing (`lib/pairing.js`), `/version` probe + multi-daemon port scan, `chrome.runtime.getPlatformInfo()` keepalive + jittered backoff, `lib/debugger-hub.js` (SW-restart restore, `ownedByUs`, foreign-frame eviction, `sessionId`, focus emulation), `lib/window-groups.js` (background non-minimized window placement, collapsed tab groups, popup adoption), `lib/tab-cleanup.js` (`autoDiscardable: false`, mute hygiene, `leaveLastWindowOpen`), `content-overlay.js` (handoff card + foreign-frame eviction), `lib/ring-log.js`, `chrome.tabs.onReplaced`, hash-only & `about:blank#` navigation fixes, extension-world element handle, and fixed manifest `key`.
+
+---
+
+## 12. CAPTCHA solving (agent-native) — implemented on `feat/captcha-solve`
+
+**Goal:** CAPTCHAs are solved by the agent itself — vision + browser-control tools — locally, with **zero paid services**, as a deterministic extension of the existing `challenges.ts` detection pipeline.
+
+**What shipped (Phase A, opt-in):**
+
+- `solve_captcha` — report-only; `--verify` to re-check with a forced full probe. Same `checkChallenge` engine; never solves, never clicks, never calls an API.
+- `src/captcha.ts` — widget-type classification (`checkbox | image | slider | audio | video | unknown`) + report builder. Pure module; zero I/O. The page-derived reason is always inside its own untrusted-content boundary.
+- `tests/captcha.test.ts` — fixtures for classification, report shape (+ untrusted boundary), `--verify`, garbage-input safety, both-tier wiring (CDP + silent extension tier, attach-free).
+
+**Verify semantics:** `--verify` does not prove the answer was accepted — it re-reads the page with a forced full probe (no fast-path skip) and reports `still present` vs `clear` vs `unknown`. The report proves detection evidence, not ground truth. A failed or incomplete read reports `unknown`, never `clear`.
+
+**Explicitly out of scope:** frame-ref `shot --ref`, crop-aware `ocr --ref`, `CHALLENGE:` remedy-line change, game heading reporting, `drag --xy`, paid opt-in providers. Extension: zero changes. No new permissions, dependencies, or network.
+
+**Research and decisions:** [CAPTCHA-PLAN.md](CAPTCHA-PLAN.md).

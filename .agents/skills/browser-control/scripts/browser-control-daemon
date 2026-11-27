@@ -42,6 +42,8 @@
 #   shot [--ref <ref>] [--marks] [--full] [--png] [--to <path>]
 #   verdict | health | styles <ref|css> [--properties a,b] | issues [--kind <k>] [--clear]
 #   perf [--reload] [--duration <ms>]
+#   solve_captcha [--verify]           report a challenge on the page (agent-native; never solves)
+#                                      --verify re-checks after a solve: still present | clear
 #
 # Act on it (each prints what changed; --quiet leaves that out; --no-boundaries omits markers):
 #   click <ref|label> | click --xy <x,y>
@@ -262,6 +264,7 @@ cmd="${1:-}"; [[ $# -gt 0 ]] && shift
 
 # Flags may sit anywhere after the command; unknown --flags are rejected immediately.
 match=""; quiet=""; raw=""; all=false; ax=false; keys=false; fast=false; focused=false; marks=false; full=false; png=false; snap=""
+verify=false
 scroll=false; reload=false; clear_flag=false
 find=""; within=""; max=""; until=""; xy=""; ref_flag=""; to=""; out_path=""
 wait_text=""; wait_selector=""; wait_url=""; timeout=""
@@ -270,7 +273,7 @@ browser=""; viewport=""; color_scheme=""; ua=""; mobile=false; reduced_motion=fa
 max_time=""; new_window=""; keep_open=""
 params_list=(); where_list=()
 args=()
-case "$cmd" in snap | text | form | query | read-urls | ocr | click | hover | type | select | upload | drag | wait | key | value | shot | nav | eval | close | fill | do | verdict | health | styles | issues | perf | dialog | emulate | handoff | notes | flow | script)
+case "$cmd" in snap | text | form | query | read-urls | ocr | click | hover | type | select | upload | drag | wait | key | value | shot | nav | eval | close | fill | do | verdict | health | styles | issues | perf | dialog | emulate | handoff | solve_captcha | notes | flow | script)
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --match) match="${2:?--match needs text from the tab url or title}"; shift 2 ;;
@@ -288,6 +291,7 @@ case "$cmd" in snap | text | form | query | read-urls | ocr | click | hover | ty
       --scroll) scroll=true; shift ;;
       --reload) reload=true; shift ;;
       --clear) clear_flag=true; shift ;;
+      --verify) verify=true; shift ;;
       --find) find="${2:?--find needs text}"; shift 2 ;;
       --within) within="${2:?--within needs a ref or CSS selector}"; shift 2 ;;
       --max) max="${2:?--max needs a number}"; shift 2 ;;
@@ -515,6 +519,11 @@ case "$cmd" in
   ocr)
     input='{'; [[ -z "$find" ]] || input+='"find":'"$(json_str "$find")"
     run POST "page/ocr$(query "$(arg 0)")" "$input}"
+    ;;
+  solve_captcha)
+    input='{}'
+    [[ "$verify" != true ]] || input='{"verify":true}'
+    run POST "page/solve_captcha$(query "$(arg 0)")" "$input"
     ;;
   type)
     if [[ "$focused" == true ]]; then
