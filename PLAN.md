@@ -417,7 +417,7 @@ Done when: `bun run build:skill`, `typecheck`, `bun test`, `tests/e2e/`, and all
 | Click point | Center-weighted random point inside the visible box, inset by a margin, hit-checked (3 tries, then center). `--xy` lands exactly | margin min(20%, 10 px) x, min(20%, 8 px) y (15% under 14 px) |
 | Click timing | Hover dwell, press hold, gap between multi-clicks | 45–115 ms, 55–130 ms, 65–135 ms |
 | Key hold | `key` command | 35–85 ms |
-| Scroll into view | Already in view: nothing. Otherwise 1–4 eased wheel flicks over the target's scroller toward 32–54% of the viewport height; stops when the page stops moving, then falls back to an instant `scrollIntoView` | flicks 280–680 px (scrolls shorter than 280 px use one flick of exactly that length), 4–12 events at 15–19 ms, 75–175 ms apart; total ≤ 650 ms |
+| Scroll into view | Already in view: nothing. Otherwise 1–4 eased wheel flicks over the target's scroller toward 32–54% of the viewport height; stops when the page stops moving, then falls back to an instant `scrollIntoView` | flicks 280–680 px (scrolls shorter than 280 px use one flick of exactly that length; lengths are whole pixels), 4–12 events at 15–19 ms (fewer when the flick is too short to split), 75–175 ms apart; total ≤ 650 ms |
 | `do`/`fill` pacing | Think pause between steps, minus time already spent settling; none after `wait` or the last step | 160–420 ms |
 | Post-`nav` dwell | Applied lazily before the next input, not inside `nav`, so reads and slow agent turns add nothing | `clamp(220 + 0.08·chars·(0.8–1.25), 220, 850)` ms |
 | Pagination | A same-host navigation within 4 s of the last one waits out a jittered minimum gap | 1.6–2.8 s |

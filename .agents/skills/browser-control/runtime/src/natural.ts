@@ -197,7 +197,7 @@ function synthesizeAxis(
   const minusRoom = to - lo;
   const canPlus = plusRoom >= minMag;
   const canMinus = minusRoom >= minMag;
-  if (!canPlus && !canMinus) return plusRoom >= minusRoom ? hi : lo;
+  if (!canPlus && !canMinus) return plusRoom >= minusRoom ? hi : lo; // also covers an off-screen `to`
 
   let sign = rng() < 0.5 ? -1 : 1;
   if (!canPlus) sign = -1;
@@ -205,7 +205,7 @@ function synthesizeAxis(
 
   const room = sign === 1 ? plusRoom : minusRoom;
   const mag = randBetween(rng, minMag, Math.min(maxMag, room));
-  return to + sign * mag;
+  return Math.min(hi, Math.max(lo, to + sign * mag));
 }
 
 /**

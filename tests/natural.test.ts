@@ -358,3 +358,16 @@ describe("isNaturalEnabled switch precedence", () => {
     }
   });
 });
+
+describe("synthesizeStartPoint off-screen target", () => {
+  test("keeps the start inside the viewport when the destination is off-screen", () => {
+    const viewport = { width: 1280, height: 720 };
+    for (let seed = 1; seed <= 200; seed++) {
+      const p = synthesizeStartPoint({ x: 1600, y: -300 }, viewport, createSeededRng(seed));
+      expect(p.x).toBeGreaterThanOrEqual(0);
+      expect(p.x).toBeLessThanOrEqual(viewport.width);
+      expect(p.y).toBeGreaterThanOrEqual(0);
+      expect(p.y).toBeLessThanOrEqual(viewport.height);
+    }
+  });
+});
