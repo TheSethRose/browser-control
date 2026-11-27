@@ -273,6 +273,7 @@ describe("daemon page helpers", () => {
     const keys = (calls: Call[]) =>
       calls.filter((c) => c.input["method"] === "Input.dispatchKeyEvent").map((c) => c.input["params"] as Record<string, unknown>);
     const quick = { sleep: async () => {} };
+    // Fixed rng below: a random typo or key rollover would change which keys are sent or held.
     const live = (type: string, flags = "") => `{"type":"${type}","flags":[${flags}]}`;
     for (const [field, typos] of [["", false], [live("number"), false], [live("text", '"payment"'), false], [live("text"), true]] as const) {
       const m = makeFakeInvoker({ field });
@@ -281,7 +282,7 @@ describe("daemon page helpers", () => {
     }
 
     const emoji = makeFakeInvoker({ field: live("text") });
-    await createPageHelperHandler(emoji.invoke, undefined, undefined, quick)("type", { _natural: true, ref: "e2", text: "go 🚀", quiet: true });
+    await createPageHelperHandler(emoji.invoke, undefined, undefined, { ...quick, rng: () => 0.5 })("type", { _natural: true, ref: "e2", text: "go 🚀", quiet: true });
     expect(cdpMethods(emoji.calls)).not.toContain("Input.insertText");
     expect(keys(emoji.calls).filter((k) => k["key"] === "🚀").map((k) => [k["type"], k["text"]])).toEqual([["keyDown", "🚀"], ["keyUp", undefined]]);
 
@@ -289,7 +290,7 @@ describe("daemon page helpers", () => {
     const refused = { ok: false as const, error: { code: "EXECUTION_FAILED" as const, message: "DIALOG_OPEN: alert" } };
     let ups = 0;
     const blocked = makeFakeInvoker({ onCdp: (m, p) => (m === "Input.dispatchKeyEvent" && p["type"] === "keyUp" && ups++ === 0 ? refused : undefined) });
-    const blockedHandle = createPageHelperHandler(blocked.invoke, undefined, undefined, quick);
+    const blockedHandle = createPageHelperHandler(blocked.invoke, undefined, undefined, { ...quick, rng: () => 0.5 });
     expect(text(await blockedHandle("type", { _natural: true, ref: "e2", text: "hi", quiet: true }))).toContain("release: delivery unverified (a dialog opened)");
     const sent = keys(blocked.calls);
     expect(text(await blockedHandle("dialog", { sub: "accept" }))).not.toContain("# HELD");
