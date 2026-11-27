@@ -189,6 +189,9 @@ function withTimeout(promise, ms, what) {
 
 function scriptingError(err, tabId) {
   const text = String(err?.message || err);
+  if (text.startsWith("DIALOG_OPEN:")) {
+    return err instanceof Error ? err : new Error(text);
+  }
   if (/cannot access|cannot be scripted|extensions gallery|chrome:\/\/|error page/i.test(text)) {
     return new Error(`RESTRICTED_PAGE: the extension cannot run on tab ${tabId} (${text}); use a DevTools (cdp) tab for it`);
   }
@@ -477,6 +480,8 @@ export async function completeHandoff(tabId, expectedHandoffId) {
 export { handoffTabs };
 
 const BC_DIALOG_PROBE_DELAY_MS = 1_500;
+const BC_LIVENESS_PROBE_TIMEOUT_MS = 400;
+const RESOLVE_MARKER_TTL_MS = 10_000;
 
 function assertTabAllowed(tabId) {
   if (!tabAllowed(tabId)) {
@@ -546,13 +551,19 @@ export async function runBcSilent(tabId, steps, opts = {}) {
   const timeoutMs = Number(opts.timeoutMs) > 0 ? Number(opts.timeoutMs) : 30_000;
   const probeDelayMs =
     Number(opts.dialogProbeDelayMs) > 0 ? Number(opts.dialogProbeDelayMs) : BC_DIALOG_PROBE_DELAY_MS;
+  const livenessTimeoutMs =
+    Number(opts.livenessProbeTimeoutMs) > 0 ? Number(opts.livenessProbeTimeoutMs) : BC_LIVENESS_PROBE_TIMEOUT_MS;
   let unsubscribe;
   let timer;
   let probeTimer;
+  let livenessTimer;
   let settled = false;
+  let cancelled = false;
   let timedOut = false;
+  const isCancelled = () => cancelled;
   const dialogPromise = new Promise((_, reject) => {
     unsubscribe = debuggerHub.subscribeDialogOpening(tabId, (dialog) => {
+      cancelled = true;
       reject(new Error(debuggerHub.formatDialogError(tabId, dialog)));
     });
   });
@@ -560,34 +571,68 @@ export async function runBcSilent(tabId, steps, opts = {}) {
   const timeoutPromise = new Promise((_, reject) => {
     timer = setTimeout(() => {
       timedOut = true;
+      cancelled = true;
       reject(new Error("__BC_TIMEOUT__"));
     }, timeoutMs);
   });
   let rejectEarlyDialog;
   const earlyProbePromise = new Promise((_, reject) => {
-    rejectEarlyDialog = reject;
+    rejectEarlyDialog = (err) => {
+      cancelled = true;
+      reject(err);
+    };
   });
   earlyProbePromise.catch(() => {});
 
   if (probeDelayMs < timeoutMs) {
     probeTimer = setTimeout(() => {
-      if (settled || !tabAllowed(tabId)) return;
-      probeOpenDialog(tabId, {
-        allowUnconfirmed: false,
-        waitMs: Math.min(1_000, Math.max(200, timeoutMs - probeDelayMs)),
-      })
-        .then((dialogErr) => {
-          if (!settled && dialogErr) rejectEarlyDialog(dialogErr);
+      if (settled || cancelled || !tabAllowed(tabId)) return;
+      const known = debuggerHub.getOpenDialog(tabId);
+      if (known) {
+        rejectEarlyDialog(new Error(debuggerHub.formatDialogError(tabId, known)));
+        return;
+      }
+      // Probe silently first so healthy slow reads never attach chrome.debugger (which shows a banner).
+      // Only attach and confirm a dialog if this tiny probe also stalls on a blocked renderer.
+      const remainingMs = Math.max(100, timeoutMs - probeDelayMs);
+      const probeWaitMs = Math.min(livenessTimeoutMs, remainingMs);
+      let livenessStalled = false;
+      const livenessTimeout = new Promise((resolve) => {
+        livenessTimer = setTimeout(() => {
+          livenessStalled = true;
+          resolve(false);
+        }, probeWaitMs);
+      });
+      const livenessExec = chrome.scripting
+        .executeScript({
+          target: scriptTarget(tabId, opts.frameId),
+          world: "ISOLATED",
+          func: () => 1,
+        })
+        .then(() => true)
+        .catch(() => true);
+
+      Promise.race([livenessExec, livenessTimeout])
+        .then((answered) => {
+          clearTimeout(livenessTimer);
+          if (answered || !livenessStalled || settled || cancelled || !tabAllowed(tabId)) return;
+          return probeOpenDialog(tabId, {
+            allowUnconfirmed: false,
+            waitMs: Math.min(1_000, Math.max(200, timeoutMs - probeDelayMs - probeWaitMs)),
+          }).then((dialogErr) => {
+            if (!settled && !cancelled && dialogErr) rejectEarlyDialog(dialogErr);
+          });
         })
         .catch(() => {});
     }, probeDelayMs);
   }
 
-  const stepsPromise = runBcSteps(tabId, steps, opts.frameId);
+  const stepsPromise = runBcSteps(tabId, steps, opts.frameId, isCancelled);
   stepsPromise.catch(() => {});
   try {
     return await Promise.race([stepsPromise, dialogPromise, earlyProbePromise, timeoutPromise]);
   } catch (err) {
+    cancelled = true;
     if (timedOut || String(err?.message || "") === "__BC_TIMEOUT__") {
       const dialogErr = await probeOpenDialog(tabId, { allowUnconfirmed: true, waitMs: 1_000 });
       throw (
@@ -597,16 +642,23 @@ export async function runBcSilent(tabId, steps, opts = {}) {
         )
       );
     }
+    if (String(err?.message || err).startsWith("DIALOG_OPEN:")) {
+      throw err instanceof Error ? err : new Error(String(err));
+    }
     throw scriptingError(err, tabId);
   } finally {
     settled = true;
     clearTimeout(timer);
     clearTimeout(probeTimer);
+    clearTimeout(livenessTimer);
     unsubscribe?.();
   }
 }
 
-async function runBcSteps(tabId, steps, frameId) {
+async function runBcSteps(tabId, steps, frameId, isCancelled = () => false) {
+  if (isCancelled() || debuggerHub.getOpenDialog(tabId)) {
+    throw new Error("CANCELLED: bc_call aborted");
+  }
   const target = scriptTarget(tabId, frameId);
   const probe = await chrome.scripting.executeScript({
     target,
@@ -614,12 +666,18 @@ async function runBcSteps(tabId, steps, frameId) {
     func: (v) => Boolean(globalThis.__bc && globalThis.__bc.v === v),
     args: [PAGE_HELPERS_VERSION],
   });
+  if (isCancelled() || debuggerHub.getOpenDialog(tabId)) {
+    throw new Error("CANCELLED: bc_call aborted");
+  }
   if (!probe?.[0]?.result) {
     await chrome.scripting.executeScript({
       target,
       world: "ISOLATED",
       files: [PAGE_HELPERS_FILE],
     });
+    if (isCancelled() || debuggerHub.getOpenDialog(tabId)) {
+      throw new Error("CANCELLED: bc_call aborted");
+    }
   }
   const exec = await chrome.scripting.executeScript({
     target,
@@ -653,6 +711,9 @@ async function runBcSteps(tabId, steps, frameId) {
     },
     args: [steps],
   });
+  if (isCancelled()) {
+    throw new Error("CANCELLED: bc_call aborted");
+  }
   const payload = exec?.[0]?.result;
   if (!payload) throw new Error("EXECUTION_FAILED: scripting returned no result");
   if (!payload.ok) throw new Error(payload.error || "EXECUTION_FAILED: __bc step failed");
@@ -677,7 +738,9 @@ export async function resolveBcNode(tabId, refOrSelector, opts = {}) {
   const evalInExtensionContext = async (ctx) => {
     const expression = isRef
       ? `globalThis.__bc?.el(${JSON.stringify(target)})`
-      : `document.querySelector(${JSON.stringify(target)})`;
+      : target.includes("data-bc-resolve")
+        ? `(() => { const now = Date.now(); for (const s of document.querySelectorAll("[data-bc-resolve]")) { const m = /^bc-(\\d+)-/.exec(s.getAttribute("data-bc-resolve") || ""); if (!m || Number(m[1]) <= now) s.removeAttribute("data-bc-resolve"); } return document.querySelector(${JSON.stringify(target)}); })()`
+        : `document.querySelector(${JSON.stringify(target)})`;
     return debuggerHub.sendCommand(tabId, "Runtime.evaluate", {
       uniqueContextId: ctx.uniqueId,
       expression,
@@ -725,7 +788,7 @@ export async function resolveBcNode(tabId, refOrSelector, opts = {}) {
     try {
       evalRes = await evalInExtensionContext(context);
     } catch (err) {
-      if (/Cannot find context|Execution context was destroyed/i.test(String(err?.message || err))) {
+      if (/Cannot find context|uniqueContextId not found|Execution context was destroyed/i.test(String(err?.message || err))) {
         debuggerHub.invalidateExtensionContext(tabId, context.uniqueId);
         const refreshed = await debuggerHub.findExtensionContext(tabId, {
           expectedOrigin,
@@ -764,12 +827,20 @@ export async function resolveBcNode(tabId, refOrSelector, opts = {}) {
 
   // Fallback: one-shot data-bc-resolve stamp + DOM.querySelector (does not pierce shadow roots).
   assertTabAllowed(tabId);
-  const marker = `bc-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const markerTtlMs = Number(opts.markerTtlMs) > 0 ? Number(opts.markerTtlMs) : RESOLVE_MARKER_TTL_MS;
+  const expiresAt = Date.now() + markerTtlMs;
+  const marker = `bc-${expiresAt}-${Math.random().toString(36).slice(2, 10)}`;
   const stamped = await chrome.scripting.executeScript({
     target: scriptTarget(tabId, opts.frameId),
     world: "ISOLATED",
     func: (ref, tok, refMode) => {
       try {
+        const now = Date.now();
+        for (const stale of document.querySelectorAll("[data-bc-resolve]")) {
+          const val = stale.getAttribute("data-bc-resolve") || "";
+          const m = /^bc-(\d+)-/.exec(val);
+          if (!m || Number(m[1]) <= now) stale.removeAttribute("data-bc-resolve");
+        }
         const el = refMode ? globalThis.__bc?.el(ref) : document.querySelector(ref);
         if (!el || !el.isConnected) return { ok: false, error: refMode ? `STALE_REF: ${ref} not found` : `NO_MATCH: ${ref} not found` };
         el.setAttribute("data-bc-resolve", tok);
@@ -786,25 +857,35 @@ export async function resolveBcNode(tabId, refOrSelector, opts = {}) {
     const doc = await debuggerHub.sendCommand(tabId, "DOM.getDocument", { depth: 1 });
     const rootId = doc?.root?.nodeId;
     if (!rootId) throw new Error("EXECUTION_FAILED: DOM.getDocument returned no root");
+    if (Date.now() > expiresAt) throw new Error(`NO_MATCH: resolve marker expired for ${target}`);
     const q = await debuggerHub.sendCommand(tabId, "DOM.querySelector", {
       nodeId: rootId,
       selector: `[data-bc-resolve="${marker}"]`,
     });
     if (!q?.nodeId) throw new Error(`NO_MATCH: CDP could not locate ${target}`);
+    if (Date.now() > expiresAt) throw new Error(`NO_MATCH: resolve marker expired for ${target}`);
     const resolved = await debuggerHub.sendCommand(tabId, "DOM.resolveNode", { nodeId: q.nodeId });
     return { nodeId: q.nodeId, objectId: resolved?.object?.objectId };
   } finally {
-    await chrome.scripting
-      .executeScript({
-        target: scriptTarget(tabId, opts.frameId),
-        world: "ISOLATED",
-        func: (tok) => {
-          const el = document.querySelector(`[data-bc-resolve="${tok}"]`);
-          if (el) el.removeAttribute("data-bc-resolve");
-        },
-        args: [marker],
-      })
-      .catch(() => {});
+    if (tabAllowed(tabId)) {
+      await chrome.scripting
+        .executeScript({
+          target: scriptTarget(tabId, opts.frameId),
+          world: "ISOLATED",
+          func: (tok) => {
+            const now = Date.now();
+            for (const el of document.querySelectorAll("[data-bc-resolve]")) {
+              const val = el.getAttribute("data-bc-resolve") || "";
+              const m = /^bc-(\d+)-/.exec(val);
+              if (val === tok || !m || Number(m[1]) <= now) {
+                el.removeAttribute("data-bc-resolve");
+              }
+            }
+          },
+          args: [marker],
+        })
+        .catch(() => {});
+    }
   }
 }
 

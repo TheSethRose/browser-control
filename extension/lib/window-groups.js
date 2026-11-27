@@ -401,25 +401,24 @@ export function createWindowGroups({
 
   /**
    * After a handoff ends (done, cleared, or timeout), reactivate the user's previously
-   * active tab only while the handoff tab still has focus, and re-collapse the "Agents · N" group.
+   * active tab only while the handoff tab's window is the focused Chrome window, never
+   * focusing a window to restore, and re-collapse the "Agents · N" group.
    */
   async function restoreAfterHandoff(handoffTabId, previous = null) {
     const handoffTab = await chromeApi.tabs.get(handoffTabId).catch(() => null);
     const handoffWinId = handoffTab?.windowId;
     let handoffStillFocused = Boolean(handoffTab && handoffTab.active && typeof handoffWinId === "number");
 
-    if (handoffStillFocused && typeof chromeApi.windows?.get === "function") {
-      const handoffWin = await chromeApi.windows.get(handoffWinId).catch(() => null);
-      if (handoffWin && handoffWin.focused === false) {
-        const allWins = (await chromeApi.windows?.getAll?.({ populate: false }).catch(() => null)) || null;
-        if (Array.isArray(allWins) && allWins.some((w) => w && w.focused === true)) {
-          // User switched to another browser window during handoff.
+    if (handoffStillFocused) {
+      if (typeof chromeApi.windows?.getLastFocused === "function") {
+        const last = await chromeApi.windows.getLastFocused({ windowTypes: ["normal"] }).catch(() => null);
+        if (!last || last.focused !== true || last.id !== handoffWinId) {
           handoffStillFocused = false;
-        } else if (typeof chromeApi.windows?.getLastFocused === "function") {
-          const last = await chromeApi.windows.getLastFocused({ windowTypes: ["normal"] }).catch(() => null);
-          if (last && typeof last.id === "number" && last.id !== handoffWinId) {
-            handoffStillFocused = false;
-          }
+        }
+      } else if (typeof chromeApi.windows?.get === "function") {
+        const handoffWin = await chromeApi.windows.get(handoffWinId).catch(() => null);
+        if (!handoffWin || handoffWin.focused !== true) {
+          handoffStillFocused = false;
         }
       }
     }
@@ -434,9 +433,6 @@ export function createWindowGroups({
       const prevTab = await chromeApi.tabs.get(previous.tabId).catch(() => null);
       if (prevTab) {
         const prevWinId = typeof prevTab.windowId === "number" ? prevTab.windowId : previous.windowId;
-        if (typeof prevWinId === "number" && prevWinId !== handoffWinId) {
-          await chromeApi.windows?.update?.(prevWinId, { focused: true }).catch(() => {});
-        }
         await chromeApi.tabs.update(prevTab.id, { active: true }).catch(() => {});
         if (typeof prevWinId === "number") {
           currentActiveByWindow.set(prevWinId, prevTab.id);

@@ -663,7 +663,7 @@ describe("handoff end refocuses user's previous tab and re-collapses Agents grou
     expect(fake.groupMap.get(groupId!)?.collapsed).toBe(true);
   });
 
-  test("cross-window: restoreAfterHandoff refocuses the user's original window and tab", async () => {
+  test("cross-window: restoreAfterHandoff activates previous tab when handoff window is focused without focusing another window", async () => {
     const fake = makeFakeChrome({
       windows: [
         { id: 1, type: "normal", state: "normal", focused: true },
@@ -686,11 +686,53 @@ describe("handoff end refocuses user's previous tab and re-collapses Agents grou
 
     await wg.expandGroupForTab(20);
     expect(fake.winMap.get(2)?.focused).toBe(true);
+    const callsBeforeRestore = fake.calls.length;
 
     const restored = await wg.restoreAfterHandoff(20, prev);
     expect(restored).toEqual({ restoredTabId: 10, restoredWindowId: 1 });
-    expect(fake.winMap.get(1)?.focused).toBe(true);
     expect(fake.tabMap.get(10)?.active).toBe(true);
+    // S5: never call windows.update({ focused: true }) during restore.
+    const restoreWindowCalls = fake.calls.slice(callsBeforeRestore).filter((c) => c.api === "windows.update");
+    expect(restoreWindowCalls).toEqual([]);
+  });
+
+  test("S5: switching to another app during cross-window handoff does not restore or pull Chrome to foreground", async () => {
+    const fake = makeFakeChrome({
+      windows: [
+        { id: 1, type: "normal", state: "normal", focused: true },
+        { id: 2, type: "normal", state: "normal", focused: false },
+      ],
+      tabs: [
+        { id: 10, windowId: 1, url: "https://user-work.test", active: true, groupId: -1 },
+        { id: 20, windowId: 2, url: "https://agent.test", active: true, groupId: -1 },
+      ],
+      lastFocusedWindowId: 2,
+    });
+
+    const wg = createWindowGroups({
+      chrome: fake.chrome,
+      getSettings: () => ({ tabGroupMode: "shared", autoCollapse: true }),
+      isAgentTab: (id: number) => id === 20,
+    });
+
+    const prev = await wg.captureActiveTabForRestore(20);
+    expect(prev).toEqual({ tabId: 10, windowId: 1 });
+
+    await wg.expandGroupForTab(20);
+    expect(fake.winMap.get(2)?.focused).toBe(true);
+
+    // User switches to another OS app: no Chrome window is focused, though getLastFocused still reports window 2.
+    fake.winMap.get(1)!.focused = false;
+    fake.winMap.get(2)!.focused = false;
+    const callsBeforeRestore = fake.calls.length;
+
+    const restored = await wg.restoreAfterHandoff(20, prev);
+    expect(restored).toBeNull();
+    const restoreCalls = fake.calls.slice(callsBeforeRestore);
+    expect(restoreCalls.filter((c) => c.api === "windows.update")).toEqual([]);
+    expect(restoreCalls.filter((c) => c.api === "tabs.update")).toEqual([]);
+    expect(fake.winMap.get(1)?.focused).toBe(false);
+    expect(fake.winMap.get(2)?.focused).toBe(false);
   });
 
   test("closed previous tab during handoff does not throw", async () => {
@@ -1015,7 +1057,7 @@ function makeBackgroundChrome(opts: {
     storage: { ...fake.chrome.storage, onChanged: noopListener },
   };
 
-  return { fullChrome, cdpCalls, executeScriptCalls, emitDebuggerEvent, sendRuntimeMessage };
+  return { fullChrome, calls: fake.calls, cdpCalls, executeScriptCalls, emitDebuggerEvent, sendRuntimeMessage };
 }
 
 async function withBackgroundModule<T>(
@@ -1134,8 +1176,237 @@ describe("background.js resolveBcNode & runBcSilent review fixes (S1, S3, S6, S7
     });
   });
 
-  test("S6: runBcSilent probes early for a pre-existing dialog on an unattached tab, while allowing slow non-dialog scripts to finish", async () => {
-    // 1. Pre-existing dialog on unattached tab -> early probe attaches, triggers Page.enable, fails fast with DIALOG_OPEN.
+  test("S1: resolveBcNode treats Chrome's 'uniqueContextId not found' as stale and retries with refreshed context", async () => {
+    const extId = "gdoaemlogkgnnojmjcgjfaphohadilcf";
+    let runtimeEnableCount = 0;
+    const evalUniqueIds: unknown[] = [];
+    const env = makeBackgroundChrome({
+      extensionId: extId,
+      sendCommand: async (target, method, params, emit) => {
+        if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "MAIN-FRAME" } } };
+        if (method === "Runtime.enable") {
+          runtimeEnableCount++;
+          const uniqueId = runtimeEnableCount === 1 ? "stale-unique-1" : "fresh-unique-2";
+          emit(target, "Runtime.executionContextCreated", {
+            context: {
+              id: 4,
+              uniqueId,
+              origin: `chrome-extension://${extId}`,
+              auxData: { isDefault: false, type: "isolated", frameId: "MAIN-FRAME" },
+            },
+          });
+          return {};
+        }
+        if (method === "Runtime.evaluate") {
+          const p = (params ?? {}) as Record<string, unknown>;
+          evalUniqueIds.push(p["uniqueContextId"]);
+          if (p["uniqueContextId"] === "stale-unique-1") {
+            throw new Error("uniqueContextId not found");
+          }
+          return { result: { objectId: "obj-refreshed-42", subtype: "node" } };
+        }
+        return {};
+      },
+    });
+
+    await withBackgroundModule("s1-unique-ctx-not-found", env.fullChrome, async (bg) => {
+      const resolved = await bg.resolveBcNode(7, "e4", { mode: "ref" });
+      expect(resolved).toEqual({ objectId: "obj-refreshed-42" });
+      expect(evalUniqueIds).toEqual(["stale-unique-1", "fresh-unique-2"]);
+      expect(env.cdpCalls.some((c) => c.method === "Runtime.disable")).toBe(true);
+    });
+  });
+
+  test("S3: revoking grant after fallback stamp skips cleanup injection, and expired markers are rejected and pruned", async () => {
+    let revokeNow: (() => Promise<void>) | undefined;
+    const stampedMarkers: string[] = [];
+
+    // 1. Revoke right after fallback stamps data-bc-resolve -> cleanup executeScript must not run.
+    const envRevoke = makeBackgroundChrome({
+      executeScript: async (details) => {
+        const d = details as { args?: unknown[] };
+        if (Array.isArray(d.args) && typeof d.args[1] === "string" && d.args[1].startsWith("bc-")) {
+          stampedMarkers.push(d.args[1]);
+          return [{ result: { ok: true } }];
+        }
+        return [{ result: true }];
+      },
+      sendCommand: async (_target, method) => {
+        if (method === "Page.getFrameTree") return {}; // Force fallback path
+        if (method === "DOM.getDocument") {
+          await revokeNow?.();
+          return { root: { nodeId: 1 } };
+        }
+        return {};
+      },
+    });
+
+    await withBackgroundModule("s3-post-stamp-revoke", envRevoke.fullChrome, async (bg) => {
+      await envRevoke.sendRuntimeMessage({ type: "setMode", mode: "lent" });
+      await envRevoke.sendRuntimeMessage({ type: "toggleLend", tabId: 7 });
+      revokeNow = async () => {
+        await envRevoke.sendRuntimeMessage({ type: "toggleLend", tabId: 7 });
+      };
+      await expect(bg.resolveBcNode(7, "#box", { mode: "selector" })).rejects.toThrow(/REFUSED/);
+      // Call 1: world-ensure; Call 2: fallback stamp. Cleanup (Call 3) must be skipped after revocation.
+      expect(envRevoke.executeScriptCalls.length).toBe(2);
+      expect(stampedMarkers.length).toBe(1);
+      expect(stampedMarkers[0]).toMatch(/^bc-\d+-/);
+    });
+
+    // 2. Expired marker is ignored by resolver (throws NO_MATCH) and stale DOM attributes are pruned on next stamp.
+    const removedAttrs: string[] = [];
+    const envExpire = makeBackgroundChrome({
+      executeScript: async (details) => {
+        const d = details as { func?: (...args: unknown[]) => unknown; args?: unknown[] };
+        if (Array.isArray(d.args) && typeof d.args[1] === "string" && d.args[1].startsWith("bc-") && typeof d.func === "function") {
+          // Run the real stamp function against a minimal fake document containing an expired marker.
+          const staleNode = {
+            attrs: new Map<string, string>([["data-bc-resolve", "bc-1-expired"]]),
+            isConnected: true,
+            getAttribute(k: string) {
+              return this.attrs.get(k) ?? null;
+            },
+            setAttribute(k: string, v: string) {
+              this.attrs.set(k, v);
+            },
+            removeAttribute(k: string) {
+              removedAttrs.push(`${k}=${this.attrs.get(k)}`);
+              this.attrs.delete(k);
+            },
+          };
+          const prevDoc = (globalThis as Record<string, unknown>)["document"];
+          (globalThis as Record<string, unknown>)["document"] = {
+            querySelectorAll: () => [staleNode],
+            querySelector: (sel: string) => (sel === "#box" ? staleNode : null),
+          };
+          try {
+            const out = d.func(...d.args);
+            return [{ result: out }];
+          } finally {
+            if (prevDoc === undefined) delete (globalThis as Record<string, unknown>)["document"];
+            else (globalThis as Record<string, unknown>)["document"] = prevDoc;
+          }
+        }
+        return [{ result: true }];
+      },
+      sendCommand: async (_target, method) => {
+        if (method === "Page.getFrameTree") return {};
+        if (method === "DOM.getDocument") {
+          await new Promise((r) => setTimeout(r, 35));
+          return { root: { nodeId: 1 } };
+        }
+        if (method === "DOM.querySelector") return { nodeId: 99 };
+        return {};
+      },
+    });
+
+    await withBackgroundModule("s3-marker-expiry", envExpire.fullChrome, async (bg) => {
+      await expect(bg.resolveBcNode(7, "#box", { mode: "selector", markerTtlMs: 15 })).rejects.toThrow(
+        /NO_MATCH:.*expired/,
+      );
+      expect(removedAttrs).toContain("data-bc-resolve=bc-1-expired");
+    });
+  });
+
+  test("S6: in-flight dialog whose message contains 'cannot access' reports DIALOG_OPEN, not RESTRICTED_PAGE", async () => {
+    const env = makeBackgroundChrome({
+      executeScript: () => new Promise(() => {}),
+      sendCommand: async (target, method, _params, emit) => {
+        if (method === "Page.enable") {
+          setTimeout(() => {
+            emit(target, "Page.javascriptDialogOpening", {
+              type: "alert",
+              message: "You cannot access this record",
+              url: "https://app.test",
+            });
+          }, 5);
+          return new Promise(() => {});
+        }
+        if (method === "Runtime.evaluate") return new Promise(() => {});
+        return {};
+      },
+    });
+
+    await withBackgroundModule("s6-cannot-access-dialog", env.fullChrome, async (bg) => {
+      let msg = "";
+      try {
+        await bg.runBcSilent(7, [{ kind: "href" }], {
+          timeoutMs: 10_000,
+          dialogProbeDelayMs: 25,
+          livenessProbeTimeoutMs: 25,
+        });
+      } catch (e) {
+        msg = (e as Error).message;
+      }
+      expect(msg).toMatch(/^DIALOG_OPEN:/);
+      expect(msg).toContain("You cannot access this record");
+      expect(msg).not.toContain("RESTRICTED_PAGE");
+    });
+  });
+
+  test("S8: blocked select cancelled on DIALOG_OPEN is never dispatched after dialog closes", async () => {
+    let releaseProbe: ((v: unknown) => void) | undefined;
+    let actionDispatched = false;
+    let helpersInjected = false;
+
+    const env = makeBackgroundChrome({
+      executeScript: (details) => {
+        const d = details as { files?: string[]; args?: unknown[] };
+        if (Array.isArray(d.files) && d.files.length > 0) {
+          helpersInjected = true;
+          return Promise.resolve([{ result: true }]);
+        }
+        if (Array.isArray(d.args) && Array.isArray(d.args[0])) {
+          actionDispatched = true;
+          return Promise.resolve([{ result: { ok: true, values: ["selected"] } }]);
+        }
+        if (Array.isArray(d.args) && typeof d.args[0] === "number") {
+          // First probe (__bc version check) blocks behind the open dialog until dialog closes.
+          return new Promise((resolve) => {
+            releaseProbe = resolve;
+          });
+        }
+        // Liveness probe (() => 1) also blocks while the modal dialog is open.
+        return new Promise(() => {});
+      },
+      sendCommand: async (target, method, _params, emit) => {
+        if (method === "Page.enable") {
+          setTimeout(() => {
+            emit(target, "Page.javascriptDialogOpening", {
+              type: "confirm",
+              message: "Confirm action",
+              url: "https://app.test",
+            });
+          }, 5);
+          return new Promise(() => {});
+        }
+        if (method === "Runtime.evaluate") return new Promise(() => {});
+        return {};
+      },
+    });
+
+    await withBackgroundModule("s8-cancel-select", env.fullChrome, async (bg) => {
+      await expect(
+        bg.runBcSilent(7, [{ kind: "bc", method: "select", args: ["Color", "green"] }], {
+          timeoutMs: 10_000,
+          dialogProbeDelayMs: 25,
+          livenessProbeTimeoutMs: 25,
+        }),
+      ).rejects.toThrow(/DIALOG_OPEN:.*Confirm action/);
+
+      // Simulate dialog closing and Chrome unblocking the queued probe executeScript.
+      env.emitDebuggerEvent({ tabId: 7 }, "Page.javascriptDialogClosed", { result: true });
+      releaseProbe?.([{ result: true }]);
+      await new Promise((r) => setTimeout(r, 40));
+
+      expect(helpersInjected).toBe(false);
+      expect(actionDispatched).toBe(false);
+    });
+  });
+
+  test("S6 & S9: runBcSilent probes silently before attaching debugger — healthy slow reads stay silent, stalled dialogs attach and fail fast", async () => {
+    // 1. Pre-existing dialog on unattached tab -> liveness probe also stalls -> attaches, triggers Page.enable, fails fast with DIALOG_OPEN.
     const envDialog = makeBackgroundChrome({
       executeScript: () => new Promise(() => {}),
       sendCommand: async (target, method, _params, emit) => {
@@ -1154,37 +1425,45 @@ describe("background.js resolveBcNode & runBcSilent review fixes (S1, S3, S6, S7
       },
     });
 
-    await withBackgroundModule("s6-dialog", envDialog.fullChrome, async (bg) => {
+    await withBackgroundModule("s6-s9-dialog", envDialog.fullChrome, async (bg) => {
       const t0 = Date.now();
       await expect(
-        bg.runBcSilent(7, [{ kind: "href" }], { timeoutMs: 10_000, dialogProbeDelayMs: 40 }),
+        bg.runBcSilent(7, [{ kind: "href" }], {
+          timeoutMs: 10_000,
+          dialogProbeDelayMs: 30,
+          livenessProbeTimeoutMs: 30,
+        }),
       ).rejects.toThrow(/DIALOG_OPEN:.*pre-existing/);
       expect(Date.now() - t0).toBeLessThan(500);
+      expect(envDialog.calls.some((c) => c.api === "debugger.attach")).toBe(true);
     });
 
-    // 2. Slow legitimate script with no dialog -> early probe sees no dialog and lets script finish within budget.
-    let callIdx = 0;
+    // 2. Slow healthy read (> dialogProbeDelayMs) -> liveness probe answers -> stays silent (never attaches debugger) and finishes cleanly.
     const envSlow = makeBackgroundChrome({
-      executeScript: async () => {
-        callIdx++;
-        if (callIdx === 1) {
-          await new Promise((r) => setTimeout(r, 120));
-          return [{ result: true }];
+      executeScript: async (details) => {
+        const d = details as { args?: unknown[] };
+        if (Array.isArray(d.args) && typeof d.args[0] === "number") {
+          return [{ result: true }]; // __bc version check
         }
-        return [{ result: { ok: true, values: ["https://app.test/slow"] } }];
-      },
-      sendCommand: async (_target, method) => {
-        if (method === "Runtime.evaluate") return { result: { value: 1 } };
-        return {};
+        if (Array.isArray(d.args) && Array.isArray(d.args[0])) {
+          // Slow async read (longer than dialogProbeDelayMs + livenessProbeTimeoutMs).
+          await new Promise((r) => setTimeout(r, 120));
+          return [{ result: { ok: true, values: ["https://app.test/slow"] } }];
+        }
+        // Silent liveness probe (() => 1) answers immediately on a responsive renderer.
+        return [{ result: 1 }];
       },
     });
 
-    await withBackgroundModule("s6-slow", envSlow.fullChrome, async (bg) => {
-      const values = await bg.runBcSilent(7, [{ kind: "href" }], { timeoutMs: 5_000, dialogProbeDelayMs: 30 });
+    await withBackgroundModule("s6-s9-slow", envSlow.fullChrome, async (bg) => {
+      const values = await bg.runBcSilent(7, [{ kind: "href" }], {
+        timeoutMs: 5_000,
+        dialogProbeDelayMs: 25,
+        livenessProbeTimeoutMs: 30,
+      });
       expect(values).toEqual(["https://app.test/slow"]);
-      expect(envSlow.cdpCalls.some((c) => c.method === "Page.enable")).toBe(true);
+      expect(envSlow.calls.some((c) => c.api === "debugger.attach")).toBe(false);
+      expect(envSlow.cdpCalls.length).toBe(0);
     });
   });
 });
-
-
