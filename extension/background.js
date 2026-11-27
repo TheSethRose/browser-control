@@ -29,7 +29,7 @@ const VERSION_PROBE_TIMEOUT_MS = 800;
 const DEBUGGER_IDLE_MS = 30_000;
 const KEEPALIVE_MS = 20_000;
 const PAGE_HELPERS_FILE = "page-helpers.js";
-const PAGE_HELPERS_VERSION = 7;
+const PAGE_HELPERS_VERSION = 9;
 const OVERLAY_FILE = "content-overlay.js";
 const HANDOFF_NOTIF_PREFIX = "bc-handoff-";
 const HANDOFF_ICON_DATA_URL =
@@ -170,6 +170,53 @@ async function loadConfig() {
   settings = normalizeSettings(stored);
   scheduleIdleSweepTimer();
   return config;
+}
+
+// CDP sessionId for a cross-origin (OOPIF) child frame, or undefined for the main frame and
+// same-process frames, which share the tab's own debugger session.
+async function frameSessionFor(tabId, frameId) {
+  await restoreReady;
+  return debuggerHub.sessionForFrame(
+    tabId,
+    frameId,
+    (id, fid) => chrome.webNavigation.getFrame({ tabId: id, frameId: fid }),
+    (ids, fid) => probeFrameSession(tabId, fid, ids),
+  );
+}
+
+// Same-URL sibling OOPIFs: stamp the extension frame's document, then ask each child session which one has it.
+async function probeFrameSession(tabId, frameId, sessionIds) {
+  assertTabAllowed(tabId);
+  const tok = `bc-frame-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const stamp = (value) =>
+    chrome.scripting.executeScript({
+      target: scriptTarget(tabId, frameId),
+      world: "ISOLATED",
+      func: (v) => {
+        const root = document.documentElement;
+        if (!root) return;
+        if (v) root.setAttribute("data-bc-frame", v);
+        else root.removeAttribute("data-bc-frame");
+      },
+      args: [value],
+    });
+  await stamp(tok);
+  try {
+    for (const sessionId of sessionIds) {
+      const res = await debuggerHub
+        .sendCommand(
+          tabId,
+          "Runtime.evaluate",
+          { expression: 'document.documentElement?.getAttribute("data-bc-frame")', returnByValue: true },
+          { sessionId },
+        )
+        .catch(() => null);
+      if (res?.result?.value === tok) return sessionId;
+    }
+    return undefined;
+  } finally {
+    await stamp("").catch(() => {});
+  }
 }
 
 function scriptTarget(tabId, frameId) {
@@ -853,18 +900,21 @@ export async function resolveBcNode(tabId, refOrSelector, opts = {}) {
   });
   const res = stamped?.[0]?.result;
   if (!res?.ok) throw new Error(res?.error || `NO_MATCH: could not resolve ${target}`);
+  const session = { sessionId: typeof opts.sessionId === "string" && opts.sessionId !== "" ? opts.sessionId : undefined };
   try {
-    const doc = await debuggerHub.sendCommand(tabId, "DOM.getDocument", { depth: 1 });
+    const doc = await debuggerHub.sendCommand(tabId, "DOM.getDocument", { depth: 1 }, session);
     const rootId = doc?.root?.nodeId;
     if (!rootId) throw new Error("EXECUTION_FAILED: DOM.getDocument returned no root");
     if (Date.now() > expiresAt) throw new Error(`NO_MATCH: resolve marker expired for ${target}`);
-    const q = await debuggerHub.sendCommand(tabId, "DOM.querySelector", {
-      nodeId: rootId,
-      selector: `[data-bc-resolve="${marker}"]`,
-    });
+    const q = await debuggerHub.sendCommand(
+      tabId,
+      "DOM.querySelector",
+      { nodeId: rootId, selector: `[data-bc-resolve="${marker}"]` },
+      session,
+    );
     if (!q?.nodeId) throw new Error(`NO_MATCH: CDP could not locate ${target}`);
     if (Date.now() > expiresAt) throw new Error(`NO_MATCH: resolve marker expired for ${target}`);
-    const resolved = await debuggerHub.sendCommand(tabId, "DOM.resolveNode", { nodeId: q.nodeId });
+    const resolved = await debuggerHub.sendCommand(tabId, "DOM.resolveNode", { nodeId: q.nodeId }, session);
     return { nodeId: q.nodeId, objectId: resolved?.object?.objectId };
   } finally {
     if (tabAllowed(tabId)) {
@@ -1114,6 +1164,7 @@ async function handleRequest(msg) {
         mode: params.mode,
         frameId: params.frameId,
         cdpFrameId: params.cdpFrameId,
+        sessionId: params.sessionId || (await frameSessionFor(tabId, params.frameId)),
       });
     }
 
@@ -1154,7 +1205,7 @@ async function handleRequest(msg) {
       }
       await restoreReady;
       const result = await debuggerHub.sendCommand(tabId, method, params.params || {}, {
-        sessionId: params.sessionId,
+        sessionId: params.sessionId || (await frameSessionFor(tabId, params.frameId)),
       });
       return { result: result ?? {} };
     }
