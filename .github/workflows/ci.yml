@@ -58,3 +58,78 @@ jobs:
       - name: Test
         working-directory: browser-control
         run: bun test
+
+  # Real Chrome for Testing + the unpacked extension against the local fixture page.
+  # BC_E2E_REQUIRED=1 makes a missing browser or a skipped check fail the job instead of passing.
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out browser-control
+        uses: actions/checkout@v4
+        with:
+          path: browser-control
+          # Full history: the stale-extension check archives the pre-PR #10 build.
+          fetch-depth: 0
+
+      # @agent-software/core resolves as file:../agent-software/core, a private sibling repo.
+      - name: Check agent-software token
+        env:
+          TOKEN: ${{ secrets.AGENT_SOFTWARE_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::Secret AGENT_SOFTWARE_TOKEN is not set. Add a fine-grained, read-only (Contents) token for TheSethRose/agent-software."
+            exit 1
+          fi
+
+      - name: Check out agent-software
+        uses: actions/checkout@v4
+        with:
+          repository: TheSethRose/agent-software
+          token: ${{ secrets.AGENT_SOFTWARE_TOKEN }}
+          path: agent-software
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+
+      - name: Install
+        working-directory: browser-control
+        run: bun install
+
+      # chrome@stable moves, so the cache key rolls weekly (ISO year-week) and on runner OS.
+      - name: Cache key
+        id: cft-week
+        run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Chrome for Testing
+        id: cft-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/cft
+          key: cft-${{ runner.os }}-chrome-stable-${{ steps.cft-week.outputs.week }}
+
+      - name: Install Chrome for Testing
+        if: steps.cft-cache.outputs.cache-hit != 'true'
+        working-directory: browser-control
+        run: bunx @puppeteer/browsers install chrome@stable --path "$RUNNER_TEMP/cft"
+
+      - name: Resolve Chrome for Testing binary
+        run: |
+          bin="$(find "$RUNNER_TEMP/cft" -type f -name chrome -path '*/chrome-linux64/chrome' | head -n 1)"
+          if [ -z "$bin" ]; then
+            echo "::error::Chrome for Testing not found under $RUNNER_TEMP/cft"
+            find "$RUNNER_TEMP/cft" -maxdepth 3
+            exit 1
+          fi
+          echo "Using $bin"
+          {
+            echo "BC_E2E_CHROME=$bin"
+            echo "BC_E2E_REQUIRED=1"
+            echo "BROWSER_CONTROL_BACKENDS=extension"
+          } >> "$GITHUB_ENV"
+
+      - name: E2E
+        working-directory: browser-control
+        run: bun run test:e2e
