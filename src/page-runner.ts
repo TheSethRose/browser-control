@@ -12,6 +12,23 @@ import { isAbsolute } from "node:path";
 import { runBrowse, type Runner } from "./backends/browse";
 import { backendOrder } from "./backends/router";
 import { extensionTabOf, getRegisteredExtensionBcCall, type BcCallFn } from "./backends/extension";
+import {
+  SHORT_PAGE_CHARS,
+  buildChallengeProbeExpression,
+  classifyChallenge,
+  fastVendorSelectors,
+  formatChallengeOutput,
+  isDenialTitle,
+  isSuspiciousSnapshot,
+  isSuspiciousTitle,
+  isSuspiciousUrl,
+  matchProbeSelectorsFromRows,
+  parseBcQueryRows,
+  parseBcTextForProbe,
+  probeSelectors,
+  type ChallengeDetection,
+  type ChallengeProbe,
+} from "./challenges";
 import { inspectIssues, inspectPerf, inspectStyles } from "./devtools";
 import {
   buildFlow,
@@ -42,7 +59,7 @@ import {
 } from "./page-helpers";
 import { createPictureTracker, imageWidth, resizeImage } from "./picture";
 import { buildHumanKeystrokes } from "./typing";
-import { didYouMean, withRemedy } from "./safety";
+import { didYouMean, withRemedy, wrapUntrusted } from "./safety";
 import { createScriptRunner, writeOutputFile } from "./script";
 
 type Json = Record<string, unknown>;
@@ -61,6 +78,20 @@ const PAGE_ACTIONS = [
 ] as const;
 
 const DEFAULT_HANDOFF_TIMEOUT_MS = 10 * 60 * 1000;
+const CHALLENGE_WAIT_MAX_MS = 8_000;
+const CHALLENGE_POLL_MS = 500;
+const CHALLENGE_PROBE_RESERVE_MS = 250;
+const CHALLENGE_PROBE_SEP = "\n__BC_CHALLENGE_SEP__\n";
+const CHALLENGE_PROBE_EXPR = buildChallengeProbeExpression(false);
+const FAST_VENDOR_CSS = fastVendorSelectors.join(",");
+/** One cheap querySelector-style check for known challenge markers (`# N row(s)` header). */
+const VENDOR_MARKER_STEP = {
+  kind: "bc",
+  method: "query",
+  args: [{ selector: FAST_VENDOR_CSS, fields: { id: "@id" }, limit: 1, all: true }],
+  fallback: "",
+} as const;
+const PROBE_SELECTORS_CSS = probeSelectors.join(",");
 const EXTENSION_REQUEST_SYMBOL = Symbol.for("browser-control.extension-request");
 type ExtensionRequestFn = (op: string, params?: Json, timeoutMs?: number) => Promise<unknown>;
 
@@ -77,6 +108,25 @@ function browseTabNumber(targetId: unknown): number | undefined {
   const n = Number(targetId.slice("browse:".length));
   return Number.isInteger(n) ? n : undefined;
 }
+
+function stripHash(url: string): string {
+  const idx = url.indexOf("#");
+  return idx >= 0 ? url.slice(0, idx) : url;
+}
+
+type ProbeReadResult =
+  | { kind: "skip"; url?: string }
+  | { kind: "probe"; probe: ChallengeProbe }
+  | { kind: "error" };
+
+type ChallengeCheckResult =
+  | { status: "clear"; waited: boolean; url?: string }
+  | {
+      status: "interactive" | "block" | "non-interactive-timeout";
+      detection: ChallengeDetection;
+      url: string;
+      waited: boolean;
+    };
 
 function hostOf(url: string): string {
   try {
@@ -203,6 +253,7 @@ export function createPageHelperHandler(
     rng?: () => number;
     bcCall?: BcCallFn;
     extensionRequest?: ExtensionRequestFn;
+    challengeWaitMaxMs?: number;
   } = {},
 ) {
   const daemonSessionId = options.sessionId ?? randomUUID().slice(0, 12);
@@ -1556,7 +1607,9 @@ export function createPageHelperHandler(
     try {
       const digest = await writeOutputFile(outPath, valueOf(res));
       const preview = valueOf(res).split("\n").slice(0, 12).join("\n");
-      return success(`${digest}\n${preview}`);
+      const challenge = (res.data as Json | undefined)?.["challenge"];
+      const value = `${digest}\n${preview}`;
+      return challenge !== undefined ? { ok: true, data: { value, challenge } } : success(value);
     } catch (err) {
       return failure("EXECUTION_FAILED", `ARTIFACT_WRITE_FAILED: ${(err as Error).message}`);
     }
@@ -1654,6 +1707,265 @@ export function createPageHelperHandler(
     }
   }
 
+  const challengeBackendOf = (tid: string | undefined): "extension" | "cdp" =>
+    extensionTabOf(tid) !== undefined ? "extension" : "cdp";
+
+  function challengeDataOf(
+    detection: ChallengeDetection,
+    status: "interactive" | "non-interactive-timeout",
+    targetUrl: string,
+    backend: "extension" | "cdp",
+  ) {
+    return {
+      kind: detection.kind,
+      vendor: detection.vendor,
+      status,
+      url: targetUrl,
+      message: formatChallengeOutput(detection, targetUrl, { backend, untrustedBoundary: true }),
+    };
+  }
+
+  async function raceDeadline<T>(promise: Promise<T>, deadline: number | undefined, onTimeout: T): Promise<T> {
+    if (deadline === undefined) return promise;
+    const rem = deadline - Date.now();
+    if (rem <= 0) return onTimeout;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        promise.catch(() => onTimeout),
+        new Promise<T>((resolve) => {
+          timer = setTimeout(() => resolve(onTimeout), rem);
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  async function readChallengeProbeCdp(
+    targetId: string | undefined,
+    timeoutMs = 4_000,
+    deadline?: number,
+  ): Promise<ProbeReadResult> {
+    const budget = deadline !== undefined ? Math.min(timeoutMs, deadline - Date.now()) : timeoutMs;
+    if (budget <= 0) return { kind: "error" };
+    const res = await raceDeadline(
+      invoke("evaluate", {
+        expression: CHALLENGE_PROBE_EXPR,
+        isolated: true,
+        ...(targetId ? { targetId } : {}),
+        timeoutMs: Math.max(1, Math.floor(budget)),
+      }),
+      deadline,
+      failure("EXECUTION_FAILED", "CHALLENGE_PROBE_TIMEOUT"),
+    );
+    if (!res.ok) return { kind: "error" };
+    const raw = valueOf(res);
+    if (!raw || !raw.startsWith("{")) return { kind: "skip" };
+    try {
+      const parsed = JSON.parse(raw) as { skip?: boolean; url?: string; probe?: ChallengeProbe };
+      if (parsed.skip) return { kind: "skip", url: typeof parsed.url === "string" ? parsed.url : undefined };
+      if (parsed.probe && typeof parsed.probe === "object") return { kind: "probe", probe: parsed.probe };
+      return { kind: "skip" };
+    } catch {
+      return { kind: "skip" };
+    }
+  }
+
+  /**
+   * Read a lightweight bot-challenge probe for the current page.
+   * - On extension tabs: stays on the silent `evalHelper` (`bc_call`) tier so normal pages never attach `chrome.debugger`.
+   * - During a non-interactive interstitial wait, if a throttled/collapsed background extension tab stops answering
+   *   `bc_call`, falls back to `evaluate` (which enables focus emulation so the interstitial's timers can finish).
+   * - On CDP tabs: runs a single self-contained `evaluate` expression that exits early on normal long pages.
+   */
+  async function readChallengeProbe(
+    targetId: string | undefined,
+    opts: { wallHint?: string; reprobe?: boolean; deadline?: number } = {},
+  ): Promise<ProbeReadResult> {
+    const remaining = (cap: number): number =>
+      opts.deadline !== undefined ? Math.min(cap, opts.deadline - Date.now()) : cap;
+
+    if (extensionTabOf(targetId) !== undefined) {
+      const baseTimeout = opts.reprobe ? 1_500 : 4_000;
+      const quickBudget = remaining(baseTimeout);
+      if (quickBudget <= 0) return { kind: "error" };
+      const quick = await raceDeadline(
+        evalHelper(
+          {
+            steps: [
+              { kind: "href" },
+              { kind: "title" },
+              { kind: "bc", method: "text", args: [{ all: true, max: 3000 }] },
+              { kind: "bc", method: "query", args: [{ selector: FAST_VENDOR_CSS, fields: { id: "@id" }, limit: 1, all: true }] },
+            ],
+            join: CHALLENGE_PROBE_SEP,
+          },
+          targetId,
+          Math.max(1, Math.floor(quickBudget)),
+        ),
+        opts.deadline,
+        failure("EXECUTION_FAILED", "CHALLENGE_PROBE_TIMEOUT"),
+      );
+      if (!quick.ok) {
+        return opts.reprobe ? readChallengeProbeCdp(targetId, baseTimeout, opts.deadline) : { kind: "error" };
+      }
+      const rawQuick = valueOf(quick);
+      if (!rawQuick.includes(CHALLENGE_PROBE_SEP)) return { kind: "skip" };
+      const [url = "", title = "", rawText = "", rawVendor = ""] = rawQuick.split(CHALLENGE_PROBE_SEP);
+      const { text, textLength } = parseBcTextForProbe(rawText);
+      const hasVendor = parseBcQueryRows(rawVendor).length > 0;
+      const suspicious =
+        opts.wallHint === "captcha" ||
+        opts.wallHint === "rate-limit" ||
+        textLength < SHORT_PAGE_CHARS ||
+        hasVendor ||
+        isSuspiciousTitle(title) ||
+        isSuspiciousUrl(url);
+      if (!suspicious) return { kind: "skip", url };
+
+      const markersBudget = remaining(baseTimeout);
+      if (markersBudget <= 0) return { kind: "error" };
+      const markers = await raceDeadline(
+        evalHelper(
+          {
+            steps: [
+              { kind: "bc", method: "query", args: [{ selector: "iframe[src]", fields: { src: "@src" }, limit: 20, all: true }] },
+              { kind: "bc", method: "query", args: [{ selector: "script[src]", fields: { src: "@src" }, limit: 50, all: true }] },
+              {
+                kind: "bc",
+                method: "query",
+                args: [{ selector: PROBE_SELECTORS_CSS, fields: { id: "@id", cls: "@class", src: "@src", title: "@title" }, limit: 20, all: true }],
+              },
+              {
+                kind: "bc",
+                method: "query",
+                args: [{ selector: PROBE_SELECTORS_CSS, fields: { id: "@id", cls: "@class", src: "@src", title: "@title" }, limit: 20, all: false }],
+              },
+              { kind: "bc", method: "query", args: [{ selector: "awswaf-captcha", fields: { id: "@id" }, limit: 1, all: true }] },
+            ],
+            join: CHALLENGE_PROBE_SEP,
+          },
+          targetId,
+          Math.max(1, Math.floor(markersBudget)),
+        ),
+        opts.deadline,
+        failure("EXECUTION_FAILED", "CHALLENGE_PROBE_TIMEOUT"),
+      );
+      const [rawFrames = "", rawScripts = "", rawSel = "", rawVis = "", rawAws = ""] = markers.ok
+        ? valueOf(markers).split(CHALLENGE_PROBE_SEP)
+        : [];
+      const frameUrls = parseBcQueryRows(rawFrames).map((r) => r["src"]).filter((s): s is string => Boolean(s));
+      const scriptSrcs = parseBcQueryRows(rawScripts).map((r) => r["src"]).filter((s): s is string => Boolean(s));
+      const hasAws = parseBcQueryRows(rawAws).length > 0;
+      const selectors = matchProbeSelectorsFromRows(parseBcQueryRows(rawSel), hasAws);
+      const visibleSelectors = matchProbeSelectorsFromRows(parseBcQueryRows(rawVis), false);
+      const probe: ChallengeProbe = {
+        url,
+        title: title.trim(),
+        text,
+        textLength,
+        frameUrls,
+        scriptSrcs,
+        selectors,
+        visibleSelectors,
+      };
+      // Check HTTP navigation status before accepting a non-block match on a denial-titled page
+      // (e.g. a long "403 Access Denied" page with a CAPTCHA) or a short AWS WAF SDK page.
+      const preliminary = classifyChallenge(probe);
+      const needsStatus =
+        preliminary?.kind !== "block" &&
+        (isDenialTitle(title) || (textLength < SHORT_PAGE_CHARS && scriptSrcs.some((s) => /\.awswaf\.com\//.test(s))));
+      if (needsStatus) {
+        const statusBudget = remaining(2_000);
+        if (statusBudget > 0) {
+          const statusRes = await raceDeadline(
+            invoke("evaluate", {
+              expression: '(() => { const n = performance.getEntriesByType && performance.getEntriesByType("navigation")[0]; return n && typeof n.responseStatus === "number" ? n.responseStatus : 0; })()',
+              isolated: true,
+              ...(targetId ? { targetId } : {}),
+              timeoutMs: Math.max(1, Math.floor(statusBudget)),
+            }),
+            opts.deadline,
+            failure("EXECUTION_FAILED", "CHALLENGE_PROBE_TIMEOUT"),
+          );
+          const statusNum = statusRes.ok ? Number((statusRes.data as Json)["value"]) : 0;
+          if (Number.isInteger(statusNum) && statusNum > 0) {
+            return { kind: "probe", probe: { ...probe, status: statusNum } };
+          }
+        }
+      }
+      return { kind: "probe", probe };
+    }
+
+    return readChallengeProbeCdp(targetId, opts.reprobe ? 1_500 : 4_000, opts.deadline);
+  }
+
+  /**
+   * Run the challenge classifier; auto-wait boundedly (~8 s) on `non-interactive` interstitials,
+   * and immediately report `interactive` or `block` without retrying.
+   */
+  async function checkChallenge(
+    targetId: string | undefined,
+    opts: { wallHint?: string; knownUrl?: string } = {},
+  ): Promise<ChallengeCheckResult> {
+    const first = await readChallengeProbe(targetId, { wallHint: opts.wallHint });
+    if (first.kind !== "probe") {
+      return { status: "clear", waited: false, url: first.kind === "skip" ? first.url : opts.knownUrl };
+    }
+    let lastProbe = first.probe;
+    let detection = classifyChallenge(lastProbe);
+    if (!detection) return { status: "clear", waited: false, url: lastProbe.url };
+    if (detection.kind === "block") {
+      return { status: "block", detection, url: lastProbe.url || opts.knownUrl || "", waited: false };
+    }
+    if (detection.kind === "interactive") {
+      return { status: "interactive", detection, url: lastProbe.url || opts.knownUrl || "", waited: false };
+    }
+
+    const waitMaxMs = options.challengeWaitMaxMs ?? CHALLENGE_WAIT_MAX_MS;
+    const started = Date.now();
+    const deadline = started + waitMaxMs;
+    let waitedMs = 0;
+    const remainingBudget = () => Math.max(0, Math.min(deadline - Date.now(), waitMaxMs - waitedMs));
+    while (remainingBudget() > 0) {
+      // Keep part of the budget for one last probe so a page that clears near the deadline is seen.
+      const rem = remainingBudget();
+      const reserve = Math.min(CHALLENGE_PROBE_RESERVE_MS, Math.floor(rem / 2));
+      const last = rem - reserve <= CHALLENGE_POLL_MS;
+      const step = Math.min(CHALLENGE_POLL_MS, rem - reserve);
+      if (step <= 0) break;
+      await pause(step);
+      waitedMs += step;
+      if (deadline - Date.now() <= 0) break;
+      const next = await readChallengeProbe(targetId, { reprobe: true, deadline });
+      if (next.kind === "error") continue;
+      if (next.kind === "skip") {
+        return { status: "clear", waited: true, url: next.url || opts.knownUrl };
+      }
+      lastProbe = next.probe;
+      const nextDetection = classifyChallenge(lastProbe);
+      if (!nextDetection) {
+        return { status: "clear", waited: true, url: lastProbe.url };
+      }
+      detection = nextDetection;
+      if (detection.kind === "block") {
+        return { status: "block", detection, url: lastProbe.url || opts.knownUrl || "", waited: true };
+      }
+      if (detection.kind === "interactive") {
+        return { status: "interactive", detection, url: lastProbe.url || opts.knownUrl || "", waited: true };
+      }
+      if (last) break;
+    }
+
+    return {
+      status: "non-interactive-timeout",
+      detection,
+      url: lastProbe.url || opts.knownUrl || "",
+      waited: true,
+    };
+  }
+
   async function handlePage(action: string, input: Json, rawTargetId?: string): Promise<InvokeResult> {
     const { browseTab, extensionTarget } = await resolveTargetBackend(rawTargetId);
     const targetId = rawTargetId ?? extensionTarget;
@@ -1685,6 +1997,34 @@ export function createPageHelperHandler(
         const res = await evalHelper({ kind: "bc", method: "snapshot", args: [opts] }, targetId);
         if (!res.ok) return res;
         let out = valueOf(res);
+        let challengePrefix = "";
+        let challengeMeta: ReturnType<typeof challengeDataOf> | undefined;
+        if (!find && !within && input["_skipChallengeCheck"] !== true && isSuspiciousSnapshot(out)) {
+          const wallHint = out.includes("# WALL: captcha") ? "captcha" : out.includes("# WALL: rate-limit") ? "rate-limit" : undefined;
+          const snapUrl = /^# .* \| (https?:\/\/[^\s]+)/.exec(out)?.[1];
+          const challengeBackend = challengeBackendOf(targetId);
+          const challenge = await checkChallenge(targetId, { wallHint, knownUrl: snapUrl });
+          if (challenge.status === "block") {
+            return failure(
+              "EXECUTION_FAILED",
+              formatChallengeOutput(challenge.detection, challenge.url || snapUrl || "", {
+                backend: challengeBackend,
+                untrustedBoundary: true,
+              }),
+            );
+          }
+          if (challenge.status === "interactive" || challenge.status === "non-interactive-timeout") {
+            const targetUrl = challenge.url || snapUrl || "";
+            challengePrefix = formatChallengeOutput(challenge.detection, targetUrl, {
+              backend: challengeBackend,
+              untrustedBoundary: true,
+            });
+            challengeMeta = challengeDataOf(challenge.detection, challenge.status, targetUrl, challengeBackend);
+          } else if (challenge.waited) {
+            const refreshed = await evalHelper({ kind: "bc", method: "snapshot", args: [opts] }, targetId);
+            if (refreshed.ok) out = valueOf(refreshed);
+          }
+        }
         // Attach per-site agent notes if present for the page's origin.
         const urlMatch = /^# .* \| (https?:\/\/[^\s]+)/.exec(out);
         if (urlMatch?.[1]) {
@@ -1695,11 +2035,12 @@ export function createPageHelperHandler(
           const frames = await snapFrames(opts, targetId);
           if (frames.length) out += `\n${frames.join("\n")}`;
         }
-        if (!find && !within && !out.includes("\n- ") && !out.includes("# WALL:") && !out.includes("# snap diff")) {
+        if (!challengePrefix && !find && !within && !out.includes("\n- ") && !out.includes("# WALL:") && !out.includes("# snap diff")) {
           const ax = await snapAx(undefined, targetId);
           if (ax.ok && valueOf(ax).includes("\n- ")) out += `\n# No controls found in the DOM.\n${valueOf(ax)}`;
         }
-        return maybeSaveOut(success(out), input);
+        if (challengePrefix) out = `${challengePrefix}\n${out}`;
+        return maybeSaveOut(challengeMeta ? { ok: true, data: { value: out, challenge: challengeMeta } } : success(out), input);
       }
 
       case "form": {
@@ -1760,8 +2101,11 @@ export function createPageHelperHandler(
           : await readProperty("href", targetId);
         if (browseTab === undefined && start && !start.ok) return start;
         const startUrl = start?.ok ? valueOf(start) : "";
+        let prevUrl = startUrl;
         const out: string[] = [];
         let stopped: string | undefined;
+        let challengeReport: string | undefined;
+        const challengeBackend = challengeBackendOf(targetId);
         for (const [i, step] of steps.entries()) {
           const res = await act(step.action, { ...step.input, quiet: true }, targetId, true, browseTab, true);
           if (!res.ok) {
@@ -1780,13 +2124,15 @@ export function createPageHelperHandler(
             stopped = `step ${i + 1} was not read back as typed`;
             break;
           }
-          if (i === steps.length - 1) continue;
+          const isLastStep = i === steps.length - 1;
+          if (isLastStep && browseTab !== undefined) continue;
           const state = await evalHelper(
             {
               steps: [
                 { kind: "bc", method: "settle", discard: true },
                 { kind: "href" },
                 { kind: "bc", method: "wall", fallback: "" },
+                VENDOR_MARKER_STEP,
               ],
               join: "\n",
             },
@@ -1795,21 +2141,56 @@ export function createPageHelperHandler(
           );
           let url = "";
           let wall = "";
-          if (state.ok) [url = "", wall = ""] = valueOf(state).split("\n");
+          let rest: string[] = [];
+          if (state.ok) [url = "", wall = "", ...rest] = valueOf(state).split("\n");
           else {
             await waitParsed(targetId);
             const again = await evalHelper(
-              { steps: [{ kind: "href" }, { kind: "bc", method: "wall", fallback: "" }], join: "\n" },
+              { steps: [{ kind: "href" }, { kind: "bc", method: "wall", fallback: "" }, VENDOR_MARKER_STEP], join: "\n" },
               targetId,
               8_000,
             );
-            if (again.ok) [url = "", wall = ""] = valueOf(again).split("\n");
+            if (again.ok) [url = "", wall = "", ...rest] = valueOf(again).split("\n");
           }
-          if (wall) stopped = `the page is a ${wall} wall after step ${i + 1}`;
-          else if (url && startUrl && hostOf(url) !== hostOf(startUrl)) {
-            stopped = `step ${i + 1} left ${hostOf(startUrl)} for ${hostOf(url)}`;
+          const markerRows = rest.join("\n");
+          const navigated = Boolean(url && prevUrl && stripHash(url) !== stripHash(prevUrl));
+          const challengeWall = wall === "captcha" || wall === "rate-limit" || /^# [1-9]\d* row/.test(markerRows);
+          if (browseTab === undefined && (navigated || challengeWall)) {
+            const challenge = await checkChallenge(targetId, { wallHint: wall, knownUrl: url });
+            if (challenge.status === "block") {
+              challengeReport = formatChallengeOutput(challenge.detection, challenge.url || url, {
+                backend: challengeBackend,
+                untrustedBoundary: true,
+              });
+              stopped = `blocked by ${challenge.detection.vendor} after step ${i + 1}`;
+              break;
+            }
+            if (challenge.status === "interactive" || challenge.status === "non-interactive-timeout") {
+              challengeReport = formatChallengeOutput(challenge.detection, challenge.url || url, {
+                backend: challengeBackend,
+                untrustedBoundary: true,
+              });
+              stopped = `${challenge.detection.vendor} challenge after step ${i + 1}`;
+              break;
+            }
+            if (challenge.waited) {
+              const afterWait = await evalHelper(
+                { steps: [{ kind: "href" }, { kind: "bc", method: "wall", fallback: "" }], join: "\n" },
+                targetId,
+                4_000,
+              );
+              if (afterWait.ok) [url = "", wall = ""] = valueOf(afterWait).split("\n");
+              else if (challenge.url) url = challenge.url;
+            }
           }
-          if (stopped) break;
+          if (url) prevUrl = url;
+          if (!isLastStep) {
+            if (wall) stopped = `the page is a ${wall} wall after step ${i + 1}`;
+            else if (url && startUrl && hostOf(url) !== hostOf(startUrl)) {
+              stopped = `step ${i + 1} left ${hostOf(startUrl)} for ${hostOf(url)}`;
+            }
+            if (stopped) break;
+          }
         }
         if (stopped) out.push(`# STOPPED: ${stopped}. ${steps.length - out.length} step(s) not run.`);
         if (!quiet) {
@@ -1819,10 +2200,11 @@ export function createPageHelperHandler(
               cacheBrowseSnapshot(browseTab, valueOf(delta));
               out.push(valueOf(delta));
             }
-          } else {
+          } else if (!challengeReport) {
             out.push(await changes(startUrl, targetId));
           }
         }
+        if (challengeReport) out.unshift(challengeReport);
         return stopped ? failure("EXECUTION_FAILED", out.join("\n")) : success(out.join("\n"));
       }
 
@@ -2011,19 +2393,69 @@ export function createPageHelperHandler(
             tab,
             8_000,
           );
+          let final = "";
+          let wall = "";
           if (state.ok) {
-            const [final = "", wall = ""] = valueOf(state).split("\n");
-            if (final && final !== url) lines.push(`# url: ${final}`);
+            [final = "", wall = ""] = valueOf(state).split("\n");
+          }
+          const challengeBackend = challengeBackendOf(tab);
+          const challenge = await checkChallenge(tab, { wallHint: wall, knownUrl: final || url });
+          if (challenge.status === "block") {
+            return failure(
+              "EXECUTION_FAILED",
+              formatChallengeOutput(challenge.detection, challenge.url || final || url, {
+                backend: challengeBackend,
+                untrustedBoundary: true,
+              }),
+            );
+          }
+          if (challenge.status === "interactive" || challenge.status === "non-interactive-timeout") {
+            const targetUrl = challenge.url || final || url;
+            // The final URL and redirect host come from the page, so keep them inside the boundary.
+            const navDetails: string[] = [];
+            if (final && final !== url) navDetails.push(`# url: ${final}`);
             if (final && hostOf(final) && hostOf(url) && hostOf(final) !== hostOf(url)) {
-              lines.push(`# REDIRECTED: ${hostOf(url)} -> ${hostOf(final)}`);
+              navDetails.push(`# REDIRECTED: ${hostOf(url)} -> ${hostOf(final)}`);
             }
-            if (wall && input["snap"] !== true) {
-              lines.push(`# WALL: ${wall}. Stop and hand this tab to the user; do not solve or bypass it.`);
+            if (navDetails.length) lines.push(wrapUntrusted(navDetails.join("\n")));
+            return {
+              ok: true,
+              data: {
+                value: `${formatChallengeOutput(challenge.detection, targetUrl, { backend: challengeBackend, untrustedBoundary: true })}\n${lines.join("\n")}`,
+                challenge: challengeDataOf(challenge.detection, challenge.status, targetUrl, challengeBackend),
+              },
+            };
+          }
+          if (challenge.waited) {
+            const afterWait = await evalHelper(
+              {
+                steps: [
+                  { kind: "bc", method: "settle", discard: true },
+                  { kind: "href" },
+                  { kind: "bc", method: "wall", fallback: "" },
+                ],
+                join: "\n",
+              },
+              tab,
+              8_000,
+            );
+            if (afterWait.ok) {
+              [final = "", wall = ""] = valueOf(afterWait).split("\n");
+            } else if (challenge.url) {
+              final = challenge.url;
+              wall = "";
             }
+          }
+          if (final && final !== url) lines.push(`# url: ${final}`);
+          if (final && hostOf(final) && hostOf(url) && hostOf(final) !== hostOf(url)) {
+            lines.push(`# REDIRECTED: ${hostOf(url)} -> ${hostOf(final)}`);
+          }
+          if (wall && input["snap"] !== true) {
+            lines.push(`# WALL: ${wall}. Stop and hand this tab to the user; do not solve or bypass it.`);
           }
         }
         if (input["snap"] === true) {
-          const snap = await handlePage("snap", {}, tab);
+          const snap = await handlePage("snap", { _skipChallengeCheck: !onBrowse }, tab);
           lines.push(snap.ok ? valueOf(snap) : `# snap failed: ${messageOf(snap).slice(0, 200)}`);
         }
         return success(lines.join("\n"));
