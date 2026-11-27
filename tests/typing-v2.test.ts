@@ -4,21 +4,17 @@
  */
 import { describe, expect, test } from "bun:test";
 import { createSeededRng } from "../src/natural";
-import {
-  classifyFieldKind,
-  planTyping,
-  type HumanKeystroke,
-  type HumanTypingOptions,
-  type TypingPlan,
-} from "../src/typing";
+import { classifyFieldKind, planTyping, type HumanKeystroke, type HumanTypingOptions, type TypingPlan } from "../src/typing";
 
 const PROSE =
   "The quick brown fox jumps over the lazy dog. She packed her bag before dawn, then walked to the station. " +
   "It was cold enough that the platform lights looked warm. Nobody spoke on the train.";
-
 const SEEDS = (n: number) => Array.from({ length: n }, (_, i) => i + 1);
 const plan = (text: string, seed: number, opts: HumanTypingOptions = {}): TypingPlan =>
   planTyping(text, { rng: createSeededRng(seed), fieldKind: "prose", ...opts });
+const median = (xs: number[]): number => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)]!;
+const wpm = (text: string, p: TypingPlan): number => (text.length / 5) / (p.durationMs / 60000);
+const both = (a: boolean, b: boolean) => expect([a, b]).toEqual([true, true]);
 
 /** Replay as a text editor: Shift and keyUp insert nothing, Backspace deletes one grapheme. */
 function replay(events: HumanKeystroke[]): string {
@@ -32,19 +28,14 @@ function replay(events: HumanKeystroke[]): string {
   return buf;
 }
 
-type Key = { ch: string; down: number; up: number; mod?: number };
-
+type Down = { ch: string; down: number; mod?: number };
 /** Character keys in absolute time, each keyUp paired with its keyDown (rollover keeps that order). */
 function charKeys(events: HumanKeystroke[]) {
   let t = 0;
-  const keys: Key[] = [];
-  const shiftDowns: number[] = [];
-  const shiftUps: number[] = [];
-  const open: Array<Omit<Key, "up">> = [];
+  const keys: Array<Down & { up: number }> = [], shiftDowns: number[] = [], shiftUps: number[] = [], open: Down[] = [];
   for (const ev of events) {
     t += ev.delayMs;
-    if (ev.kind === "insert") continue;
-    if (ev.spec.key === "Backspace") continue;
+    if (ev.kind === "insert" || ev.spec.key === "Backspace") continue;
     if (ev.spec.key === "Shift") (ev.kind === "keyDown" ? shiftDowns : shiftUps).push(t);
     else if (ev.kind === "keyDown") open.push({ ch: ev.ch, down: t, mod: ev.spec.modifiers });
     else keys.push({ ...open.shift()!, up: t });
@@ -52,13 +43,8 @@ function charKeys(events: HumanKeystroke[]) {
   return { keys, shiftDowns, shiftUps };
 }
 
-type Gap = { ms: number; a: string; b: string; shifted: boolean };
-
-const gaps = (keys: Key[]): Gap[] =>
+const gaps = (keys: Array<Down & { up: number }>) =>
   keys.slice(1).map((b, i) => ({ ms: b.down - keys[i]!.down, a: keys[i]!.ch, b: b.ch, shifted: Boolean(keys[i]!.mod || b.mod) }));
-
-const median = (xs: number[]): number => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)]!;
-const wpm = (text: string, p: TypingPlan): number => (text.length / 5) / (p.durationMs / 60000);
 
 describe("typing v2", () => {
   test("the same seed rebuilds the same plan, a new seed does not", () => {
@@ -67,24 +53,13 @@ describe("typing v2", () => {
   });
 
   test("every plan replays to the exact text, including under heavy typos and any speed", () => {
-    const samples = [
-      "Hello, World!",
-      "seth@example.com",
-      "+1 (555) 123-4567",
-      "2026-11-27",
-      "https://example.com/a?b=c&d=e",
-      PROSE,
-      "  leading and trailing  ",
-      "ünïcodé and 絵文字 mixed 🚀 with ASCII",
-      "",
-    ];
+    const samples = ["Hello, World!", "seth@example.com", "+1 (555) 123-4567", "2026-11-27", "https://example.com/a?b=c&d=e", PROSE, "  leading and trailing  ", "ünïcodé and 絵文字 mixed 🚀 with ASCII", ""];
     for (const text of samples) for (const seed of SEEDS(15)) expect(replay(plan(text, seed).events)).toBe(text);
     for (const speedFactor of [0.85, 1, 1.15]) expect(replay(plan(PROSE, 4, { speedFactor }).events)).toBe(PROSE);
     for (const heavy of ["abcdefghij klmnopqrst uvwxyz 0123456789", "cafe\u0301xyz nai\u0308ve 👍🏽ok Ünï", "\u0600abcdef"]) {
       for (const seed of SEEDS(40)) {
         const p = plan(heavy, seed, { typoRate: 0.6, maxTypos: 30 });
-        expect(p.typos).toBeGreaterThan(0);
-        expect(replay(p.events)).toBe(heavy);
+        both(p.typos > 0, replay(p.events) === heavy);
       }
     }
     for (const seed of SEEDS(40)) {
@@ -97,8 +72,7 @@ describe("typing v2", () => {
   test("median prose speed lands in the 75-95 wpm band, and Shift barely slows title case", () => {
     const meds = [PROSE, PROSE.replace(/\b[a-z]/g, (c) => c.toUpperCase())].map((text) => {
       const med = median(SEEDS(61).map((seed) => wpm(text, plan(text, seed))));
-      expect(med).toBeGreaterThanOrEqual(75);
-      expect(med).toBeLessThanOrEqual(95);
+      expect(med).toBeWithin(75, 95);
       return med;
     });
     expect(meds[1]! / meds[0]!).toBeGreaterThanOrEqual(0.98);
@@ -107,12 +81,10 @@ describe("typing v2", () => {
   test("within-word gaps sit in 45-100 ms, nothing under 40 ms, and pauses stay rare", () => {
     const all = SEEDS(20).flatMap((seed) => gaps(charKeys(plan(PROSE, seed).events).keys));
     const intra = median(all.filter((g) => g.a !== " " && g.b !== " " && !g.shifted && !/[.!?,;:]/.test(g.a)).map((g) => g.ms));
-    expect(intra).toBeGreaterThanOrEqual(45);
-    expect(intra).toBeLessThanOrEqual(100);
+    expect(intra).toBeWithin(45, 100);
     expect(Math.min(...all.map((g) => g.ms))).toBeGreaterThanOrEqual(40);
     const pauseShare = all.filter((g) => g.ms >= 300).length / all.length;
-    expect(pauseShare).toBeGreaterThan(0.02);
-    expect(pauseShare).toBeLessThan(0.2);
+    expect(pauseShare).toBeWithin(0.02, 0.2);
     expect(median(all.filter((g) => g.a === " " && !g.shifted).map((g) => g.ms))).toBeGreaterThan(intra);
   });
 
@@ -129,25 +101,21 @@ describe("typing v2", () => {
       }
     }
     expect(fast).toBeGreaterThan(200);
-    expect(rolled / fast).toBeGreaterThanOrEqual(0.2);
-    expect(rolled / fast).toBeLessThanOrEqual(0.4);
+    expect(rolled / fast).toBeWithin(0.2, 0.4);
   });
 
   test("Shift goes down before and up after every capital and shifted symbol", () => {
     const text = "Hello Big World: 2026! (yes) @ $5 total?";
     const { keys, shiftDowns, shiftUps } = charKeys(plan(text, 5).events);
-    expect(shiftDowns.length).toBeGreaterThan(0);
-    expect(shiftDowns.length).toBe(shiftUps.length);
+    both(shiftDowns.length > 0, shiftDowns.length === shiftUps.length);
     const shifted = keys.filter((k) => /^[A-Z]$/.test(k.ch) || /[!@#$%^&*()_+{}|:"<>?~]/.test(k.ch));
     expect(shifted.length).toBeGreaterThan(5);
     for (const key of shifted) {
       const down = shiftDowns.filter((d) => d <= key.down).at(-1)!;
       const up = shiftUps.find((u) => u >= key.up)!;
       expect(key.mod).toBe(8);
-      expect(key.down - down).toBeGreaterThanOrEqual(25);
-      expect(key.down - down).toBeLessThanOrEqual(95);
-      expect(up - key.up).toBeGreaterThanOrEqual(15);
-      expect(up - key.up).toBeLessThanOrEqual(80);
+      expect(key.down - down).toBeWithin(25, 95);
+      expect(up - key.up).toBeWithin(15, 80);
     }
     // In dispatch order, Shift is down exactly while a Shift-bit key goes down; every key comes up.
     for (const t of ["aAaAa", text, PROSE]) {
@@ -164,8 +132,7 @@ describe("typing v2", () => {
           expect(down).toBe(ev.kind === "keyUp");
           down = ev.kind === "keyDown";
         }
-        expect(down).toBe(false);
-        expect(held.size).toBe(0);
+        expect([down, held.size]).toEqual([false, 0]);
       }
     }
     // Consecutive capitals hold one Shift across the run.
@@ -180,28 +147,24 @@ describe("typing v2", () => {
       const kinds = new Set<string>();
       for (const seed of SEEDS(seeds)) {
         const p = plan(text, seed, opts);
-        typos += p.typos;
-        chars += p.chars;
+        [typos, chars] = [typos + p.typos, chars + p.chars];
         backspaces += p.events.filter((e) => e.kind === "keyDown" && e.spec.key === "Backspace").length;
         for (const kind of p.typoKinds) kinds.add(kind);
       }
       return { rate: typos / chars, kinds, typos, backspaces };
     };
     const prose = stats(PROSE.repeat(2).toLowerCase(), 120, { maxTypos: 40 });
-    expect(prose.rate).toBeGreaterThanOrEqual(0.015);
-    expect(prose.rate).toBeLessThanOrEqual(0.03);
+    expect(prose.rate).toBeWithin(0.015, 0.03);
     expect(prose.backspaces).toBeGreaterThanOrEqual(prose.typos);
     for (const kind of ["adjacent", "transpose", "double", "drop"]) expect(prose.kinds.has(kind)).toBe(true);
     const email = stats("someone@example.com", 300, { fieldKind: classifyFieldKind("someone@example.com") });
-    expect(email.rate).toBeGreaterThanOrEqual(0.005);
-    expect(email.rate).toBeLessThanOrEqual(0.01);
+    expect(email.rate).toBeWithin(0.005, 0.01);
   });
 
   test("fieldKind none, the default, never types a typo", () => {
     for (const seed of SEEDS(30)) {
       const p = planTyping(PROSE, { rng: createSeededRng(seed) });
-      expect(p.typos).toBe(0);
-      expect(replay(p.events)).toBe(PROSE);
+      expect([p.typos, replay(p.events)]).toEqual([0, PROSE]);
     }
   });
 

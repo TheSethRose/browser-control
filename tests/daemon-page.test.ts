@@ -281,14 +281,14 @@ describe("daemon page helpers", () => {
     expect(cdpMethods(emoji.calls)).not.toContain("Input.insertText");
     expect(keys(emoji.calls).filter((k) => k["key"] === "🚀").map((k) => [k["type"], k["text"]])).toEqual([["keyDown", "🚀"], ["keyUp", undefined]]);
 
-    // A keyUp a dialog refused is reported as held and never re-sent, even after the dialog closes.
+    // A keyUp a dialog refused may have landed: it reads as unverified, is never re-sent, and is not held.
     const refused = { ok: false as const, error: { code: "EXECUTION_FAILED" as const, message: "DIALOG_OPEN: alert" } };
     let ups = 0;
     const blocked = makeFakeInvoker({ onCdp: (m, p) => (m === "Input.dispatchKeyEvent" && p["type"] === "keyUp" && ups++ === 0 ? refused : undefined) });
     const blockedHandle = createPageHelperHandler(blocked.invoke, undefined, undefined, quick);
-    expect(text(await blockedHandle("type", { _natural: true, ref: "e2", text: "hi", quiet: true }))).toContain("# HELD: key h still down. It was not sent again");
+    expect(text(await blockedHandle("type", { _natural: true, ref: "e2", text: "hi", quiet: true }))).toContain("release: delivery unverified (a dialog opened)");
     const sent = keys(blocked.calls);
-    expect(text(await blockedHandle("dialog", { sub: "accept" }))).toContain("# HELD: key h still down");
+    expect(text(await blockedHandle("dialog", { sub: "accept" }))).not.toContain("# HELD");
     expect([sent.filter((k) => k["type"] === "keyUp" && k["key"] === "h").length, keys(blocked.calls).length]).toEqual([1, sent.length]);
 
     // Events run against elapsed time, so 8 ms per CDP round trip doesn't slow the typing,
@@ -316,6 +316,43 @@ describe("daemon page helpers", () => {
     // One line is a single sample of the 75-95 wpm band at speed 0.85-1.15, so allow 5% noise.
     expect(slow).toBeGreaterThanOrEqual(75 * 0.85 * 0.95);
     expect(slow).toBeLessThanOrEqual(95 * 1.15 * 1.05);
+  });
+
+  test("natural typing: a keyUp timeout still reports the Shift it left down", async () => {
+    const timeout = { ok: false as const, error: { code: "EXECUTION_FAILED" as const, message: "CDP_TIMEOUT: no reply" } };
+    let timedOut = false;
+    const lost = makeFakeInvoker({
+      field: '{"type":"text","flags":[]}',
+      onCdp: (m, p) => (m === "Input.dispatchKeyEvent" && p["type"] === "keyUp" && p["key"] === "H" && !timedOut ? (timedOut = true, timeout) : undefined),
+    });
+    const handle = createPageHelperHandler(lost.invoke, undefined, undefined, { sleep: async () => {} });
+    const out = text(await handle("type", { _natural: true, ref: "e2", text: "Hi", quiet: true }));
+    expect(timedOut).toBe(true);
+    expect(out).toContain("delivered_unverified");
+    expect(out).toContain("# HELD: key Shift still down");
+  });
+
+  test("natural typing: an oversleeping pause shifts the schedule instead of eating the next hold", async () => {
+    let clock = 0;
+    const holds: number[] = [];
+    const downAt = new Map<string, number>();
+    const m = makeFakeInvoker({
+      field: '{"type":"text","flags":[]}',
+      onCdp: (method, params) => {
+        if (method !== "Input.dispatchKeyEvent") return undefined;
+        const key = String(params["key"]);
+        if (params["type"] !== "keyUp") downAt.set(key, clock);
+        else if (downAt.has(key)) {
+          holds.push(clock - downAt.get(key)!);
+          downAt.delete(key);
+        }
+        return undefined;
+      },
+    });
+    const opts = { rng: createSeededRng(7), now: () => clock, sleep: async (ms: number) => void (clock += ms + 80) };
+    await createPageHelperHandler(m.invoke, undefined, undefined, opts)("type", { _natural: true, ref: "e2", text: "hold still", quiet: true });
+    expect(holds.length).toBeGreaterThan(5);
+    expect(Math.min(...holds)).toBeGreaterThanOrEqual(40);
   });
 
   test("select handles native <select> and custom ARIA comboboxes", async () => {

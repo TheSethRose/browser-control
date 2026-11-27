@@ -659,7 +659,7 @@ describe("page-runner natural motion integration", () => {
   });
 
   const DIALOG_MSG = "DIALOG_OPEN: a JavaScript alert dialog is open on tab 5";
-  /** `opener` opens a dialog as it is delivered; while open, input is refused before dispatch. */
+  /** `opener` opens a dialog as it is delivered; while open, input is refused before dispatch. Every attempt is counted. */
   function dialogWrap(opener: string, sent: Array<{ type: string; targetId?: string }>) {
     let open = false;
     return (next: Invoke): Invoke => async (op, inp = {}) => {
@@ -667,8 +667,8 @@ describe("page-runner natural motion integration", () => {
       const type = String((inp["params"] as Record<string, unknown> | undefined)?.["type"] ?? "");
       if (op === "execute_cdp" && method === "Page.handleJavaScriptDialog") open = false;
       else if (op === "execute_cdp" && method.startsWith("Input.dispatch")) {
-        if (open) return { ok: false, error: { code: "EXECUTION_FAILED", message: DIALOG_MSG } };
         sent.push({ type, targetId: inp["targetId"] as string | undefined });
+        if (open) return { ok: false, error: { code: "EXECUTION_FAILED", message: DIALOG_MSG } };
         if (type === opener) {
           open = true;
           return { ok: false, error: { code: "EXECUTION_FAILED", message: DIALOG_MSG } };
@@ -680,43 +680,38 @@ describe("page-runner natural motion integration", () => {
   const releaseCount = (sent: Array<{ type: string }>, t: string) => sent.filter((e) => e.type === t).length;
   const textOf = (res: InvokeResult): string => (res.ok ? String((res.data as { value: unknown }).value) : res.error.message);
 
-  test("E1: a dialog-blocked release is never re-sent, and dialog accept reports what is still held", async () => {
+  test("E1: a dialog-refused press keeps its input possibly down; a refused release is unverified", async () => {
     await withNaturalOn(async () => {
-      for (const [action, input, release, held] of [
-        ["drag", { from: "e1", to: "e2", quiet: true }, "mouseReleased", "# HELD: mouse left button still down"],
-        ["key", { key: "Tab", quiet: true }, "keyUp", "# HELD: key Tab still down"],
+      const keyTab = { key: "Tab", quiet: true };
+      const drag = { from: "e1", to: "e2", quiet: true };
+      // The dialog opens as the press is delivered: the press may have landed, so its release goes out once, and a
+      // release refused in turn leaves the input possibly down.
+      for (const [action, input, press, release, held] of [
+        ["key", keyTab, "rawKeyDown", "keyUp", "# HELD: key Tab may still be down"],
+        ["drag", drag, "mousePressed", "mouseReleased", "# HELD: mouse left button may still be down"],
+      ] as const) {
+        const sent: Array<{ type: string }> = [];
+        const h = makeNaturalMock({ inView: true }).handler(5, dialogWrap(press, sent));
+        expect((await h(action, input)).ok).toBe(false);
+        expect(releaseCount(sent, release)).toBe(1);
+        const accepted = textOf(await h("dialog", { sub: "accept" }));
+        expect([accepted.includes(held), accepted.includes("was not sent again")]).toEqual([true, true]);
+      }
+      // The release itself opens the dialog: the press landed and the release may have too, so it is unverified.
+      for (const [action, input, release] of [
+        ["key", keyTab, "keyUp"],
+        ["drag", drag, "mouseReleased"],
       ] as const) {
         const sent: Array<{ type: string }> = [];
         const h = makeNaturalMock({ inView: true }).handler(5, dialogWrap(release, sent));
-        expect((await h(action, input)).ok).toBe(false);
-        expect(releaseCount(sent, release)).toBe(1);
-        const accepted = await h("dialog", { sub: "accept" });
-        expect(accepted.ok).toBe(true);
-        expect(textOf(accepted)).toContain(held);
-        expect(textOf(accepted)).toContain("the caller decides what to do next");
+        expect(textOf(await h(action, input))).toContain("release: delivery unverified (a dialog opened)");
+        expect(textOf(await h("dialog", { sub: "accept" }))).not.toContain("# HELD");
         expect(releaseCount(sent, release)).toBe(1);
       }
     });
   });
 
-  test("E2: the command whose release the dialog blocked reports the held input", async () => {
-    await withNaturalOn(async () => {
-      const sent: Array<{ type: string }> = [];
-      const h = makeNaturalMock({ inView: true }).handler(5, dialogWrap("keyUp", sent));
-      const res = await h("key", { key: "Tab", quiet: true });
-      expect(res.ok).toBe(false);
-      expect(textOf(res)).toContain(DIALOG_MSG);
-      expect(textOf(res)).toContain("# HELD: key Tab still down");
-
-      const dragged: Array<{ type: string }> = [];
-      const hd = makeNaturalMock({ inView: true }).handler(5, dialogWrap("mouseReleased", dragged));
-      const dragRes = await hd("drag", { from: "e1", to: "e2", quiet: true });
-      expect(dragRes.ok).toBe(false);
-      expect(textOf(dragRes)).toContain("# HELD: mouse left button still down");
-    });
-  });
-
-  test("E3: held input is keyed by browser and tab, so a short id and its qualified id share one record", async () => {
+  test("E2: held input is keyed by browser and tab, so a short id and its qualified id share one record", async () => {
     await withNaturalOn(async () => {
       const resolveKey = (id: string): string | undefined =>
         id === "extension:5" || id === "extension:chrome-aaa111:5"
@@ -725,10 +720,10 @@ describe("page-runner natural motion integration", () => {
             ? "extension:edge-bbb222:5"
             : undefined;
       const sent: Array<{ type: string }> = [];
-      const h = makeNaturalMock({ inView: true }).handler(5, dialogWrap("keyUp", sent), { extensionResolveKey: resolveKey });
+      const h = makeNaturalMock({ inView: true }).handler(5, dialogWrap("rawKeyDown", sent), { extensionResolveKey: resolveKey });
       await h("key", { key: "Tab", quiet: true }, "extension:5");
       const same = await h("dialog", { sub: "accept" }, "extension:chrome-aaa111:5");
-      expect(textOf(same)).toContain("# HELD: key Tab still down");
+      expect(textOf(same)).toContain("# HELD: key Tab may still be down");
       const other = await h("dialog", { sub: "accept" }, "extension:edge-bbb222:5");
       expect(other.ok).toBe(true);
       expect(textOf(other)).not.toContain("# HELD");
@@ -762,6 +757,36 @@ describe("page-runner natural motion integration", () => {
       expect(pointer.length).toBeGreaterThan(0);
       expect([...new Set(pointer.map((e) => e.targetId))]).toEqual(["T1"]);
       expect(seen.filter((e) => e.method === "Input.dispatchKeyEvent").map((e) => e.targetId)).toEqual(["T2", "T2"]);
+    });
+  });
+
+  test("E5: a tab switch mid-type keeps every key event on the tab typing started on", async () => {
+    await withNaturalOn(async () => {
+      let active = "T1";
+      let switched = false;
+      const seen: Array<{ method: string; targetId?: string }> = [];
+      const base = makeNaturalMock({ inView: true });
+      const inv: Invoke = async (op, inp = {}) => {
+        if (op === "get_browser_status") return { ok: true, data: { connected: true, activeTargetId: active } };
+        // An unpinned call resolves to whichever tab is active now, as the real backend does.
+        if (op === "execute_cdp") seen.push({ method: String(inp["method"]), targetId: (inp["targetId"] as string | undefined) ?? active });
+        return base.invoke(op, inp);
+      };
+      const h: ReturnType<typeof createPageHelperHandler> = createPageHelperHandler(inv, undefined, undefined, {
+        rng: createSeededRng(3),
+        sleep: async () => {
+          if (switched) return;
+          switched = true;
+          active = "T2";
+          await h("key", { key: "Tab", quiet: true, fast: true });
+        },
+        bcCall: async () => ({ value: "https://a.test/\nhit: button#ok" }),
+      });
+      expect((await h("type", { ref: "e1", text: "hi", quiet: true, _natural: true })).ok).toBe(true);
+      expect(switched).toBe(true);
+      const keyed = seen.filter((e) => e.method === "Input.dispatchKeyEvent");
+      expect(keyed.filter((e) => e.targetId === "T2")).toHaveLength(2); // the nested key command only
+      expect([...new Set(keyed.filter((e) => e.targetId !== "T2").map((e) => e.targetId))]).toEqual(["T1"]);
     });
   });
 
