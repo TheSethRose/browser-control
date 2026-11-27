@@ -2035,7 +2035,9 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
           if (tid !== undefined) {
             activeTab = { profileId: targetLink.profileId, slug: targetLink.slug, tabId: tid };
           }
-          const created = res?.created === true || createdNewTab;
+          // Created only when the extension returned a tab id other than the one we passed in.
+          const created =
+            typeof res?.tabId === "number" && res.tabId !== tabId && (res?.created === true || createdNewTab);
           return {
             loaded: res?.loaded !== false,
             targetId: tid === undefined ? null : formatTargetId(targetLink, tid),

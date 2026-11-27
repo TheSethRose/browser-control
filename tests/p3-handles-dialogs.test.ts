@@ -1566,6 +1566,17 @@ describe("background.js resolveBcNode & runBcSilent review fixes (S1, S3, S6, S7
       await expect(bg.closeTab(3)).rejects.toThrow(/^REFUSED:.*only closes tabs it opened/);
       expect(env.calls.some((c) => c.api === "tabs.remove")).toBe(false);
 
+      // Ownership moves to the user while the close is in flight -> refused, tabs.remove never runs.
+      bg.agentTabs.add(3);
+      const origGetAll = env.fullChrome.windows.getAll;
+      env.fullChrome.windows.getAll = async (opts) => {
+        bg.agentTabs.delete(3);
+        return origGetAll(opts);
+      };
+      await expect(bg.closeTab(3)).rejects.toThrow(/^REFUSED:.*only closes tabs it opened/);
+      env.fullChrome.windows.getAll = origGetAll;
+      expect(env.calls.some((c) => c.api === "tabs.remove" && c.args[0] === 3)).toBe(false);
+
       // 4. Agent tab -> closes cleanly even in Only tabs I share mode.
       const res = await bg.closeTab(4);
       expect(res).toEqual({ ok: true, closed: true });

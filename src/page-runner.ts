@@ -2551,7 +2551,11 @@ export function createPageHelperHandler(
         if (!nav.ok) return nav;
         const data = nav.data as Json;
         const tab = typeof data["targetId"] === "string" ? (data["targetId"] as string) : targetId;
-        const createdNewTab = data["created"] === true && typeof tab === "string" && extensionTabOf(tab) !== undefined;
+        // Only the tab id this nav returned may be cleaned up, never the caller's targetId.
+        const newTab =
+          data["created"] === true && typeof data["targetId"] === "string" && extensionTabOf(data["targetId"]) !== undefined
+            ? (data["targetId"] as string)
+            : undefined;
         const onBrowse = browseTabNumber(tab) !== undefined || (tab === undefined && browseTab !== undefined);
         const lines = [JSON.stringify(data)];
         if (!onBrowse) {
@@ -2572,8 +2576,16 @@ export function createPageHelperHandler(
           if (state.ok) {
             [final = "", wall = ""] = valueOf(state).split("\n");
           } else if (messageOf(state).startsWith("EXTENSION_ONLY:") || messageOf(state).includes("RESTRICTED_PAGE:")) {
-            if (createdNewTab && messageOf(state).includes("RESTRICTED_PAGE:")) {
-              await invoke("close_target", { targetId: tab }).catch(() => {});
+            if (newTab !== undefined && messageOf(state).includes("RESTRICTED_PAGE:")) {
+              const closed = await invoke("close_target", { targetId: newTab }).catch((e: unknown) =>
+                failure("EXECUTION_FAILED", e instanceof Error ? e.message : String(e)),
+              );
+              if (!closed.ok) {
+                return failure(
+                  state.ok ? "EXECUTION_FAILED" : state.error.code,
+                  `${messageOf(state)}\nThe tab this nav opened (${newTab}) is still open: ${messageOf(closed)}`,
+                );
+              }
             }
             return state;
           }

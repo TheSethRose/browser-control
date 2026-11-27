@@ -2377,6 +2377,9 @@ describe("relay handshake tracking, fix lines, and timeout", () => {
 
       await connectMockExtension(backend.getPort()!, token, (op, params) => {
         if (op === "navigate") {
+          if (params["url"] === "chrome://no-id") {
+            return { loaded: true, url: "chrome://no-id", title: "Restricted", created: true };
+          }
           const existing = typeof params["tabId"] === "number" ? params["tabId"] : undefined;
           const tabId = existing ?? ++nextTabId;
           return {
@@ -2391,6 +2394,7 @@ describe("relay handshake tracking, fix lines, and timeout", () => {
           throw new Error("Cannot access a chrome:// URL");
         }
         if (op === "close_tab") {
+          if (Number(params["tabId"]) === 93) throw new Error("REFUSED: cleanup refused for test");
           closedTabIds.push(Number(params["tabId"]));
           return { ok: true, closed: true };
         }
@@ -2431,6 +2435,20 @@ describe("relay handshake tracking, fix lines, and timeout", () => {
       const newWinRes = await handlePage("nav", { url: "chrome://settings", newWindow: true });
       expect(newWinRes.ok).toBe(false);
       if (!newWinRes.ok) expect(newWinRes.error.message).toMatch(/EXTENSION_ONLY: RESTRICTED_PAGE:.*chrome:\/\//);
+      expect(closedTabIds).toEqual([91, 92]);
+
+      // 4. Extension returns no tab id (claims created) while tab 5 is selected -> never closes tab 5.
+      const noIdRes = await handlePage("nav", { url: "chrome://no-id", newWindow: true });
+      expect(noIdRes.ok).toBe(false);
+      expect(closedTabIds).toEqual([91, 92]);
+
+      // 5. Cleanup of the new tab (93) is refused -> the error says the tab is still open and why.
+      const refusedRes = await handlePage("nav", { url: "chrome://flags", newWindow: true });
+      expect(refusedRes.ok).toBe(false);
+      if (!refusedRes.ok) {
+        expect(refusedRes.error.message).toMatch(/EXTENSION_ONLY: RESTRICTED_PAGE:/);
+        expect(refusedRes.error.message).toContain("The tab this nav opened (extension:93) is still open: REFUSED: cleanup refused for test");
+      }
       expect(closedTabIds).toEqual([91, 92]);
       expect(cdpLog).toEqual([]);
     } finally {
