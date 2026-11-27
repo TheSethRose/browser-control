@@ -160,8 +160,17 @@ export async function runStaleExtensionCheck(
 
     // Confirm no lingering ESTABLISHED socket stays open on the isolated relay port.
     await sleep(300);
-    const lsof = spawn(["lsof", "-nP", `-iTCP:${port}`, "-sTCP:ESTABLISHED"], { stdout: "pipe", stderr: "ignore" });
-    const lsofOut = (await new Response(lsof.stdout).text()).trim();
+    // Only this run's relay (this process) and its browser; another app may use the same port number.
+    const pids = [process.pid, browser?.pid].filter((p): p is number => typeof p === "number").join(",");
+    const lsof = spawn(["lsof", "-nP", "-a", "-p", pids, `-iTCP:${port}`, "-sTCP:ESTABLISHED"], {
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    const lsofOut = (await new Response(lsof.stdout).text())
+      .split("\n")
+      .filter((line) => line.includes(`:${port}`))
+      .join("\n")
+      .trim();
     await lsof.exited;
     const stillPending = backend.getHandshakeRecords().some((r) => r.stage !== "rejected");
     check("stale-socket-closed", !stillPending && lsofOut === "", lsofOut || "no ESTABLISHED sockets");

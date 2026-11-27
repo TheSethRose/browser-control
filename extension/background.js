@@ -565,7 +565,42 @@ export { agentTabs, handoffTabs };
 
 const BC_DIALOG_PROBE_DELAY_MS = 1_500;
 const BC_LIVENESS_PROBE_TIMEOUT_MS = 400;
+const BC_MAX_NAVIGATION_RETRIES = 2;
+// Calls with no page side effect, safe to rerun on the document that replaced their target.
+// Anything else (scrolling, focus, input, marks, input probes, fetches) is never replayed.
+const BC_REPLAY_SAFE = new Set([
+  "snapshot", "wall", "surface", "canvasHash", "pageScrollPoint", "hitCheck", "guard", "guardFocused", "verifyRef",
+  "healRef", "cellInfo", "cellEditor", "cellRead", "listPosition", "locateOption", "locateFile", "locate", "el",
+  "checkWait", "value", "verdict", "health", "frames", "frameOffset", "baseline", "settle", "diff", "hit", "viewport",
+  "markBoxes", "form", "query", "text",
+]);
+const BC_DOC_REF = /^@?(f\d+:)?e\d+$/;
 const RESOLVE_MARKER_TTL_MS = 10_000;
+
+function bcStepReplaySafe(st) {
+  if (st?.kind !== "bc") return true;
+  if (st.method === "point") return st.args?.[1]?.noScroll === true;
+  return BC_REPLAY_SAFE.has(st.method);
+}
+
+// Element refs (e12, f1:e3) name nodes of one document; a call carrying one never reruns on another.
+// The walk is bounded; args too large to scan count as carrying a ref.
+function bcStepHasRef(st) {
+  if (st?.kind !== "bc" || !Array.isArray(st.args)) return false;
+  const stack = [...st.args];
+  const seen = new Set();
+  for (let budget = 10_000; stack.length; budget--) {
+    if (budget <= 0) return true;
+    const v = stack.pop();
+    if (typeof v === "string") {
+      if (BC_DOC_REF.test(v)) return true;
+    } else if (v && typeof v === "object" && !seen.has(v)) {
+      seen.add(v);
+      for (const x of Object.values(v)) stack.push(x);
+    }
+  }
+  return false;
+}
 
 function assertTabAllowed(tabId) {
   if (!tabAllowed(tabId)) {
@@ -626,6 +661,8 @@ async function probeOpenDialog(tabId, { allowUnconfirmed = false, waitMs = 1_000
 }
 
 // Silent Tier: run __bc v7 methods in Chrome's ISOLATED content-script world (no yellow debugger banner).
+// Chrome never settles an executeScript whose document a browser-side navigation replaces mid-call
+// (tabs.update, omnibox, history), so each attempt pins its target document and watches for its replacement.
 export async function runBcSilent(tabId, steps, opts = {}) {
   assertTabAllowed(tabId);
   const open = debuggerHub.getOpenDialog(tabId);
@@ -633,18 +670,49 @@ export async function runBcSilent(tabId, steps, opts = {}) {
     throw new Error(debuggerHub.formatDialogError(tabId, open));
   }
   const timeoutMs = Number(opts.timeoutMs) > 0 ? Number(opts.timeoutMs) : 30_000;
+  const deadline = Date.now() + timeoutMs;
   const probeDelayMs =
     Number(opts.dialogProbeDelayMs) > 0 ? Number(opts.dialogProbeDelayMs) : BC_DIALOG_PROBE_DELAY_MS;
   const livenessTimeoutMs =
     Number(opts.livenessProbeTimeoutMs) > 0 ? Number(opts.livenessProbeTimeoutMs) : BC_LIVENESS_PROBE_TIMEOUT_MS;
+  const targetFrame = typeof opts.frameId === "number" ? opts.frameId : 0;
   let unsubscribe;
   let timer;
   let probeTimer;
-  let livenessTimer;
   let settled = false;
   let cancelled = false;
   let timedOut = false;
-  const isCancelled = () => cancelled;
+  // Probe results belong to one attempt; a probe stranded on a replaced document never counts.
+  let attempt = 0;
+  let stalledAttempt = 0;
+  let answeredAttempt = 0;
+  let cur = null;
+  let lastTarget = scriptTarget(tabId, opts.frameId);
+
+  const changed = (kind) => cur?.changed(kind);
+  const onCommitted = (d) => {
+    if (!cur || d.tabId !== tabId || d.documentLifecycle === "prerender") return;
+    if (d.documentId && d.documentId === cur.doc.documentId) return;
+    if (d.frameId === targetFrame) changed("committed");
+    else if (cur.doc.chain.has(d.frameId)) changed("frame-gone");
+  };
+  const onTabReplaced = (d) => {
+    if (d?.replacedTabId === tabId) changed("replaced");
+  };
+  // bfcache restores and prerender activations swap the document; compare by documentId.
+  const onUpdated = (id, info) => {
+    const a = cur;
+    if (id !== tabId || !a?.doc.documentId || !(info?.status === "loading" || info?.url)) return;
+    Promise.resolve(chrome.webNavigation.getFrame({ tabId, frameId: targetFrame }))
+      .then((f) => {
+        if (a === cur && f?.documentId !== a.doc.documentId) changed(f ? "committed" : "frame-gone");
+      })
+      .catch(() => {});
+  };
+  chrome.webNavigation?.onCommitted?.addListener(onCommitted);
+  chrome.webNavigation?.onTabReplaced?.addListener(onTabReplaced);
+  chrome.tabs?.onUpdated?.addListener(onUpdated);
+
   const dialogPromise = new Promise((_, reject) => {
     unsubscribe = debuggerHub.subscribeDialogOpening(tabId, (dialog) => {
       cancelled = true;
@@ -659,6 +727,7 @@ export async function runBcSilent(tabId, steps, opts = {}) {
       reject(new Error("__BC_TIMEOUT__"));
     }, timeoutMs);
   });
+  timeoutPromise.catch(() => {});
   let rejectEarlyDialog;
   const earlyProbePromise = new Promise((_, reject) => {
     rejectEarlyDialog = (err) => {
@@ -668,63 +737,130 @@ export async function runBcSilent(tabId, steps, opts = {}) {
   });
   earlyProbePromise.catch(() => {});
 
-  if (probeDelayMs < timeoutMs) {
-    probeTimer = setTimeout(() => {
-      if (settled || cancelled || !tabAllowed(tabId)) return;
-      const known = debuggerHub.getOpenDialog(tabId);
-      if (known) {
-        rejectEarlyDialog(new Error(debuggerHub.formatDialogError(tabId, known)));
-        return;
-      }
-      // Probe silently first so healthy slow reads never attach chrome.debugger (which shows a banner).
-      // Only attach and confirm a dialog if this tiny probe also stalls on a blocked renderer.
-      const remainingMs = Math.max(100, timeoutMs - probeDelayMs);
-      const probeWaitMs = Math.min(livenessTimeoutMs, remainingMs);
-      let livenessStalled = false;
-      const livenessTimeout = new Promise((resolve) => {
-        livenessTimer = setTimeout(() => {
-          livenessStalled = true;
-          resolve(false);
-        }, probeWaitMs);
-      });
-      const livenessExec = chrome.scripting
-        .executeScript({
-          target: scriptTarget(tabId, opts.frameId),
-          world: "ISOLATED",
-          func: () => 1,
-        })
-        .then(() => true)
-        .catch(() => true);
-
-      Promise.race([livenessExec, livenessTimeout])
-        .then((answered) => {
+  // Tiny silent script: true when the attempt's document answers within waitMs.
+  const liveness = (n, target, waitMs) =>
+    new Promise((resolve) => {
+      let done = false;
+      const livenessTimer = setTimeout(() => {
+        if (done) return;
+        done = true;
+        if (n === attempt) stalledAttempt = n;
+        resolve(false);
+      }, waitMs);
+      chrome.scripting
+        .executeScript({ target, world: "ISOLATED", func: () => 1 })
+        .catch(() => {})
+        .then(() => {
+          if (n === attempt) {
+            answeredAttempt = n;
+            if (stalledAttempt === n) stalledAttempt = 0;
+          }
+          if (done) return;
+          done = true;
           clearTimeout(livenessTimer);
-          if (answered || !livenessStalled || settled || cancelled || !tabAllowed(tabId)) return;
-          return probeOpenDialog(tabId, {
-            allowUnconfirmed: false,
-            waitMs: Math.min(1_000, Math.max(200, timeoutMs - probeDelayMs - probeWaitMs)),
-          }).then((dialogErr) => {
-            if (!settled && !cancelled && dialogErr) rejectEarlyDialog(dialogErr);
-          });
-        })
-        .catch(() => {});
-    }, probeDelayMs);
-  }
+          resolve(true);
+        });
+    });
 
-  const stepsPromise = runBcSteps(tabId, steps, opts.frameId, isCancelled);
-  stepsPromise.catch(() => {});
+  const scheduleProbe = (n, target) => {
+    clearTimeout(probeTimer);
+    if (probeDelayMs >= deadline - Date.now()) return;
+    probeTimer = setTimeout(async () => {
+      try {
+        if (n !== attempt || settled || cancelled || !tabAllowed(tabId)) return;
+        const known = debuggerHub.getOpenDialog(tabId);
+        if (known) {
+          rejectEarlyDialog(new Error(debuggerHub.formatDialogError(tabId, known)));
+          return;
+        }
+        // Probe silently first so healthy slow reads never attach chrome.debugger (which shows a banner).
+        // Only attach and confirm a dialog if this tiny probe also stalls on a blocked renderer.
+        const probeWaitMs = Math.min(livenessTimeoutMs, Math.max(100, deadline - Date.now()));
+        if (await liveness(n, target, probeWaitMs)) return;
+        if (n !== attempt || settled || cancelled || !tabAllowed(tabId)) return;
+        const dialogErr = await probeOpenDialog(tabId, {
+          allowUnconfirmed: false,
+          waitMs: Math.min(1_000, Math.max(200, deadline - Date.now())),
+        });
+        if (n === attempt && !settled && !cancelled && dialogErr) rejectEarlyDialog(dialogErr);
+      } catch {
+        /* the probe is best effort */
+      }
+    }, probeDelayMs);
+  };
+
+  let navigations = 0;
   try {
-    return await Promise.race([stepsPromise, dialogPromise, earlyProbePromise, timeoutPromise]);
+    for (;;) {
+      assertTabAllowed(tabId);
+      const n = ++attempt;
+      if (Date.now() >= deadline) throw new Error("__BC_TIMEOUT__");
+      const token = { stale: false, ran: false };
+      try {
+        // Record commits that land during the frame lookup; the lookup may return the replaced document.
+        let early = null;
+        cur = { doc: { chain: new Set([0, targetFrame]) }, changed: (kind) => (early ??= kind) };
+        const doc = await bcFrameDoc(tabId, targetFrame);
+        assertTabAllowed(tabId);
+        if (early === "replaced") throw bcNavigated("replaced");
+        if (early && doc.documentId) {
+          const f = await Promise.resolve(chrome.webNavigation.getFrame({ tabId, frameId: targetFrame })).catch(() => ({}));
+          if (f?.documentId !== doc.documentId) throw bcNavigated(f ? "committed" : "frame-gone");
+        }
+        const target = doc.documentId ? { tabId, documentIds: [doc.documentId] } : scriptTarget(tabId, opts.frameId);
+        lastTarget = target;
+        const navigated = new Promise((_, reject) => {
+          cur = { doc, changed: (kind) => reject(bcNavigated(kind)) };
+        });
+        navigated.catch(() => {});
+        scheduleProbe(n, target);
+        const stepsPromise = runBcSteps(tabId, steps, target, () => cancelled || token.stale, () => {
+          token.ran = true;
+        }).catch((err) => {
+          // Chrome rejects a documentId whose document is already gone.
+          throw /No document with id/i.test(String(err?.message || "")) ? bcNavigated("committed") : err;
+        });
+        stepsPromise.catch(() => {});
+        return await Promise.race([stepsPromise, navigated, dialogPromise, earlyProbePromise, timeoutPromise]);
+      } catch (err) {
+        if (String(err?.message || "") !== "__BC_NAVIGATED__" || cancelled) throw err;
+        token.stale = true;
+        cur = null;
+        if (err.kind === "replaced") {
+          throw new Error(`EXECUTION_FAILED: page changed: tab ${tabId} was replaced during the call; run tabs, then retry`);
+        }
+        if (err.kind === "frame-gone") {
+          throw new Error(`EXECUTION_FAILED: page changed: frame ${targetFrame} of tab ${tabId} is gone (a parent frame loaded a new page); snap, then retry`);
+        }
+        if (steps.some(bcStepHasRef)) {
+          throw new Error(`EXECUTION_FAILED: page changed: tab ${tabId} loaded a new page, so refs from the old page are gone; snap, then retry`);
+        }
+        if (token.ran && !steps.every(bcStepReplaySafe)) {
+          throw new Error(`EXECUTION_FAILED: page changed: tab ${tabId} loaded a new page while the step ran; snap, then retry`);
+        }
+        if (++navigations > BC_MAX_NAVIGATION_RETRIES) {
+          throw new Error(`EXECUTION_FAILED: tab ${tabId} kept loading new pages during the call; wait for it to settle, then retry`);
+        }
+      }
+    }
   } catch (err) {
     cancelled = true;
     if (timedOut || String(err?.message || "") === "__BC_TIMEOUT__") {
-      const dialogErr = await probeOpenDialog(tabId, { allowUnconfirmed: true, waitMs: 1_000 });
-      throw (
-        dialogErr ||
-        new Error(
-          `EXECUTION_FAILED: tab ${tabId} got no answer in ${timeoutMs} ms (a JavaScript dialog may be blocking the page)`,
-        )
-      );
+      const known = debuggerHub.getOpenDialog(tabId);
+      if (known) throw new Error(debuggerHub.formatDialogError(tabId, known));
+      // Suspect a dialog only when the current document is stalled right now.
+      let stalled = stalledAttempt === attempt && attempt > 0;
+      if (!stalled && answeredAttempt !== attempt && tabAllowed(tabId)) {
+        // Check the frame's current document; the attempt's target may be a replaced or bfcached one.
+        const now = await bcFrameDoc(tabId, targetFrame);
+        const target = now.documentId ? { tabId, documentIds: [now.documentId] } : lastTarget;
+        stalled = !(await liveness(attempt, target, livenessTimeoutMs));
+      }
+      if (stalled) {
+        const dialogErr = tabAllowed(tabId) ? await probeOpenDialog(tabId, { allowUnconfirmed: true, waitMs: 1_000 }) : null;
+        throw dialogErr || new Error(`EXECUTION_FAILED: tab ${tabId} got no answer in ${timeoutMs} ms (a JavaScript dialog may be blocking the page)`);
+      }
+      throw new Error(`EXECUTION_FAILED: tab ${tabId} got no answer in ${timeoutMs} ms (no dialog detected; the page may be busy or still loading)`);
     }
     if (String(err?.message || err).startsWith("DIALOG_OPEN:")) {
       throw err instanceof Error ? err : new Error(String(err));
@@ -732,18 +868,46 @@ export async function runBcSilent(tabId, steps, opts = {}) {
     throw scriptingError(err, tabId);
   } finally {
     settled = true;
+    cur = null;
     clearTimeout(timer);
     clearTimeout(probeTimer);
-    clearTimeout(livenessTimer);
     unsubscribe?.();
+    chrome.webNavigation?.onCommitted?.removeListener(onCommitted);
+    chrome.webNavigation?.onTabReplaced?.removeListener(onTabReplaced);
+    chrome.tabs?.onUpdated?.removeListener(onUpdated);
   }
 }
 
-async function runBcSteps(tabId, steps, frameId, isCancelled = () => false) {
+function bcNavigated(kind) {
+  return Object.assign(new Error("__BC_NAVIGATED__"), { kind });
+}
+
+// The target frame's current document and its ancestor chain (target included).
+async function bcFrameDoc(tabId, frameId) {
+  const fallback = { chain: new Set([0, frameId]) };
+  let frames;
+  try {
+    frames = await Promise.race([
+      chrome.webNavigation?.getAllFrames?.({ tabId }),
+      new Promise((resolve) => setTimeout(resolve, 500)),
+    ]);
+  } catch {
+    return fallback;
+  }
+  if (!Array.isArray(frames)) return fallback;
+  const byId = new Map(frames.map((f) => [f.frameId, f]));
+  const chain = new Set();
+  for (let f = byId.get(frameId); f && !chain.has(f.frameId); f = byId.get(f.parentFrameId)) chain.add(f.frameId);
+  const me = byId.get(frameId);
+  if (!me) return fallback;
+  return { documentId: typeof me.documentId === "string" ? me.documentId : undefined, chain };
+}
+
+async function runBcSteps(tabId, steps, target, isCancelled = () => false, onRun = () => {}) {
   if (isCancelled() || debuggerHub.getOpenDialog(tabId)) {
     throw new Error("CANCELLED: bc_call aborted");
   }
-  const target = scriptTarget(tabId, frameId);
+  assertTabAllowed(tabId);
   const probe = await chrome.scripting.executeScript({
     target,
     world: "ISOLATED",
@@ -754,6 +918,7 @@ async function runBcSteps(tabId, steps, frameId, isCancelled = () => false) {
     throw new Error("CANCELLED: bc_call aborted");
   }
   if (!probe?.[0]?.result) {
+    assertTabAllowed(tabId);
     await chrome.scripting.executeScript({
       target,
       world: "ISOLATED",
@@ -763,6 +928,8 @@ async function runBcSteps(tabId, steps, frameId, isCancelled = () => false) {
       throw new Error("CANCELLED: bc_call aborted");
     }
   }
+  assertTabAllowed(tabId);
+  onRun();
   const exec = await chrome.scripting.executeScript({
     target,
     world: "ISOLATED",
