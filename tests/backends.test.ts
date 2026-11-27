@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { OperationHandler } from "@agent-software/core";
 import { createBrowseBackend, type Runner } from "../src/backends/browse";
 import { route } from "../src/backends/router";
+import { BackendUnavailable } from "../src/backends/types";
 
 /** A fake `browse` CLI: records calls and answers from a table keyed by tool name. */
 function fakeBrowse(answers: Record<string, { code?: number; out: string }>) {
@@ -168,5 +169,24 @@ describe("router with extension first", () => {
     await ops["navigate"]!({ url: "https://x", browser: "chrome-abc123" });
     expect(extCalls).toEqual(["navigate:chrome-abc123"]);
     expect(log).toEqual(["select_target:ABC"]);
+  });
+
+  test("a navigate that names an offline browser fails instead of using the CDP tab", async () => {
+    const log: string[] = [];
+    const ext = {
+      name: "extension",
+      handles: (op: string) => op === "navigate",
+      invoke: async () => {
+        throw new BackendUnavailable("extension", 'browser "chrome-abc123" is not connected');
+      },
+      listTargets: async () => [],
+      clearActive: () => {},
+      status: async () => ({}),
+    };
+    const ops = route(fakeCdp(log), [ext as never], () => ["extension", "cdp"]);
+    await expect(ops["navigate"]!({ url: "https://x", browser: "chrome-abc123" })).rejects.toThrow(
+      /not connected/,
+    );
+    expect(log).toEqual([]);
   });
 });

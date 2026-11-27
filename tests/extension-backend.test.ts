@@ -873,6 +873,28 @@ describe("Phase 2 slice B: BrowserLinks and chunked frames", () => {
     expect(evs2.events.map((e) => e.params.from)).toEqual([2]);
   });
 
+  test("an event waiter keeps matching after a second browser connects", async () => {
+    const token = randomBytes(32).toString("hex");
+    const backend = createExtensionBackend({ ...allocPortWindow(), token, waitConnectMs: 1_000 });
+    disposables.push(backend);
+    await backend.start!();
+    const port = backend.getPort()!;
+    const list = (op: string) => (op === "list_tabs" ? { tabs: [{ tabId: 42, title: "t", url: "u" }] } : { ok: true });
+
+    const first = await connectMockExtension(port, token, list, { profileId: "wait-a", browser: "Chrome" });
+    expect((await backend.listTargets()).map((t) => t.targetId)).toEqual(["extension:42"]);
+    const waited = backend.invoke("wait_for_event", {
+      method: "bc.handoffDone",
+      targetId: "extension:42",
+      match: { handoffId: "h1" },
+      timeoutMs: 2_000,
+    }) as Promise<{ found: boolean }>;
+
+    await connectMockExtension(port, token, list, { profileId: "wait-b", browser: "Brave" });
+    first.ws.send(JSON.stringify({ type: "event", tabId: 42, method: "bc.handoffDone", params: { handoffId: "h1" } }));
+    expect((await waited).found).toBe(true);
+  });
+
   test("S5: stale short id rejected after its profile leaves instead of routing to another profile", async () => {
     const token = randomBytes(32).toString("hex");
     const backend = createExtensionBackend({ ...allocPortWindow(), token, waitConnectMs: 1_000 });
@@ -1013,6 +1035,26 @@ describe("Phase 2 slice B: BrowserLinks and chunked frames", () => {
     }
     expect(browser1.receivedReqs.filter((r) => r.op === "navigate")).toHaveLength(0);
     expect(browser2.receivedReqs.filter((r) => r.op === "navigate")).toHaveLength(1);
+  });
+
+  test("cancelUnsent drops a queued batch that never started sending", async () => {
+    const sent: string[] = [];
+    let blocked = true;
+    const queue = new OutboundFrameQueue({
+      send(frame: string): number {
+        sent.push(frame);
+        return blocked ? -1 : frame.length;
+      },
+    });
+    const first = queue.enqueue(["a1", "a2"]);
+    const secondFrames = ["b1"];
+    const second = queue.enqueue(secondFrames);
+    queue.cancelUnsent(secondFrames);
+    await expect(second).rejects.toThrow(/cancelled before it was sent/);
+    blocked = false;
+    queue.drain();
+    await first;
+    expect(sent).toEqual(["a1", "a2"]);
   });
 
   test("S6: a large outbound batch (>=250 chunks) completes with backpressure", async () => {

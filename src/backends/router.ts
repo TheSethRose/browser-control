@@ -97,7 +97,8 @@ export function route(
         if (op === "select_target" || op === "navigate") active = name;
         return result;
       } catch (error) {
-        if (!(error instanceof BackendUnavailable)) throw error;
+        // A named browser that is offline is an error, never a reason to use another tab.
+        if (!(error instanceof BackendUnavailable) || input["browser"] !== undefined) throw error;
         skipped.push(error.message);
         if (active === name) active = undefined;
       }

@@ -342,6 +342,14 @@ export class OutboundFrameQueue {
     this.flush();
   }
 
+  /** Drop a batch that hasn't started sending, so a timed-out request never runs later. */
+  cancelUnsent(frames: string[]): void {
+    const index = this.queue.findIndex((q) => q.frames === frames && q.index === 0);
+    if (index === -1) return;
+    const [batch] = this.queue.splice(index, 1);
+    batch!.reject(new Error("EXECUTION_FAILED: request cancelled before it was sent"));
+  }
+
   failAll(reason: string): void {
     this.closedReason = reason;
     this.paused = false;
@@ -899,22 +907,26 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
   const events = new EventBuffer(options.eventBufferSize ?? 1000);
   const eventWaiters = new Set<EventWaiter>();
 
-  function rememberShortTarget(tabId: number, profileId: string): void {
-    shortTargetOwners.delete(tabId);
+  // Bindings are never evicted, so a stale short id can't be reissued to another browser.
+  // Once the table is full, new tabs get qualified ids instead.
+  function rememberShortTarget(tabId: number, profileId: string): boolean {
+    const owner = shortTargetOwners.get(tabId);
+    if (owner !== undefined) return owner === profileId;
+    if (shortTargetOwners.size >= MAX_SHORT_TARGET_OWNERS) return false;
     shortTargetOwners.set(tabId, profileId);
-    if (shortTargetOwners.size > MAX_SHORT_TARGET_OWNERS) {
-      const oldest = shortTargetOwners.keys().next().value;
-      if (oldest !== undefined) shortTargetOwners.delete(oldest);
-    }
+    return true;
   }
 
   function formatTargetId(link: { profileId: string; slug: string }, tabId: number): string {
-    const owner = shortTargetOwners.get(tabId);
-    if (links.size > 1 || (owner !== undefined && owner !== link.profileId)) {
-      return `${NAME}:${link.slug}:${tabId}`;
+    if (links.size > 1 || !rememberShortTarget(tabId, link.profileId)) {
+      return eventKey(link, tabId);
     }
-    rememberShortTarget(tabId, link.profileId);
     return `${NAME}:${tabId}`;
+  }
+
+  // Events are keyed by the qualified id so the key can't change when a second browser connects.
+  function eventKey(link: { slug: string }, tabId: number): string {
+    return `${NAME}:${link.slug}:${tabId}`;
   }
 
   function findLinkBySlug(slug: string): BrowserLink | undefined {
@@ -982,7 +994,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
       typeof msg.sessionId === "string"
         ? msg.sessionId
         : tabId !== undefined
-          ? formatTargetId(link, tabId)
+          ? eventKey(link, tabId)
           : undefined;
     const params =
       typeof msg.params === "object" && msg.params !== null && !Array.isArray(msg.params)
@@ -1361,6 +1373,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
     return new Promise<unknown>((resolve, reject) => {
       const timer = setTimeout(() => {
         link.pending.delete(reqId);
+        link.outbound.cancelUnsent(encoded.frames);
         reject(new Error(`CDP_TIMEOUT: extension op "${op}" timed out after ${timeoutMs}ms`));
       }, timeoutMs);
       link.pending.set(reqId, { resolve, reject, timer });
@@ -1760,7 +1773,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
             typeof input["sessionId"] === "string"
               ? input["sessionId"]
               : resolved
-                ? formatTargetId(resolved.link, resolved.tabId)
+                ? eventKey(resolved.link, resolved.tabId)
                 : undefined;
           const limit = typeof input["limit"] === "number" ? input["limit"] : 100;
           const clear = input["clear"] !== false;
@@ -1788,7 +1801,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
             typeof input["sessionId"] === "string"
               ? input["sessionId"]
               : resolved
-                ? formatTargetId(resolved.link, resolved.tabId)
+                ? eventKey(resolved.link, resolved.tabId)
                 : undefined;
           const match =
             typeof input["match"] === "object" && input["match"] !== null && !Array.isArray(input["match"])
