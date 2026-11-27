@@ -799,9 +799,10 @@ export function createDebuggerHub({
   /**
    * CDP sessionId of the out-of-process iframe whose document is `frameUrl`. Turns on flattened
    * Target.setAutoAttach once per attachment, then matches child targets by URL (exact, then
-   * origin + path, then origin). Returns undefined when no child target matches (same-process frame).
+   * origin + path, then origin). When several children tie (same-URL siblings), `choose(sessionIds)`
+   * picks the right one. Returns undefined when no child target matches (same-process frame).
    */
-  async function frameSession(tabId, frameUrl, timeoutMs = 1_500) {
+  async function frameSession(tabId, frameUrl, timeoutMs = 1_500, choose) {
     const entry = await ensureAttached(tabId);
     if (!entry.autoAttached) {
       await chromeApi.debugger.sendCommand({ tabId }, "Target.setAutoAttach", {
@@ -820,26 +821,48 @@ export function createDebuggerHub({
       }
     };
     const want = parts(String(frameUrl || ""));
+    const tiers = [
+      (c) => c.url === frameUrl,
+      (c) => parts(c.url).path === want.path,
+      (c) => parts(c.url).origin === want.origin,
+    ];
     const pick = () => {
       const kids = [...entry.childSessions.entries()].filter(([, c]) => c.type === "iframe");
-      const hit =
-        kids.find(([, c]) => c.url === frameUrl) ||
-        kids.find(([, c]) => parts(c.url).path === want.path) ||
-        kids.find(([, c]) => parts(c.url).origin === want.origin);
-      return hit ? hit[0] : undefined;
+      for (const tier of tiers) {
+        const ids = kids.filter(([, c]) => tier(c)).map(([id]) => id);
+        if (ids.length) return ids;
+      }
+      return [];
     };
     const deadline = Date.now() + timeoutMs;
     for (;;) {
-      const sessionId = pick();
-      if (sessionId || Date.now() >= deadline) return sessionId;
+      const ids = pick();
+      if (ids.length > 1 && typeof choose === "function") {
+        const chosen = await choose(ids).catch(() => undefined);
+        if (chosen) return chosen;
+      }
+      if (ids.length || Date.now() >= deadline) return ids[0];
       await new Promise((r) => setTimeout(r, 50));
     }
+  }
+
+  /**
+   * CDP session for extension frame `frameId`: undefined for the main frame and same-process frames.
+   * Throws STALE_REF when an explicit frameId no longer exists, so commands never fall back to the top page.
+   */
+  async function sessionForFrame(tabId, frameId, getFrame, choose) {
+    if (typeof frameId !== "number" || frameId === 0) return undefined;
+    const frame = await Promise.resolve(getFrame(tabId, frameId)).catch(() => null);
+    if (!frame) throw new Error(`STALE_REF: frame ${frameId} is gone. Run snap again.`);
+    if (!frame.url) return undefined;
+    return frameSession(tabId, frame.url, undefined, choose ? (ids) => choose(ids, frameId) : undefined);
   }
 
   return {
     attachedTabs,
     ensureAttached,
     frameSession,
+    sessionForFrame,
     detachTab,
     detachAll,
     holdDebugger,

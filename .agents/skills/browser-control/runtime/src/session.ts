@@ -67,6 +67,8 @@ export type PageTarget = {
   url: string;
   attached: boolean;
   openerId?: string;
+  /** Parent frame of an iframe target (the frame that embeds it). */
+  parentFrameId?: string;
 };
 
 export class CdpError extends Error {
@@ -610,6 +612,7 @@ export class CdpConnection {
         url: string;
         attached: boolean;
         openerId?: string;
+        parentFrameId?: string;
       }>;
     };
     let targets: PageTarget[] = targetInfos.map((t) => ({
@@ -619,6 +622,7 @@ export class CdpConnection {
       url: t.url,
       attached: t.attached,
       openerId: t.openerId,
+      ...(t.parentFrameId ? { parentFrameId: t.parentFrameId } : {}),
     }));
     if (!opts.includeAll) {
       targets = targets.filter(

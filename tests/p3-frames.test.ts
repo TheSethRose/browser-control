@@ -164,3 +164,187 @@ describe("debugger hub OOPIF sessions", () => {
     expect(await hub.frameSession(5, "http://elsewhere.test/", 100)).toBeUndefined();
   });
 });
+
+type BcInput = { targetId?: string; steps: readonly Step[] };
+
+/** Minimal handler with caller-supplied helper, CDP and extension stubs; records where helpers ran. */
+function stubHandler(opts: {
+  bc: (method: string | undefined, input: BcInput) => { value: string };
+  cdp?: (method: string, targetId?: string) => unknown;
+  targets?: unknown[];
+  listFrames?: () => unknown[];
+}) {
+  const ran: Array<{ method?: string; targetId?: string; args?: readonly unknown[] }> = [];
+  const invoke = async (op: string, input: Record<string, unknown> = {}): Promise<InvokeResult> => {
+    if (op === "list_targets") return { ok: true, data: { targets: opts.targets ?? [] } };
+    if (op === "evaluate") {
+      const expr = String(input["expression"]);
+      const calls = [...expr.matchAll(/__bc\.(\w+)\(([^)]*)\)/g)];
+      const last = calls.at(-1);
+      const args = last?.[2] ? (JSON.parse(`[${last[2]}]`) as unknown[]) : [];
+      const step = { kind: "bc", method: last?.[1], args };
+      const targetId = input["targetId"] as string | undefined;
+      ran.push({ method: step.method, targetId, args });
+      try {
+        return { ok: true, data: opts.bc(step.method, { targetId, steps: calls.map(() => step) }) };
+      } catch (error) {
+        return { ok: false, error: { code: "EXECUTION_FAILED", message: `JS_EXCEPTION: ${String(error)}` } } as InvokeResult;
+      }
+    }
+    if (op === "execute_cdp") {
+      return { ok: true, data: { result: opts.cdp?.(String(input["method"]), input["targetId"] as string | undefined) ?? {} } };
+    }
+    return { ok: true, data: { result: {} } };
+  };
+  const bcCall = async (input: BcInput) => {
+    const last = input.steps.at(-1)!;
+    ran.push({ method: last.method, targetId: input.targetId, args: last.args });
+    return opts.bc(last.method, input);
+  };
+  const extensionRequest = async (op: string) => {
+    if (op === "list_frames") return { frames: opts.listFrames?.() ?? [] };
+    throw new Error(`unexpected op ${op}`);
+  };
+  return { handle: createPageHelperHandler(invoke, undefined, undefined, { bcCall, extensionRequest }), ran };
+}
+
+const pointOrMiss = (method: string | undefined, input: BcInput, hits: Record<string, string>) => {
+  if (method === "point") return { value: input.steps.length > 1 ? "http://x/ 1 2" : "1 2" };
+  if (method === "frameOffset") return { value: "0 0" };
+  if (method === "locate" || method === "locateFile") {
+    const hit = input.targetId ? hits[input.targetId] : undefined;
+    if (hit && input.steps.at(-1)?.args?.[0] === "Cross input") return { value: hit };
+    throw new Error(`NO_MATCH: no control named "x". Run snap to see the controls.`);
+  }
+  return { value: "" };
+};
+
+describe("p3 frames review fixes", () => {
+  test("S1: CDP label fallback only uses iframe targets embedded in the selected tab", async () => {
+    const { handle, ran } = stubHandler({
+      targets: [
+        { targetId: "IF-OTHER", type: "iframe", url: CROSS_SRC, parentFrameId: "TAB-B" },
+        { targetId: "IF-MINE", type: "iframe", url: CROSS_SRC, parentFrameId: "SAME-ORIGIN-CHILD" },
+      ],
+      cdp: (method) =>
+        method === "Page.getFrameTree"
+          ? { frameTree: { frame: { id: "TAB-A" }, childFrames: [{ frame: { id: "SAME-ORIGIN-CHILD" } }] } }
+          : {},
+      bc: (method, input) =>
+        method === "frames" && input.targetId === "TAB-A"
+          ? { value: JSON.stringify([{ i: 1, src: CROSS_SRC, title: "" }]) }
+          : method === "frames"
+            ? { value: "[]" }
+            : pointOrMiss(method, input, { "IF-OTHER": "e1", "IF-MINE": "e1" }),
+    });
+    const res = await handle("hover", { ref: "Cross input" }, "TAB-A");
+    expect(res.ok).toBe(true);
+    expect(ran.some((r) => r.targetId === "IF-OTHER")).toBe(false);
+    expect(ran.find((r) => r.method === "point")?.targetId).toBe("IF-MINE");
+  });
+
+  test("S2: a label lookup after frames reorder never rebinds a saved f1 ref", async () => {
+    let order = [{ i: 1, src: CROSS_SRC, title: "" }];
+    let frames = [{ frameId: 7, url: CROSS_SRC }];
+    const { handle, ran } = stubHandler({
+      listFrames: () => frames,
+      bc: (method, input) =>
+        method === "frames"
+          ? { value: input.targetId === TOP ? JSON.stringify(order) : "[]" }
+          : pointOrMiss(method, input, { [FRAME]: "e1" }),
+    });
+    expect((await handle("hover", { ref: "Cross input" }, TOP)).ok).toBe(true);
+    order = [{ i: 1, src: "http://ads.test/x", title: "" }, { i: 2, src: CROSS_SRC, title: "" }];
+    frames = [{ frameId: 9, url: "http://ads.test/x" }, { frameId: 7, url: CROSS_SRC }];
+    const relabeled = await handle("hover", { ref: "Cross input" }, TOP);
+    expect(JSON.stringify(relabeled)).toContain("f2:e1");
+    ran.length = 0;
+    expect((await handle("hover", { ref: "f1:e1" }, TOP)).ok).toBe(true);
+    expect(ran.find((r) => r.method === "point")?.targetId).toBe(FRAME);
+  });
+
+  test("S6: snap --full forwards full to child frames so a repeat snap lists their controls", async () => {
+    const { handle, ran } = stubHandler({
+      listFrames: () => [{ frameId: 7, url: CROSS_SRC }],
+      bc: (method, input) => {
+        const inFrame = input.targetId === FRAME;
+        if (method === "frames") return { value: inFrame ? "[]" : JSON.stringify([{ i: 1, src: CROSS_SRC, title: "" }]) };
+        if (method !== "snapshot") return { value: "" };
+        const full = (input.steps.at(-1)?.args?.[0] as { full?: boolean } | undefined)?.full === true;
+        if (!inFrame) return { value: `# page | http://127.0.0.1:49260/\n# 1 cross-origin iframe(s): listed below\n- button "Top" [e1]` };
+        return { value: full ? `# frame\n- textbox "Cross input" [e1]\n- button "Go" [e2]` : "# frame\n# snap diff (2 refs unchanged and still valid; pass --full for all)" };
+      },
+    });
+    await handle("snap", { full: true }, TOP);
+    const res = await handle("snap", { full: true }, TOP);
+    const out = JSON.stringify(res);
+    expect(out).toContain("2 control(s)");
+    expect(out).toContain("[f1:e2]");
+    expect(ran.filter((r) => r.method === "snapshot" && r.targetId === FRAME).every((r) => (r.args?.[0] as { full?: boolean }).full === true)).toBe(true);
+    const diff = JSON.stringify(await handle("snap", {}, TOP));
+    expect(diff).toContain("0 control(s) changed; snap diff");
+  });
+});
+
+describe("debugger hub frame session review fixes", () => {
+  function hubWith(children: Array<{ sessionId: string; url: string }>) {
+    const mem = new Map<string, unknown>();
+    const storage = {
+      async get() {
+        return Object.fromEntries(mem);
+      },
+      async set(obj: Record<string, unknown>) {
+        for (const [k, v] of Object.entries(obj)) mem.set(k, v);
+      },
+      async remove(keys: string[]) {
+        for (const k of keys) mem.delete(k);
+      },
+    };
+    let hub: ReturnType<typeof createDebuggerHub>;
+    const chrome = {
+      runtime: { id: "ext" },
+      storage: { session: storage, local: storage },
+      tabs: { get: async (id: number) => ({ id, url: "http://127.0.0.1:49260/" }) },
+      debugger: {
+        attach: async () => {},
+        detach: async () => {},
+        sendCommand: async (target: { tabId: number }, method: string) => {
+          if (method === "Target.setAutoAttach") {
+            queueMicrotask(() => {
+              for (const c of children) {
+                hub.handleDebuggerEvent({ tabId: target.tabId }, "Target.attachedToTarget", {
+                  sessionId: c.sessionId,
+                  targetInfo: { targetId: `T-${c.sessionId}`, type: "iframe", url: c.url },
+                });
+              }
+            });
+          }
+          return {};
+        },
+      },
+    };
+    hub = createDebuggerHub({ chrome, idleMs: 60_000 });
+    return hub;
+  }
+
+  test("S4: same-URL sibling OOPIFs are told apart by the probe, not by attach order", async () => {
+    const hub = hubWith([
+      { sessionId: "S-FIRST", url: CROSS_SRC },
+      { sessionId: "S-SECOND", url: CROSS_SRC },
+    ]);
+    const asked: string[][] = [];
+    const choose = async (ids: string[]) => {
+      asked.push(ids);
+      return "S-SECOND";
+    };
+    expect(await hub.frameSession(5, CROSS_SRC, 500, choose)).toBe("S-SECOND");
+    expect(asked[0]).toEqual(["S-FIRST", "S-SECOND"]);
+  });
+
+  test("S5: an explicit frameId that no longer exists throws STALE_REF instead of using the top session", async () => {
+    const hub = hubWith([{ sessionId: "S-CROSS", url: CROSS_SRC }]);
+    await expect(hub.sessionForFrame(5, 7, async () => null)).rejects.toThrow(/^STALE_REF: frame 7 is gone/);
+    expect(await hub.sessionForFrame(5, 0, async () => null)).toBeUndefined();
+    expect(await hub.sessionForFrame(5, 7, async () => ({ url: CROSS_SRC }))).toBe("S-CROSS");
+  });
+});

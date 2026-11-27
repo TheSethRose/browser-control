@@ -175,11 +175,48 @@ async function loadConfig() {
 // CDP sessionId for a cross-origin (OOPIF) child frame, or undefined for the main frame and
 // same-process frames, which share the tab's own debugger session.
 async function frameSessionFor(tabId, frameId) {
-  if (typeof frameId !== "number" || frameId === 0) return undefined;
-  const frame = await chrome.webNavigation.getFrame({ tabId, frameId }).catch(() => null);
-  if (!frame?.url) return undefined;
   await restoreReady;
-  return debuggerHub.frameSession(tabId, frame.url);
+  return debuggerHub.sessionForFrame(
+    tabId,
+    frameId,
+    (id, fid) => chrome.webNavigation.getFrame({ tabId: id, frameId: fid }),
+    (ids, fid) => probeFrameSession(tabId, fid, ids),
+  );
+}
+
+// Same-URL sibling OOPIFs: stamp the extension frame's document, then ask each child session which one has it.
+async function probeFrameSession(tabId, frameId, sessionIds) {
+  assertTabAllowed(tabId);
+  const tok = `bc-frame-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const stamp = (value) =>
+    chrome.scripting.executeScript({
+      target: scriptTarget(tabId, frameId),
+      world: "ISOLATED",
+      func: (v) => {
+        const root = document.documentElement;
+        if (!root) return;
+        if (v) root.setAttribute("data-bc-frame", v);
+        else root.removeAttribute("data-bc-frame");
+      },
+      args: [value],
+    });
+  await stamp(tok);
+  try {
+    for (const sessionId of sessionIds) {
+      const res = await debuggerHub
+        .sendCommand(
+          tabId,
+          "Runtime.evaluate",
+          { expression: 'document.documentElement?.getAttribute("data-bc-frame")', returnByValue: true },
+          { sessionId },
+        )
+        .catch(() => null);
+      if (res?.result?.value === tok) return sessionId;
+    }
+    return undefined;
+  } finally {
+    await stamp("").catch(() => {});
+  }
 }
 
 function scriptTarget(tabId, frameId) {
