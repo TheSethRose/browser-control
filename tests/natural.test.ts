@@ -584,6 +584,96 @@ describe("page-runner natural motion integration", () => {
       expect(stagnant.evalExprs.some((e) => e.includes('__bc.point("e1", {"detail":true})'))).toBe(true);
     });
   });
+
+  test("S1: post-hover hitCheck STALE_REF fails without press; covered hover point retries before pressing", async () => {
+    await withNaturalOn(async () => {
+      let n1 = 0, n2 = 0;
+      const m1 = makeNaturalMock({ inView: true }), m2 = makeNaturalMock({ inView: true });
+      const h1 = createPageHelperHandler(async (op, inp = {}) =>
+        op === "evaluate" && String(inp["expression"] ?? "").includes("__bc.hitCheck") && ++n1 >= 2
+          ? { ok: false, error: { code: "EXECUTION_FAILED", message: "JS_EXCEPTION: Error: STALE_REF: e1 is gone" } }
+          : m1.invoke(op, inp), undefined, undefined, { sleep: async () => {}, rng: createSeededRng(7), now: () => 0 });
+      const r1 = await h1("click", { ref: "e1", quiet: true });
+      expect(r1.ok).toBe(false);
+      expect(!r1.ok && r1.error.message).toContain("STALE_REF");
+      expect(m1.cdpCalls.filter((c) => c.params["type"] === "mousePressed")).toHaveLength(0);
+
+      const h2 = createPageHelperHandler(async (op, inp = {}) =>
+        op === "evaluate" && String(inp["expression"] ?? "").includes("__bc.hitCheck") && ++n2 === 2
+          ? { ok: true, data: { value: JSON.stringify({ ok: false, reason: "covered by tooltip" }) } }
+          : m2.invoke(op, inp), undefined, undefined, { sleep: async () => {}, rng: createSeededRng(7), now: () => 0 });
+      expect((await h2("click", { ref: "e1", quiet: true })).ok).toBe(true);
+      const last = m2.cdpCalls.filter((c) => c.params["type"] === "mouseMoved").at(-1)!.params;
+      const press = m2.cdpCalls.find((c) => c.params["type"] === "mousePressed")!.params;
+      expect(n2).toBeGreaterThanOrEqual(4);
+      expect([press["x"], press["y"]]).toEqual([last["x"], last["y"]]);
+    });
+  });
+
+  test("S3: cross-origin frame clicks use legacy instant scroll and 3-event click", async () => {
+    await withNaturalOn(async () => {
+      const m = makeNaturalMock({ inView: true });
+      let tag = "";
+      const h = createPageHelperHandler(async (op, inp = {}) => {
+        if (op === "list_targets") return { ok: true, data: { targets: [{ targetId: "IF1", url: "https://x.test/", parentFrameId: "TOP" }] } };
+        if (op === "execute_cdp" && inp["method"] === "Page.getFrameTree") return { ok: true, data: { result: { frameTree: { frame: { id: "TOP" } } } } };
+        if (op === "evaluate") {
+          const expr = String(inp["expression"] ?? "");
+          if (expr.includes("__bc.snapshot")) return { ok: true, data: { value: "# P | https://a.test/\n# 1 cross-origin iframe(s)\n- button \"Go\" [e1]" } };
+          if (expr.includes("__bc.frames()")) return { ok: true, data: { value: '[{"i":1,"src":"https://x.test/","title":"X"}]' } };
+          if (expr.includes("__bc.tagFrames")) { tag = /\["([^"]+)"\]/.exec(expr)?.[1] ?? ""; return { ok: true, data: { value: "1" } }; }
+          if (expr.includes("__bc.frameTag")) return { ok: true, data: { value: tag } };
+          if (expr.includes("__bc.frameOffset")) return { ok: true, data: { value: "100 50" } };
+          if (inp["targetId"] === "IF1" && expr.includes("__bc.point")) { expect(expr).not.toContain('"detail":true'); return { ok: true, data: { value: "40 30 visible" } }; }
+        }
+        return m.invoke(op, inp);
+      }, undefined, undefined, { sleep: async (ms) => { m.sleeps.push(ms); }, rng: createSeededRng(11), now: () => 0 });
+      await h("snap", {});
+      expect((await h("click", { ref: "f1:e1", quiet: true })).ok).toBe(true);
+      const mouse = m.cdpCalls.filter((c) => c.method === "Input.dispatchMouseEvent");
+      expect(mouse.map((e) => e.params["type"])).toEqual(["mouseMoved", "mousePressed", "mouseReleased"]);
+      expect([mouse[0]!.params["x"], mouse[0]!.params["y"]]).toEqual([140, 80]);
+      expect(m.sleeps).toHaveLength(0);
+    });
+  });
+
+  test("S4: pointer state isolates implicit CDP tabs, strips @<id> frames, updates on --fast, and clears on dialog", async () => {
+    await withNaturalOn(async () => {
+      let activeTab = "TAB-A", failMove = 0;
+      const m = makeNaturalMock({ inView: true });
+      const h = createPageHelperHandler(async (op, inp = {}) => {
+        if (op === "get_browser_status") return { ok: true, data: { connected: true, activeTargetId: activeTab } };
+        if (op === "execute_cdp" && (inp["params"] as any)?.type === "mouseMoved" && failMove > 0 && --failMove === 0) {
+          return { ok: false, error: { code: "EXECUTION_FAILED", message: "DIALOG_OPEN: alert" } };
+        }
+        return m.invoke(op, inp);
+      }, undefined, undefined, { sleep: async () => {}, rng: createSeededRng(19), now: () => 0, bcCall: async () => ({ value: "https://a.test/\nhit: button#ok" }) });
+      const movesOf = async (fn: () => Promise<InvokeResult>) => { const i = m.cdpCalls.length; const r = await fn(); return { r, moves: m.cdpCalls.slice(i).filter((c) => c.params["type"] === "mouseMoved") }; };
+      await h("click", { xy: [900, 500], fast: true, quiet: true });
+      activeTab = "TAB-B";
+      expect((await movesOf(() => h("click", { xy: [901, 500], quiet: true }))).moves.length).toBeGreaterThanOrEqual(4);
+      activeTab = "TAB-A";
+      expect((await movesOf(() => h("click", { xy: [901, 500], quiet: true }))).moves).toHaveLength(1);
+      await h("click", { xy: [300, 300], fast: true, quiet: true }, "extension:42@7");
+      expect((await movesOf(() => h("click", { xy: [301, 300], quiet: true }, "extension:42"))).moves).toHaveLength(1);
+      failMove = 2;
+      const cut = await movesOf(() => h("click", { xy: [100, 100], quiet: true }));
+      expect(cut.r.ok).toBe(false);
+      expect((await movesOf(() => h("click", { xy: [Number(cut.moves[0]!.params["x"]), Number(cut.moves[0]!.params["y"])], quiet: true }))).moves.length).toBeGreaterThanOrEqual(4);
+    });
+  });
+
+  test("S5: document scroll moves resting pointer off nested scroller to pageScrollPoint", async () => {
+    await withNaturalOn(async () => {
+      const m = makeNaturalMock({ inView: false });
+      const h = createPageHelperHandler(m.invoke, undefined, undefined, { sleep: async () => {}, rng: createSeededRng(31), now: () => 0 });
+      await h("click", { xy: [80, 300], fast: true, quiet: true });
+      expect((await h("click", { ref: "e1", quiet: true })).ok).toBe(true);
+      const wheels = m.cdpCalls.filter((c) => c.params["type"] === "mouseWheel");
+      expect(wheels.length).toBeGreaterThanOrEqual(4);
+      for (const w of wheels) expect([w.params["x"], w.params["y"]]).toEqual([640, 400]);
+    });
+  });
 });
 
 describe("page-helpers v10 — point detail/noScroll, hitCheck, pageScrollPoint", () => {
