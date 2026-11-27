@@ -30,6 +30,9 @@ const NO_PAUSE_MAX = 340;
 // aggregate one (summed over every boundary) and the per-boundary bound is the ceiling only.
 const MIN_PAUSE = 160;
 const MIN_DWELL = 220;
+// The reading dwell's ceiling (src/natural.ts). The long fixture carries enough text that the uncapped
+// plan clears it at the lowest jitter roll, so its measured dwell is the cap and nothing else.
+const DWELL_CAP = 850;
 const THINK_SETTLE_CAP = 130;
 const THINK_FLOOR = MIN_PAUSE - THINK_SETTLE_CAP;
 const THINK_CEILING = 420;
@@ -59,6 +62,28 @@ const isKey = (e: Ev, id: string) => e[7] === id && (e[0] === "keydown" || e[0] 
 const fmt = (n: number) => Math.round(n);
 const between = (v: number, lo: number, hi: number, up = TOL) => v >= lo - TOL && v <= hi + up;
 const stepGap = (v: number) => between(v, 160, 420, TOL + STEP_START);
+// One tolerance for "the pause really reached the page": the next step resolves its target (locate,
+// guard, focus, pointer planning) after the pause and the page stamps its first event a few ms later,
+// so a measured dispatch gap may fall slightly short of the pause the runner planned. Every per-boundary
+// floor uses this single constant; the summed floor at the end is only a smoke check.
+const PAUSE_TOL = TOL;
+/** One planned think pause, as the runner traces it under BC_E2E_PACING_TRACE=1. */
+type ThinkPause = { after: number; planned: number; slept: number };
+/** Read the runner's test-only trace line (`# PACING {"think":[...]}`); undefined when absent. */
+const thinkPauses = (out: string): ThinkPause[] | undefined => {
+  if (!/^# PACING /m.test(out)) return undefined;
+  try {
+    const parsed = JSON.parse(out.split("\n").find((l) => l.startsWith("# PACING "))!.slice(9)) as { think?: ThinkPause[] };
+    return Array.isArray(parsed.think) ? parsed.think : undefined;
+  } catch {
+    return undefined;
+  }
+};
+/** A boundary is on plan when the runner paused there, inside the planner's 160-420 ms range. */
+const pauseOnPlan = (rows: ThinkPause[] | undefined, after: number[]) =>
+  rows !== undefined &&
+  rows.length === after.length &&
+  rows.every((r, i) => r.after === after[i] && r.planned >= MIN_PAUSE && r.planned <= THINK_CEILING);
 
 export async function runPacingCheck(
   bc: Bc,
@@ -88,9 +113,6 @@ export async function runPacingCheck(
   const allTrusted: Ev[] = [];
   const keep = (evs: Ev[]) => (allTrusted.push(...evs), evs);
   const timing: Record<string, { natural?: number; fast?: number }> = {};
-  /** Runs that set a value in the page: each emits one untrusted input+change pair (see check 6). */
-  let dateSets = 0;
-  let selectSets = 0;
 
   /** Gap from the last keystroke of each field to the first lead event of the next field. */
   const fieldGaps = (evs: Ev[], ids: string[]) =>
@@ -100,6 +122,18 @@ export async function runPacingCheck(
       const next = evs.find((e) => e[1] > lastT && LEAD.has(e[0]));
       return next ? next[1] - lastT : NaN;
     });
+  /**
+   * Untrusted echoes on one control in one run. `select` and `type` into a date field set the value in
+   * the page by design and emit exactly one input+change pair, so a per-control count on a run's own log
+   * cannot be cancelled by a duplicate in one run and a missing pair in another.
+   */
+  const echoPairs = (evs: Ev[], id: string) => {
+    const bad = evs.filter((e) => e[2] !== true && e[7] === id);
+    const count = (kind: string) => bad.filter((e) => e[0] === kind).length;
+    return { input: count("input"), change: count("change"), other: bad.length - count("input") - count("change") };
+  };
+  const oneEcho = (echo: ReturnType<typeof echoPairs>) => echo.input === 1 && echo.change === 1 && echo.other === 0;
+  const echoText = (echo: ReturnType<typeof echoPairs>) => `input=${echo.input} change=${echo.change} other=${echo.other}`;
   const dumpFile = process.env["BC_E2E_PACING_DUMP"];
   const dump = async (name: string, data: unknown) => {
     if (dumpFile) await Bun.write(`${dumpFile}.${name}.json`, JSON.stringify(data));
@@ -117,25 +151,28 @@ export async function runPacingCheck(
     await reset();
     const r = await timed(["fill", ...(fast ? ["--fast"] : []), fillArg]);
     const evs = keep(await events());
-    dateSets++; // one `type` into the date field per fill run
     await dump(`fill-${name}`, { out: r.out, evs });
     const values = await readBack();
     const submitted = await evalJson<number>("window.__submitted");
     const gaps = fieldGaps(evs, FIELDS.map((f) => f[1]));
     const lastInput = Math.max(...evs.filter((e) => ["keydown", "keyup", "input"].includes(e[0])).map((e) => e[1]));
-    return { r, evs, values, submitted, gaps, tail: r.end - lastInput, name };
+    // One `type` into the date field per run, so this run's log carries exactly one input+change pair.
+    const echo = echoPairs(evs, "start");
+    return { r, evs, values, submitted, gaps, tail: r.end - lastInput, name, echo, planned: thinkPauses(r.out) };
   };
   const fillN = await fillRun(false, "natural");
   const valuesOk = JSON.stringify(fillN.values) === JSON.stringify(EXPECTED);
   record("pacing-fill10-values", valuesOk && !/STOPPED|FAILED/.test(fillN.r.out), `${JSON.stringify(fillN.values)} ${fillN.r.out}`);
   record("pacing-fill10-gaps", fillN.gaps.every(stepGap), `gaps=${fillN.gaps.map(fmt).join(",")}`);
   record("pacing-fill10-no-submit", fillN.submitted === 0, `submitted=${fillN.submitted}`);
+  record("pacing-fill10-date-echo", oneEcho(fillN.echo), echoText(fillN.echo));
   timing["fill10"] = { natural: fillN.r.ms };
 
   const fillF = await fillRun(true, "fast");
   record("pacing-fill10-fast-values", JSON.stringify(fillF.values) === JSON.stringify(EXPECTED), JSON.stringify(fillF.values));
   record("pacing-fill10-fast-gaps", median(fillF.gaps) < NO_PAUSE_MAX, `gaps=${fillF.gaps.map(fmt).join(",")}`);
   record("pacing-fill10-fast-no-submit", fillF.submitted === 0, `submitted=${fillF.submitted}`);
+  record("pacing-fill10-fast-date-echo", oneEcho(fillF.echo), echoText(fillF.echo));
   // The tail after the last keystroke is settle + diff + wrapper exit in both modes; natural must add no pause.
   record("pacing-fill10-no-trailing-pause", fillN.tail <= fillF.tail + TOL + 100, `natural tail=${fmt(fillN.tail)} fast tail=${fmt(fillF.tail)}`);
   timing["fill10"]!.fast = fillF.r.ms;
@@ -153,6 +190,22 @@ export async function runPacingCheck(
   console.log(`NOTE pacing pause deltas fill10=${fillDeltas.map(fmt).join(",")}`);
   const gapList = (xs: number[]) => xs.map(fmt).join(",");
   record("pacing-fill10-pause-per-step", fillDeltas.length === 9 && fillDeltas.every(pauseDelta), `natural=${gapList(fillN.gaps)} fast=${gapList(fillF.gaps)}`);
+  // Per boundary, from the runner's own plan: the settled difference above can cancel to 0, so the floor is
+  // checked against the traced plan and the dispatch gap it produced. One boundary per pair of fields (1-9).
+  const fillBoundaries = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+  const fillPlanned = fillN.planned;
+  record(
+    "pacing-fill10-pause-plan",
+    pauseOnPlan(fillPlanned, fillBoundaries),
+    `planned=${JSON.stringify(fillPlanned)} range=${MIN_PAUSE}-${THINK_CEILING}ms`,
+  );
+  record(
+    "pacing-fill10-pause-dispatched",
+    fillPlanned !== undefined &&
+      fillPlanned.length === 9 &&
+      fillPlanned.every((p) => (fillN.gaps[p.after - 1] ?? NaN) >= p.planned - PAUSE_TOL),
+    `planned=${fillPlanned?.map((p) => p.planned).join(",")} gaps=${gapList(fillN.gaps)} tol=${PAUSE_TOL}ms`,
+  );
 
   // 2. do(5) with a wait step: pause between steps, none after `wait`, none after the last step.
   const steps = JSON.stringify([
@@ -167,7 +220,6 @@ export async function runPacingCheck(
     await reset();
     const r = await timed(["do", ...(fast ? ["--fast"] : []), steps]);
     const evs = keep(await events());
-    selectSets++; // one `select` step per do run
     await dump(`do-${fast ? "fast" : "natural"}`, { out: r.out, evs });
     const lastOf = (pred: (e: Ev) => boolean) => Math.max(...evs.filter(pred).map((e) => e[1]));
     const leadAfter = (t: number, prev: string) => evs.find((e) => e[1] > t && LEAD.has(e[0]) && !(e[0] === "focus" && e[7] === prev))?.[1] ?? NaN;
@@ -186,6 +238,9 @@ export async function runPacingCheck(
       gap45: (evs.find((e) => e[1] > s4End && e[7] === "country")?.[1] ?? NaN) - s4End,
       tail: r.end - Math.max(...evs.map((e) => e[1])),
       submitted: await evalJson<number>("window.__submitted"),
+      // One `select` step per run, so this run's own log carries exactly one input+change pair.
+      echo: echoPairs(evs, "country"),
+      planned: thinkPauses(r.out),
     };
   };
   const doN = await doRun(false);
@@ -206,9 +261,26 @@ export async function runPacingCheck(
   console.log(`NOTE pacing pause deltas do5 gap12=${fmt(doDeltas.gap12)} gap45=${fmt(doDeltas.gap45)} wait=${fmt(doDeltas.wait)}`);
   record("pacing-do5-pause-per-step", pauseDelta(doDeltas.gap12) && pauseDelta(doDeltas.gap45), `gap12=${fmt(doDeltas.gap12)} gap45=${fmt(doDeltas.gap45)}`);
   record("pacing-do5-wait-pause", pauseDelta(doDeltas.wait), `wait boundary delta=${fmt(doDeltas.wait)}`);
-  // The floors, over all 12 boundaries of the two batches: the summed deltas must carry the summed minimum
-  // pause and no boundary may exceed the plan's ceiling. Removing the pause drops the sum to ~0 (measured -6);
-  // the idle and loaded runs measured 1997 and 817.
+  record("pacing-do5-select-echo", oneEcho(doN.echo) && oneEcho(doF.echo), `natural ${echoText(doN.echo)} fast ${echoText(doF.echo)}`);
+  // Per boundary from the runner's plan: a pause after steps 1, 2 and 4, and none after `wait` (step 3) or
+  // the last step. The dispatch gap must carry each planned pause within one tolerance.
+  const doGaps: Record<number, number> = { 1: doN.gap12, 2: doN.gap24, 4: doN.gap45 };
+  const doPlanned = doN.planned;
+  record(
+    "pacing-do5-pause-plan",
+    pauseOnPlan(doPlanned, [1, 2, 4]),
+    `planned=${JSON.stringify(doPlanned)} range=${MIN_PAUSE}-${THINK_CEILING}ms`,
+  );
+  record(
+    "pacing-do5-pause-dispatched",
+    doPlanned !== undefined &&
+      doPlanned.length === 3 &&
+      doPlanned.every((p) => (doGaps[p.after] ?? NaN) >= p.planned - PAUSE_TOL),
+    `planned=${doPlanned?.map((p) => `${p.after}:${p.planned}`).join(",")} gaps=${[doN.gap12, doN.gap24, doN.gap45].map(fmt).join(",")} tol=${PAUSE_TOL}ms`,
+  );
+  // The per-boundary plan checks above are the floor; this aggregate is the smoke check that the pauses
+  // still add up over all 12 boundaries and that none exceeds the plan's ceiling. Removing the pause drops
+  // the sum to ~0 (measured -6); the idle and loaded runs measured 1997 and 817.
   const pauseSum = pauseDeltas.filter(Number.isFinite).reduce((a, b) => a + b, 0);
   const pauseFloor = pauseDeltas.length * THINK_FLOOR;
   console.log(`NOTE pacing pause sum=${fmt(pauseSum)} floor=${pauseFloor}`);
@@ -263,6 +335,10 @@ export async function runPacingCheck(
   // exit) and the next call's start-up adds about the same. Both ends are asserted, so a missing or
   // text-blind dwell fails the low end and an over-long one the high end. No TIMING entry here, because the
   // natural nav also reads the body length, so the two calls' durations do not isolate the dwell.
+  //
+  // The long fixture carries ~20k chars, so its uncapped plan is 1520-2250 ms and the 850 ms cap is what
+  // decides the number: at the lowest jitter (0.8) it is still over the cap. That makes the `long` bounds
+  // both the cap, so removing the clamp in src/natural.ts pushes the measured dwell past 910 and fails.
   const dwellRun = async (path: string, fast: boolean) => {
     const flag = fast ? ["--fast"] : [];
     const nav = await timed(["nav", ...flag, `${base}${path}`]);
@@ -275,11 +351,13 @@ export async function runPacingCheck(
   for (const [name, path] of [["short", "/pacing-short"], ["long", "/pacing-long"]] as const) {
     const slow = await dwellRun(path, false);
     const quick = await dwellRun(path, true);
-    const floor = clamp(220 + 0.08 * slow.chars * 0.8, 220, 850);
-    const ceiling = clamp(220 + 0.08 * slow.chars * 1.25, 220, 850);
+    const floor = clamp(220 + 0.08 * slow.chars * 0.8, 220, DWELL_CAP);
+    const ceiling = clamp(220 + 0.08 * slow.chars * 1.25, 220, DWELL_CAP);
     const seen = `chars=${slow.chars} planned=${fmt(floor)}-${fmt(ceiling)} natural=${fmt(slow.dwell)} fast=${fmt(quick.dwell)}`;
     console.log(`NOTE pacing dwell ${name} ${seen}`);
-    record(`pacing-nav-dwell-${name}`, between(slow.dwell, floor, ceiling), seen);
+    // The capped fixture must sit on the cap at both jitter ends, or its bounds would not test the clamp.
+    const capped = name !== "long" || (floor === DWELL_CAP && ceiling === DWELL_CAP);
+    record(`pacing-nav-dwell-${name}`, capped && between(slow.dwell, floor, ceiling), `cap=${DWELL_CAP} ${seen}`);
     record(`pacing-nav-dwell-${name}-fast`, quick.dwell < floor - TOL, `fast dwell=${fmt(quick.dwell)}ms, planned floor ${fmt(floor)}ms`);
   }
 
@@ -328,6 +406,7 @@ export async function runPacingCheck(
     await legacyClick("natural-off", []);
     const off = await fillRun(false, "off");
     record("pacing-natural-off-fill-gaps", median(off.gaps) < NO_PAUSE_MAX && off.submitted === 0, `gaps=${off.gaps.map(fmt).join(",")}`);
+    record("pacing-natural-off-date-echo", oneEcho(off.echo), echoText(off.echo));
     const nc = await navClick(false);
     const first = nc.evs.find((e) => e[0] !== "scroll")?.[1] ?? NaN;
     record("pacing-natural-off-no-dwell", first - nc.nav.end < 220 - TOL, `first input ${fmt(first - nc.nav.end)}ms after nav returned`);
@@ -397,15 +476,17 @@ export async function runPacingCheck(
   }
 
   // 6. Every event these commands dispatch is trusted input, with one exception: `select` and `type` into a
-  // date field set the value in the page by design, so each such run emits exactly one untrusted input+change
-  // pair on that control. Any other untrusted event, or a second echo, fails.
-  const expected: Record<string, number> = { "input:country": selectSets, "change:country": selectSets, "input:start": dateSets, "change:start": dateSets };
+  // date field set the value in the page by design, and each such step emits exactly one untrusted
+  // input+change pair on that control. The exact counts are checked on each run's own log above
+  // (pacing-*-date-echo, pacing-do5-select-echo), so a duplicate in one run cannot cancel a missing pair in
+  // another. What is left for the summed log is that no other untrusted event happened anywhere.
+  const allowed = new Set(["input:country", "change:country", "input:start", "change:start"]);
   const counted: Record<string, number> = {};
   for (const e of allTrusted) if (e[2] !== true) counted[`${e[0]}:${e[7]}`] = (counted[`${e[0]}:${e[7]}`] ?? 0) + 1;
-  const diff = [...new Set([...Object.keys(counted), ...Object.keys(expected)])].filter((k) => (counted[k] ?? 0) !== (expected[k] ?? 0));
+  const diff = Object.keys(counted).filter((k) => !allowed.has(k));
   console.log(`NOTE pacing: untrusted echoes ${JSON.stringify(counted)}`);
   record("pacing-all-trusted", allTrusted.length > 0 && diff.length === 0,
-    `${allTrusted.length} events; untrusted=${JSON.stringify(counted)} expected=${JSON.stringify(expected)} diff=${diff.join(",")}`);
+    `${allTrusted.length} events; untrusted=${JSON.stringify(counted)} unexpected=${diff.join(",")}`);
 
   // 8. A challenge page stops fill/do before a field is set, a button is pressed, or the form submits.
   type Wall = { v: string; submitted: number; pressed: number; typed: number };

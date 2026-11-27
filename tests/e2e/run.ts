@@ -217,6 +217,9 @@ async function main(): Promise<number> {
     XDG_CONFIG_HOME: xdg,
     BROWSER_CONTROL_BACKENDS: "extension",
     BROWSER_CONTROL_DAEMON_DIR: daemonDir,
+    // The pacing check reads each planned think pause from the `do` output; without this the daemon adds no
+    // trace line, so callers see the same output as always.
+    BC_E2E_PACING_TRACE: "1",
     [RELAY_PORTS_ENV]: `${relayPort}-${relayPort}`,
   };
 

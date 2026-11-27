@@ -57,7 +57,7 @@ import {
   planPaginationGap,
   planPointerPath,
   planTextScrollStep,
-  planThinkPause,
+  planThinkPauseDetail,
   planWheelScroll,
   type Box2D,
   type Point2D,
@@ -106,6 +106,11 @@ const CHALLENGE_PROBE_RESERVE_MS = 250;
 /** Before step 1: at most two probe tries inside this budget; past it the page state stays unknown. */
 const PRE_STEP_PROBE_TRIES = 2;
 const PRE_STEP_PROBE_BUDGET_MS = 1_500;
+/**
+ * Each try gets its own share of the budget, so a first try that times out cannot eat the retry: the
+ * probe's own timeout is wall-clock, so the whole budget on try one left nothing for try two.
+ */
+const PRE_STEP_PROBE_ATTEMPT_MS = 700;
 const CHALLENGE_PROBE_SEP = "\n__BC_CHALLENGE_SEP__\n";
 const CHALLENGE_PROBE_EXPR = buildChallengeProbeExpression(false);
 const FAST_VENDOR_CSS = fastVendorSelectors.join(",");
@@ -144,16 +149,27 @@ type ProbeReadResult =
   | { kind: "probe"; probe: ChallengeProbe }
   | { kind: "error" };
 
-/** Parse a readback of {@link CHALLENGE_PROBE_EXPR}: `{skip,url}` or `{skip:false,probe}`, else "skip". */
-function parseProbeReadback(raw: string): ProbeReadResult {
-  if (!raw || !raw.startsWith("{")) return { kind: "skip" };
+/**
+ * Parse a readback of {@link CHALLENGE_PROBE_EXPR}: `{skip,url}` or `{skip:false,probe}`, else "skip".
+ * `strict` is for the pre-step guard: there a readback that cannot be parsed, or that arrives without the
+ * URL the classifier and the host boundary both need, is incomplete, so it reads as "error" (unknown) and
+ * never as "skip" (clear).
+ */
+function parseProbeReadback(raw: string, strict = false): ProbeReadResult {
+  const bad = (): ProbeReadResult => (strict ? { kind: "error" } : { kind: "skip" });
+  if (!raw || !raw.startsWith("{")) return bad();
   try {
     const parsed = JSON.parse(raw) as { skip?: boolean; url?: string; probe?: ChallengeProbe };
-    if (parsed.skip) return { kind: "skip", url: typeof parsed.url === "string" ? parsed.url : undefined };
-    if (parsed.probe && typeof parsed.probe === "object") return { kind: "probe", probe: parsed.probe };
-    return { kind: "skip" };
+    if (parsed.skip === true) {
+      return typeof parsed.url === "string" && parsed.url !== "" ? { kind: "skip", url: parsed.url } : bad();
+    }
+    if (parsed.probe && typeof parsed.probe === "object") {
+      if (strict && !(typeof parsed.probe.url === "string" && parsed.probe.url !== "")) return { kind: "error" };
+      return { kind: "probe", probe: parsed.probe };
+    }
+    return bad();
   } catch {
-    return { kind: "skip" };
+    return bad();
   }
 }
 
@@ -2481,6 +2497,7 @@ export function createPageHelperHandler(
     targetId: string | undefined,
     timeoutMs = 4_000,
     deadline?: number,
+    strict = false,
   ): Promise<ProbeReadResult> {
     const budget = deadline !== undefined ? Math.min(timeoutMs, deadline - Date.now()) : timeoutMs;
     if (budget <= 0) return { kind: "error" };
@@ -2495,7 +2512,7 @@ export function createPageHelperHandler(
       failure("EXECUTION_FAILED", "CHALLENGE_PROBE_TIMEOUT"),
     );
     if (!res.ok) return { kind: "error" };
-    return parseProbeReadback(valueOf(res));
+    return parseProbeReadback(valueOf(res), strict);
   }
 
   /**
@@ -2503,7 +2520,12 @@ export function createPageHelperHandler(
    * `eval` tool is read-only and already the route for `evaluate` on these tabs, so the self-contained
    * probe expression runs there unchanged and feeds the same classifier.
    */
-  async function readChallengeProbeBrowse(browseTab: number, timeoutMs = 4_000, deadline?: number): Promise<ProbeReadResult> {
+  async function readChallengeProbeBrowse(
+    browseTab: number,
+    timeoutMs = 4_000,
+    deadline?: number,
+    strict = false,
+  ): Promise<ProbeReadResult> {
     const budget = deadline !== undefined ? Math.min(timeoutMs, deadline - Date.now()) : timeoutMs;
     if (budget <= 0) return { kind: "error" };
     const res = await raceDeadline(
@@ -2512,7 +2534,7 @@ export function createPageHelperHandler(
       failure("EXECUTION_FAILED", "CHALLENGE_PROBE_TIMEOUT"),
     );
     if (!res.ok) return { kind: "error" };
-    return parseProbeReadback(valueOf(res));
+    return parseProbeReadback(valueOf(res), strict);
   }
 
   /**
@@ -2524,14 +2546,16 @@ export function createPageHelperHandler(
    */
   async function readChallengeProbe(
     targetId: string | undefined,
-    opts: { wallHint?: string; reprobe?: boolean; deadline?: number } = {},
+    opts: { wallHint?: string; reprobe?: boolean; deadline?: number; strict?: boolean } = {},
   ): Promise<ProbeReadResult> {
     const remaining = (cap: number): number =>
       opts.deadline !== undefined ? Math.min(cap, opts.deadline - Date.now()) : cap;
 
     // browse tabs have no `__bc` helper; their read-only `eval` runs the same self-contained probe.
     const browseTab = browseTabNumber(targetId);
-    if (browseTab !== undefined) return readChallengeProbeBrowse(browseTab, opts.reprobe ? 1_500 : 4_000, opts.deadline);
+    if (browseTab !== undefined) {
+      return readChallengeProbeBrowse(browseTab, opts.reprobe ? 1_500 : 4_000, opts.deadline, opts.strict);
+    }
 
     if (extensionTabOf(targetId) !== undefined) {
       const baseTimeout = opts.reprobe ? 1_500 : 4_000;
@@ -2555,11 +2579,14 @@ export function createPageHelperHandler(
         failure("EXECUTION_FAILED", "CHALLENGE_PROBE_TIMEOUT"),
       );
       if (!quick.ok) {
-        return opts.reprobe ? readChallengeProbeCdp(targetId, baseTimeout, opts.deadline) : { kind: "error" };
+        return opts.reprobe ? readChallengeProbeCdp(targetId, baseTimeout, opts.deadline, opts.strict) : { kind: "error" };
       }
       const rawQuick = valueOf(quick);
-      if (!rawQuick.includes(CHALLENGE_PROBE_SEP)) return { kind: "skip" };
-      const [url = "", title = "", rawText = "", rawVendor = ""] = rawQuick.split(CHALLENGE_PROBE_SEP);
+      if (!rawQuick.includes(CHALLENGE_PROBE_SEP)) return opts.strict === true ? { kind: "error" } : { kind: "skip" };
+      const quickParts = rawQuick.split(CHALLENGE_PROBE_SEP);
+      // A readback missing one of the four fields is incomplete, not a safe page: in strict mode it is unknown.
+      if (opts.strict === true && quickParts.length !== 4) return { kind: "error" };
+      const [url = "", title = "", rawText = "", rawVendor = ""] = quickParts;
       const { text, textLength } = parseBcTextForProbe(rawText);
       const hasVendor = parseBcQueryRows(rawVendor).length > 0;
       const suspicious =
@@ -2599,9 +2626,11 @@ export function createPageHelperHandler(
         opts.deadline,
         failure("EXECUTION_FAILED", "CHALLENGE_PROBE_TIMEOUT"),
       );
-      const [rawFrames = "", rawScripts = "", rawSel = "", rawVis = "", rawAws = ""] = markers.ok
-        ? valueOf(markers).split(CHALLENGE_PROBE_SEP)
-        : [];
+      const markerParts = markers.ok ? valueOf(markers).split(CHALLENGE_PROBE_SEP) : [];
+      // Five steps join into five fields. A failed or short marker read leaves every marker list empty,
+      // which is exactly what a normal page looks like, so strict mode calls it an error, never a clear.
+      if (opts.strict === true && markerParts.length !== 5) return { kind: "error" };
+      const [rawFrames = "", rawScripts = "", rawSel = "", rawVis = "", rawAws = ""] = markerParts;
       const frameUrls = parseBcQueryRows(rawFrames).map((r) => r["src"]).filter((s): s is string => Boolean(s));
       const scriptSrcs = parseBcQueryRows(rawScripts).map((r) => r["src"]).filter((s): s is string => Boolean(s));
       const hasAws = parseBcQueryRows(rawAws).length > 0;
@@ -2645,7 +2674,7 @@ export function createPageHelperHandler(
       return { kind: "probe", probe };
     }
 
-    return readChallengeProbeCdp(targetId, opts.reprobe ? 1_500 : 4_000, opts.deadline);
+    return readChallengeProbeCdp(targetId, opts.reprobe ? 1_500 : 4_000, opts.deadline, opts.strict);
   }
 
   /**
@@ -2658,9 +2687,10 @@ export function createPageHelperHandler(
     targetId: string | undefined,
     opts: { wallHint?: string; knownUrl?: string; unknownOnError?: boolean; deadline?: number } = {},
   ): Promise<ChallengeCheckResult> {
-    const first = await readChallengeProbe(targetId, { wallHint: opts.wallHint, deadline: opts.deadline });
+    const strict = opts.unknownOnError === true;
+    const first = await readChallengeProbe(targetId, { wallHint: opts.wallHint, deadline: opts.deadline, strict });
     if (first.kind !== "probe") {
-      if (first.kind === "error" && opts.unknownOnError === true) {
+      if (first.kind === "error" && strict) {
         return { status: "unknown", waited: false, url: opts.knownUrl };
       }
       return { status: "clear", waited: false, url: first.kind === "skip" ? first.url : opts.knownUrl };
@@ -2690,8 +2720,13 @@ export function createPageHelperHandler(
       await pause(step);
       waitedMs += step;
       if (deadline - Date.now() <= 0) break;
-      const next = await readChallengeProbe(targetId, { reprobe: true, deadline });
-      if (next.kind === "error") continue;
+      const next = await readChallengeProbe(targetId, { reprobe: true, deadline, strict });
+      if (next.kind === "error") {
+        // Strict reads must not poll past a page they cannot read: the deadline would end in
+        // non-interactive-timeout, which reports a challenge that was never seen.
+        if (strict) return { status: "unknown", waited: false, url: opts.knownUrl };
+        continue;
+      }
       if (next.kind === "skip") {
         return { status: "clear", waited: true, url: next.url || opts.knownUrl };
       }
@@ -2721,7 +2756,8 @@ export function createPageHelperHandler(
   /**
    * The pre-step-1 challenge guard. A probe error there is not "clear": step 1 must not run on a page
    * whose state could not be read. Two tries inside a short budget, then it stays unknown. The budget is
-   * wall-clock, like the probe's own deadline (the probe reads use `Date.now()` for their timeouts).
+   * wall-clock, like the probe's own deadline (the probe reads use `Date.now()` for their timeouts), and
+   * each try is capped to its own share so a timing-out first try always leaves the second one time to run.
    */
   async function probeChallengeBeforeStep1(
     targetId: string | undefined,
@@ -2731,7 +2767,8 @@ export function createPageHelperHandler(
     const deadline = Date.now() + PRE_STEP_PROBE_BUDGET_MS;
     let result: ChallengeCheckResult = { status: "unknown", waited: false, url: knownUrl };
     for (let attempt = 0; attempt < PRE_STEP_PROBE_TRIES; attempt++) {
-      result = await checkChallenge(targetId, { wallHint, knownUrl, unknownOnError: true, deadline });
+      const attemptDeadline = Math.min(deadline, Date.now() + PRE_STEP_PROBE_ATTEMPT_MS);
+      result = await checkChallenge(targetId, { wallHint, knownUrl, unknownOnError: true, deadline: attemptDeadline });
       if (result.status !== "unknown" || Date.now() >= deadline) break;
     }
     return result;
@@ -2741,8 +2778,11 @@ export function createPageHelperHandler(
     const resolved = await resolveTargetBackend(rawTargetId);
     const { browseTab, extensionTarget, cdpTarget } = resolved;
     // Pin the concrete tab so pacing keys, pointer state and frame maps never share an empty key
-    // across tabs when the caller omits a target.
-    const targetId = rawTargetId ?? extensionTarget ?? cdpTarget;
+    // across tabs when the caller omits a target. A browse batch resolves only a tab number, so pin
+    // `browse:<n>`: the guard and every probe route by target id, and an empty id sent them to the CDP
+    // backend instead of the browse tab they were about to act on.
+    const targetId =
+      rawTargetId ?? extensionTarget ?? cdpTarget ?? (browseTab !== undefined ? `browse:${browseTab}` : undefined);
 
     const quiet = input["quiet"] === true;
 
@@ -2882,6 +2922,10 @@ export function createPageHelperHandler(
         let challengeReport: string | undefined;
         const challengeBackend = challengeBackendOf(targetId);
         const naturalPacing = isNatural(input);
+        // Test-only trace: the e2e compares each planned pause to the dispatch gap it produced. Off unless
+        // BC_E2E_PACING_TRACE=1, so no caller's output changes.
+        const pacingTrace: Array<{ after: number; planned: number; slept: number }> | undefined =
+          process.env["BC_E2E_PACING_TRACE"] === "1" ? [] : undefined;
         // Nothing looks at the page until a step has run, so a batch would act on a challenge page before the
         // post-step check could see it. Probe up front on the same terms as that check: a wall, a challenge, a
         // page that could not be read, or a redirect off the start host stops the batch with every step unrun.
@@ -2927,6 +2971,10 @@ export function createPageHelperHandler(
               if (after.url) prevUrl = after.url;
               else if (challenge.url) prevUrl = challenge.url;
               preWall = after.wall;
+            } else if (challenge.url) {
+              // Nothing newer was read, so the probe's own URL is the freshest: a redirect during the
+              // first probe would otherwise leave the boundary comparing the URL from before it.
+              prevUrl = challenge.url;
             }
             // A captcha or rate-limit wall the probe could not classify still stops the batch unrun.
             if (preWall === "captcha" || preWall === "rate-limit") {
@@ -3033,8 +3081,9 @@ export function createPageHelperHandler(
           }
           // Think pause before the next step: skip after `wait` (already idle) and on a fast step.
           if (naturalPacing && !isLastStep && !step.fast && step.action !== "wait") {
-            const thinkMs = planThinkPause(rng, now() - settleStartedAt);
-            if (thinkMs > 0) await pause(thinkMs);
+            const { want, sleepMs } = planThinkPauseDetail(rng, now() - settleStartedAt);
+            if (sleepMs > 0) await pause(sleepMs);
+            pacingTrace?.push({ after: i + 1, planned: want, slept: sleepMs });
           }
         }
         if (stopped) out.push(`# STOPPED: ${stopped}. ${steps.length - out.length} step(s) not run.`);
@@ -3050,6 +3099,7 @@ export function createPageHelperHandler(
           }
         }
         if (challengeReport) out.unshift(challengeReport);
+        if (pacingTrace) out.push(`# PACING ${JSON.stringify({ think: pacingTrace })}`);
         return stopped ? failure("EXECUTION_FAILED", out.join("\n")) : success(out.join("\n"));
       }
 

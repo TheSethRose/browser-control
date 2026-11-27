@@ -154,7 +154,7 @@ type FakeExtPage = {
  * Fake extension harness: serves `bcCall` silently and records any `invoke("evaluate")` calls
  * so tests can prove normal pages never attach the debugger on extension tabs.
  */
-function makeExtensionHarness(pages: FakeExtPage[], targetId = "extension:42") {
+function makeExtensionHarness(pages: FakeExtPage[], targetId = "extension:42", harnessOpts: { failMarkers?: boolean } = {}) {
   const bcCalls: BcCallInput[] = [];
   const evalCalls: Call[] = [];
   const sleeps: number[] = [];
@@ -187,6 +187,7 @@ function makeExtensionHarness(pages: FakeExtPage[], targetId = "extension:42") {
           const opts = (step.args?.[0] ?? {}) as { selector?: string; all?: boolean };
           const sel = String(opts.selector ?? "");
           if (sel === "iframe[src]") {
+            if (harnessOpts.failMarkers === true) throw new Error("RELAY: marker read failed");
             return formatRows(sel, (p.frames ?? []).map((src) => ({ src })));
           }
           if (sel === "script[src]") {
@@ -663,6 +664,21 @@ describe("bot-challenge wiring: extension tabs (silent bc_call tier)", () => {
     expect(extBlock.sleeps).toHaveLength(0);
     expect(extBlock.evalCalls).toHaveLength(0);
     expect(textOf(rBlock)).toStartWith("BLOCKED: cloudflare ");
+  });
+
+  test("an extension marker read that comes back incomplete is unknown before step 1, not clear", async () => {
+    // A short page is suspicious, so the probe reads its markers; a truncated marker readback used to
+    // leave every marker list empty, which classifies as a clear page.
+    const ext = makeExtensionHarness(
+      [{ url: "https://a.test/next", title: "Next", bodyText: "Next" }],
+      "extension:42",
+      { failMarkers: true },
+    );
+    const res = await ext.handle("do", { steps: [{ key: "Tab" }], quiet: true }, "extension:42");
+    expect(res.ok).toBe(false);
+    expect(textOf(res)).toContain("# STOPPED: page state unknown before step 1");
+    expect(textOf(res)).toContain("1 step(s) not run");
+    expect(ext.evalCalls).toHaveLength(0); // the strict read never attaches the debugger
   });
 });
 
