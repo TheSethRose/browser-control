@@ -2583,7 +2583,7 @@ export function createPageHelperHandler(
               const note = !closed.ok
                 ? `may still be open (closing it could not be confirmed): ${messageOf(closed)}`
                 : (closed.data as Json | undefined)?.["closed"] === false
-                  ? "is still open"
+                  ? "may still be open (closing it could not be confirmed)"
                   : undefined;
               if (note !== undefined) {
                 return failure(

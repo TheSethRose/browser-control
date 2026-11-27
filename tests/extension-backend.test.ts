@@ -2454,10 +2454,10 @@ describe("relay handshake tracking, fix lines, and timeout", () => {
       }
       expect(closedTabIds).toEqual([91, 92]);
 
-      // 6. Cleanup reports closed:false -> the error says the tab is still open.
+      // 6. Cleanup reports closed:false (tab may already be gone) -> the error says it may still be open.
       const notClosedRes = await handlePage("nav", { url: "chrome://gpu", newWindow: true });
       expect(notClosedRes.ok).toBe(false);
-      if (!notClosedRes.ok) expect(notClosedRes.error.message).toContain("The tab this nav opened (extension:94) is still open.");
+      if (!notClosedRes.ok) expect(notClosedRes.error.message).toContain("The tab this nav opened (extension:94) may still be open (closing it could not be confirmed).");
       expect(cdpLog).toEqual([]);
     } finally {
       if (savedBackends === undefined) delete process.env["BROWSER_CONTROL_BACKENDS"];
