@@ -238,7 +238,7 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
       case "close":
         return text(
           await invoke("close_target", targetId ? { targetId } : {}),
-          (data) => `closed ${data.targetId ?? ""}`.trim(),
+          (data) => (data.closed === false ? `not closed ${data.targetId ?? ""}` : `closed ${data.targetId ?? ""}`).trim(),
           false,
         );
       case "nav": {

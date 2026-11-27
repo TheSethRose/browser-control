@@ -189,6 +189,7 @@ type MockConnectOpts = {
   chunkedResponses?: boolean;
   maxChunkDataBytes?: number;
   manualRequests?: boolean;
+  features?: string[];
 };
 
 async function connectMockExtension(
@@ -219,6 +220,7 @@ async function connectMockExtension(
       version: "2.0.0",
       helpersVersion: PAGE_HELPERS_VERSION,
       protocolVersion: PROTOCOL_VERSION,
+      features: opts.features ?? ["agent_close"],
       nonce: extNonce,
     }),
   );
@@ -2435,6 +2437,27 @@ describe("relay handshake tracking, fix lines, and timeout", () => {
       if (savedBackends === undefined) delete process.env["BROWSER_CONTROL_BACKENDS"];
       else process.env["BROWSER_CONTROL_BACKENDS"] = savedBackends;
     }
+  });
+
+  test("F3: close_target refuses an extension whose hello lacks agent_close and never sends close_tab", async () => {
+    const token = randomBytes(32).toString("hex");
+    const backend = createExtensionBackend({ ...allocPortWindow(), token, waitConnectMs: 1_000 });
+    disposables.push(backend);
+    await backend.start!();
+    const sent: string[] = [];
+    await connectMockExtension(
+      backend.getPort()!,
+      token,
+      (op) => {
+        sent.push(op);
+        return { ok: true };
+      },
+      { features: [] },
+    );
+    const ops = route(fakeCdp([]), [backend], () => ["extension"]);
+    const err = await Promise.resolve(ops["close_target"]!({ targetId: "extension:10" })).catch((e: unknown) => e);
+    expect(String((err as Error).message ?? err)).toContain("too old to close tabs safely");
+    expect(sent).not.toContain("close_tab");
   });
 
   test("F3: close_target closes active or explicit agent tab, clears activeTargetId, and surfaces REFUSED without CDP fallback", async () => {

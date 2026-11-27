@@ -554,7 +554,10 @@ export async function closeTab(tabId) {
   if (!agentTabs.has(tabId)) {
     throw new Error(`REFUSED: tab ${tabId} wasn't opened by Browser Control. Browser Control only closes tabs it opened.`);
   }
-  const res = await closeTabInternal(tabId);
+  const res = await closeTabInternal(tabId, { onlyIf: () => agentTabs.has(tabId) });
+  if (res?.closed === false && !agentTabs.has(tabId)) {
+    throw new Error(`REFUSED: tab ${tabId} wasn't opened by Browser Control. Browser Control only closes tabs it opened.`);
+  }
   return { ok: true, closed: res?.closed !== false };
 }
 
@@ -1434,6 +1437,7 @@ async function openRelaySocket(port, versionInfo) {
       version: extVersion,
       helpersVersion: PAGE_HELPERS_VERSION,
       protocolVersion: PROTOCOL_VERSION,
+      features: ["agent_close"],
       nonce: extNonce,
     });
   });

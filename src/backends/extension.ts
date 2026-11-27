@@ -856,6 +856,7 @@ type WsState = {
   browser?: string;
   extensionVersion?: string;
   helpersVersion?: number;
+  agentClose?: boolean;
   slug?: string;
 };
 
@@ -870,6 +871,8 @@ type BrowserLink = {
   slug: string;
   browser: string;
   extensionVersion: string;
+  // Hello listed "agent_close": close_tab only closes tabs the extension opened.
+  agentClose: boolean;
   ws: ServerWebSocket<WsState>;
   outbound: OutboundFrameQueue;
   pending: Map<number, PendingReq>;
@@ -1331,6 +1334,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
       slug,
       browser,
       extensionVersion: data.extensionVersion ?? "",
+      agentClose: data.agentClose === true,
       ws,
       outbound: new OutboundFrameQueue(ws, options.backpressureLimit),
       pending,
@@ -1472,6 +1476,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
       data.browser = browser;
       data.extensionVersion = version;
       data.helpersVersion = helpersVersion;
+      data.agentClose = Array.isArray(msg["features"]) && (msg["features"] as unknown[]).includes("agent_close");
       data.stage = "awaiting_response";
       data.handshake.stage = "challenge_sent";
       data.handshake.timestamp = now();
@@ -1925,6 +1930,11 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
           const resolved = resolveTarget(input["targetId"]);
           if (!resolved) throw new BackendUnavailable(NAME, "no extension tab selected");
           const targetId = formatTargetId(resolved.link, resolved.tabId);
+          if (!resolved.link.agentClose) {
+            throw new Error(
+              "REFUSED: this Browser Control extension is too old to close tabs safely. Reload Browser Control at chrome://extensions, then try again.",
+            );
+          }
           const res = (await requestOnLink(
             resolved.link,
             "close_tab",
