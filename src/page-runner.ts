@@ -11,7 +11,7 @@ import { existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { runBrowse, type Runner } from "./backends/browse";
 import { backendOrder } from "./backends/router";
-import { extensionTabOf, getRegisteredExtensionBcCall, type BcCallFn } from "./backends/extension";
+import { extensionFrameTarget, extensionTabOf, getRegisteredExtensionBcCall, type BcCallFn } from "./backends/extension";
 import { inspectIssues, inspectPerf, inspectStyles } from "./devtools";
 import {
   buildFlow,
@@ -482,7 +482,13 @@ export function createPageHelperHandler(
       return { ok: true, loc };
     }
     const found = await evalHelper({ kind: "bc", method: "locate", args: [loc.label, kind] }, targetId);
-    if (!found.ok) return { ok: false, res: found };
+    if (!found.ok) {
+      if (messageOf(found).includes("NO_MATCH:")) {
+        const hit = await locateInFrames("locate", [loc.label, kind], targetId);
+        if (hit) return { ok: true, loc: { kind: "frame", frame: hit.frame, ref: hit.ref } };
+      }
+      return { ok: false, res: found };
+    }
     return { ok: true, loc: { kind: "dom", ref: valueOf(found) } };
   }
 
@@ -666,7 +672,32 @@ export function createPageHelperHandler(
   const inputFailed = (res: InvokeResult, what: string): InvokeResult =>
     messageOf(res).startsWith("CDP_TIMEOUT") ? success(`${what}: delivered_unverified (${DIALOG_HINT})`) : res;
 
-  async function snapFrames(opts: Json, targetId?: string): Promise<string[]> {
+  /** Targets that can run helpers inside a child frame: OOPIF targets on CDP, frame ids on extension tabs. */
+  async function frameTargetPool(targetId?: string): Promise<Array<{ targetId: string; url: string }>> {
+    if (extensionTabOf(targetId) !== undefined) {
+      const extRequest =
+        options.extensionRequest ??
+        ((globalThis as Record<symbol, unknown>)[EXTENSION_REQUEST_SYMBOL] as ExtensionRequestFn | undefined);
+      if (!extRequest) return [];
+      try {
+        const res = (await extRequest("list_frames", { targetId })) as
+          | { frames?: Array<{ frameId: number; url: string }> }
+          | undefined;
+        return (res?.frames ?? [])
+          .filter((fr) => typeof fr.frameId === "number" && fr.frameId !== 0)
+          .map((fr) => ({ targetId: extensionFrameTarget(targetId!, fr.frameId), url: fr.url }));
+      } catch {
+        return [];
+      }
+    }
+    const targets = await invoke("list_targets", { types: ["iframe"] });
+    return targets.ok ? [...(((targets.data as Json)["targets"] as Array<{ targetId: string; url: string }>) ?? [])] : [];
+  }
+
+  /** The top page's cross-origin iframes (first 8), each matched to a helper target when one is reachable. */
+  async function crossFrames(
+    targetId?: string,
+  ): Promise<Array<{ i: number; src: string; title: string; target?: string }>> {
     const listed = await evalHelper({ kind: "bc", method: "frames" }, targetId);
     if (!listed.ok) return [];
     let frames: Array<{ i: number; src: string; title: string }>;
@@ -676,8 +707,7 @@ export function createPageHelperHandler(
       return [];
     }
     if (frames.length === 0) return [];
-    const targets = await invoke("list_targets", { types: ["iframe"] });
-    const pool = targets.ok ? [...(((targets.data as Json)["targets"] as Array<{ targetId: string; url: string }>) ?? [])] : [];
+    const pool = await frameTargetPool(targetId);
     const path = (u: string) => {
       try {
         const p = new URL(u);
@@ -697,27 +727,56 @@ export function createPageHelperHandler(
       const at = pool.findIndex(test);
       return at === -1 ? undefined : pool.splice(at, 1)[0];
     };
-    const ids: string[] = [];
-    const out: string[] = [];
-    for (const f of frames.slice(0, 8)) {
+    return frames.slice(0, 8).map((f) => {
       const t = take((x) => x.url === f.src) ?? take((x) => path(x.url) === path(f.src)) ?? take((x) => origin(x.url) === origin(f.src));
+      return { ...f, ...(t ? { target: t.targetId } : {}) };
+    });
+  }
+
+  /** Record which target serves each `f<n>` frame ref for this tab. */
+  function rememberFrames(frames: Array<{ i: number; target?: string }>, targetId?: string): void {
+    const ids: string[] = [];
+    for (const f of frames) ids[f.i - 1] = f.target ?? "";
+    frameTargets.set(targetId ?? "", ids);
+  }
+
+  /** Run a label lookup helper inside each reachable cross-origin iframe; first hit wins. */
+  async function locateInFrames(
+    method: "locate" | "locateFile",
+    args: string[],
+    targetId?: string,
+  ): Promise<{ frame: number; ref: string } | undefined> {
+    const frames = await crossFrames(targetId);
+    if (frames.length === 0) return undefined;
+    rememberFrames(frames, targetId);
+    for (const f of frames) {
+      if (!f.target) continue;
+      const hit = await evalHelper({ kind: "bc", method, args }, f.target, 5_000);
+      if (hit.ok && /^e\d+$/.test(valueOf(hit))) return { frame: f.i, ref: valueOf(hit) };
+    }
+    return undefined;
+  }
+
+  async function snapFrames(opts: Json, targetId?: string): Promise<string[]> {
+    const frames = await crossFrames(targetId);
+    if (frames.length === 0) return [];
+    const out: string[] = [];
+    for (const f of frames) {
       const label = `f${f.i}${f.title ? ` "${f.title}"` : ""} ${hostOf(f.src)}`;
-      if (!t) {
-        ids[f.i - 1] = "";
+      if (!f.target) {
         out.push(`# iframe ${label}: not reachable; click by coordinates (click --xy) or see references/dom-and-input.md`);
         continue;
       }
-      ids[f.i - 1] = t.targetId;
       const inner = await evalHelper(
         { kind: "bc", method: "snapshot", args: [{ all: opts["all"] === true, find: opts["find"] }] },
-        t.targetId,
+        f.target,
         5_000,
       );
       const lines = inner.ok ? valueOf(inner).split("\n").filter((l) => l.startsWith("- ")) : [];
       out.push(`# iframe ${label}: ${lines.length} control(s)`);
       out.push(...lines.map((l) => l.replace(/\[e(\d+)\]/, `[f${f.i}:e$1]`)));
     }
-    frameTargets.set(targetId ?? "", ids);
+    rememberFrames(frames, targetId);
     return out;
   }
 
@@ -1161,7 +1220,8 @@ export function createPageHelperHandler(
           return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: a file input ref, label, or CSS selector is required");
         }
         const frame = /^@?f([0-9]+):(e[0-9]+)$/.exec(refInput);
-        const fieldTarget = frame ? frameTarget(Number(frame[1]), targetId) : targetId;
+        let fileFrame = frame ? Number(frame[1]) : undefined;
+        let fieldTarget = frame ? frameTarget(Number(frame[1]), targetId) : targetId;
         if (frame && !fieldTarget) {
           return failure("EXECUTION_FAILED", `STALE_REF: iframe f${frame[1]} is not known for this tab. Run snap again.`);
         }
@@ -1170,8 +1230,18 @@ export function createPageHelperHandler(
           { kind: "bc", method: "locateFile", args: [frame ? frame[2]! : refInput] },
           fieldTarget,
         );
-        if (!located.ok) return located;
-        const fileRef = valueOf(located);
+        let fileRef: string;
+        if (located.ok) {
+          fileRef = valueOf(located);
+        } else {
+          const hit = !frame && messageOf(located).includes("NO_MATCH:")
+            ? await locateInFrames("locateFile", [refInput], targetId)
+            : undefined;
+          if (!hit) return located;
+          fileRef = hit.ref;
+          fileFrame = hit.frame;
+          fieldTarget = frameTarget(hit.frame, targetId);
+        }
         const objRes = await resolveObject({ kind: "bc", method: "el", args: [fileRef] }, fieldTarget);
         if (!objRes.ok) return objRes.res;
         try {
@@ -1180,7 +1250,7 @@ export function createPageHelperHandler(
         } finally {
           await cdp("Runtime.releaseObject", { objectId: objRes.objectId }, fieldTarget).catch(() => {});
         }
-        const label = frame ? `f${frame[1]}:${fileRef}` : fileRef;
+        const label = fileFrame !== undefined ? `f${fileFrame}:${fileRef}` : fileRef;
         return withChanges(`upload ${label} <- ${filePath}: delivered`, before?.ok ? valueOf(before) : undefined, quiet, targetId);
       }
 

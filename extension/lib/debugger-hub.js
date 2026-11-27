@@ -96,6 +96,8 @@ export function createDebuggerHub({
       postAttachTimedOut: false,
       mainFrameId: undefined,
       extensionContexts: new Map(), // uniqueId -> { id, uniqueId, origin, frameId, type, isDefault }
+      childSessions: new Map(), // sessionId -> { targetId, type, url } for auto-attached OOPIF targets
+      autoAttached: false,
     };
   }
 
@@ -668,6 +670,20 @@ export function createDebuggerHub({
     if (typeof source?.tabId !== "number") return;
     const entry = attachedTabs.get(source.tabId);
     if (!source.sessionId && entry) {
+      if (method === "Target.attachedToTarget" && typeof params?.sessionId === "string") {
+        const info = params.targetInfo || {};
+        entry.childSessions.set(params.sessionId, {
+          targetId: String(info.targetId || ""),
+          type: String(info.type || ""),
+          url: String(info.url || ""),
+        });
+      } else if (method === "Target.detachedFromTarget" && typeof params?.sessionId === "string") {
+        entry.childSessions.delete(params.sessionId);
+      } else if (method === "Target.targetInfoChanged" && params?.targetInfo) {
+        for (const child of entry.childSessions.values()) {
+          if (child.targetId === params.targetInfo.targetId) child.url = String(params.targetInfo.url || "");
+        }
+      }
       if (method === "Runtime.executionContextCreated") {
         const ctx = params?.context;
         const uniqueId = typeof ctx?.uniqueId === "string" ? ctx.uniqueId : "";
@@ -780,9 +796,50 @@ export function createDebuggerHub({
     onBadgeChange();
   }
 
+  /**
+   * CDP sessionId of the out-of-process iframe whose document is `frameUrl`. Turns on flattened
+   * Target.setAutoAttach once per attachment, then matches child targets by URL (exact, then
+   * origin + path, then origin). Returns undefined when no child target matches (same-process frame).
+   */
+  async function frameSession(tabId, frameUrl, timeoutMs = 1_500) {
+    const entry = await ensureAttached(tabId);
+    if (!entry.autoAttached) {
+      await chromeApi.debugger.sendCommand({ tabId }, "Target.setAutoAttach", {
+        autoAttach: true,
+        waitForDebuggerOnStart: false,
+        flatten: true,
+      });
+      entry.autoAttached = true;
+    }
+    const parts = (u) => {
+      try {
+        const p = new URL(u);
+        return { origin: p.origin, path: p.origin + p.pathname };
+      } catch {
+        return { origin: u, path: u };
+      }
+    };
+    const want = parts(String(frameUrl || ""));
+    const pick = () => {
+      const kids = [...entry.childSessions.entries()].filter(([, c]) => c.type === "iframe");
+      const hit =
+        kids.find(([, c]) => c.url === frameUrl) ||
+        kids.find(([, c]) => parts(c.url).path === want.path) ||
+        kids.find(([, c]) => parts(c.url).origin === want.origin);
+      return hit ? hit[0] : undefined;
+    };
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const sessionId = pick();
+      if (sessionId || Date.now() >= deadline) return sessionId;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  }
+
   return {
     attachedTabs,
     ensureAttached,
+    frameSession,
     detachTab,
     detachAll,
     holdDebugger,

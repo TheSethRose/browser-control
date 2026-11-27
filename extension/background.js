@@ -172,6 +172,16 @@ async function loadConfig() {
   return config;
 }
 
+// CDP sessionId for a cross-origin (OOPIF) child frame, or undefined for the main frame and
+// same-process frames, which share the tab's own debugger session.
+async function frameSessionFor(tabId, frameId) {
+  if (typeof frameId !== "number" || frameId === 0) return undefined;
+  const frame = await chrome.webNavigation.getFrame({ tabId, frameId }).catch(() => null);
+  if (!frame?.url) return undefined;
+  await restoreReady;
+  return debuggerHub.frameSession(tabId, frame.url);
+}
+
 function scriptTarget(tabId, frameId) {
   return typeof frameId === "number" ? { tabId, frameIds: [frameId] } : { tabId };
 }
@@ -853,18 +863,21 @@ export async function resolveBcNode(tabId, refOrSelector, opts = {}) {
   });
   const res = stamped?.[0]?.result;
   if (!res?.ok) throw new Error(res?.error || `NO_MATCH: could not resolve ${target}`);
+  const session = { sessionId: typeof opts.sessionId === "string" && opts.sessionId !== "" ? opts.sessionId : undefined };
   try {
-    const doc = await debuggerHub.sendCommand(tabId, "DOM.getDocument", { depth: 1 });
+    const doc = await debuggerHub.sendCommand(tabId, "DOM.getDocument", { depth: 1 }, session);
     const rootId = doc?.root?.nodeId;
     if (!rootId) throw new Error("EXECUTION_FAILED: DOM.getDocument returned no root");
     if (Date.now() > expiresAt) throw new Error(`NO_MATCH: resolve marker expired for ${target}`);
-    const q = await debuggerHub.sendCommand(tabId, "DOM.querySelector", {
-      nodeId: rootId,
-      selector: `[data-bc-resolve="${marker}"]`,
-    });
+    const q = await debuggerHub.sendCommand(
+      tabId,
+      "DOM.querySelector",
+      { nodeId: rootId, selector: `[data-bc-resolve="${marker}"]` },
+      session,
+    );
     if (!q?.nodeId) throw new Error(`NO_MATCH: CDP could not locate ${target}`);
     if (Date.now() > expiresAt) throw new Error(`NO_MATCH: resolve marker expired for ${target}`);
-    const resolved = await debuggerHub.sendCommand(tabId, "DOM.resolveNode", { nodeId: q.nodeId });
+    const resolved = await debuggerHub.sendCommand(tabId, "DOM.resolveNode", { nodeId: q.nodeId }, session);
     return { nodeId: q.nodeId, objectId: resolved?.object?.objectId };
   } finally {
     if (tabAllowed(tabId)) {
@@ -1113,6 +1126,7 @@ async function handleRequest(msg) {
         mode: params.mode,
         frameId: params.frameId,
         cdpFrameId: params.cdpFrameId,
+        sessionId: params.sessionId || (await frameSessionFor(tabId, params.frameId)),
       });
     }
 
@@ -1153,7 +1167,7 @@ async function handleRequest(msg) {
       }
       await restoreReady;
       const result = await debuggerHub.sendCommand(tabId, method, params.params || {}, {
-        sessionId: params.sessionId,
+        sessionId: params.sessionId || (await frameSessionFor(tabId, params.frameId)),
       });
       return { result: result ?? {} };
     }
