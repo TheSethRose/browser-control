@@ -2551,6 +2551,7 @@ export function createPageHelperHandler(
         if (!nav.ok) return nav;
         const data = nav.data as Json;
         const tab = typeof data["targetId"] === "string" ? (data["targetId"] as string) : targetId;
+        const createdNewTab = data["created"] === true && typeof tab === "string" && extensionTabOf(tab) !== undefined;
         const onBrowse = browseTabNumber(tab) !== undefined || (tab === undefined && browseTab !== undefined);
         const lines = [JSON.stringify(data)];
         if (!onBrowse) {
@@ -2570,7 +2571,10 @@ export function createPageHelperHandler(
           let wall = "";
           if (state.ok) {
             [final = "", wall = ""] = valueOf(state).split("\n");
-          } else if (messageOf(state).startsWith("EXTENSION_ONLY:")) {
+          } else if (messageOf(state).startsWith("EXTENSION_ONLY:") || messageOf(state).includes("RESTRICTED_PAGE:")) {
+            if (createdNewTab && messageOf(state).includes("RESTRICTED_PAGE:")) {
+              await invoke("close_target", { targetId: tab }).catch(() => {});
+            }
             return state;
           }
           const challengeBackend = challengeBackendOf(tab);

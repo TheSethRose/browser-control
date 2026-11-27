@@ -6,8 +6,11 @@ local fixture pages in `fixtures/`.
 
 It covers shadow DOM, two cross-origin iframes with the same URL (each input typed and read back),
 a file input, a `target="_blank"` popup, `alert` and `confirm` (accept and dismiss), a hash link, a
-simulated Cloudflare/Turnstile challenge (`CHALLENGE:` output), and `handoff` (timeout clears the
-card; a trusted click on Continue returns `handoff: done`).
+simulated Cloudflare/Turnstile challenge (`CHALLENGE:` output), `handoff` (timeout clears the card;
+a person can still focus and type into a page input while the card is showing, then a trusted click
+on Continue returns `handoff: done`), restricted `chrome://` pages (refuses with `EXTENSION_ONLY`
+without touching CDP, and closes any newly created tab so the tab count stays unchanged), `close`
+(closes an agent-opened tab), `extension disable`/`enable`, and stale extension handshake reporting.
 
 - Finds Chrome for Testing in `~/.cache/puppeteer`, `~/.cache/browser-control/cft`, or
   `~/.cache/ms-playwright`; set `BC_E2E_CHROME=<binary>` to choose one. If none is found it prints

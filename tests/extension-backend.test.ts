@@ -304,6 +304,7 @@ function fakeCdp(log: string[]): Record<string, OperationHandler> {
     wait_for_event: op("wait_for_event", { found: false, timedOut: true, waitedMs: 0 }),
     select_target: op("select_target"),
     clear_target: op("clear_target"),
+    close_target: op("close_target"),
     list_targets: op("list_targets", { targets: [{ targetId: "CDP1", type: "page", title: "cdp", url: "https://cdp" }] }),
     get_browser_status: op("get_browser_status", { connected: false }),
   };
@@ -2359,5 +2360,133 @@ describe("relay handshake tracking, fix lines, and timeout", () => {
     const resp = await fetch(`http://127.0.0.1:${port}/version`);
     expect(resp.status).toBe(200);
     expect(resp.headers.get("connection")?.toLowerCase()).toBe("close");
+  });
+
+  test("F2: nav to a restricted URL closes a newly created tab before returning RESTRICTED_PAGE, never an existing tab", async () => {
+    const savedBackends = process.env["BROWSER_CONTROL_BACKENDS"];
+    process.env["BROWSER_CONTROL_BACKENDS"] = "extension";
+    try {
+      const token = randomBytes(32).toString("hex");
+      const backend = createExtensionBackend({ ...allocPortWindow(), token, waitConnectMs: 1_000 });
+      disposables.push(backend);
+      await backend.start!();
+      let nextTabId = 90;
+      const closedTabIds: number[] = [];
+
+      await connectMockExtension(backend.getPort()!, token, (op, params) => {
+        if (op === "navigate") {
+          const existing = typeof params["tabId"] === "number" ? params["tabId"] : undefined;
+          const tabId = existing ?? ++nextTabId;
+          return {
+            tabId,
+            loaded: true,
+            url: String(params["url"] ?? ""),
+            title: "Restricted",
+            ...(existing === undefined ? { created: true } : {}),
+          };
+        }
+        if (op === "bc_call") {
+          throw new Error("Cannot access a chrome:// URL");
+        }
+        if (op === "close_tab") {
+          closedTabIds.push(Number(params["tabId"]));
+          return { ok: true, closed: true };
+        }
+        return { ok: true };
+      });
+
+      const cdpLog: string[] = [];
+      const ops = route(fakeCdp(cdpLog), [backend], () => ["extension"]);
+      const invoke = async (op: string, input: Record<string, unknown> = {}): Promise<InvokeResult> => {
+        try {
+          return { ok: true, data: await ops[op]!(input) };
+        } catch (err) {
+          return { ok: false, error: { code: "EXECUTION_FAILED", message: (err as Error).message } };
+        }
+      };
+      const handlePage = createPageHelperHandler(invoke, undefined, undefined, {
+        bcCall: (input) => backend.bcCall(input),
+        sleep: async () => {},
+        rng: () => 0.5,
+      });
+
+      // 1. No active tab -> nav creates tab 91, gets refused as RESTRICTED_PAGE, closes tab 91.
+      const createdRes = await handlePage("nav", { url: "chrome://version" });
+      expect(createdRes.ok).toBe(false);
+      if (!createdRes.ok) expect(createdRes.error.message).toMatch(/EXTENSION_ONLY: RESTRICTED_PAGE:.*chrome:\/\//);
+      expect(closedTabIds).toEqual([91]);
+      expect(backend.hasActive?.()).toBe(false);
+
+      // 2. Existing selected tab -> nav reuses tab 5, gets refused as RESTRICTED_PAGE, never closes tab 5.
+      await ops["select_target"]!({ targetId: "extension:5" });
+      const existingRes = await handlePage("nav", { url: "chrome://version" });
+      expect(existingRes.ok).toBe(false);
+      if (!existingRes.ok) expect(existingRes.error.message).toMatch(/EXTENSION_ONLY: RESTRICTED_PAGE:.*chrome:\/\//);
+      expect(closedTabIds).toEqual([91]);
+      expect(backend.hasActive?.()).toBe(true);
+
+      // 3. Existing selected tab + newWindow -> creates tab 92, refused, closes ONLY tab 92 (never tab 5).
+      const newWinRes = await handlePage("nav", { url: "chrome://settings", newWindow: true });
+      expect(newWinRes.ok).toBe(false);
+      if (!newWinRes.ok) expect(newWinRes.error.message).toMatch(/EXTENSION_ONLY: RESTRICTED_PAGE:.*chrome:\/\//);
+      expect(closedTabIds).toEqual([91, 92]);
+      expect(cdpLog).toEqual([]);
+    } finally {
+      if (savedBackends === undefined) delete process.env["BROWSER_CONTROL_BACKENDS"];
+      else process.env["BROWSER_CONTROL_BACKENDS"] = savedBackends;
+    }
+  });
+
+  test("F3: close_target closes active or explicit agent tab, clears activeTargetId, and surfaces REFUSED without CDP fallback", async () => {
+    const token = randomBytes(32).toString("hex");
+    const backend = createExtensionBackend({ ...allocPortWindow(), token, waitConnectMs: 1_000 });
+    disposables.push(backend);
+    await backend.start!();
+
+    const agentSet = new Set<number>([10, 11]);
+    const closed: number[] = [];
+    await connectMockExtension(backend.getPort()!, token, (op, params) => {
+      if (op === "close_tab") {
+        const tid = Number(params["tabId"]);
+        if (!agentSet.has(tid)) {
+          throw new Error(`REFUSED: tab ${tid} wasn't opened by Browser Control. Browser Control only closes tabs it opened.`);
+        }
+        agentSet.delete(tid);
+        closed.push(tid);
+        return { ok: true, closed: true };
+      }
+      return { ok: true };
+    });
+
+    const cdpLog: string[] = [];
+    const ops = route(fakeCdp(cdpLog), [backend], () => ["extension"]);
+
+    // Active agent tab closes when targetId is omitted.
+    await ops["select_target"]!({ targetId: "extension:10" });
+    expect(await ops["close_target"]!({})).toEqual({
+      closed: true,
+      targetId: "extension:10",
+      backend: "extension",
+    });
+    expect(closed).toEqual([10]);
+    expect(backend.hasActive?.()).toBe(false);
+
+    // Explicit agent tab closes.
+    expect(await ops["close_target"]!({ targetId: "extension:11" })).toEqual({
+      closed: true,
+      targetId: "extension:11",
+      backend: "extension",
+    });
+    expect(closed).toEqual([10, 11]);
+
+    // User tab refusal surfaces REFUSED directly and never touches CDP.
+    await ops["select_target"]!({ targetId: "extension:99" });
+    const refusedErr = await Promise.resolve(ops["close_target"]!({})).catch((e: unknown) => e);
+    expect(refusedErr).toBeInstanceOf(Error);
+    expect((refusedErr as Error).message).toMatch(
+      /^REFUSED: tab 99 wasn't opened by Browser Control\. Browser Control only closes tabs it opened\.$/,
+    );
+    expect(backend.hasActive?.()).toBe(true);
+    expect(cdpLog).toEqual([]);
   });
 });

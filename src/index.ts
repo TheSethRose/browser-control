@@ -241,6 +241,10 @@ const cdpOperations: Record<string, OperationHandler> = {
     return { activeTargetId: null, activeSessionId: null };
   },
 
+  close_target: async () => {
+    throw new Error("INPUT_INVALID: close_target is only available on extension tabs; on cdp use execute_cdp with Target.closeTarget");
+  },
+
   execute_cdp: async (input) => {
     const method = str(input["method"]);
     if (!method) throw new Error("INPUT_INVALID: method is required");

@@ -37,6 +37,7 @@ export const EXTENSION_ONLY_HINT =
 
 /** Operations that act on one tab. */
 const TAB_OPS = new Set([
+  "close_target",
   "evaluate",
   "navigate",
   "capture_screenshot",

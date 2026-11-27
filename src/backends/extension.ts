@@ -55,6 +55,7 @@ const MAX_SHORT_TARGET_OWNERS = 2048;
 
 const OPS = new Set([
   "select_target",
+  "close_target",
   "navigate",
   "evaluate",
   "execute_cdp",
@@ -1919,6 +1920,31 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
           return { activeTargetId: targetId, targetId, browser: resolved.link.slug, backend: NAME };
         }
 
+        case "close_target": {
+          await waitForConnection();
+          const resolved = resolveTarget(input["targetId"]);
+          if (!resolved) throw new BackendUnavailable(NAME, "no extension tab selected");
+          const targetId = formatTargetId(resolved.link, resolved.tabId);
+          const res = (await requestOnLink(
+            resolved.link,
+            "close_tab",
+            { tabId: resolved.tabId },
+            timeoutMs ?? DEFAULT_REQ_TIMEOUT_MS,
+          )) as { ok?: boolean; closed?: boolean };
+          if (
+            activeTab &&
+            activeTab.profileId === resolved.link.profileId &&
+            activeTab.tabId === resolved.tabId
+          ) {
+            activeTab = undefined;
+          }
+          return {
+            closed: res?.closed !== false,
+            targetId,
+            backend: NAME,
+          };
+        }
+
         case "navigate": {
           const url = String(input["url"] ?? "");
           if (!url) throw new Error("INPUT_INVALID: url is required");
@@ -1980,6 +2006,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
           const keepOpen = input["keepOpen"] === true;
           // A new window always means a new tab, so the resolved tab only picks the browser.
           if (newWindow) tabId = undefined;
+          const createdNewTab = tabId === undefined;
 
           const res = (await requestOnLink(
             targetLink,
@@ -1993,11 +2020,12 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
               ...(timeoutMs !== undefined ? { timeoutMs } : {}),
             },
             (timeoutMs ?? 30_000) + 10_000,
-          )) as { tabId?: number; loaded?: boolean; url?: string; title?: string };
+          )) as { tabId?: number; loaded?: boolean; url?: string; title?: string; created?: boolean };
           const tid = typeof res?.tabId === "number" ? res.tabId : tabId;
           if (tid !== undefined) {
             activeTab = { profileId: targetLink.profileId, slug: targetLink.slug, tabId: tid };
           }
+          const created = res?.created === true || createdNewTab;
           return {
             loaded: res?.loaded !== false,
             targetId: tid === undefined ? null : formatTargetId(targetLink, tid),
@@ -2005,6 +2033,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
             title: res?.title ?? "",
             browser: targetLink.slug,
             backend: NAME,
+            ...(created ? { created: true } : {}),
           };
         }
 

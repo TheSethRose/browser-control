@@ -11,6 +11,10 @@ export const MAX_FOREIGN_FRAME_RETRIES = 2;
 export const ATTACHED_STORAGE_KEY = "bc_attached_tabs";
 export const POST_ATTACH_SETUP_TIMEOUT_MS = 1_500;
 
+export function tabNotSharedMessage(tabId) {
+  return `REFUSED: tab ${tabId} isn't shared with Browser Control. Click the Browser Control icon on that tab, then Share this tab.`;
+}
+
 const DIALOG_SAFE_METHODS = new Set([
   "Page.handleJavaScriptDialog",
   "Target.getTargetInfo",
@@ -283,9 +287,7 @@ export function createDebuggerHub({
 
   async function ensureAttached(tabId, opts = {}) {
     if (!isTabAllowed(tabId)) {
-      throw new Error(
-        `REFUSED: tab ${tabId} is not lent to Browser Control (click the extension icon to lend it or switch to All tabs)`,
-      );
+      throw new Error(tabNotSharedMessage(tabId));
     }
     const skipFocusEmulation = opts.skipFocusEmulation === true;
     const existing = attachedTabs.get(tabId);

@@ -34,6 +34,7 @@ function fakeCdp(log: string[]): Record<string, OperationHandler> {
     execute_cdp: op("execute_cdp"),
     select_target: op("select_target"),
     clear_target: op("clear_target"),
+    close_target: op("close_target"),
     list_targets: op("list_targets", { targets: [{ targetId: "ABC", type: "page", title: "t", url: "u" }] }),
     get_browser_status: op("get_browser_status", { connected: true }),
   };
@@ -305,7 +306,7 @@ describe("router with extension only (no implicit cdp fallback)", () => {
     expect(log).toEqual([]);
   });
 
-  test("BackendUnavailable (disconnected, not lent) refuses with EXTENSION_ONLY and never calls CDP", async () => {
+  test("BackendUnavailable (disconnected, not shared) refuses with EXTENSION_ONLY and never calls CDP", async () => {
     const log: string[] = [];
     const disconnected = fakeExtension({
       invoke: async () => {
@@ -323,14 +324,14 @@ describe("router with extension only (no implicit cdp fallback)", () => {
       /^EXTENSION_ONLY: extension is not connected\./,
     );
 
-    const notLent = fakeExtension({
+    const notShared = fakeExtension({
       invoke: async () => {
-        throw new BackendUnavailable("extension", "tab 5 is not lent");
+        throw new BackendUnavailable("extension", "tab 5 isn't shared with Browser Control");
       },
     });
-    const opsNotLent = route(fakeCdp(log), [notLent], () => ["extension"]);
-    await expect(opsNotLent["navigate"]!({ url: "https://example.com" })).rejects.toThrow(
-      /^EXTENSION_ONLY: tab 5 is not lent\. CDP is used only when asked:/,
+    const opsNotShared = route(fakeCdp(log), [notShared], () => ["extension"]);
+    await expect(opsNotShared["navigate"]!({ url: "https://example.com" })).rejects.toThrow(
+      /^EXTENSION_ONLY: tab 5 isn't shared with Browser Control\. CDP is used only when asked:/,
     );
     expect(log).toEqual([]);
   });

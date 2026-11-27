@@ -8,6 +8,7 @@
 #                                     --browser <slug> opens it in that browser
 #                                     extension tabs only: --new-window opens it in a new
 #                                     window; --keep-open keeps the tab past idle cleanup
+#   close [targetId]                  close an agent-opened extension tab (active tab if omitted)
 #   eval '<js>'                       run JavaScript, print its value ('-' reads stdin)
 #   call <op> ['<json>']              any operation, JSON in and out
 #   start [browser]                   switch browser by name (chrome, beta, brave, ardia); opens it
@@ -217,7 +218,7 @@ browser=""; viewport=""; color_scheme=""; ua=""; mobile=false; reduced_motion=fa
 max_time=""; new_window=""; keep_open=""
 params_list=(); where_list=()
 args=()
-case "$cmd" in snap | text | form | query | read-urls | ocr | click | hover | type | select | upload | drag | wait | key | value | shot | nav | eval | fill | do | verdict | health | styles | issues | perf | dialog | emulate | handoff | notes | flow | script)
+case "$cmd" in snap | text | form | query | read-urls | ocr | click | hover | type | select | upload | drag | wait | key | value | shot | nav | eval | close | fill | do | verdict | health | styles | issues | perf | dialog | emulate | handoff | notes | flow | script)
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --match) match="${2:?--match needs text from the tab url or title}"; shift 2 ;;
@@ -332,6 +333,9 @@ case "$cmd" in
     run POST "nav$(query "$(arg 1)" "$extra")" "$(arg 0)"
     ;;
   tabs | ops) run GET "$cmd" ;;
+  close)
+    run POST "close$(query "$(arg 0)")" ''
+    ;;
   snap)
     input='{"all":'"$all"',"ax":'"$ax"',"full":'"$full"
     [[ -z "$find" ]] || input+=',"find":'"$(json_str "$find")"

@@ -4,7 +4,7 @@
   "name": "Browser Control Companion",
   "version": "2.0.0",
   "minimum_chrome_version": "125",
-  "description": "Local-only companion for browser-control: silent isolated-world reads, on-demand tab CDP, and per-tab lending without remote-debugging flags.",
+  "description": "Local-only companion for browser-control: silent isolated-world reads, on-demand tab CDP, and per-tab sharing without remote-debugging flags.",
   "permissions": [
     "tabs",
     "tabGroups",

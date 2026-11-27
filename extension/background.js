@@ -6,7 +6,7 @@
 // Keepalive (`chrome.runtime.getPlatformInfo`) and mutual HMAC handshake patterns adapted from
 // anomalyco/browse (MIT License).
 
-import { createDebuggerHub } from "./lib/debugger-hub.js";
+import { createDebuggerHub, tabNotSharedMessage } from "./lib/debugger-hub.js";
 import { createFrameDecoder, encodeMessage, TRANSPORT_MAX_PAYLOAD_BYTES, utf8ByteLength } from "./lib/frames.js";
 import {
   PROTOCOL_VERSION,
@@ -440,9 +440,7 @@ async function sendHandoffOverlay(tabId, message, origin, handoffId) {
 }
 
 export async function handoffStart(tabId, rawMessage, rawHandoffId) {
-  if (!tabAllowed(tabId)) {
-    throw new Error(`REFUSED: tab ${tabId} is not lent to Browser Control`);
-  }
+  assertTabAllowed(tabId);
   if (handoffTabs.has(tabId)) {
     throw new Error(`HANDOFF_IN_PROGRESS: tab ${tabId} already has an active handoff`);
   }
@@ -548,7 +546,19 @@ export async function completeHandoff(tabId, expectedHandoffId) {
   return { ok: true, completed: true, handoffId };
 }
 
-export { handoffTabs };
+export async function closeTab(tabId) {
+  await tabSetsReady;
+  if (!Number.isInteger(tabId)) {
+    throw new Error("INPUT_INVALID: tabId is required");
+  }
+  if (!agentTabs.has(tabId)) {
+    throw new Error(`REFUSED: tab ${tabId} wasn't opened by Browser Control. Browser Control only closes tabs it opened.`);
+  }
+  const res = await closeTabInternal(tabId);
+  return { ok: true, closed: res?.closed !== false };
+}
+
+export { agentTabs, handoffTabs };
 
 const BC_DIALOG_PROBE_DELAY_MS = 1_500;
 const BC_LIVENESS_PROBE_TIMEOUT_MS = 400;
@@ -556,7 +566,7 @@ const RESOLVE_MARKER_TTL_MS = 10_000;
 
 function assertTabAllowed(tabId) {
   if (!tabAllowed(tabId)) {
-    throw new Error(`REFUSED: tab ${tabId} is not lent to Browser Control`);
+    throw new Error(tabNotSharedMessage(tabId));
   }
 }
 
@@ -991,9 +1001,10 @@ function stripHash(url) {
 async function navigateTab(tabId, rawUrl, until, timeoutMs, opts = {}) {
   const url = normalizeNavigateUrl(rawUrl);
   const wantDcl = until === "domcontentloaded";
+  const createdNewTab = !tabId;
 
   if (tabId) {
-    if (!tabAllowed(tabId)) throw new Error(`REFUSED: tab ${tabId} is not lent`);
+    assertTabAllowed(tabId);
     if (opts.keepOpen === true && agentTabs.has(tabId)) tabCleanup.markKeepOpen(tabId, true);
     const existing = await chrome.tabs.get(tabId).catch(() => null);
     if (existing?.url && url.includes("#") && stripHash(existing.url) === stripHash(url) && existing.url !== url) {
@@ -1086,12 +1097,21 @@ async function navigateTab(tabId, rawUrl, until, timeoutMs, opts = {}) {
     }
   } catch (err) {
     finish(false);
+    if (createdNewTab && typeof tid === "number") {
+      await closeTabInternal(tid).catch(() => {});
+    }
     throw err;
   }
 
   const loaded = await loadedPromise;
   const finalTab = typeof tid === "number" ? await chrome.tabs.get(tid).catch(() => null) : null;
-  return { tabId: tid, loaded, url: finalTab?.url || url, title: finalTab?.title || "" };
+  return {
+    tabId: tid,
+    loaded,
+    url: finalTab?.url || url,
+    title: finalTab?.title || "",
+    ...(createdNewTab ? { created: true } : {}),
+  };
 }
 
 async function handleRequest(msg) {
@@ -1131,25 +1151,23 @@ async function handleRequest(msg) {
     }
 
     case "activate_tab": {
-      if (!tabAllowed(tabId)) throw new Error(`REFUSED: tab ${tabId} is not lent`);
+      assertTabAllowed(tabId);
       await windowGroups.expandGroupForTab(tabId);
       return { ok: true };
     }
 
     case "close_tab": {
-      if (!tabAllowed(tabId)) throw new Error(`REFUSED: tab ${tabId} is not lent`);
-      await closeTabInternal(tabId);
-      return { ok: true };
+      return await closeTab(tabId);
     }
 
     case "reload": {
-      if (!tabAllowed(tabId)) throw new Error(`REFUSED: tab ${tabId} is not lent`);
+      assertTabAllowed(tabId);
       await chrome.tabs.reload(tabId, { bypassCache: params.bypassCache === true });
       return { ok: true };
     }
 
     case "list_frames": {
-      if (!tabAllowed(tabId)) throw new Error(`REFUSED: tab ${tabId} is not lent`);
+      assertTabAllowed(tabId);
       const frames = (await chrome.webNavigation.getAllFrames({ tabId })) || [];
       return {
         frames: frames.map((f) => ({ frameId: f.frameId, parentFrameId: f.parentFrameId, url: f.url || "" })),
