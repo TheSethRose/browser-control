@@ -397,6 +397,11 @@ describe("page-runner natural motion integration", () => {
         const expr = String(input["expression"] ?? "");
         evalExprs.push(expr);
         const base = expr.includes("__bc.baseline()");
+        if (expr.includes("location.href, __bc.wall()")) return val("https://a.test/\n");
+        // The pre-step guard reads the page the same way: a normal page answers a complete `{skip,url}`.
+        if (expr.includes("responseStatus") && expr.includes("visibleSelectors")) {
+          return val(JSON.stringify({ skip: true, url: "https://a.test/" }));
+        }
         if (expr.includes("__bc.verifyRef")) return val("e1");
         if (expr.includes("__bc.hitCheck")) return val('{"ok":true}');
         // Points left of x=200 sit over a nested scroller; anything else is over the document.
@@ -412,6 +417,7 @@ describe("page-runner natural motion integration", () => {
           if (!noScroll && !expr.includes('"detail":true')) return val(base ? "https://a.test/ 350 220 visible" : "350 220 visible");
           return val(base ? `https://a.test/\n${makeDetail(!noScroll)}` : makeDetail(!noScroll));
         }
+        if (expr.includes("__bc.baseline")) return val("https://a.test/");
         if (expr.includes("__bc.readInputProbe")) return val('{"mousedown":1,"mouseup":1}');
         if (expr.includes("__bc.setTypedValue")) return val("__not_typed__");
         if (expr.includes("__bc.cellInfo")) return val("__not_cell__");
