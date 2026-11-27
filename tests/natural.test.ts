@@ -496,6 +496,54 @@ describe("page-runner natural motion integration", () => {
     });
   });
 
+  test("a page that acks input once a second ends natural motion early instead of stalling the click", async () => {
+    await withNaturalOn(async () => {
+      // CI headless Chrome acked each mouseMoved ~1016 ms late, so a 20-40 step path ran past the 45 s e2e budget.
+      const run = async (inView: boolean, releaseFails = false) => {
+        const nat = makeNaturalMock({ inView });
+        let clock = 0;
+        const slowAcks: Invoke = async (op, input = {}) => {
+          const params = (input["params"] ?? {}) as Record<string, unknown>;
+          const res = await nat.invoke(op, input);
+          if (op !== "execute_cdp") return res;
+          if (params["type"] === "mouseMoved" || params["type"] === "mouseWheel") clock += 1_000;
+          if (releaseFails && params["type"] === "mouseReleased") {
+            return { ok: false, error: { code: "EXECUTION_FAILED", message: 'DIALOG_OPEN: a JavaScript alert dialog is open ("hello") on tab 1' } };
+          }
+          return res;
+        };
+        const handler = createPageHelperHandler(slowAcks, undefined, undefined, {
+          sleep: async (ms) => { clock += ms; },
+          rng: createSeededRng(77),
+          now: () => clock,
+          bcCall: async () => ({ value: "https://a.test/\nhit: button#ok" }),
+        });
+        const res = await handler("click", { ref: "e1", quiet: true });
+        return { nat, res, elapsedMs: clock };
+      };
+
+      const near = await run(true);
+      expect(near.res.ok).toBe(true);
+      const moves = near.nat.ofType("mouseMoved");
+      expect(moves).toHaveLength(2);
+      const press = near.nat.ofType("mousePressed")[0]!.params;
+      expect([press["x"], press["y"]]).toEqual([moves.at(-1)!.params["x"], moves.at(-1)!.params["y"]]);
+      expect(near.elapsedMs).toBeLessThan(3_000);
+
+      const far = await run(false);
+      expect(far.res.ok).toBe(true);
+      expect(far.nat.ofType("mouseWheel")).toHaveLength(1);
+      expect(far.nat.evalExprs.some((e) => e.includes('__bc.point("e1", {"detail":true})'))).toBe(true);
+      expect(far.elapsedMs).toBeLessThan(8_000);
+
+      // A click whose release opens an alert reports the dialog within a few seconds.
+      const alert = await run(true, true);
+      expect(alert.res.ok).toBe(false);
+      expect(alert.res.ok ? "" : alert.res.error.message).toMatch(/^DIALOG_OPEN:/);
+      expect(alert.elapsedMs).toBeLessThan(3_000);
+    });
+  });
+
   test("off-screen target emits eased mouseWheel events and falls back to instant scrollIntoView when stagnant", async () => {
     await withNaturalOn(async () => {
       const instant = (m: ReturnType<typeof makeNaturalMock>) => m.evalExprs.some((e) => e.includes('__bc.point("e1", {"detail":true})'));
