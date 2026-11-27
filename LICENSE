@@ -24,8 +24,9 @@ SOFTWARE.
 
 Third-party notice
 
-Parts of the extension relay, pairing, and extension code (src/backends/extension.ts,
-src/challenges.ts, and files under extension/) are adapted from anomalyco/browse
+Parts of the extension relay, pairing, extension code, and natural motion planners
+(src/backends/extension.ts, src/challenges.ts, src/natural.ts, and files under
+extension/) are adapted from anomalyco/browse
 (https://github.com/anomalyco/browse), used under the MIT License:
 
 MIT License
