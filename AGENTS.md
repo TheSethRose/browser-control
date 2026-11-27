@@ -46,6 +46,9 @@ typecheck, and tests on every PR into `v2` and `main`.
   Keychain password prompts to the user. This applies to `tests/e2e/`, every launcher helper,
   and one-off probes. Never launch a browser without both flags.
 - Never launch or drive the user's own Chrome profile from tests.
+- Live runs (probes, manual checks, delegate tasks) set `BROWSER_CONTROL_BACKENDS=extension`, with no
+  `cdp`. With `extension,cdp`, a command no extension browser answers falls through to CDP and
+  reaches the user's real Chrome.
 - `tests/e2e/` runs Chrome for Testing with the unpacked `extension/` loaded
   (`--load-extension` plus `--disable-extensions-except`) against a local fixture page. Install
   it with `bunx @puppeteer/browsers install chrome@stable`. Run it with `bun run test:e2e`.
