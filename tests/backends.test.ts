@@ -171,6 +171,26 @@ describe("router with extension first", () => {
     expect(log).toEqual(["select_target:ABC"]);
   });
 
+  test("a browser-named navigate goes to the extension even with cdp first", async () => {
+    const log: string[] = [];
+    const extCalls: string[] = [];
+    const ext = {
+      name: "extension",
+      handles: (op: string) => op === "navigate",
+      invoke: async (op: string) => {
+        extCalls.push(op);
+        return { targetId: "extension:5" };
+      },
+      listTargets: async () => [],
+      clearActive: () => {},
+      status: async () => ({}),
+    };
+    const ops = route(fakeCdp(log), [ext as never], () => ["cdp", "extension"]);
+    await ops["navigate"]!({ url: "https://x", browser: "chrome-abc123" });
+    expect(extCalls).toEqual(["navigate"]);
+    expect(log).toEqual([]);
+  });
+
   test("a navigate that names an offline browser fails instead of using the CDP tab", async () => {
     const log: string[] = [];
     const ext = {

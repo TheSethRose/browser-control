@@ -71,6 +71,16 @@ export function route(
       return result;
     }
 
+    // `nav --browser <slug>` names an extension browser, whatever the backend order.
+    if (op === "navigate" && typeof input["browser"] === "string") {
+      const owner = enabledBackends().find((b) => b.handles(op, input, active === b.name));
+      if (owner) {
+        const result = await owner.invoke(op, input);
+        active = owner.name;
+        return result;
+      }
+    }
+
     const skipped: string[] = [];
     for (const name of enabled()) {
       if (name === CDP) {
