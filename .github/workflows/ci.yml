@@ -144,21 +144,13 @@ jobs:
           fi
           "$BC_E2E_CHROME" --version
 
-      # Surface Chrome's own stderr when a launch fails, since the e2e runner discards it.
+      # Fail fast if Chrome cannot start at all; the e2e runner discards Chrome's stderr.
       - name: Probe Chrome launch
         run: |
-          dir="$(dirname "$BC_E2E_CHROME")"
-          ls -l "$dir/chrome_sandbox" || true
           profile="$(mktemp -d)"
-          echo "--- default sandbox ---"
           "$BC_E2E_CHROME" --headless=new --use-mock-keychain --password-store=basic \
             --user-data-dir="$profile" --no-first-run --no-default-browser-check \
-            --dump-dom about:blank 2>&1 | head -40 || true
-          echo "--- no-sandbox ---"
-          profile2="$(mktemp -d)"
-          "$BC_E2E_CHROME" --headless=new --no-sandbox --disable-dev-shm-usage --use-mock-keychain \
-            --password-store=basic --user-data-dir="$profile2" --no-first-run \
-            --no-default-browser-check --dump-dom about:blank 2>&1 | head -40 || true
+            --dump-dom about:blank > /dev/null
 
       - name: E2E
         working-directory: browser-control
