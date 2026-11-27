@@ -49,6 +49,8 @@ export function backendOrder(): string[] {
   return [...new Set(names)];
 }
 
+const EXTENSION = "extension";
+
 export function route(
   cdpOps: Record<string, OperationHandler>,
   backends: Backend[],
@@ -60,6 +62,15 @@ export function route(
   const enabledBackends = () => enabled().flatMap((n) => (n === CDP ? [] : [byName.get(n)!]));
 
   async function runOp(op: string, input: OpInput): Promise<unknown> {
+    // `nav --browser <slug>` names an extension browser, whatever the backend order or target.
+    if (op === "navigate" && typeof input["browser"] === "string") {
+      const ext = enabled().includes(EXTENSION) ? byName.get(EXTENSION) : undefined;
+      if (!ext) throw new Error("INPUT_INVALID: --browser needs the extension backend enabled");
+      const result = await ext.invoke(op, input);
+      active = ext.name;
+      return result;
+    }
+
     const prefix = prefixOf(input["targetId"]);
     const named = prefix !== undefined && enabled().includes(prefix) ? byName.get(prefix) : undefined;
     if (named) {
@@ -87,8 +98,9 @@ export function route(
         if (op === "select_target") active = CDP;
         return handler(input);
       }
-      // A selected DevTools tab keeps untargeted calls (`nav <url>`) on that tab.
-      if (active === CDP && input["targetId"] === undefined) continue;
+      // A selected DevTools tab keeps untargeted calls (`nav <url>`) on that tab,
+      // unless the call names a browser (`nav --browser <slug>`).
+      if (active === CDP && input["targetId"] === undefined && input["browser"] === undefined) continue;
       const backend = byName.get(name)!;
       if (!backend.handles(op, input, active === name)) continue;
       try {
@@ -96,7 +108,8 @@ export function route(
         if (op === "select_target" || op === "navigate") active = name;
         return result;
       } catch (error) {
-        if (!(error instanceof BackendUnavailable)) throw error;
+        // A named browser that is offline is an error, never a reason to use another tab.
+        if (!(error instanceof BackendUnavailable) || input["browser"] !== undefined) throw error;
         skipped.push(error.message);
         if (active === name) active = undefined;
       }

@@ -1,17 +1,17 @@
 /**
- * The `extension` backend: drives a real Chromium browser through the local MV3 companion
+ * The `extension` backend: drives real Chromium browsers through the local MV3 companion
  * extension over a loopback WebSocket relay (127.0.0.1, ports 49222-49229).
  *
  * Needs no remote-debugging flag and no per-connection "Allow" click. Silent reads run in the
  * extension's ISOLATED content-script world via `bc_call`; trusted input and DevTools calls
  * attach `chrome.debugger` on demand via `cdp`.
  *
- * Mutual HMAC-SHA256 challenge-response handshake and MV3 keepalive patterns adapted from
- * anomalyco/browse (MIT License).
+ * Mutual HMAC-SHA256 challenge-response handshake, BrowserLinks multi-browser identity, and MV3
+ * keepalive patterns adapted from anomalyco/browse (MIT License).
  */
 
-import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { link, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { link as fsLink, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import type { Server, ServerWebSocket } from "bun";
@@ -30,7 +30,12 @@ export const PORT_RANGE_START = 49222;
 export const PORT_RANGE_END = 49229;
 
 export const PRE_AUTH_MAX_BYTES = 64 * 1024;
+export const TRANSPORT_MAX_PAYLOAD_BYTES = 1024 * 1024;
+export const CHUNK_MAX_DATA_BYTES = 512 * 1024;
 export const POST_AUTH_MAX_BYTES = 64 * 1024 * 1024;
+export const MAX_CONCURRENT_CHUNK_STREAMS = 16;
+export const CHUNK_STREAM_TIMEOUT_MS = 30_000;
+export const MAX_ABORTED_CHUNK_STREAMS = 64;
 export const HANDSHAKE_TIMEOUT_MS = 10_000;
 
 export const CLOSE_REPLACED = 4001;
@@ -41,6 +46,8 @@ export const CLOSE_AUTH_REFUSED = 4006;
 const DEFAULT_WAIT_CONNECT_MS = 35_000;
 const DEFAULT_LIST_WAIT_MS = 5_000;
 const DEFAULT_REQ_TIMEOUT_MS = 60_000;
+const DEFAULT_MAX_FRAME_BYTES = 900 * 1024;
+const MAX_SHORT_TARGET_OWNERS = 2048;
 
 const OPS = new Set([
   "select_target",
@@ -55,6 +62,8 @@ const OPS = new Set([
 
 const HEX_32_RE = /^[0-9a-f]{32}$/i;
 const HEX_64_RE = /^[0-9a-f]{64}$/i;
+const DIGITS_RE = /^\d+$/;
+const SLUG_RE = /^[a-z0-9][a-z0-9-]*$/i;
 
 export function relayProofMessage(port: number, extNonce: string, relayNonce: string): string {
   return `bc-v2|relay|127.0.0.1:${port}/extension|${extNonce}|${relayNonce}`;
@@ -112,7 +121,7 @@ async function publishPrivateFile(file: string, body: string, replace: boolean):
       return true;
     }
     try {
-      await link(tmp, file);
+      await fsLink(tmp, file);
       return true;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
@@ -150,7 +159,9 @@ export async function ensureRelayToken(tokenFile: string = defaultTokenFilePath(
 async function repairRelayToken(tokenFile: string): Promise<string> {
   await mkdir(dirname(tokenFile), { recursive: true, mode: 0o700 });
   const read = await readPrivateToken(tokenFile);
-  if (!("token" in read) && read.state === "bad") await publishPrivateFile(tokenFile, newTokenBody(randomBytes(32).toString("hex")), true);
+  if (!("token" in read) && read.state === "bad") {
+    await publishPrivateFile(tokenFile, newTokenBody(randomBytes(32).toString("hex")), true);
+  }
   return ensureRelayToken(tokenFile);
 }
 
@@ -167,6 +178,503 @@ export async function setupExtensionPairing(
   await publishPrivateFile(pairingFile, `${JSON.stringify({ token, port }, null, 2)}\n`, true);
   return { tokenFile, pairingFile, port };
 }
+
+// ---------------------------------------------------------------------------
+// Deterministic stateless browser slug: <brand>-<first 6 hex chars of sha256(profileId)>
+// ---------------------------------------------------------------------------
+
+function slugifyPart(raw: string, fallback: string): string {
+  const cleaned = String(raw || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return cleaned || fallback;
+}
+
+function browserSlugPrefix(browser: string): string {
+  const lower = String(browser || "").toLowerCase();
+  if (lower.includes("brave")) return "brave";
+  if (lower.includes("edge")) return "edge";
+  if (lower.includes("opera")) return "opera";
+  if (lower.includes("vivaldi")) return "vivaldi";
+  if (lower.includes("arc")) return "arc";
+  if (lower.includes("comet")) return "comet";
+  if (lower.includes("chromium")) return "chromium";
+  if (lower.includes("chrome")) return "chrome";
+  return slugifyPart(browser, "browser");
+}
+
+/** Deterministic slug `<brand>-<first 6 hex chars of sha256(profileId)>` (no stored state). */
+export function browserSlugFor(browser: string, profileId: string): string {
+  const brand = browserSlugPrefix(browser);
+  const suffix = createHash("sha256").update(profileId, "utf8").digest("hex").slice(0, 6);
+  return `${brand}-${suffix}`;
+}
+
+// ---------------------------------------------------------------------------
+// Chunked post-auth frame encoder, backpressure queue & reassembler
+// ---------------------------------------------------------------------------
+
+function sliceUtf8Chunk(text: string, start: number, maxDataBytes: number): string {
+  const remaining = text.length - start;
+  if (remaining <= 0) return "";
+  let end = Math.min(text.length, start + maxDataBytes);
+  if (end < text.length) {
+    const c = text.charCodeAt(end - 1);
+    if (c >= 0xd800 && c <= 0xdbff) end -= 1;
+  }
+  const initial = text.slice(start, end);
+  if (Buffer.byteLength(initial, "utf8") <= maxDataBytes) return initial;
+
+  let lo = 1;
+  let hi = end - start;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (Buffer.byteLength(text.slice(start, start + mid), "utf8") <= maxDataBytes) {
+      lo = mid;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  if (start + lo < text.length) {
+    const c = text.charCodeAt(start + lo - 1);
+    if (c >= 0xd800 && c <= 0xdbff && lo > 1) lo -= 1;
+  }
+  return text.slice(start, start + lo);
+}
+
+let autoChunkStreamId = 1;
+
+export function encodeChunkedFrames(
+  obj: Record<string, unknown>,
+  options: { id?: string; maxDataBytes?: number; maxFrameBytes?: number; maxTotalBytes?: number } = {},
+):
+  | { ok: true; frames: string[]; chunked: boolean; totalBytes: number }
+  | { ok: false; error: string; totalBytes: number } {
+  const maxDataBytes = options.maxDataBytes ?? CHUNK_MAX_DATA_BYTES;
+  const maxFrameBytes = options.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES;
+  const maxTotalBytes = options.maxTotalBytes ?? POST_AUTH_MAX_BYTES;
+  const serialized = JSON.stringify(obj);
+  const totalBytes = Buffer.byteLength(serialized, "utf8");
+
+  if (totalBytes > maxTotalBytes) {
+    return {
+      ok: false,
+      error: `EXECUTION_FAILED: Message too large (${totalBytes} bytes > ${maxTotalBytes} limit)`,
+      totalBytes,
+    };
+  }
+
+  const singleThreshold = Math.min(maxDataBytes, maxFrameBytes);
+  if (totalBytes <= singleThreshold) {
+    return { ok: true, frames: [serialized], chunked: false, totalBytes };
+  }
+
+  const streamId =
+    options.id ?? (obj["id"] !== undefined ? String(obj["id"]) : `d-${autoChunkStreamId++}`);
+  const frames: string[] = [];
+  let offset = 0;
+  let seq = 0;
+  while (offset < serialized.length) {
+    let data = sliceUtf8Chunk(serialized, offset, maxDataBytes);
+    let last = offset + data.length >= serialized.length;
+    let frame = JSON.stringify({ type: "chunk", id: streamId, seq, last, data });
+    while (Buffer.byteLength(frame, "utf8") > maxFrameBytes && data.length > 1) {
+      let nextLen = Math.max(1, Math.floor(data.length / 2));
+      const c = data.charCodeAt(nextLen - 1);
+      if (c >= 0xd800 && c <= 0xdbff && nextLen > 1) nextLen -= 1;
+      data = data.slice(0, nextLen);
+      last = offset + data.length >= serialized.length;
+      frame = JSON.stringify({ type: "chunk", id: streamId, seq, last, data });
+    }
+    frames.push(frame);
+    offset += data.length;
+    seq += 1;
+  }
+  return { ok: true, frames, chunked: true, totalBytes };
+}
+
+export type FrameSocket = {
+  send(data: string): number;
+  getBufferedAmount?(): number;
+};
+
+// Bun's ServerWebSocket default; a send that would exceed it is dropped (returns 0).
+const DEFAULT_BACKPRESSURE_LIMIT = 16 * 1024 * 1024;
+
+type QueuedFrames = {
+  frames: string[];
+  index: number;
+  resolve: () => void;
+  reject: (error: Error) => void;
+};
+
+/**
+ * Per-connection outbound frame queue that respects Bun ServerWebSocket send return codes:
+ * - `> 0`: sent immediately
+ * - `-1`: buffered under backpressure -> pause and resume on `drain()`
+ * - `0`: dropped -> fail that message cleanly; never report success for a partially sent message
+ */
+export class OutboundFrameQueue {
+  private readonly queue: QueuedFrames[] = [];
+  private paused = false;
+  private closedReason?: string;
+
+  constructor(
+    private readonly ws: FrameSocket,
+    private readonly backpressureLimit: number = DEFAULT_BACKPRESSURE_LIMIT,
+  ) {}
+
+  enqueue(frames: string[]): Promise<void> {
+    if (this.closedReason !== undefined) {
+      return Promise.reject(new BackendUnavailable(NAME, this.closedReason));
+    }
+    if (frames.length === 0) return Promise.resolve();
+    return new Promise<void>((resolve, reject) => {
+      this.queue.push({ frames, index: 0, resolve, reject });
+      if (!this.paused) this.flush();
+    });
+  }
+
+  drain(): void {
+    if (this.closedReason !== undefined) return;
+    this.paused = false;
+    this.flush();
+  }
+
+  /** Drop a batch that hasn't started sending, so a timed-out request never runs later. */
+  cancelUnsent(frames: string[]): void {
+    const index = this.queue.findIndex((q) => q.frames === frames && q.index === 0);
+    if (index === -1) return;
+    const [batch] = this.queue.splice(index, 1);
+    batch!.reject(new Error("EXECUTION_FAILED: request cancelled before it was sent"));
+  }
+
+  failAll(reason: string): void {
+    this.closedReason = reason;
+    this.paused = false;
+    const err = new BackendUnavailable(NAME, reason);
+    while (this.queue.length > 0) {
+      this.queue.shift()!.reject(err);
+    }
+  }
+
+  get isPaused(): boolean {
+    return this.paused;
+  }
+
+  get pendingCount(): number {
+    return this.queue.length;
+  }
+
+  private flush(): void {
+    while (!this.paused && this.queue.length > 0) {
+      const current = this.queue[0]!;
+      while (current.index < current.frames.length) {
+        const frame = current.frames[current.index]!;
+        // drain() can fire while data is still buffered; wait for the next drain instead of overflowing.
+        const buffered = this.ws.getBufferedAmount?.() ?? 0;
+        if (buffered > 0 && buffered + Buffer.byteLength(frame) > this.backpressureLimit) {
+          this.paused = true;
+          return;
+        }
+        let status: number;
+        try {
+          status = this.ws.send(frame);
+        } catch (err) {
+          this.queue.shift();
+          current.reject(
+            new BackendUnavailable(NAME, `failed to send to extension: ${(err as Error).message}`),
+          );
+          break;
+        }
+        if (status === 0) {
+          this.queue.shift();
+          current.reject(
+            new Error(
+              `EXECUTION_FAILED: WebSocket frame dropped (sent ${current.index}/${current.frames.length} frames)`,
+            ),
+          );
+          break;
+        }
+        current.index += 1;
+        if (status === -1) {
+          this.paused = true;
+          return;
+        }
+      }
+      if (this.queue[0] === current && current.index >= current.frames.length) {
+        this.queue.shift();
+        current.resolve();
+      }
+    }
+  }
+}
+
+type ChunkDecodeResult =
+  | { kind: "message"; message: Record<string, unknown> }
+  | { kind: "pending" }
+  | { kind: "ignored" }
+  | { kind: "error"; id: string; reqId?: number; error: string };
+
+type ChunkStream = {
+  nextSeq: number;
+  totalBytes: number;
+  parts: string[];
+  lastActivityAt: number;
+  timer?: ReturnType<typeof setTimeout>;
+  reqId?: number;
+};
+
+function numericReqIdOf(rawId: unknown, explicitReqId?: unknown): number | undefined {
+  if (typeof explicitReqId === "number" && Number.isInteger(explicitReqId)) return explicitReqId;
+  if (typeof rawId === "number" && Number.isInteger(rawId)) return rawId;
+  if (typeof rawId === "string" && DIGITS_RE.test(rawId)) return Number(rawId);
+  return undefined;
+}
+
+// Bounds per-chunk bookkeeping so tiny or empty chunks can't outgrow the byte budget.
+const MAX_CHUNKS_PER_STREAM = 4096;
+const MAX_STREAM_ID_LENGTH = 128;
+
+export class ChunkReassembler {
+  private readonly maxDataBytes: number;
+  private readonly maxTotalBytes: number;
+  private readonly maxBufferedBytes: number;
+  private readonly maxConcurrent: number;
+  private readonly timeoutMs: number;
+  private readonly maxAbortedIds: number;
+  private readonly now: () => number;
+  private readonly onExpire?: (info: { id: string; reqId?: number }) => void;
+  private readonly streams = new Map<string, ChunkStream>();
+  private readonly aborted = new Map<string, number>();
+  private totalBufferedBytes = 0;
+
+  constructor(options: {
+    maxDataBytes?: number;
+    maxTotalBytes?: number;
+    maxBufferedBytes?: number;
+    maxConcurrent?: number;
+    timeoutMs?: number;
+    maxAbortedIds?: number;
+    now?: () => number;
+    onExpire?: (info: { id: string; reqId?: number }) => void;
+  } = {}) {
+    this.maxDataBytes = options.maxDataBytes ?? CHUNK_MAX_DATA_BYTES;
+    this.maxTotalBytes = options.maxTotalBytes ?? POST_AUTH_MAX_BYTES;
+    this.maxBufferedBytes = options.maxBufferedBytes ?? this.maxTotalBytes;
+    this.maxConcurrent = options.maxConcurrent ?? MAX_CONCURRENT_CHUNK_STREAMS;
+    this.timeoutMs = options.timeoutMs ?? CHUNK_STREAM_TIMEOUT_MS;
+    this.maxAbortedIds = options.maxAbortedIds ?? MAX_ABORTED_CHUNK_STREAMS;
+    this.now = options.now ?? (() => Date.now());
+    this.onExpire = options.onExpire;
+  }
+
+  private deleteStream(id: string): ChunkStream | undefined {
+    const entry = this.streams.get(id);
+    if (!entry) return undefined;
+    if (entry.timer !== undefined) clearTimeout(entry.timer);
+    this.totalBufferedBytes = Math.max(0, this.totalBufferedBytes - entry.totalBytes);
+    this.streams.delete(id);
+    return entry;
+  }
+
+  private rememberAborted(id: string): void {
+    this.aborted.delete(id);
+    this.aborted.set(id, this.now());
+    while (this.aborted.size > this.maxAbortedIds) {
+      const oldest = this.aborted.keys().next().value;
+      if (oldest === undefined) break;
+      this.aborted.delete(oldest);
+    }
+  }
+
+  private scheduleExpiry(id: string, stream: ChunkStream): void {
+    if (stream.timer !== undefined) clearTimeout(stream.timer);
+    stream.lastActivityAt = this.now();
+    const timer = setTimeout(() => {
+      if (this.streams.get(id) !== stream) return;
+      this.deleteStream(id);
+      this.onExpire?.({ id, reqId: stream.reqId });
+    }, this.timeoutMs);
+    if (typeof timer === "object" && timer !== null && "unref" in timer && typeof timer.unref === "function") {
+      timer.unref();
+    }
+    stream.timer = timer;
+  }
+
+  private pruneExpiredAborted(): void {
+    const t = this.now();
+    for (const [id, ts] of this.aborted) {
+      if (t - ts > this.timeoutMs) this.aborted.delete(id);
+    }
+  }
+
+  private abort(id: string, isLast: boolean): void {
+    this.deleteStream(id);
+    if (isLast) this.aborted.delete(id);
+    else this.rememberAborted(id);
+  }
+
+  push(msg: Record<string, unknown>): ChunkDecodeResult {
+    if (msg["type"] !== "chunk") return { kind: "message", message: msg };
+    this.pruneExpiredAborted();
+
+    const rawId = msg["id"];
+    const validId =
+      (typeof rawId === "string" && rawId.trim() !== "" && rawId.length <= MAX_STREAM_ID_LENGTH) ||
+      (typeof rawId === "number" && Number.isInteger(rawId));
+    const seq = msg["seq"];
+    const last = msg["last"];
+    const data = msg["data"];
+    const reqId = numericReqIdOf(rawId, msg["reqId"]);
+
+    if (
+      !validId ||
+      typeof seq !== "number" ||
+      !Number.isInteger(seq) ||
+      seq < 0 ||
+      typeof last !== "boolean" ||
+      typeof data !== "string"
+    ) {
+      return {
+        kind: "error",
+        id: validId ? String(rawId) : "",
+        reqId,
+        error: "EXECUTION_FAILED: malformed chunk frame",
+      };
+    }
+
+    const id = String(rawId);
+    if (this.aborted.has(id)) {
+      if (last) this.aborted.delete(id);
+      return { kind: "ignored" };
+    }
+
+    const chunkBytes = Buffer.byteLength(data, "utf8");
+    if (chunkBytes > this.maxDataBytes) {
+      this.abort(id, last);
+      return {
+        kind: "error",
+        id,
+        reqId,
+        error: `EXECUTION_FAILED: chunk data too large (${chunkBytes} bytes > ${this.maxDataBytes} limit)`,
+      };
+    }
+
+    let stream = this.streams.get(id);
+    if (!stream) {
+      if (seq !== 0) {
+        this.abort(id, last);
+        return {
+          kind: "error",
+          id,
+          reqId,
+          error: `EXECUTION_FAILED: chunked frame out of order (stream ${id}: expected seq 0, got ${seq})`,
+        };
+      }
+      if (this.streams.size >= this.maxConcurrent) {
+        this.abort(id, last);
+        return {
+          kind: "error",
+          id,
+          reqId,
+          error: `EXECUTION_FAILED: too many concurrent chunked streams (limit ${this.maxConcurrent})`,
+        };
+      }
+      stream = { nextSeq: 0, totalBytes: 0, parts: [], lastActivityAt: this.now(), reqId };
+      this.streams.set(id, stream);
+    }
+
+    if (seq !== stream.nextSeq) {
+      this.abort(id, last);
+      return {
+        kind: "error",
+        id,
+        reqId,
+        error: `EXECUTION_FAILED: chunked frame out of order (stream ${id}: expected seq ${stream.nextSeq}, got ${seq})`,
+      };
+    }
+
+    if (stream.parts.length >= MAX_CHUNKS_PER_STREAM) {
+      this.abort(id, last);
+      return {
+        kind: "error",
+        id,
+        reqId,
+        error: `EXECUTION_FAILED: too many chunks in stream ${id} (limit ${MAX_CHUNKS_PER_STREAM})`,
+      };
+    }
+
+    if (stream.totalBytes + chunkBytes > this.maxTotalBytes) {
+      this.abort(id, last);
+      return {
+        kind: "error",
+        id,
+        reqId,
+        error: `EXECUTION_FAILED: chunked message too large (stream ${id} exceeds ${this.maxTotalBytes} bytes)`,
+      };
+    }
+
+    if (this.totalBufferedBytes + chunkBytes > this.maxBufferedBytes) {
+      this.abort(id, last);
+      return {
+        kind: "error",
+        id,
+        reqId,
+        error: `EXECUTION_FAILED: chunked buffer limit exceeded (aggregate unfinished bytes > ${this.maxBufferedBytes} limit)`,
+      };
+    }
+
+    stream.parts.push(data);
+    stream.totalBytes += chunkBytes;
+    this.totalBufferedBytes += chunkBytes;
+    stream.nextSeq += 1;
+
+    if (!last) {
+      this.scheduleExpiry(id, stream);
+      return { kind: "pending" };
+    }
+
+    this.deleteStream(id);
+    try {
+      const parsed = JSON.parse(stream.parts.join(""));
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+        throw new Error("reassembled payload is not a JSON object");
+      }
+      return { kind: "message", message: parsed as Record<string, unknown> };
+    } catch (err) {
+      return {
+        kind: "error",
+        id,
+        reqId,
+        error: `EXECUTION_FAILED: invalid JSON in reassembled chunk stream ${id}: ${(err as Error).message}`,
+      };
+    }
+  }
+
+  clear(): void {
+    for (const id of [...this.streams.keys()]) this.deleteStream(id);
+    this.totalBufferedBytes = 0;
+    this.aborted.clear();
+  }
+
+  size(): number {
+    return this.streams.size;
+  }
+
+  bufferedBytes(): number {
+    return this.totalBufferedBytes;
+  }
+
+  abortedSize(): number {
+    return this.aborted.size;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Target IDs & structured helper step combiner
+// ---------------------------------------------------------------------------
 
 /** Combine structured `bc_call` step results the same way `renderSteps()` evaluates them on CDP. */
 export function combineStepValues(call: NormalizedHelperCall, values: readonly unknown[]): unknown {
@@ -189,12 +697,26 @@ export function combineStepValues(call: NormalizedHelperCall, values: readonly u
   return kept.map((v) => (v === null || v === undefined ? "" : String(v))).join(join);
 }
 
-const id = (tab: number) => `${NAME}:${tab}`;
+/** Parse `extension:<tabId>` or `extension:<slug>:<tabId>`. */
+export function parseExtensionTargetId(targetId: unknown): { slug?: string; tabId: number } | undefined {
+  if (prefixOf(targetId) !== NAME) return undefined;
+  const rest = (targetId as string).slice(NAME.length + 1);
+  if (!rest) return undefined;
+  const colon = rest.indexOf(":");
+  if (colon === -1) {
+    if (!DIGITS_RE.test(rest)) return undefined;
+    const n = Number(rest);
+    return Number.isSafeInteger(n) ? { tabId: n } : undefined;
+  }
+  const slug = rest.slice(0, colon);
+  const tabPart = rest.slice(colon + 1);
+  if (!slug || !SLUG_RE.test(slug) || !DIGITS_RE.test(tabPart)) return undefined;
+  const n = Number(tabPart);
+  return Number.isSafeInteger(n) ? { slug: slug.toLowerCase(), tabId: n } : undefined;
+}
 
 export function extensionTabOf(targetId: unknown): number | undefined {
-  if (prefixOf(targetId) !== NAME) return undefined;
-  const n = Number((targetId as string).slice(NAME.length + 1));
-  return Number.isInteger(n) ? n : undefined;
+  return parseExtensionTargetId(targetId)?.tabId;
 }
 
 export type BcCallInput = {
@@ -218,19 +740,43 @@ export function registerExtensionBcCall(fn: BcCallFn | undefined): void {
   }
 }
 
+const EXTENSION_REQUEST_SYMBOL = Symbol.for("browser-control.extension-request");
+const TARGET_REQUEST_OPS = new Set(["handoff_start", "handoff_clear"]);
+
+export type ExtensionRequestFn = (
+  op: string,
+  params?: Record<string, unknown>,
+  timeoutMs?: number,
+) => Promise<unknown>;
+
+function registerExtensionRequest(fn: ExtensionRequestFn | undefined): void {
+  const holder = globalThis as Record<symbol, unknown>;
+  if (fn) {
+    holder[EXTENSION_REQUEST_SYMBOL] = fn;
+  } else {
+    delete holder[EXTENSION_REQUEST_SYMBOL];
+  }
+}
+
 export function getRegisteredExtensionBcCall(): BcCallFn | undefined {
   return (globalThis as Record<symbol, unknown>)[BC_CALL_SYMBOL] as BcCallFn | undefined;
 }
 
+// ---------------------------------------------------------------------------
+// Relay WebSocket server & BrowserLinks
+// ---------------------------------------------------------------------------
+
 type WsState = {
   stage: "awaiting_hello" | "awaiting_response" | "ready";
   authenticated: boolean;
+  closed: boolean;
   handshakeTimer?: ReturnType<typeof setTimeout>;
   extNonce?: string;
   relayNonce?: string;
   profileId?: string;
   browser?: string;
   extensionVersion?: string;
+  slug?: string;
 };
 
 type PendingReq = {
@@ -239,11 +785,36 @@ type PendingReq = {
   timer: ReturnType<typeof setTimeout>;
 };
 
+type BrowserLink = {
+  profileId: string;
+  slug: string;
+  browser: string;
+  extensionVersion: string;
+  ws: ServerWebSocket<WsState>;
+  outbound: OutboundFrameQueue;
+  pending: Map<number, PendingReq>;
+  decoder: ChunkReassembler;
+  connectedAt: number;
+};
+
+type ActiveTabRef = {
+  profileId: string;
+  slug: string;
+  tabId: number;
+};
+
 type EventWaiter = {
   matcher: EventMatcher;
   resolve: (event: CdpEvent) => void;
   reject: (error: Error) => void;
   timer: ReturnType<typeof setTimeout>;
+};
+
+export type ConnectedBrowserInfo = {
+  slug: string;
+  profileId: string;
+  browser: string;
+  extensionVersion: string;
 };
 
 export type ExtensionBackendOptions = {
@@ -259,13 +830,21 @@ export type ExtensionBackendOptions = {
   artifactDir?: () => string;
   eventBufferSize?: number;
   registerGlobal?: boolean;
+  maxPostAuthBytes?: number;
+  maxChunkDataBytes?: number;
+  maxBufferedChunkBytes?: number;
+  maxConcurrentChunkStreams?: number;
+  chunkStreamTimeoutMs?: number;
+  backpressureLimit?: number;
+  now?: () => number;
 };
 
 export interface ExtensionBackend extends Backend {
   readonly instanceId: string;
   getPort(): number | undefined;
   isConnected(): boolean;
-  request(op: string, params?: Record<string, unknown>, timeoutMs?: number): Promise<unknown>;
+  getConnectedBrowsers(): ConnectedBrowserInfo[];
+  request(op: string, params?: Record<string, unknown>, timeoutMs?: number, browserSlug?: string): Promise<unknown>;
   bcCall(input: BcCallInput): Promise<{ value: unknown }>;
   waitForConnection(timeoutMs?: number): Promise<void>;
 }
@@ -304,6 +883,12 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
   const listTargetsWaitMs = options.listTargetsWaitMs ?? DEFAULT_LIST_WAIT_MS;
   const expectedHelpersVersion = options.helpersVersion ?? PAGE_HELPERS_VERSION;
   const resolveArtifacts = options.artifactDir ?? defaultArtifactDir;
+  const maxPostAuthBytes = options.maxPostAuthBytes ?? POST_AUTH_MAX_BYTES;
+  const maxChunkDataBytes = options.maxChunkDataBytes ?? CHUNK_MAX_DATA_BYTES;
+  const maxBufferedChunkBytes = options.maxBufferedChunkBytes ?? maxPostAuthBytes;
+  const maxConcurrentChunkStreams = options.maxConcurrentChunkStreams ?? MAX_CONCURRENT_CHUNK_STREAMS;
+  const chunkStreamTimeoutMs = options.chunkStreamTimeoutMs ?? CHUNK_STREAM_TIMEOUT_MS;
+  const now = options.now ?? (() => Date.now());
   const instanceId = randomUUID();
 
   let server: Server<WsState> | undefined;
@@ -312,13 +897,57 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
   let startPromise: Promise<void> | undefined;
   let startError: string | undefined;
 
-  let activeSocket: ServerWebSocket<WsState> | undefined;
-  let activeTab: number | undefined;
+  // BrowserLinks: profileId -> live authenticated BrowserLink
+  const links = new Map<string, BrowserLink>();
+  // Short target id (`extension:<tabId>`) -> profileId that it was issued for
+  const shortTargetOwners = new Map<number, string>();
+  let activeTab: ActiveTabRef | undefined;
   let nextReqId = 1;
-  const pending = new Map<number, PendingReq>();
   const connectWaiters = new Set<{ resolve: () => void; reject: (err: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   const events = new EventBuffer(options.eventBufferSize ?? 1000);
   const eventWaiters = new Set<EventWaiter>();
+
+  // Bindings are never evicted, so a stale short id can't be reissued to another browser.
+  // Once the table is full, new tabs get qualified ids instead.
+  function rememberShortTarget(tabId: number, profileId: string): boolean {
+    const owner = shortTargetOwners.get(tabId);
+    if (owner !== undefined) return owner === profileId;
+    if (shortTargetOwners.size >= MAX_SHORT_TARGET_OWNERS) return false;
+    shortTargetOwners.set(tabId, profileId);
+    return true;
+  }
+
+  function formatTargetId(link: { profileId: string; slug: string }, tabId: number): string {
+    if (links.size > 1 || !rememberShortTarget(tabId, link.profileId)) {
+      return eventKey(link, tabId);
+    }
+    return `${NAME}:${tabId}`;
+  }
+
+  // Events are keyed by the qualified id so the key can't change when a second browser connects.
+  function eventKey(link: { slug: string }, tabId: number): string {
+    return `${NAME}:${link.slug}:${tabId}`;
+  }
+
+  function findLinkBySlug(slug: string): BrowserLink | undefined {
+    const want = slug.trim().toLowerCase();
+    for (const link of links.values()) {
+      if (link.slug.toLowerCase() === want) return link;
+    }
+    return undefined;
+  }
+
+  function defaultLink(): BrowserLink | undefined {
+    if (activeTab) {
+      const active = links.get(activeTab.profileId);
+      if (active) return active;
+    }
+    return links.values().next().value;
+  }
+
+  function connectedSlugs(): string[] {
+    return [...links.values()].map((l) => l.slug);
+  }
 
   function clearHandshakeTimer(ws: ServerWebSocket<WsState>): void {
     if (ws.data.handshakeTimer) {
@@ -327,13 +956,15 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
     }
   }
 
-  function failAllPending(reason: string): void {
+  function failLinkPending(link: BrowserLink, reason: string): void {
+    link.outbound.failAll(reason);
     const err = new BackendUnavailable(NAME, reason);
-    for (const [reqId, p] of pending) {
+    for (const [reqId, p] of link.pending) {
       clearTimeout(p.timer);
-      pending.delete(reqId);
+      link.pending.delete(reqId);
       p.reject(err);
     }
+    link.decoder.clear();
   }
 
   function notifyConnected(): void {
@@ -353,14 +984,17 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
     }
   }
 
-  function dispatchEvent(msg: { tabId?: unknown; sessionId?: unknown; method?: unknown; params?: unknown }): void {
+  function dispatchEvent(
+    link: BrowserLink,
+    msg: { tabId?: unknown; sessionId?: unknown; method?: unknown; params?: unknown },
+  ): void {
     if (typeof msg.method !== "string") return;
     const tabId = typeof msg.tabId === "number" ? msg.tabId : undefined;
     const sessionId =
       typeof msg.sessionId === "string"
         ? msg.sessionId
         : tabId !== undefined
-          ? id(tabId)
+          ? eventKey(link, tabId)
           : undefined;
     const params =
       typeof msg.params === "object" && msg.params !== null && !Array.isArray(msg.params)
@@ -377,12 +1011,107 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
     }
   }
 
+  function attachAuthenticatedLink(ws: ServerWebSocket<WsState>): void {
+    const data = ws.data;
+    const profileId = data.profileId!;
+    const browser = data.browser!;
+    const slug = browserSlugFor(browser, profileId);
+
+    clearHandshakeTimer(ws);
+    data.stage = "ready";
+    data.authenticated = true;
+    data.slug = slug;
+
+    const existing = links.get(profileId);
+    if (existing && existing.ws !== ws) {
+      try {
+        existing.ws.close(CLOSE_REPLACED, "replaced by newer connection");
+      } catch {
+        /* ignore */
+      }
+      failLinkPending(existing, "replaced by newer connection");
+    }
+
+    const pending = new Map<number, PendingReq>();
+    const decoder = new ChunkReassembler({
+      maxDataBytes: CHUNK_MAX_DATA_BYTES,
+      maxTotalBytes: maxPostAuthBytes,
+      maxBufferedBytes: maxBufferedChunkBytes,
+      maxConcurrent: maxConcurrentChunkStreams,
+      timeoutMs: chunkStreamTimeoutMs,
+      now,
+      onExpire: ({ id, reqId }) => {
+        if (reqId === undefined) return;
+        const p = pending.get(reqId);
+        if (!p) return;
+        clearTimeout(p.timer);
+        pending.delete(reqId);
+        p.reject(new Error(`EXECUTION_FAILED: chunked stream ${id} expired after ${chunkStreamTimeoutMs}ms`));
+      },
+    });
+
+    const link: BrowserLink = {
+      profileId,
+      slug,
+      browser,
+      extensionVersion: data.extensionVersion ?? "",
+      ws,
+      outbound: new OutboundFrameQueue(ws, options.backpressureLimit),
+      pending,
+      decoder,
+      connectedAt: now(),
+    };
+    links.set(profileId, link);
+
+    ws.send(
+      JSON.stringify({
+        type: "welcome",
+        instanceId,
+        version: RELAY_VERSION,
+        protocolVersion: PROTOCOL_VERSION,
+        helpersVersion: expectedHelpersVersion,
+        slug,
+      }),
+    );
+    notifyConnected();
+  }
+
+  function handleAuthenticatedMessage(link: BrowserLink, msg: Record<string, unknown>): void {
+    const type = msg["type"];
+    if (type === "ping") {
+      link.outbound.enqueue([JSON.stringify({ type: "pong" })]).catch(() => {});
+      return;
+    }
+    if (type === "res" && typeof msg["id"] === "number") {
+      const p = link.pending.get(msg["id"]);
+      if (!p) return;
+      clearTimeout(p.timer);
+      link.pending.delete(msg["id"]);
+      if (msg["ok"] === true) {
+        p.resolve(msg["result"]);
+      } else {
+        const errText = String(msg["error"] ?? "extension request failed");
+        if (errText.startsWith("RESTRICTED_PAGE:")) {
+          p.reject(new BackendUnavailable(NAME, errText));
+        } else {
+          p.reject(new Error(errText));
+        }
+      }
+      return;
+    }
+    if (type === "event") {
+      dispatchEvent(link, msg as { tabId?: unknown; sessionId?: unknown; method?: unknown; params?: unknown });
+    }
+  }
+
   function handleWsMessage(ws: ServerWebSocket<WsState>, raw: string | Buffer): void {
     const data = ws.data;
-    const byteLen = typeof raw === "string" ? Buffer.byteLength(raw, "utf8") : raw.byteLength;
+    if (data.closed) return;
 
+    const byteLen = typeof raw === "string" ? Buffer.byteLength(raw, "utf8") : raw.byteLength;
     if (!data.authenticated && byteLen > PRE_AUTH_MAX_BYTES) {
       clearHandshakeTimer(ws);
+      data.closed = true;
       ws.close(1009, "pre-auth message too large");
       return;
     }
@@ -409,12 +1138,14 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
         ws.close(CLOSE_BAD_HELLO, "bad hello: expected hello");
         return;
       }
+
       const profileId = msg["profileId"];
       const browser = msg["browser"];
       const version = msg["version"];
       const helpersVersion = msg["helpersVersion"];
       const protocolVersion = msg["protocolVersion"];
       const nonce = msg["nonce"];
+
       if (
         typeof profileId !== "string" || profileId.trim() === "" ||
         typeof browser !== "string" || browser.trim() === "" ||
@@ -466,57 +1197,28 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
         return;
       }
 
-      clearHandshakeTimer(ws);
-      data.stage = "ready";
-      data.authenticated = true;
-
-      if (activeSocket && activeSocket !== ws) {
-        try {
-          activeSocket.close(CLOSE_REPLACED, "replaced by newer connection");
-        } catch {
-          /* ignore */
-        }
-      }
-      activeSocket = ws;
-      ws.send(
-        JSON.stringify({
-          type: "welcome",
-          instanceId,
-          version: RELAY_VERSION,
-          protocolVersion: PROTOCOL_VERSION,
-          helpersVersion: expectedHelpersVersion,
-        }),
-      );
-      notifyConnected();
+      attachAuthenticatedLink(ws);
       return;
     }
 
     // Authenticated traffic
-    const type = msg["type"];
-    if (type === "ping") {
-      ws.send(JSON.stringify({ type: "pong" }));
-      return;
-    }
-    if (type === "res" && typeof msg["id"] === "number") {
-      const p = pending.get(msg["id"]);
-      if (!p) return;
-      clearTimeout(p.timer);
-      pending.delete(msg["id"]);
-      if (msg["ok"] === true) {
-        p.resolve(msg["result"]);
-      } else {
-        const errText = String(msg["error"] ?? "extension request failed");
-        if (errText.startsWith("RESTRICTED_PAGE:")) {
-          p.reject(new BackendUnavailable(NAME, errText));
-        } else {
-          p.reject(new Error(errText));
+    const link = data.profileId ? links.get(data.profileId) : undefined;
+    if (!link || link.ws !== ws) return;
+
+    const decoded = link.decoder.push(msg);
+    if (decoded.kind === "pending" || decoded.kind === "ignored") return;
+    if (decoded.kind === "error") {
+      if (decoded.reqId !== undefined) {
+        const p = link.pending.get(decoded.reqId);
+        if (p) {
+          clearTimeout(p.timer);
+          link.pending.delete(decoded.reqId);
+          p.reject(new Error(decoded.error));
         }
       }
       return;
     }
-    if (type === "event") {
-      dispatchEvent(msg as { tabId?: unknown; sessionId?: unknown; method?: unknown; params?: unknown });
-    }
+    handleAuthenticatedMessage(link, decoded.message);
   }
 
   async function start(): Promise<void> {
@@ -564,6 +1266,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
                   data: {
                     stage: "awaiting_hello",
                     authenticated: false,
+                    closed: false,
                   },
                 });
                 if (upgraded) return undefined;
@@ -572,8 +1275,9 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
               return new Response("Not Found", { status: 404 });
             },
             websocket: {
-              maxPayloadLength: POST_AUTH_MAX_BYTES,
+              maxPayloadLength: TRANSPORT_MAX_PAYLOAD_BYTES,
               perMessageDeflate: false,
+              ...(options.backpressureLimit !== undefined ? { backpressureLimit: options.backpressureLimit } : {}),
               open(ws) {
                 ws.data.handshakeTimer = setTimeout(() => {
                   if (!ws.data.authenticated) {
@@ -584,11 +1288,24 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
               message(ws, message) {
                 handleWsMessage(ws, message);
               },
+              drain(ws) {
+                const profileId = ws.data.profileId;
+                if (!profileId) return;
+                const link = links.get(profileId);
+                if (link && link.ws === ws) {
+                  link.outbound.drain();
+                }
+              },
               close(ws) {
+                ws.data.closed = true;
                 clearHandshakeTimer(ws);
-                if (activeSocket === ws) {
-                  activeSocket = undefined;
-                  failAllPending("extension disconnected");
+                const profileId = ws.data.profileId;
+                if (profileId) {
+                  const link = links.get(profileId);
+                  if (link && link.ws === ws) {
+                    links.delete(profileId);
+                    failLinkPending(link, "extension disconnected");
+                  }
                 }
               },
             },
@@ -597,6 +1314,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
           boundPort = srv.port;
           if (options.registerGlobal) {
             registerExtensionBcCall(bcCall);
+            registerExtensionRequest(targetRequest);
           }
           return;
         } catch (err) {
@@ -613,7 +1331,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
 
   async function waitForConnection(timeoutMs: number = waitConnectMs): Promise<void> {
     await start();
-    if (activeSocket && activeSocket.data.authenticated) return;
+    if (links.size > 0) return;
     if (timeoutMs <= 0) {
       throw new BackendUnavailable(NAME, "extension is not connected");
     }
@@ -635,47 +1353,136 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
     });
   }
 
-  async function request(
+  async function requestOnLink(
+    link: BrowserLink,
     op: string,
     params: Record<string, unknown> = {},
     timeoutMs: number = DEFAULT_REQ_TIMEOUT_MS,
   ): Promise<unknown> {
-    await waitForConnection();
-    const ws = activeSocket;
-    if (!ws || !ws.data.authenticated) {
-      throw new BackendUnavailable(NAME, "extension is not connected");
+    if (!link.ws.data.authenticated || link.ws.data.closed) {
+      throw new BackendUnavailable(NAME, `browser "${link.slug}" is not connected`);
     }
     const reqId = nextReqId++;
+    const encoded = encodeChunkedFrames(
+      { type: "req", id: reqId, op, params },
+      { maxDataBytes: maxChunkDataBytes, maxTotalBytes: maxPostAuthBytes },
+    );
+    if (!encoded.ok) {
+      throw new Error(encoded.error);
+    }
     return new Promise<unknown>((resolve, reject) => {
       const timer = setTimeout(() => {
-        pending.delete(reqId);
+        link.pending.delete(reqId);
+        link.outbound.cancelUnsent(encoded.frames);
         reject(new Error(`CDP_TIMEOUT: extension op "${op}" timed out after ${timeoutMs}ms`));
       }, timeoutMs);
-      pending.set(reqId, { resolve, reject, timer });
-      try {
-        ws.send(JSON.stringify({ type: "req", id: reqId, op, params }));
-      } catch (err) {
-        clearTimeout(timer);
-        pending.delete(reqId);
-        reject(new BackendUnavailable(NAME, `failed to send to extension: ${(err as Error).message}`));
-      }
+      link.pending.set(reqId, { resolve, reject, timer });
+      link.outbound.enqueue(encoded.frames).catch((err) => {
+        const p = link.pending.get(reqId);
+        if (!p) return;
+        clearTimeout(p.timer);
+        link.pending.delete(reqId);
+        reject(err as Error);
+      });
     });
   }
 
-  function tabFor(input: OpInput): number | undefined {
-    return extensionTabOf(input["targetId"]) ?? activeTab;
+  async function request(
+    op: string,
+    params: Record<string, unknown> = {},
+    timeoutMs: number = DEFAULT_REQ_TIMEOUT_MS,
+    browserSlug?: string,
+  ): Promise<unknown> {
+    await waitForConnection();
+    const link = browserSlug ? findLinkBySlug(browserSlug) : defaultLink();
+    if (!link) {
+      if (browserSlug) {
+        throw new Error(
+          `INPUT_INVALID: browser "${browserSlug}" is not connected (connected: ${connectedSlugs().join(", ") || "none"})`,
+        );
+      }
+      throw new BackendUnavailable(NAME, "extension is not connected");
+    }
+    return requestOnLink(link, op, params, timeoutMs);
+  }
+
+  function resolveTarget(targetId: unknown): { link: BrowserLink; tabId: number } | undefined {
+    if (targetId !== undefined) {
+      const parsed = parseExtensionTargetId(targetId);
+      if (!parsed) return undefined;
+      if (parsed.slug) {
+        const link = findLinkBySlug(parsed.slug);
+        if (!link) {
+          throw new BackendUnavailable(NAME, `browser "${parsed.slug}" is not connected`);
+        }
+        return { link, tabId: parsed.tabId };
+      }
+      const boundProfileId = shortTargetOwners.get(parsed.tabId);
+      if (boundProfileId !== undefined) {
+        const boundLink = links.get(boundProfileId);
+        if (!boundLink) {
+          throw new Error(
+            `NO_ACTIVE_TARGET: tab ${String(targetId)} belonged to a browser that disconnected; list tabs again`,
+          );
+        }
+        return { link: boundLink, tabId: parsed.tabId };
+      }
+      if (links.size === 1) {
+        const only = links.values().next().value!;
+        rememberShortTarget(parsed.tabId, only.profileId);
+        return { link: only, tabId: parsed.tabId };
+      }
+      if (links.size === 0) {
+        throw new BackendUnavailable(NAME, "extension is not connected");
+      }
+      throw new Error(
+        `INPUT_INVALID: ambiguous extension targetId "${String(targetId)}" with multiple browsers connected (${connectedSlugs().join(", ")}); use extension:<slug>:${parsed.tabId}`,
+      );
+    }
+    if (!activeTab) return undefined;
+    const link = links.get(activeTab.profileId);
+    if (!link) {
+      throw new BackendUnavailable(NAME, `browser "${activeTab.slug}" is not connected`);
+    }
+    return { link, tabId: activeTab.tabId };
+  }
+
+  async function targetRequest(
+    op: string,
+    params: Record<string, unknown> = {},
+    timeoutMs: number = DEFAULT_REQ_TIMEOUT_MS,
+  ): Promise<unknown> {
+    if (!TARGET_REQUEST_OPS.has(op)) {
+      throw new Error(`INPUT_INVALID: extension op "${op}" is not allowed`);
+    }
+    await waitForConnection();
+    const { targetId, tabId: _ignored, ...rest } = params;
+    const resolved = resolveTarget(targetId);
+    if (!resolved) {
+      throw new BackendUnavailable(NAME, "no extension tab selected");
+    }
+    return requestOnLink(resolved.link, op, { ...rest, tabId: resolved.tabId }, timeoutMs);
+  }
+
+  // An explicit target must never widen into "all events" while no browser is connected.
+  function eventTarget(targetId: unknown): { link: BrowserLink; tabId: number } | undefined {
+    if (links.size > 0) return resolveTarget(targetId);
+    if (targetId !== undefined) throw new BackendUnavailable(NAME, "extension is not connected");
+    return undefined;
   }
 
   async function bcCall(input: BcCallInput): Promise<{ value: unknown }> {
-    const tab = extensionTabOf(input.targetId) ?? activeTab;
-    if (tab === undefined) {
+    await waitForConnection();
+    const resolved = resolveTarget(input.targetId);
+    if (!resolved) {
       throw new BackendUnavailable(NAME, "no extension tab selected");
     }
     const reqTimeout = typeof input.timeoutMs === "number" ? input.timeoutMs + 5_000 : DEFAULT_REQ_TIMEOUT_MS;
-    const res = (await request(
+    const res = (await requestOnLink(
+      resolved.link,
       "bc_call",
       {
-        tabId: tab,
+        tabId: resolved.tabId,
         steps: input.steps,
         ...(typeof input.frameId === "number" ? { frameId: input.frameId } : {}),
         ...(typeof input.timeoutMs === "number" ? { timeoutMs: input.timeoutMs } : {}),
@@ -687,6 +1494,15 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
     return { value };
   }
 
+  function getConnectedBrowsers(): ConnectedBrowserInfo[] {
+    return [...links.values()].map((l) => ({
+      slug: l.slug,
+      profileId: l.profileId,
+      browser: l.browser,
+      extensionVersion: l.extensionVersion,
+    }));
+  }
+
   return {
     name: NAME,
     instanceId,
@@ -696,8 +1512,10 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
     },
 
     isConnected() {
-      return Boolean(activeSocket && activeSocket.data.authenticated);
+      return links.size > 0;
     },
+
+    getConnectedBrowsers,
 
     start,
     waitForConnection,
@@ -714,6 +1532,8 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
         if (isBrowserLevelMethod(method)) return false;
       }
       if (extensionTabOf(input["targetId"]) !== undefined) return true;
+      // A named browser is always ours; invoke reports it if that browser is offline.
+      if (op === "navigate" && typeof input["browser"] === "string") return true;
       if (input["targetId"] !== undefined) return false;
       return op === "navigate" ? isActive || activeTab === undefined : isActive && activeTab !== undefined;
     },
@@ -723,34 +1543,96 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
 
       switch (op) {
         case "select_target": {
-          const tab = extensionTabOf(input["targetId"]);
-          if (tab === undefined) throw new Error("INPUT_INVALID: invalid extension targetId");
-          activeTab = tab;
-          return { activeTargetId: id(tab), targetId: id(tab), backend: NAME };
+          await waitForConnection();
+          const resolved = resolveTarget(input["targetId"]);
+          if (!resolved) throw new Error("INPUT_INVALID: invalid extension targetId");
+          activeTab = {
+            profileId: resolved.link.profileId,
+            slug: resolved.link.slug,
+            tabId: resolved.tabId,
+          };
+          const targetId = formatTargetId(resolved.link, resolved.tabId);
+          return { activeTargetId: targetId, targetId, browser: resolved.link.slug, backend: NAME };
         }
 
         case "navigate": {
           const url = String(input["url"] ?? "");
           if (!url) throw new Error("INPUT_INVALID: url is required");
-          const tab = tabFor(input);
           const until = input["until"] === "domcontentloaded" ? "domcontentloaded" : "load";
-          const res = (await request(
+          const browserSlug =
+            typeof input["browser"] === "string" && input["browser"].trim() !== ""
+              ? input["browser"].trim()
+              : undefined;
+
+          await waitForConnection();
+
+          let targetLink: BrowserLink;
+          let tabId: number | undefined;
+          if (browserSlug) {
+            const matched = findLinkBySlug(browserSlug);
+            if (!matched) {
+              throw new Error(
+                `INPUT_INVALID: browser "${browserSlug}" is not connected (connected: ${connectedSlugs().join(", ") || "none"})`,
+              );
+            }
+            if (input["targetId"] !== undefined) {
+              const resolved = resolveTarget(input["targetId"]);
+              if (!resolved) {
+                throw new Error(
+                  `INPUT_INVALID: targetId "${String(input["targetId"])}" does not belong to browser "${matched.slug}"`,
+                );
+              }
+              if (resolved.link.profileId !== matched.profileId) {
+                throw new Error(
+                  `INPUT_INVALID: targetId "${String(input["targetId"])}" belongs to browser "${resolved.link.slug}", not "${matched.slug}"`,
+                );
+              }
+              targetLink = resolved.link;
+              tabId = resolved.tabId;
+            } else {
+              // Explicit `browser` ignores any implicit/active target and opens in that browser.
+              targetLink = matched;
+              tabId = undefined;
+            }
+          } else if (input["targetId"] !== undefined) {
+            const resolved = resolveTarget(input["targetId"]);
+            if (!resolved) throw new Error("INPUT_INVALID: invalid extension targetId");
+            targetLink = resolved.link;
+            tabId = resolved.tabId;
+          } else {
+            const resolved = resolveTarget(undefined);
+            if (resolved) {
+              targetLink = resolved.link;
+              tabId = resolved.tabId;
+            } else {
+              const fallback = defaultLink();
+              if (!fallback) throw new BackendUnavailable(NAME, "extension is not connected");
+              targetLink = fallback;
+              tabId = undefined;
+            }
+          }
+
+          const res = (await requestOnLink(
+            targetLink,
             "navigate",
             {
-              ...(tab !== undefined ? { tabId: tab } : {}),
+              ...(tabId !== undefined ? { tabId } : {}),
               url,
               until,
               ...(timeoutMs !== undefined ? { timeoutMs } : {}),
             },
             (timeoutMs ?? 30_000) + 10_000,
           )) as { tabId?: number; loaded?: boolean; url?: string; title?: string };
-          const tid = typeof res?.tabId === "number" ? res.tabId : tab;
-          if (tid !== undefined) activeTab = tid;
+          const tid = typeof res?.tabId === "number" ? res.tabId : tabId;
+          if (tid !== undefined) {
+            activeTab = { profileId: targetLink.profileId, slug: targetLink.slug, tabId: tid };
+          }
           return {
             loaded: res?.loaded !== false,
-            targetId: tid === undefined ? null : id(tid),
+            targetId: tid === undefined ? null : formatTargetId(targetLink, tid),
             url: res?.url ?? url,
             title: res?.title ?? "",
+            browser: targetLink.slug,
             backend: NAME,
           };
         }
@@ -761,11 +1643,13 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
           if (/\b__bc\b/.test(expression)) {
             throw new Error("INTERNAL: __bc calls on extension tabs must use bc_call, never evaluate");
           }
-          const tab = tabFor(input);
-          if (tab === undefined) throw new BackendUnavailable(NAME, "no extension tab selected");
-          const res = (await request(
+          await waitForConnection();
+          const resolved = resolveTarget(input["targetId"]);
+          if (!resolved) throw new BackendUnavailable(NAME, "no extension tab selected");
+          const res = (await requestOnLink(
+            resolved.link,
             "eval",
-            { tabId: tab, expression, isolated: input["isolated"] === true },
+            { tabId: resolved.tabId, expression, isolated: input["isolated"] === true },
             timeoutMs ?? DEFAULT_REQ_TIMEOUT_MS,
           )) as { value?: unknown; contextId?: number };
           return {
@@ -780,17 +1664,19 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
           if (isBlockedCdpMethod(method)) {
             throw new Error(`REFUSED: ${method} is blocked so browser-control never closes or crashes the user's browser`);
           }
-          const tab = tabFor(input);
-          if (tab === undefined) throw new BackendUnavailable(NAME, "no extension tab selected");
+          await waitForConnection();
+          const resolved = resolveTarget(input["targetId"]);
+          if (!resolved) throw new BackendUnavailable(NAME, "no extension tab selected");
           const params =
             typeof input["params"] === "object" && input["params"] !== null && !Array.isArray(input["params"])
               ? (input["params"] as Record<string, unknown>)
               : {};
           const sessionId = typeof input["sessionId"] === "string" ? input["sessionId"] : undefined;
-          const res = (await request(
+          const res = (await requestOnLink(
+            resolved.link,
             "cdp",
             {
-              tabId: tab,
+              tabId: resolved.tabId,
               method,
               params,
               ...(sessionId ? { sessionId } : {}),
@@ -801,8 +1687,9 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
         }
 
         case "capture_screenshot": {
-          const tab = tabFor(input);
-          if (tab === undefined) throw new BackendUnavailable(NAME, "no extension tab selected");
+          await waitForConnection();
+          const resolved = resolveTarget(input["targetId"]);
+          if (!resolved) throw new BackendUnavailable(NAME, "no extension tab selected");
           const format = input["format"] === "jpeg" ? "jpeg" : "png";
           const quality = typeof input["quality"] === "number" ? input["quality"] : undefined;
           const fullPage = input["fullPage"] === true;
@@ -810,8 +1697,8 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
             typeof input["clip"] === "object" && input["clip"] !== null && !Array.isArray(input["clip"])
               ? (input["clip"] as Record<string, unknown>)
               : undefined;
-          const res = (await request("screenshot", {
-            tabId: tab,
+          const res = (await requestOnLink(resolved.link, "screenshot", {
+            tabId: resolved.tabId,
             format,
             ...(quality !== undefined ? { quality } : {}),
             ...(fullPage ? { fullPage: true } : {}),
@@ -831,7 +1718,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
             path: filePath,
             mimeType: format === "jpeg" ? "image/jpeg" : "image/png",
             bytes: buf.length,
-            targetId: id(tab),
+            targetId: formatTargetId(resolved.link, resolved.tabId),
             backend: NAME,
           };
           if (clip) {
@@ -842,8 +1729,9 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
         }
 
         case "capture_pdf": {
-          const tab = tabFor(input);
-          if (tab === undefined) throw new BackendUnavailable(NAME, "no extension tab selected");
+          await waitForConnection();
+          const resolved = resolveTarget(input["targetId"]);
+          if (!resolved) throw new BackendUnavailable(NAME, "no extension tab selected");
           const params: Record<string, unknown> = {
             printBackground: input["printBackground"] !== false,
           };
@@ -861,8 +1749,8 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
           ] as const) {
             if (input[key] !== undefined) params[key] = input[key];
           }
-          const res = (await request("cdp", {
-            tabId: tab,
+          const res = (await requestOnLink(resolved.link, "cdp", {
+            tabId: resolved.tabId,
             method: "Page.printToPDF",
             params,
           })) as { result?: { data?: string } };
@@ -880,18 +1768,18 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
             path: filePath,
             mimeType: "application/pdf",
             bytes: buf.length,
-            targetId: id(tab),
+            targetId: formatTargetId(resolved.link, resolved.tabId),
             backend: NAME,
           };
         }
 
         case "read_events": {
-          const tab = tabFor(input);
+          const resolved = eventTarget(input["targetId"]);
           const sessionId =
             typeof input["sessionId"] === "string"
               ? input["sessionId"]
-              : tab !== undefined
-                ? id(tab)
+              : resolved
+                ? eventKey(resolved.link, resolved.tabId)
                 : undefined;
           const limit = typeof input["limit"] === "number" ? input["limit"] : 100;
           const clear = input["clear"] !== false;
@@ -914,12 +1802,12 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
         case "wait_for_event": {
           const method = typeof input["method"] === "string" ? input["method"] : "";
           if (!method) throw new Error("INPUT_INVALID: method is required");
-          const tab = tabFor(input);
+          const resolved = eventTarget(input["targetId"]);
           const sessionId =
             typeof input["sessionId"] === "string"
               ? input["sessionId"]
-              : tab !== undefined
-                ? id(tab)
+              : resolved
+                ? eventKey(resolved.link, resolved.tabId)
                 : undefined;
           const match =
             typeof input["match"] === "object" && input["match"] !== null && !Array.isArray(input["match"])
@@ -955,16 +1843,29 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
 
     async listTargets(): Promise<BackendTarget[]> {
       await waitForConnection(listTargetsWaitMs);
-      const res = (await request("list_tabs", {}, 15_000)) as {
-        tabs?: Array<{ tabId: number; url?: string; title?: string }>;
-      };
-      return (res?.tabs ?? []).map((t) => ({
-        targetId: id(t.tabId),
-        type: "page",
-        title: t.title ?? "",
-        url: t.url ?? "",
-        backend: NAME,
-      }));
+      const allLinks = [...links.values()];
+      const settled = await Promise.allSettled(
+        allLinks.map(async (link) => {
+          const res = (await requestOnLink(link, "list_tabs", {}, 15_000)) as {
+            tabs?: Array<{ tabId: number; url?: string; title?: string }>;
+          };
+          return (res?.tabs ?? []).map((t) => ({
+            targetId: formatTargetId(link, t.tabId),
+            type: "page" as const,
+            title: t.title ?? "",
+            url: t.url ?? "",
+            backend: NAME,
+          }));
+        }),
+      );
+      const targets: BackendTarget[] = [];
+      let firstErr: unknown;
+      for (const r of settled) {
+        if (r.status === "fulfilled") targets.push(...r.value);
+        else if (firstErr === undefined) firstErr = r.reason;
+      }
+      if (targets.length === 0 && firstErr !== undefined) throw firstErr;
+      return targets;
     },
 
     async status() {
@@ -973,22 +1874,29 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
       } catch {
         /* report unavailable below */
       }
-      const connected = Boolean(activeSocket && activeSocket.data.authenticated);
+      const connected = links.size > 0;
+      const primary = defaultLink();
+      const browsers = getConnectedBrowsers();
       return {
         available: connected,
         listening: Boolean(server),
         port: boundPort ?? null,
         instanceId,
         protocolVersion: PROTOCOL_VERSION,
-        ...(connected
+        browsers,
+        ...(connected && primary
           ? {
-              browser: activeSocket!.data.browser ?? null,
-              profileId: activeSocket!.data.profileId ?? null,
-              extensionVersion: activeSocket!.data.extensionVersion ?? null,
+              slug: primary.slug,
+              browser: primary.browser,
+              profileId: primary.profileId,
+              extensionVersion: primary.extensionVersion,
             }
           : {}),
         ...(startError ? { reason: startError } : {}),
-        activeTargetId: activeTab === undefined ? null : id(activeTab),
+        activeTargetId:
+          activeTab && links.has(activeTab.profileId)
+            ? formatTargetId(activeTab, activeTab.tabId)
+            : null,
       };
     },
 
@@ -999,22 +1907,24 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
     async dispose() {
       if (options.registerGlobal) {
         registerExtensionBcCall(undefined);
+        registerExtensionRequest(undefined);
       }
       failConnectWaiters("relay disposed");
-      failAllPending("relay disposed");
+      for (const link of [...links.values()]) {
+        failLinkPending(link, "relay disposed");
+        clearHandshakeTimer(link.ws);
+        try {
+          link.ws.close(1001, "relay shutting down");
+        } catch {
+          /* ignore */
+        }
+      }
+      links.clear();
+      shortTargetOwners.clear();
       for (const w of [...eventWaiters]) {
         clearTimeout(w.timer);
         eventWaiters.delete(w);
         w.reject(new Error("relay disposed"));
-      }
-      if (activeSocket) {
-        clearHandshakeTimer(activeSocket);
-        try {
-          activeSocket.close(1001, "relay shutting down");
-        } catch {
-          /* ignore */
-        }
-        activeSocket = undefined;
       }
       if (server) {
         server.stop(true);

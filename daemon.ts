@@ -17,6 +17,7 @@
 // /eval, /nav and /page/* take ?t=<targetId> or ?m=<text in the tab's url or title>,
 // ?q=1 to leave out the "what changed" lines after an action, and ?raw=1 to omit untrusted boundaries.
 import { openStandaloneCapability, type InvokeResult } from "@agent-software/core";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -66,6 +67,37 @@ function readVersion(capabilityDir: string): string {
   }
 }
 
+export type NavBrowserScope = {
+  browser: string;
+  explicitTargetId?: string;
+};
+
+/**
+ * Apply request-scoped browser selection to a `navigate` call:
+ * - Without an explicit targetId, drop any implicit/active targetId filled in by page-runner so
+ *   navigation opens in the named browser instead of hijacking another browser's active tab.
+ * - With an explicit targetId, preserve both so the backend rejects cross-browser mismatches.
+ */
+export function applyNavBrowserScope(
+  operation: string,
+  input: Json,
+  scope: NavBrowserScope | undefined,
+): Json {
+  if (operation !== "navigate" || !scope) return input;
+  if (scope.explicitTargetId !== undefined) {
+    return {
+      ...input,
+      targetId: scope.explicitTargetId,
+      ...(input["browser"] === undefined ? { browser: scope.browser } : {}),
+    };
+  }
+  const { targetId: _ignored, ...rest } = input;
+  return {
+    ...rest,
+    ...(rest["browser"] === undefined ? { browser: scope.browser } : {}),
+  };
+}
+
 export async function serveDaemon(capabilityDir: string, socketPath: string): Promise<void> {
   const capability = await openStandaloneCapability(capabilityDir);
   const maxChars = Number(process.env["BROWSER_CONTROL_MAX_OUTPUT"]) || 50_000;
@@ -89,6 +121,7 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
   };
 
   let reconnectInput: Json = { timeoutMs: 60_000 };
+  const requestBrowser = new AsyncLocalStorage<NavBrowserScope | undefined>();
 
   /** Invoke; if there is no browser connection (never made, or dropped), connect once and retry. */
   const invoke = async (operation: string, input: Json = {}): Promise<InvokeResult> => {
@@ -98,10 +131,11 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
         "DISCONNECT_REFUSED: the daemon keeps browser connections so the user is not asked to click Allow again. Disconnecting fixes nothing. Only if the user asked: browser-control-daemon stop --force",
       );
     }
-    const result = await invokeOnce(operation, input);
+    const effectiveInput = applyNavBrowserScope(operation, input, requestBrowser.getStore());
+    const result = await invokeOnce(operation, effectiveInput);
     if (operation === "connect_browser") {
       if (result.ok) {
-        const { port: _port, wsUrl: _wsUrl, ...rest } = input;
+        const { port: _port, wsUrl: _wsUrl, ...rest } = effectiveInput;
         const name = ((result.data as Json)["via"] as Json | undefined)?.["name"];
         reconnectInput = typeof name === "string" && !rest["browser"] && !rest["profileDir"] ? { ...rest, browser: name } : rest;
       }
@@ -109,7 +143,7 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
     }
     if (result.ok || !result.error.message.startsWith("NOT_CONNECTED")) return result;
     const reconnected = await invokeOnce("connect_browser", reconnectInput);
-    return reconnected.ok ? invokeOnce(operation, input) : reconnected;
+    return reconnected.ok ? invokeOnce(operation, effectiveInput) : reconnected;
   };
 
   const handlePage = createPageHelperHandler(invoke);
@@ -182,22 +216,39 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
       }
       case "eval":
         return text(await invoke("evaluate", { expression: body, targetId }), (data) => data.value, wrap);
-      case "nav":
+      case "nav": {
+        const browser = url.searchParams.get("browser")?.trim() || undefined;
+        const navScope = browser ? { browser, explicitTargetId: targetId } : undefined;
         return text(
-          await handlePage(
-            "nav",
-            { url: body, until: url.searchParams.get("until") ?? "", snap: url.searchParams.get("snap") === "1" },
-            targetId,
+          await requestBrowser.run(navScope, () =>
+            handlePage(
+              "nav",
+              { url: body, until: url.searchParams.get("until") ?? "", snap: url.searchParams.get("snap") === "1" },
+              targetId,
+            ),
           ),
           (data) => data.value,
           wrap,
         );
+      }
       case "page": {
         const parsed = parseJsonBody(body);
         if (!parsed.ok) return parsed.res;
+        const browser =
+          url.searchParams.get("browser")?.trim() ||
+          (typeof parsed.value["browser"] === "string" ? parsed.value["browser"].trim() : "") ||
+          undefined;
+        const explicitTargetId =
+          targetId ??
+          (typeof parsed.value["targetId"] === "string" && parsed.value["targetId"].trim() !== ""
+            ? parsed.value["targetId"].trim()
+            : undefined);
+        const navScope = browser ? { browser, explicitTargetId } : undefined;
         const shouldWrap = wrap && UNTRUSTED_PAGE_ACTIONS.has(operation) && !parsed.value["out"];
         return text(
-          await handlePage(operation, { ...parsed.value, ...(quiet ? { quiet: true } : {}) }, targetId),
+          await requestBrowser.run(navScope, () =>
+            handlePage(operation, { ...parsed.value, ...(quiet ? { quiet: true } : {}) }, explicitTargetId),
+          ),
           (data) => data.value,
           shouldWrap,
         );
@@ -213,10 +264,15 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
         const activeBackendInfo = activeBackendName ? (backendsState?.[activeBackendName] as Json | undefined) : undefined;
         const active = state["activeTargetId"] ?? activeBackendInfo?.["activeTargetId"];
         const others = (state["alsoConnected"] as string[] | undefined) ?? [];
+        const extBrowsers = Array.isArray(activeBackendInfo?.["browsers"])
+          ? (activeBackendInfo!["browsers"] as Array<{ slug?: string }>)
+              .map((b) => b.slug)
+              .filter((s): s is string => typeof s === "string" && s !== "")
+          : [];
         const browserLabel =
           state["browser"] ??
           (activeBackendName === "extension"
-            ? (activeBackendInfo?.["browser"] ?? "extension")
+            ? (extBrowsers.length > 0 ? extBrowsers.join(", ") : (activeBackendInfo?.["browser"] ?? "extension"))
             : activeBackendName ?? "browser");
         const header = `# ${browserLabel}${others.length > 0 ? ` (also connected: ${others.join(", ")}; switch with: start <name>)` : ""}`;
         return text(

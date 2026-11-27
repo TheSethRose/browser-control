@@ -191,16 +191,14 @@ Tested on macOS with Bun 1.4.4, a listener on `127.0.0.1:49222–49225` and a `0
 ### Multi-browser & multi-profile identity (`BrowserLinks`)
 
 - Each extension instance generates and persists a random `profileId` in `chrome.storage.local`, detects its browser brand (`Chrome`, `Brave`, `Edge`, `Opera`, `Chromium` via `navigator.userAgentData`), and supports an optional user-chosen name in the popup.
-- The daemon assigns each connected browser a stable slug (e.g. `chrome-macbook`, `brave-macbook`), stored in `~/.config/browser-control/extension-browsers.json` (`0600`).
+- The daemon derives each connected browser's slug statelessly as `<brand>-<first 6 hex of sha256(profileId)>` (e.g. `chrome-3a00d5`). No slug file is stored, so every daemon computes the same slug for the same browser. Short target IDs (`extension:<tabId>`) are bound to the browser that issued them; once that browser disconnects they fail with `NO_ACTIVE_TARGET` instead of silently hitting another browser.
 - **Collision-free tab IDs:** Chrome numbers tabs per browser, so Chrome and Brave can both have tab `42`. The relay maps `(profileId, tabId)` cleanly to target IDs (`extension:<tabId>` when one browser is connected; `extension:<browserSlug>:<tabId>` or relay-mapped IDs when multiple browsers are connected), and `--browser <slug>` picks which connected browser opens new tabs.
 
 ### Mutual authentication & pairing (MIT-adapted from `anomalyco/browse`)
 
 - **Origin check:** reject any WebSocket upgrade whose `Origin` does not match the extension's fixed ID (`403`), derived from the pinned `key` in `manifest.json`.
 - **Pre-auth guards:** cap pre-auth messages at **64 KB** and close sockets that do not complete the handshake within **10 seconds**.
-- **Two pairing paths (both end in a per-browser 32-byte secret token):**
-  1. **Zero-click unpacked (`pairing.json`):** `extension setup` writes a shared bootstrap token (or one-time code) + port hint to `~/.config/browser-control/extension-relay.json` (`0600`) and `extension/pairing.json` (`0600`, gitignored). `pairing.json` wins over stale stored tokens so re-running setup rotates cleanly.
-  2. **One-time 8-char Crockford code (`extension pair` / `onboarding.html#code=...`):** For Chrome Web Store builds, second browsers, or remote machines. The extension and daemon run ephemeral P-256 ECDH (`crypto.subtle` / `node:crypto`) + PBKDF2-derived code proof; the daemon mints and wraps a per-browser token, and the code is spent on first use (rate-limited on failures).
+- **One pairing path (unpacked builds):** `extension setup` writes a shared 32-byte token + port hint to `~/.config/browser-control/extension-relay.json` (`0600`) and `extension/pairing.json` (`0600`, gitignored). Daemons only read that file or create it once; they never rotate it. Only `extension setup` replaces it. The one-time code and per-browser tokens are deferred; see **Later: Web Store build**.
 - **Mutual challenge-response on every connect (never plaintext token on the wire):**
   1. Extension sends `hello` with `{ profileId, browser, name?, version, helpersVersion, protocolVersion, nonce }`.
   2. Daemon replies `auth.challenge` with `{ nonce: relayNonce, proof: HMAC(token, "bc-v2|relay|127.0.0.1:<port>/extension|<extNonce>|<relayNonce>") }`.
@@ -311,8 +309,8 @@ Read https://github.com/TheSethRose/browser-control and install its browser-cont
 5. Waits for the extension to connect (up to 60 s), then runs `tabs` to confirm.
 
 Additional subcommands:
-- `extension pair` — prints a one-time 8-char Crockford code (for a second browser, remote machine, or Store build) and waits for it to pair.
-- `extension browsers` / `extension revoke <slug>` — list paired/connected browsers and revoke one individually.
+- `extension browsers` — list connected browsers and their slugs.
+- `extension pair` and `extension revoke <slug>` — deferred to **Later: Web Store build** (they need per-browser tokens).
 - `extension status` — port, connected browsers, protocol/helper versions, pairing state.
 - `extension diagnostics` — pulls the extension's ring-buffer log + daemon relay state for bug reports.
 - `extension enable` / `extension disable` — toggle `extension,cdp` vs `cdp`.
@@ -357,10 +355,10 @@ Done when: `bun install`, `bun run typecheck`, and `bun test` pass with every v1
 
 ### Phase 2 — Relay backend and hardened MV3 extension
 
-- Build `src/backends/extension.ts`: port range `49222–49229`, `/version` endpoint, `Origin` check, mutual HMAC + ephemeral P-256 ECDH code exchange, pre-auth 64 KB / 10 s guards, `BrowserLinks` multi-browser slug & tab mapping, `hold_debugger`, domain re-enable, `sessionId` event routing, `__bc` tripwire, `RESTRICTED_PAGE` → `BackendUnavailable`, `handoff` waiter registry.
+- Build `src/backends/extension.ts`: port range `49222–49229`, `/version` endpoint, `Origin` check, mutual HMAC (shared token; code exchange deferred), pre-auth 64 KB / 10 s guards, `BrowserLinks` multi-browser slug & tab mapping, `hold_debugger`, domain re-enable, `sessionId` event routing, `__bc` tripwire, `RESTRICTED_PAGE` → `BackendUnavailable`, `handoff` waiter registry.
 - Register `extension` in `src/backends/registry.ts`; update `src/backends/router.ts` to route `execute_cdp`, `capture_pdf`, `read_events`, `wait_for_event` to `extension` tabs; start/dispose relay in `daemon.ts`.
-- Modularize and finish `extension/`: `lib/pairing.js`, `lib/debugger-hub.js` (SW-restart restore, `ownedByUs`, foreign-frame eviction, `sessionId`, `Emulation.setFocusEmulationEnabled`), `lib/window-groups.js` (background non-minimized window placement, collapsed `"Agents · N"` groups, popup adoption), `lib/tab-cleanup.js` (`autoDiscardable: false`, optional mute, `leaveLastWindowOpen`, optional idle cleanup), `lib/ring-log.js`, `content-overlay.js` (closed-shadow-root handoff card + foreign-frame eviction), `onboarding.html`, fixed `key` + `tabGroups`/`notifications` in `manifest.json`, and updated `popup.html`/`popup.js`.
-- Write `tests/extension-backend.test.ts` with a mock extension client: wrong origin (`403`), failed mutual HMAC (`4006`), ECDH code exchange & single-use spend, protocol/helper mismatch (`4003`), `/version` probe, multi-browser tab ID isolation, `bc_call`, `__bc` tripwire, `sessionId` event delivery to the right socket only, oversized message error without dropping socket, handoff completion, and second daemon on next port.
+- Modularize and finish `extension/`: `lib/pairing.js`, `lib/debugger-hub.js` (SW-restart restore, `ownedByUs`, foreign-frame eviction, `sessionId`, `Emulation.setFocusEmulationEnabled`), `lib/window-groups.js` (background non-minimized window placement, collapsed `"Agents · N"` groups, popup adoption), `lib/tab-cleanup.js` (`autoDiscardable: false`, optional mute, `leaveLastWindowOpen`, optional idle cleanup), `lib/ring-log.js`, `content-overlay.js` (closed-shadow-root handoff card + foreign-frame eviction), fixed `key` + `tabGroups`/`notifications` in `manifest.json`, and updated `popup.html`/`popup.js`.
+- Write `tests/extension-backend.test.ts` with a mock extension client: wrong origin (`403`), failed mutual HMAC (`4006`), chunked frames (both directions, caps, backpressure), protocol/helper mismatch (`4003`), `/version` probe, multi-browser tab ID isolation, `bc_call`, `__bc` tripwire, `sessionId` event delivery to the right socket only, oversized message error without dropping socket, handoff completion, and second daemon on next port.
 
 Done when: all unit/integration tests pass and the real extension pairs with two daemons (and two browser profiles if available) simultaneously.
 
@@ -400,6 +398,17 @@ Done when: `bun run build:skill`, `typecheck`, `bun test`, `tests/e2e/`, and all
 - Running v1 daemons stay alive in memory until agents restart them (wrapper stale-check prompts gently; no `stop --force`).
 - Remove the staging unpacked extension from Chrome and load `browser-control/extension` instead; run `extension setup` once.
 - Release as `v2.0.0` only on Seth's go-ahead. Delete the `browser-control-v2/` staging folder and its worktrees after a week of clean use.
+
+### Later: Web Store build (deferred from Phase 2)
+
+Deferred on 2026-11-26 ("ship it smaller"): the one-time pairing code (`extension pair`, `onboarding.html#code=...`), per-browser tokens, and `extension revoke <slug>`.
+
+- **Why deferred:** the unpacked build pairs with zero clicks through `pairing.json`, so the code path only matters for a Store build, a second machine, or a browser that can't read the extension folder. The first version raced: two daemons could mint or rotate tokens at once, and a half-finished pairing could leave a browser locked out. No half-built pairing path ships.
+- **Requirements when it is built:**
+  - A password-authenticated key exchange (PAKE, e.g. SPAKE2 or CPace), so a short code can't be brute-forced offline from a captured exchange. A plain ECDH + PBKDF2 code proof is not enough.
+  - Cross-process locking (one lock file under `~/.config/browser-control/`, held across read-modify-write) for every write to the token store, since up to 8 daemons share it.
+  - Per-browser tokens keyed by `profileId`, stored `0600`, written atomically; revoke removes one entry and closes that browser's sockets on every daemon.
+  - Codes are single-use, expire within 5 minutes, and lock out after a few failures.
 
 ---
 
