@@ -326,11 +326,8 @@ windowGroups.seedActiveTabs().catch(() => {});
 async function closeTabInternal(tabId, { onlyIf } = {}) {
   if (onlyIf && !onlyIf()) return { closed: false };
   await debuggerHub.detachTab(tabId);
-  const prevHandoff = handoffTabs.get(tabId);
-  handoffTabs.delete(tabId);
-  if (prevHandoff?.notifId) {
-    chrome.notifications?.clear?.(prevHandoff.notifId)?.catch?.(() => {});
-  }
+  // Handoff state is cleared by purge (onPurgeTab) only after a real close, so a handoff
+  // that starts while the detach is pending still vetoes an idle close.
   const res = await tabCleanup.closeSafely(tabId, { onlyIf });
   if (res.closed || !onlyIf) tabCleanup.purge(tabId);
   return res;
