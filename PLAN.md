@@ -365,6 +365,7 @@ Done when: all unit/integration tests pass and the real extension pairs with two
 ### Phase 3 — Full command parity on extension tabs
 
 - Wire `page-runner.ts` for full extension support: element handles for `upload` and `styles`, cross-origin frames (`list_frames` + child `sessionId`), dialog timeout detection + `dialog` command, `handoff` command + `page.handoff()` in `script`, `challenges.ts` integration on `nav`/`snap`/`do`, Retina-safe screenshots, long-wait `hold_debugger`.
+- After a handoff ends, refocus the user's previously active tab and re-collapse the Agents group.
 - Update `build:skill` to copy `src/page-helpers.js.txt` → `extension/page-helpers.js`, bundle `cli.js` and `mcp.js` (under 500 KB), and copy `extension/` (excluding `pairing.json`) into `.agents/skills/browser-control/extension/`.
 
 Done when: every command in section 3 runs cleanly on an extension tab against the fixture page.

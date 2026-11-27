@@ -363,6 +363,95 @@ export function createWindowGroups({
     await chromeApi.tabs.update(tabId, { active: true }).catch(() => {});
   }
 
+  /**
+   * Snapshot the tab the user currently has active before a handoff steals focus,
+   * so `restoreAfterHandoff` can return them to it once the handoff ends.
+   */
+  async function captureActiveTabForRestore(handoffTabId) {
+    const handoffTab = await chromeApi.tabs.get(handoffTabId).catch(() => null);
+
+    try {
+      const focusedWin = await findTargetWindow(chromeApi);
+      if (focusedWin && typeof focusedWin.id === "number") {
+        const activeInFocused = (await chromeApi.tabs.query({ active: true, windowId: focusedWin.id })) || [];
+        const picked = activeInFocused.find((t) => typeof t.id === "number" && t.id !== handoffTabId);
+        if (picked) {
+          return { tabId: picked.id, windowId: picked.windowId };
+        }
+      }
+    } catch {
+      /* fall through */
+    }
+
+    if (typeof handoffTab?.windowId === "number") {
+      try {
+        const activeInSame = (await chromeApi.tabs.query({ active: true, windowId: handoffTab.windowId })) || [];
+        const picked = activeInSame.find((t) => typeof t.id === "number" && t.id !== handoffTabId);
+        if (picked) {
+          return { tabId: picked.id, windowId: picked.windowId };
+        }
+      } catch {
+        /* fall through */
+      }
+    }
+
+    try {
+      const allActive = (await chromeApi.tabs.query({ active: true })) || [];
+      const picked =
+        allActive.find(
+          (t) => typeof t.id === "number" && t.id !== handoffTabId && t.windowId === handoffTab?.windowId,
+        ) || allActive.find((t) => typeof t.id === "number" && t.id !== handoffTabId);
+      if (picked) {
+        return { tabId: picked.id, windowId: picked.windowId };
+      }
+    } catch {
+      /* fall through */
+    }
+
+    if (typeof handoffTab?.windowId === "number") {
+      const tracked = currentActiveByWindow.get(handoffTab.windowId);
+      if (typeof tracked === "number" && tracked !== handoffTabId) {
+        return { tabId: tracked, windowId: handoffTab.windowId };
+      }
+    }
+    return null;
+  }
+
+  /**
+   * After a handoff ends (done, cleared, or timeout), reactivate the user's previously
+   * active tab (if it still exists) and re-collapse the "Agents · N" group.
+   */
+  async function restoreAfterHandoff(handoffTabId, previous = null) {
+    let restoredTab = null;
+    if (previous && typeof previous.tabId === "number" && previous.tabId !== handoffTabId) {
+      const prevTab = await chromeApi.tabs.get(previous.tabId).catch(() => null);
+      if (prevTab) {
+        const prevWinId = typeof prevTab.windowId === "number" ? prevTab.windowId : previous.windowId;
+        if (typeof prevWinId === "number") {
+          await chromeApi.windows?.update?.(prevWinId, { focused: true }).catch(() => {});
+        }
+        await chromeApi.tabs.update(prevTab.id, { active: true }).catch(() => {});
+        if (typeof prevWinId === "number") {
+          currentActiveByWindow.set(prevWinId, prevTab.id);
+        }
+        restoredTab = prevTab;
+      }
+    }
+
+    const handoffTab = await chromeApi.tabs.get(handoffTabId).catch(() => null);
+    const handoffWinId = handoffTab?.windowId;
+    if (typeof handoffWinId === "number") {
+      let activeInHandoffWin =
+        restoredTab && restoredTab.windowId === handoffWinId ? restoredTab.id : undefined;
+      if (activeInHandoffWin === undefined) {
+        const activeTabs = (await chromeApi.tabs.query({ active: true, windowId: handoffWinId }).catch(() => [])) || [];
+        activeInHandoffWin = activeTabs[0]?.id;
+      }
+      await collapseAgentGroupInWindow(handoffWinId, activeInHandoffWin);
+    }
+    return restoredTab ? { restoredTabId: restoredTab.id, restoredWindowId: restoredTab.windowId } : null;
+  }
+
   async function handleTabActivated({ tabId, windowId }) {
     if (typeof windowId === "number" && typeof tabId === "number") {
       const cur = currentActiveByWindow.get(windowId);
@@ -478,6 +567,8 @@ export function createWindowGroups({
     refreshAllAgentGroups,
     collapseAgentGroupInWindow,
     expandGroupForTab,
+    captureActiveTabForRestore,
+    restoreAfterHandoff,
     beginInternalGroupOp,
     endInternalGroupOp,
     handleTabActivated,

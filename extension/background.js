@@ -245,6 +245,7 @@ async function evictForeignFramesOnTab(tabId) {
 const debuggerHub = createDebuggerHub({
   chrome,
   idleMs: DEBUGGER_IDLE_MS,
+  enablePageOnAttach: true,
   isTabAllowed: tabAllowed,
   isTabInHandoff: (tabId) => handoffTabs.has(tabId),
   evictForeignFrames: evictForeignFramesOnTab,
@@ -377,18 +378,37 @@ export async function handoffStart(tabId, rawMessage, rawHandoffId) {
       ? rawHandoffId.trim()
       : crypto.randomUUID();
   const notifId = `${HANDOFF_NOTIF_PREFIX}${tabId}:${handoffId}`;
-  const entry = { handoffId, message, origin: "", notifId };
+  const entry = {
+    handoffId,
+    message,
+    origin: "",
+    notifId,
+    previousTabId: undefined,
+    previousWindowId: undefined,
+  };
 
   handoffTabs.set(tabId, entry);
+  let expanded = false;
   try {
     const tab = await chrome.tabs.get(tabId);
     entry.origin = originOfUrl(tab?.url || "");
     tabCleanup.touchTab(tabId);
+    const previous = await windowGroups.captureActiveTabForRestore(tabId).catch(() => null);
+    if (previous) {
+      entry.previousTabId = previous.tabId;
+      entry.previousWindowId = previous.windowId;
+    }
     await windowGroups.expandGroupForTab(tabId);
+    expanded = true;
     await sendHandoffOverlay(tabId, message, entry.origin, handoffId);
   } catch (err) {
     if (handoffTabs.get(tabId) === entry) {
       handoffTabs.delete(tabId);
+    }
+    if (expanded && entry.previousTabId !== undefined) {
+      await windowGroups
+        .restoreAfterHandoff(tabId, { tabId: entry.previousTabId, windowId: entry.previousWindowId })
+        .catch(() => {});
     }
     updateBadge();
     throw err;
@@ -429,6 +449,11 @@ export async function handoffClear(tabId, expectedHandoffId) {
   }
   await chrome.tabs.sendMessage(tabId, { type: "bc:handoff-clear", handoffId: current.handoffId }).catch(() => {});
   updateBadge();
+  const previous =
+    current.previousTabId !== undefined
+      ? { tabId: current.previousTabId, windowId: current.previousWindowId }
+      : null;
+  await windowGroups.restoreAfterHandoff(tabId, previous).catch(() => {});
   return { ok: true, tabId, handoffId: current.handoffId, cleared: true };
 }
 
@@ -451,16 +476,91 @@ export async function completeHandoff(tabId, expectedHandoffId) {
 
 export { handoffTabs };
 
+// Probe whether an unresponsive tab is blocked by an open JavaScript dialog.
+async function probeDialogOnTimeout(tabId, fallbackMessage) {
+  const known = debuggerHub.getOpenDialog(tabId);
+  if (known) {
+    return new Error(debuggerHub.formatDialogError(tabId, known));
+  }
+  try {
+    await restoreReady;
+    await debuggerHub.ensureAttached(tabId, { skipFocusEmulation: true });
+    // Trigger Page.enable without awaiting forever; if Chrome announces an open dialog, catch it.
+    let unsubscribe;
+    const dialogSeen = new Promise((resolve) => {
+      unsubscribe = debuggerHub.subscribeDialogOpening(tabId, (info) => resolve(info));
+    });
+    chrome.debugger.sendCommand({ tabId }, "Page.enable", {}).catch(() => {});
+    let probeResponded = false;
+    const evalProbe = chrome.debugger
+      .sendCommand({ tabId }, "Runtime.evaluate", { expression: "1", returnByValue: true })
+      .then(() => {
+        probeResponded = true;
+        return null;
+      })
+      .catch(() => null);
+    let timer;
+    const wait = new Promise((resolve) => {
+      timer = setTimeout(() => resolve(null), 1_000);
+    });
+    const dialog = await Promise.race([dialogSeen, evalProbe, wait]);
+    clearTimeout(timer);
+    unsubscribe?.();
+    const afterKnown = dialog || debuggerHub.getOpenDialog(tabId);
+    if (afterKnown) {
+      return new Error(debuggerHub.formatDialogError(tabId, afterKnown));
+    }
+    if (!probeResponded) {
+      const alive = await chrome.tabs.get(tabId).catch(() => null);
+      if (alive) {
+        return new Error(
+          `DIALOG_OPEN: tab ${tabId} stopped responding (a JavaScript dialog is likely open)\nremedy: run dialog accept|dismiss`,
+        );
+      }
+    }
+  } catch {
+    /* ignore probe errors and fall back to timeout message */
+  }
+  return new Error(fallbackMessage);
+}
+
 // Silent Tier: run __bc v7 methods in Chrome's ISOLATED content-script world (no yellow debugger banner).
 async function runBcSilent(tabId, steps, opts = {}) {
   if (!tabAllowed(tabId)) {
     throw new Error(`REFUSED: tab ${tabId} is not lent to Browser Control`);
   }
+  const open = debuggerHub.getOpenDialog(tabId);
+  if (open) {
+    throw new Error(debuggerHub.formatDialogError(tabId, open));
+  }
   const timeoutMs = Number(opts.timeoutMs) > 0 ? Number(opts.timeoutMs) : 30_000;
+  let unsubscribe;
+  let timer;
+  let timedOut = false;
+  const dialogPromise = new Promise((_, reject) => {
+    unsubscribe = debuggerHub.subscribeDialogOpening(tabId, (dialog) => {
+      reject(new Error(debuggerHub.formatDialogError(tabId, dialog)));
+    });
+  });
+  const timeoutPromise = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      reject(new Error("__BC_TIMEOUT__"));
+    }, timeoutMs);
+  });
   try {
-    return await withTimeout(runBcSteps(tabId, steps, opts.frameId), timeoutMs, `tab ${tabId}`);
+    return await Promise.race([runBcSteps(tabId, steps, opts.frameId), dialogPromise, timeoutPromise]);
   } catch (err) {
+    if (timedOut || String(err?.message || "") === "__BC_TIMEOUT__") {
+      throw await probeDialogOnTimeout(
+        tabId,
+        `EXECUTION_FAILED: tab ${tabId} got no answer in ${timeoutMs} ms (a JavaScript dialog may be blocking the page)`,
+      );
+    }
     throw scriptingError(err, tabId);
+  } finally {
+    clearTimeout(timer);
+    unsubscribe?.();
   }
 }
 
@@ -517,29 +617,130 @@ async function runBcSteps(tabId, steps, frameId) {
   return payload.values;
 }
 
-// Bridge a ref from the silent ISOLATED world to a CDP nodeId/objectId for upload and styles.
-async function resolveBcNode(tabId, refOrSelector) {
+// Bridge a ref or selector from the silent ISOLATED world to a CDP objectId/nodeId for upload and styles.
+// Primary: Runtime.enable + exact chrome-extension://<runtime.id> content-script context + Runtime.evaluate(returnByValue:false).
+// Works inside open shadow roots without touching the DOM.
+// Fallback: one-shot data-bc-resolve attribute stamp + DOM.querySelector (used only if context lookup fails).
+export async function resolveBcNode(tabId, refOrSelector, opts = {}) {
   if (!tabAllowed(tabId)) throw new Error(`REFUSED: tab ${tabId} is not lent to Browser Control`);
+  const target = String(refOrSelector ?? "").trim();
+  if (!target) throw new Error("INPUT_INVALID: ref or selector is required");
+  const isRef = opts.mode === "ref" || (opts.mode !== "selector" && /^@?e\d+$/.test(target));
+  const expectedOrigin = `chrome-extension://${chrome.runtime.id}`;
+  const cdpFrameId = typeof opts.cdpFrameId === "string" && opts.cdpFrameId !== "" ? opts.cdpFrameId : undefined;
+
+  await restoreReady;
+
+  const evalInExtensionContext = async (contextId) => {
+    const expression = isRef
+      ? `globalThis.__bc?.el(${JSON.stringify(target)})`
+      : `document.querySelector(${JSON.stringify(target)})`;
+    return debuggerHub.sendCommand(tabId, "Runtime.evaluate", {
+      contextId,
+      expression,
+      returnByValue: false,
+    });
+  };
+
+  let contextId = await debuggerHub.findExtensionContext(tabId, {
+    expectedOrigin,
+    frameId: cdpFrameId,
+    timeoutMs: 300,
+  });
+
+  if (contextId === undefined) {
+    // Ensure the extension's ISOLATED world exists on the page (e.g. selector lookup before any bc_call).
+    await chrome.scripting
+      .executeScript({
+        target: scriptTarget(tabId, opts.frameId),
+        world: "ISOLATED",
+        func: () => true,
+      })
+      .catch(() => {});
+    contextId = await debuggerHub.findExtensionContext(tabId, {
+      expectedOrigin,
+      frameId: cdpFrameId,
+      timeoutMs: 500,
+    });
+  }
+
+  if (contextId === undefined) {
+    contextId = await debuggerHub.findExtensionContext(tabId, {
+      expectedOrigin,
+      frameId: cdpFrameId,
+      timeoutMs: 500,
+      forceRefresh: true,
+    });
+  }
+
+  if (contextId !== undefined) {
+    let evalRes;
+    try {
+      evalRes = await evalInExtensionContext(contextId);
+    } catch (err) {
+      if (/Cannot find context|Execution context was destroyed/i.test(String(err?.message || err))) {
+        debuggerHub.invalidateExtensionContext(tabId, contextId);
+        const refreshed = await debuggerHub.findExtensionContext(tabId, {
+          expectedOrigin,
+          frameId: cdpFrameId,
+          timeoutMs: 500,
+          forceRefresh: true,
+        });
+        if (refreshed !== undefined) {
+          contextId = refreshed;
+          evalRes = await evalInExtensionContext(contextId);
+        } else {
+          contextId = undefined;
+        }
+      } else {
+        throw err;
+      }
+    }
+
+    if (contextId !== undefined) {
+      if (evalRes?.exceptionDetails) {
+        const detail =
+          evalRes.exceptionDetails.exception?.description ||
+          evalRes.exceptionDetails.text ||
+          `NO_MATCH: could not resolve ${target}`;
+        throw new Error(String(detail).replace(/^Error:\s*/, "").split("\n")[0]);
+      }
+      const obj = evalRes?.result;
+      if (!obj?.objectId || obj.subtype !== "node") {
+        throw new Error(isRef ? `STALE_REF: ${target} not found` : `NO_MATCH: could not resolve ${target}`);
+      }
+      // Populate Chrome's DOM agent document map so a subsequent DOM.requestNode({ objectId }) succeeds.
+      await debuggerHub.sendCommand(tabId, "DOM.getDocument", { depth: 0 }).catch(() => {});
+      const reqNode = await debuggerHub
+        .sendCommand(tabId, "DOM.requestNode", { objectId: obj.objectId })
+        .catch(() => null);
+      return {
+        objectId: obj.objectId,
+        ...(typeof reqNode?.nodeId === "number" && reqNode.nodeId > 0 ? { nodeId: reqNode.nodeId } : {}),
+      };
+    }
+  }
+
+  // Fallback: one-shot data-bc-resolve stamp + DOM.querySelector (does not pierce shadow roots).
   const marker = `bc-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   const stamped = await chrome.scripting.executeScript({
-    target: { tabId },
+    target: scriptTarget(tabId, opts.frameId),
     world: "ISOLATED",
-    func: (ref, tok) => {
+    func: (ref, tok, refMode) => {
       try {
-        const el = /^@?e\d+$/.test(ref) ? globalThis.__bc?.el(ref) : document.querySelector(ref);
-        if (!el || !el.isConnected) return { ok: false, error: `STALE_REF: ${ref} not found` };
+        const el = refMode ? globalThis.__bc?.el(ref) : document.querySelector(ref);
+        if (!el || !el.isConnected) return { ok: false, error: refMode ? `STALE_REF: ${ref} not found` : `NO_MATCH: ${ref} not found` };
         el.setAttribute("data-bc-resolve", tok);
         return { ok: true };
       } catch (err) {
         return { ok: false, error: String(err && err.message ? err.message : err) };
       }
     },
-    args: [String(refOrSelector), marker],
+    args: [target, marker, isRef],
   });
   const res = stamped?.[0]?.result;
-  if (!res?.ok) throw new Error(res?.error || `NO_MATCH: could not resolve ${refOrSelector}`);
+  if (!res?.ok) throw new Error(res?.error || `NO_MATCH: could not resolve ${target}`);
   try {
-    await restoreReady;
     const doc = await debuggerHub.sendCommand(tabId, "DOM.getDocument", { depth: 1 });
     const rootId = doc?.root?.nodeId;
     if (!rootId) throw new Error("EXECUTION_FAILED: DOM.getDocument returned no root");
@@ -547,19 +748,21 @@ async function resolveBcNode(tabId, refOrSelector) {
       nodeId: rootId,
       selector: `[data-bc-resolve="${marker}"]`,
     });
-    if (!q?.nodeId) throw new Error(`NO_MATCH: CDP could not locate ${refOrSelector}`);
+    if (!q?.nodeId) throw new Error(`NO_MATCH: CDP could not locate ${target}`);
     const resolved = await debuggerHub.sendCommand(tabId, "DOM.resolveNode", { nodeId: q.nodeId });
     return { nodeId: q.nodeId, objectId: resolved?.object?.objectId };
   } finally {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      world: "ISOLATED",
-      func: (tok) => {
-        const el = document.querySelector(`[data-bc-resolve="${tok}"]`);
-        if (el) el.removeAttribute("data-bc-resolve");
-      },
-      args: [marker],
-    }).catch(() => {});
+    await chrome.scripting
+      .executeScript({
+        target: scriptTarget(tabId, opts.frameId),
+        world: "ISOLATED",
+        func: (tok) => {
+          const el = document.querySelector(`[data-bc-resolve="${tok}"]`);
+          if (el) el.removeAttribute("data-bc-resolve");
+        },
+        args: [marker],
+      })
+      .catch(() => {});
   }
 }
 
@@ -783,7 +986,11 @@ async function handleRequest(msg) {
     }
 
     case "resolve_bc_node": {
-      return await resolveBcNode(tabId, params.ref);
+      return await resolveBcNode(tabId, params.ref, {
+        mode: params.mode,
+        frameId: params.frameId,
+        cdpFrameId: params.cdpFrameId,
+      });
     }
 
     case "screenshot": {
@@ -831,26 +1038,60 @@ async function handleRequest(msg) {
     case "eval": {
       const expression = String(params.expression || "");
       const isolated = params.isolated === true;
+      const openBefore = debuggerHub.getOpenDialog(tabId);
+      if (openBefore) {
+        throw new Error(debuggerHub.formatDialogError(tabId, openBefore));
+      }
       await restoreReady;
-      await debuggerHub.ensureAttached(tabId);
-      let contextId;
-      if (isolated) contextId = await getIsolatedContextForDebugger(tabId);
-      const evalParams = {
-        expression,
-        returnByValue: true,
-        awaitPromise: true,
-        ...(contextId !== undefined ? { contextId } : { replMode: true }),
+      const entry = await debuggerHub.ensureAttached(tabId);
+      const openAfterAttach = debuggerHub.getOpenDialog(tabId);
+      if (openAfterAttach) {
+        throw new Error(debuggerHub.formatDialogError(tabId, openAfterAttach));
+      }
+
+      const requestedMs = Number(params.timeoutMs) > 0 ? Number(params.timeoutMs) : 30_000;
+      const evalTimeoutMs = entry.postAttachTimedOut ? Math.min(requestedMs, 2_000) : requestedMs;
+      let timer;
+      let timedOut = false;
+      const raceEval = (promise) => {
+        const timeoutPromise = new Promise((_, reject) => {
+          timer = setTimeout(() => {
+            timedOut = true;
+            reject(new Error("__EVAL_TIMEOUT__"));
+          }, evalTimeoutMs);
+        });
+        return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timer));
       };
+
       let res;
+      let contextId;
       try {
-        res = await debuggerHub.sendCommand(tabId, "Runtime.evaluate", evalParams);
-      } catch (err) {
-        if (isolated && /Cannot find context|Execution context was destroyed/i.test(String(err?.message || err))) {
-          contextId = await getIsolatedContextForDebugger(tabId, true);
-          res = await debuggerHub.sendCommand(tabId, "Runtime.evaluate", { ...evalParams, contextId });
-        } else {
-          throw err;
+        if (isolated) contextId = await raceEval(getIsolatedContextForDebugger(tabId));
+        const evalParams = {
+          expression,
+          returnByValue: true,
+          awaitPromise: true,
+          ...(contextId !== undefined ? { contextId } : { replMode: true }),
+        };
+        try {
+          res = await raceEval(debuggerHub.sendCommand(tabId, "Runtime.evaluate", evalParams));
+        } catch (err) {
+          if (isolated && /Cannot find context|Execution context was destroyed/i.test(String(err?.message || err))) {
+            contextId = await raceEval(getIsolatedContextForDebugger(tabId, true));
+            res = await raceEval(debuggerHub.sendCommand(tabId, "Runtime.evaluate", { ...evalParams, contextId }));
+          } else {
+            throw err;
+          }
         }
+      } catch (err) {
+        if (timedOut || String(err?.message || "") === "__EVAL_TIMEOUT__") {
+          const openNow = debuggerHub.getOpenDialog(tabId);
+          if (openNow) throw new Error(debuggerHub.formatDialogError(tabId, openNow));
+          throw new Error(
+            `DIALOG_OPEN: tab ${tabId} stopped responding during eval (a JavaScript dialog may be open)\nremedy: run dialog accept|dismiss`,
+          );
+        }
+        throw err;
       }
       if (res?.exceptionDetails) {
         const detail = res.exceptionDetails.exception?.description || res.exceptionDetails.text || "unknown";
