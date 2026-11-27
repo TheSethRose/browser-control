@@ -1,8 +1,8 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import type { InvokeResult } from "@agent-software/core";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
   createSeededRng,
   isNaturalEnabled,
@@ -368,11 +368,18 @@ describe("page-runner natural motion integration", () => {
   const val = (value: string): InvokeResult => ({ ok: true, data: { value } });
 
   /** Main-frame page with one 200x40 button (e1) in a 1280x800 viewport; off-screen targets scroll by wheel delta. */
-  function makeNaturalMock(opts: { inView?: boolean; scrollDeltaPerWheel?: number } = {}) {
+  function makeNaturalMock(opts: {
+    inView?: boolean;
+    scrollDeltaPerWheel?: number;
+    draggable?: boolean;
+    failAtMouseMoveIndex?: number;
+    failMessage?: string;
+  } = {}) {
     const cdpCalls: CdpCall[] = [];
     const evalExprs: string[] = [];
     const sleeps: number[] = [];
     let currentTop = opts.inView === false ? 1200 : 200;
+    let mouseMoveCount = 0;
     const makeDetail = (forceInView: boolean) => {
       const inView = forceInView || (currentTop >= 16 && currentTop + 40 <= 784);
       const top = forceInView ? 380 : currentTop;
@@ -395,28 +402,45 @@ describe("page-runner natural motion integration", () => {
         // Points left of x=200 sit over a nested scroller; anything else is over the document.
         const sp = /__bc\.pageScrollPoint\((\d+), (\d+)\)/.exec(expr);
         if (sp) return val(JSON.stringify(Number(sp[1]) >= 200 ? { x: Number(sp[1]), y: Number(sp[2]) } : { x: 640, y: 400 }));
+        if (expr.includes("__bc.dragInfo")) {
+          return val(JSON.stringify({
+            sx: 120, sy: 200, dx: 520, dy: 460, draggable: opts.draggable === true, listMeta: null,
+          }));
+        }
         if (expr.includes("__bc.point")) {
           const noScroll = expr.includes('"noScroll":true');
           if (!noScroll && !expr.includes('"detail":true')) return val(base ? "https://a.test/ 350 220 visible" : "350 220 visible");
           return val(base ? `https://a.test/\n${makeDetail(!noScroll)}` : makeDetail(!noScroll));
         }
         if (expr.includes("__bc.readInputProbe")) return val('{"mousedown":1,"mouseup":1}');
+        if (expr.includes("__bc.setTypedValue")) return val("__not_typed__");
+        if (expr.includes("__bc.cellInfo")) return val("__not_cell__");
+        if (expr.includes("__bc.focusForType")) return val("focused");
+        if (expr.includes("__bc.value")) return val("hello");
         if (expr.includes("__bc.hit(")) return val("https://a.test/\nhit: button#ok");
         return val("ok");
       }
       if (op === "execute_cdp") {
         const params = (input["params"] ?? {}) as Record<string, unknown>;
         cdpCalls.push({ method: String(input["method"]), params, targetId: input["targetId"] as string | undefined });
+        if (params["type"] === "mouseMoved" && opts.failAtMouseMoveIndex !== undefined && ++mouseMoveCount === opts.failAtMouseMoveIndex) {
+          return { ok: false, error: { code: "EXECUTION_FAILED", message: opts.failMessage ?? "DIALOG_OPEN: alert open" } };
+        }
         if (params["type"] === "mouseWheel") currentTop -= opts.scrollDeltaPerWheel ?? Number(params["deltaY"] ?? 0);
         return { ok: true, data: { result: {} } };
       }
       return { ok: true, data: {} };
     };
     const ofType = (type: string, from = 0) => cdpCalls.slice(from).filter((c) => c.params["type"] === type);
-    const handler = (seed: number, wrap?: (next: Invoke) => Invoke) =>
+    const handler = (
+      seed: number,
+      wrap?: (next: Invoke) => Invoke,
+      extra: { extensionResolveKey?: (targetId: string) => string | undefined } = {},
+    ) =>
       createPageHelperHandler(wrap ? wrap(invoke) : invoke, undefined, undefined, {
         sleep: async (ms) => { sleeps.push(ms); }, rng: createSeededRng(seed), now: () => 0,
         bcCall: async () => ({ value: "https://a.test/\nhit: button#ok" }),
+        ...extra,
       });
     return { invoke, cdpCalls, evalExprs, sleeps, ofType, handler };
   }
@@ -581,6 +605,204 @@ describe("page-runner natural motion integration", () => {
         const firstWheel = m.cdpCalls.indexOf(wheels[0]!);
         expect(m.ofType("mouseMoved", from).some((c) => m.cdpCalls.indexOf(c) < firstWheel)).toBe(rest[0] < 200);
       }
+    });
+  });
+
+  test("off-screen target wheels from the resting pointer when already inside the viewport", async () => {
+    await withNaturalOn(async () => {
+      const mock = makeNaturalMock({ inView: false });
+      const handler = mock.handler(123);
+      // A resting pointer over the document scroller (x >= 200) is reused by the wheel without moving.
+      expect((await handler("hover", { xy: [240, 260], quiet: true })).ok).toBe(true);
+      const beforeClick = mock.cdpCalls.length;
+      expect((await handler("click", { ref: "e1", quiet: true })).ok).toBe(true);
+      const types = mock.cdpCalls.slice(beforeClick).filter((c) => c.method === "Input.dispatchMouseEvent");
+      expect(types[0]!.params).toMatchObject({ type: "mouseWheel", x: 240, y: 260 });
+      const rest = types.slice(1).map((c) => c.params["type"]);
+      expect(rest).toContain("mouseMoved");
+      expect(rest.slice(-2)).toEqual(["mousePressed", "mouseReleased"]);
+    });
+  });
+
+  test("natural hover, drag, key hold, dialog abort, and typing switch-off behave per spec", async () => {
+    await withNaturalOn(async () => {
+      const mouse = (m: ReturnType<typeof makeNaturalMock>) => m.cdpCalls.filter((c) => c.method === "Input.dispatchMouseEvent");
+      const hov = makeNaturalMock({ inView: true });
+      expect((await hov.handler(88)("hover", { xy: [500, 300], quiet: true })).ok).toBe(true);
+      expect(mouse(hov).length).toBeGreaterThanOrEqual(4);
+      expect(mouse(hov).every((e) => e.params["type"] === "mouseMoved")).toBe(true);
+
+      const drg = makeNaturalMock({ inView: true, draggable: false });
+      expect((await drg.handler(99)("drag", { from: "e1", to: "e2", quiet: true })).ok).toBe(true);
+      const types = mouse(drg).map((e) => `${e.params["type"]}:${e.params["buttons"] ?? ""}`);
+      const pressIdx = types.indexOf("mousePressed:1");
+      const relIdx = types.indexOf("mouseReleased:0");
+      expect(pressIdx).toBeGreaterThanOrEqual(3);
+      expect(relIdx - pressIdx).toBeGreaterThanOrEqual(4);
+      expect(types.slice(pressIdx + 1, relIdx).every((t) => t === "mouseMoved:1")).toBe(true);
+
+      const ky = makeNaturalMock({ inView: true });
+      expect((await ky.handler(101)("key", { key: "Enter", quiet: true })).ok).toBe(true);
+      expect(ky.sleeps).toHaveLength(1);
+      expect(ky.sleeps[0]!).toBeGreaterThanOrEqual(35);
+      expect(ky.sleeps[0]!).toBeLessThanOrEqual(85);
+
+      const dlg = makeNaturalMock({ inView: true, failAtMouseMoveIndex: 2, failMessage: "DIALOG_OPEN: alert" });
+      expect((await dlg.handler(77)("click", { ref: "e1", quiet: true })).ok).toBe(false);
+      expect(mouse(dlg).map((e) => e.params["type"])).toEqual(["mouseMoved", "mouseMoved"]);
+
+      const off = makeNaturalMock({ inView: true });
+      expect((await off.handler(55)("type", { ref: "e1", text: "hello", quiet: true, _natural: false })).ok).toBe(true);
+      expect(off.cdpCalls.some((c) => c.method === "Input.insertText")).toBe(true);
+      expect(off.sleeps).toHaveLength(0);
+    });
+  });
+
+  const DIALOG_MSG = "DIALOG_OPEN: a JavaScript alert dialog is open on tab 5";
+  /** `opener` opens a dialog as it is delivered; while open, input is refused before dispatch. */
+  function dialogWrap(opener: string, sent: Array<{ type: string; targetId?: string }>) {
+    let open = false;
+    return (next: Invoke): Invoke => async (op, inp = {}) => {
+      const method = String(inp["method"] ?? "");
+      const type = String((inp["params"] as Record<string, unknown> | undefined)?.["type"] ?? "");
+      if (op === "execute_cdp" && method === "Page.handleJavaScriptDialog") open = false;
+      else if (op === "execute_cdp" && method.startsWith("Input.dispatch")) {
+        if (open) return { ok: false, error: { code: "EXECUTION_FAILED", message: DIALOG_MSG } };
+        sent.push({ type, targetId: inp["targetId"] as string | undefined });
+        if (type === opener) {
+          open = true;
+          return { ok: false, error: { code: "EXECUTION_FAILED", message: DIALOG_MSG } };
+        }
+      }
+      return next(op, inp);
+    };
+  }
+  const releaseCount = (sent: Array<{ type: string }>, t: string) => sent.filter((e) => e.type === t).length;
+  const textOf = (res: InvokeResult): string => (res.ok ? String((res.data as { value: unknown }).value) : res.error.message);
+
+  test("E1: a dialog-blocked release is never re-sent, and dialog accept reports what is still held", async () => {
+    await withNaturalOn(async () => {
+      for (const [action, input, release, held] of [
+        ["drag", { from: "e1", to: "e2", quiet: true }, "mouseReleased", "# HELD: mouse left button still down"],
+        ["key", { key: "Tab", quiet: true }, "keyUp", "# HELD: key Tab still down"],
+      ] as const) {
+        const sent: Array<{ type: string }> = [];
+        const h = makeNaturalMock({ inView: true }).handler(5, dialogWrap(release, sent));
+        expect((await h(action, input)).ok).toBe(false);
+        expect(releaseCount(sent, release)).toBe(1);
+        const accepted = await h("dialog", { sub: "accept" });
+        expect(accepted.ok).toBe(true);
+        expect(textOf(accepted)).toContain(held);
+        expect(textOf(accepted)).toContain("the caller decides what to do next");
+        expect(releaseCount(sent, release)).toBe(1);
+      }
+    });
+  });
+
+  test("E2: the command whose release the dialog blocked reports the held input", async () => {
+    await withNaturalOn(async () => {
+      const sent: Array<{ type: string }> = [];
+      const h = makeNaturalMock({ inView: true }).handler(5, dialogWrap("keyUp", sent));
+      const res = await h("key", { key: "Tab", quiet: true });
+      expect(res.ok).toBe(false);
+      expect(textOf(res)).toContain(DIALOG_MSG);
+      expect(textOf(res)).toContain("# HELD: key Tab still down");
+
+      const dragged: Array<{ type: string }> = [];
+      const hd = makeNaturalMock({ inView: true }).handler(5, dialogWrap("mouseReleased", dragged));
+      const dragRes = await hd("drag", { from: "e1", to: "e2", quiet: true });
+      expect(dragRes.ok).toBe(false);
+      expect(textOf(dragRes)).toContain("# HELD: mouse left button still down");
+    });
+  });
+
+  test("E3: held input is keyed by browser and tab, so a short id and its qualified id share one record", async () => {
+    await withNaturalOn(async () => {
+      const resolveKey = (id: string): string | undefined =>
+        id === "extension:5" || id === "extension:chrome-aaa111:5"
+          ? "extension:chrome-aaa111:5"
+          : id === "extension:edge-bbb222:5"
+            ? "extension:edge-bbb222:5"
+            : undefined;
+      const sent: Array<{ type: string }> = [];
+      const h = makeNaturalMock({ inView: true }).handler(5, dialogWrap("keyUp", sent), { extensionResolveKey: resolveKey });
+      await h("key", { key: "Tab", quiet: true }, "extension:5");
+      const same = await h("dialog", { sub: "accept" }, "extension:chrome-aaa111:5");
+      expect(textOf(same)).toContain("# HELD: key Tab still down");
+      const other = await h("dialog", { sub: "accept" }, "extension:edge-bbb222:5");
+      expect(other.ok).toBe(true);
+      expect(textOf(other)).not.toContain("# HELD");
+    });
+  });
+
+  test("E4: a tab switch mid-drag keeps every pointer event on the tab the drag started on", async () => {
+    await withNaturalOn(async () => {
+      let active = "T1";
+      let switched = false;
+      const seen: Array<{ method: string; targetId?: string }> = [];
+      const base = makeNaturalMock({ inView: true });
+      const inv: Invoke = async (op, inp = {}) => {
+        if (op === "get_browser_status") return { ok: true, data: { connected: true, activeTargetId: active } };
+        if (op === "execute_cdp") seen.push({ method: String(inp["method"]), targetId: inp["targetId"] as string | undefined });
+        return base.invoke(op, inp);
+      };
+      const h: ReturnType<typeof createPageHelperHandler> = createPageHelperHandler(inv, undefined, undefined, {
+        rng: createSeededRng(3),
+        sleep: async () => {
+          if (switched) return;
+          switched = true;
+          active = "T2";
+          await h("key", { key: "Tab", quiet: true, fast: true });
+        },
+        bcCall: async () => ({ value: "https://a.test/\nhit: button#ok" }),
+      });
+      expect((await h("drag", { from: "e1", to: "e2", quiet: true })).ok).toBe(true);
+      expect(switched).toBe(true);
+      const pointer = seen.filter((e) => e.method === "Input.dispatchMouseEvent" || e.method === "Input.dispatchDragEvent");
+      expect(pointer.length).toBeGreaterThan(0);
+      expect([...new Set(pointer.map((e) => e.targetId))]).toEqual(["T1"]);
+      expect(seen.filter((e) => e.method === "Input.dispatchKeyEvent").map((e) => e.targetId)).toEqual(["T2", "T2"]);
+    });
+  });
+
+  test("do accepts step fast metadata and script --fast wins over a step fast:false", async () => {
+    await withNaturalOn(async () => {
+      const m = makeNaturalMock({ inView: true });
+      const h = m.handler(6);
+      const res = await h("do", { steps: [{ key: "Tab", fast: true }] });
+      expect(res.ok && String((res.data as { value: unknown }).value)).toContain("key Tab: sent");
+      expect(m.sleeps).toHaveLength(0);
+      expect((await h("script", { code: `await page.key("Tab", { fast: false });`, fast: true })).ok).toBe(true);
+      expect(m.sleeps).toHaveLength(0);
+    });
+  });
+
+  test("natural hover dwells 45-115 ms after the last move; --fast does not", async () => {
+    await withNaturalOn(async () => {
+      for (const input of [{ ref: "e1" }, { xy: [500, 300] }]) {
+        const m = makeNaturalMock({ inView: true });
+        const h = m.handler(7);
+        expect((await h("hover", { ...input, quiet: true })).ok).toBe(true);
+        const dwell = m.sleeps[m.sleeps.length - 1]!;
+        expect(dwell).toBeGreaterThanOrEqual(45);
+        expect(dwell).toBeLessThanOrEqual(115);
+        const fast = makeNaturalMock({ inView: true });
+        expect((await fast.handler(7)("hover", { ...input, quiet: true, fast: true })).ok).toBe(true);
+        expect(fast.sleeps).toHaveLength(0);
+      }
+    });
+  });
+
+  test("N1: only a boolean _natural from the wrapper counts; a file path is never read", async () => {
+    await withNaturalOn(async () => {
+      const xdg = await mkdtemp(join(tmpdir(), "bc-nat-caller-"));
+      tempDirs.push(xdg);
+      await writeFile(join(xdg, "natural"), "off\n");
+      const m = makeNaturalMock({ inView: true });
+      await m.handler(8)("key", { key: "Enter", quiet: true, _natural: { file: join(xdg, "natural") } });
+      expect(m.sleeps).toHaveLength(1);
+      await m.handler(8)("key", { key: "Enter", quiet: true, _natural: false });
+      expect(m.sleeps).toHaveLength(1);
     });
   });
 });
@@ -844,6 +1066,117 @@ describe("page-helpers v10 — point detail/noScroll, hitCheck, pageScrollPoint"
   });
 });
 
+describe("wrapper --fast forwarding and natural subcommand", () => {
+  const WRAPPER = resolve(import.meta.dir, "../.agents/skills/browser-control/scripts/browser-control-daemon");
+  type Recorded = { method: string; path: string; query: string; body: string; natFile: string | null; natEnv: string | null };
+  const seen: Recorded[] = [];
+  let dir = "";
+  let xdg = "";
+  let server: ReturnType<typeof Bun.serve>;
+
+  beforeAll(async () => {
+    dir = await mkdtemp(join(tmpdir(), "bc-nat-wrap-"));
+    xdg = await mkdtemp(join(tmpdir(), "bc-nat-xdg-"));
+    server = Bun.serve({
+      unix: join(dir, "sock"),
+      fetch(req) {
+        const url = new URL(req.url);
+        return (async () => {
+          const body = req.method === "GET" ? "" : await req.text();
+          seen.push({
+            method: req.method, path: url.pathname, query: url.search, body,
+            natFile: req.headers.get("x-bc-natural-file"), natEnv: req.headers.get("x-bc-natural"),
+          });
+          return Response.json({ ok: true, data: { value: "ok" } });
+        })();
+      },
+    });
+  });
+
+  afterAll(async () => {
+    server.stop(true);
+    await rm(dir, { recursive: true, force: true });
+    await rm(xdg, { recursive: true, force: true });
+  });
+
+  async function bc(args: string[], extraEnv: Record<string, string | undefined> = {}) {
+    const env: Record<string, string> = {};
+    for (const [k, v] of Object.entries({ ...process.env, BROWSER_CONTROL_DAEMON_DIR: dir, XDG_CONFIG_HOME: xdg, ...extraEnv })) {
+      if (v !== undefined) env[k] = v;
+    }
+    const proc = Bun.spawn(["bash", WRAPPER, ...args], { env, stdout: "pipe", stderr: "pipe" });
+    const stdout = await new Response(proc.stdout).text();
+    const stderr = await new Response(proc.stderr).text();
+    return { code: await proc.exited, stdout, stderr };
+  }
+
+  async function call(...args: string[]): Promise<Recorded> {
+    const before = seen.length;
+    const res = await bc(args);
+    expect(res.code).toBe(0);
+    const made = seen.slice(before).filter((r) => r.path !== "/status");
+    expect(made).toHaveLength(1);
+    return made[0]!;
+  }
+
+  test("forwards --fast on click, hover, select, drag, key, do, nav, text, script", async () => {
+    expect(JSON.parse((await call("click", "--fast", "e1")).body)).toEqual({ ref: "e1", fast: true });
+    expect(JSON.parse((await call("click", "--fast", "--xy", "10,20")).body)).toEqual({ xy: [10, 20], fast: true });
+    expect(JSON.parse((await call("hover", "--fast", "e1")).body)).toEqual({ ref: "e1", fast: true });
+    expect(JSON.parse((await call("hover", "--fast", "--xy", "10,20")).body)).toEqual({ xy: [10, 20], fast: true });
+    expect(JSON.parse((await call("select", "--fast", "e8", "US")).body)).toEqual({ ref: "e8", option: "US", fast: true });
+    expect(JSON.parse((await call("drag", "--fast", "e1", "e2")).body)).toEqual({ from: "e1", to: "e2", fast: true });
+    expect(JSON.parse((await call("key", "--fast", "Enter")).body)).toEqual({ key: "Enter", fast: true });
+    expect(JSON.parse((await call("do", "--fast", '[{"key":"Tab"}]')).body)).toEqual({ steps: [{ key: "Tab" }], fast: true });
+    expect(new URLSearchParams((await call("nav", "--fast", "https://example.test/")).query).get("fast")).toBe("1");
+    expect(JSON.parse((await call("text", "--fast", "--scroll")).body)).toEqual({ all: false, scroll: true, fast: true });
+    expect(JSON.parse((await call("script", "--fast", "return 1")).body)).toEqual({ code: "return 1", fast: true });
+  });
+
+  test("natural [on|off|status] reads and writes XDG_CONFIG_HOME/browser-control/natural atomically", async () => {
+    const stDefault = await bc(["natural", "status"], { BROWSER_CONTROL_NATURAL: undefined });
+    expect(stDefault.code).toBe(0);
+    expect(JSON.parse(stDefault.stdout).data).toMatchObject({ natural: "on", source: "default" });
+
+    const off = await bc(["natural", "off"], { BROWSER_CONTROL_NATURAL: undefined });
+    expect(off.code).toBe(0);
+    expect(JSON.parse(off.stdout).data.natural).toBe("off");
+    expect((await readFile(join(xdg, "browser-control", "natural"), "utf8")).trim()).toBe("off");
+
+    const stFile = await bc(["natural"], { BROWSER_CONTROL_NATURAL: undefined });
+    expect(JSON.parse(stFile.stdout).data).toMatchObject({ natural: "off", source: "file" });
+
+    const stEnv = await bc(["natural", "status"], { BROWSER_CONTROL_NATURAL: "on" });
+    expect(JSON.parse(stEnv.stdout).data).toMatchObject({ natural: "on", source: "env" });
+
+    const on = await bc(["natural", "on"], { BROWSER_CONTROL_NATURAL: undefined });
+    expect(on.code).toBe(0);
+    expect((await readFile(join(xdg, "browser-control", "natural"), "utf8")).trim()).toBe("on");
+
+    const fresh = await mkdtemp(join(tmpdir(), "bc-nat-fresh-"));
+    tempDirs.push(fresh);
+    const stFresh = await bc(["natural", "status"], { BROWSER_CONTROL_NATURAL: undefined, XDG_CONFIG_HOME: fresh });
+    expect(stFresh.stderr).toBe("");
+
+    const before = seen.length;
+    await bc(["key", "Enter"], { BROWSER_CONTROL_NATURAL: "off", XDG_CONFIG_HOME: fresh });
+    const sent = seen.slice(before).find((r) => r.path !== "/status")!;
+    expect(sent).toMatchObject({ natFile: null, natEnv: "off" });
+
+    // N6: one parser for status and the sent value; inner whitespace is not a valid setting.
+    for (const [envVal, want, src] of [["o ff", "on", "default"], ["  OFF \t", "off", "env"]] as const) {
+      const st = await bc(["natural", "status"], { BROWSER_CONTROL_NATURAL: envVal, XDG_CONFIG_HOME: fresh });
+      expect(JSON.parse(st.stdout).data).toMatchObject({ natural: want, source: src });
+      const n = seen.length;
+      await bc(["key", "Enter"], { BROWSER_CONTROL_NATURAL: envVal, XDG_CONFIG_HOME: fresh });
+      expect(seen.slice(n).find((r) => r.path !== "/status")!.natEnv).toBe(want);
+    }
+
+    const bad = await bc(["natural", "maybe"], { BROWSER_CONTROL_NATURAL: undefined });
+    expect(bad.code).toBe(1);
+    expect(bad.stdout).toContain("INPUT_INVALID");
+  });
+});
 describe("synthesizeStartPoint off-screen target", () => {
   test("keeps the start inside the viewport when the destination is off-screen", () => {
     const viewport = { width: 1280, height: 720 };
