@@ -187,7 +187,7 @@ function makeFakeChrome({
 }
 
 describe("element handles: exact extension context matching and invalidation", () => {
-  test("findExtensionContext matches only exact chrome-extension://<id> + frameId, ignoring foreign isolated worlds", async () => {
+  test("findExtensionContext matches only exact chrome-extension://<id> + known frameId + uniqueId, ignoring foreign worlds", async () => {
     const extId = "gdoaemlogkgnnojmjcgjfaphohadilcf";
     const fake = makeFakeChrome({
       extensionId: extId,
@@ -204,16 +204,16 @@ describe("element handles: exact extension context matching and invalidation", (
       if (method === "Runtime.enable") {
         // Simulate Chrome emitting multiple isolated worlds (Bitwarden, AdGuard, child frame, ours).
         hub.handleDebuggerEvent(target, "Runtime.executionContextCreated", {
-          context: { id: 1, origin: "https://app.test", auxData: { isDefault: true, type: "default", frameId: "MAIN-FRAME" } },
+          context: { id: 1, uniqueId: "u-1", origin: "https://app.test", auxData: { isDefault: true, type: "default", frameId: "MAIN-FRAME" } },
         });
         hub.handleDebuggerEvent(target, "Runtime.executionContextCreated", {
-          context: { id: 2, origin: "chrome-extension://bitwarden-other-id", auxData: { isDefault: false, type: "isolated", frameId: "MAIN-FRAME" } },
+          context: { id: 2, uniqueId: "u-2", origin: "chrome-extension://bitwarden-other-id", auxData: { isDefault: false, type: "isolated", frameId: "MAIN-FRAME" } },
         });
         hub.handleDebuggerEvent(target, "Runtime.executionContextCreated", {
-          context: { id: 3, origin: `chrome-extension://${extId}`, auxData: { isDefault: false, type: "isolated", frameId: "CHILD-FRAME" } },
+          context: { id: 3, uniqueId: "u-3", origin: `chrome-extension://${extId}`, auxData: { isDefault: false, type: "isolated", frameId: "CHILD-FRAME" } },
         });
         hub.handleDebuggerEvent(target, "Runtime.executionContextCreated", {
-          context: { id: 4, origin: `chrome-extension://${extId}`, auxData: { isDefault: false, type: "isolated", frameId: "MAIN-FRAME" } },
+          context: { id: 4, uniqueId: "u-4", origin: `chrome-extension://${extId}`, auxData: { isDefault: false, type: "isolated", frameId: "MAIN-FRAME" } },
         });
         return {};
       }
@@ -221,35 +221,78 @@ describe("element handles: exact extension context matching and invalidation", (
     };
 
     const mainCtx = await hub.findExtensionContext(11, { expectedOrigin: `chrome-extension://${extId}` });
-    expect(mainCtx).toBe(4);
+    expect(mainCtx).toMatchObject({ id: 4, uniqueId: "u-4", frameId: "MAIN-FRAME" });
 
     const childCtx = await hub.findExtensionContext(11, {
       expectedOrigin: `chrome-extension://${extId}`,
       frameId: "CHILD-FRAME",
     });
-    expect(childCtx).toBe(3);
+    expect(childCtx).toMatchObject({ id: 3, uniqueId: "u-3", frameId: "CHILD-FRAME" });
 
-    // Context destroyed removes that context so a fresh lookup resolves the new one.
-    hub.handleDebuggerEvent({ tabId: 11 }, "Runtime.executionContextDestroyed", { executionContextId: 4 });
+    // Renderer swap reuses numeric id 4 with a new uniqueId; destroying the old uniqueId keeps the new context.
+    hub.handleDebuggerEvent({ tabId: 11 }, "Runtime.executionContextCreated", {
+      context: { id: 4, uniqueId: "u-4-new", origin: `chrome-extension://${extId}`, auxData: { isDefault: false, type: "isolated", frameId: "MAIN-FRAME" } },
+    });
+    hub.handleDebuggerEvent({ tabId: 11 }, "Runtime.executionContextDestroyed", {
+      executionContextId: 4,
+      executionContextUniqueId: "u-4",
+    });
+    const afterSwap = await hub.findExtensionContext(11, {
+      expectedOrigin: `chrome-extension://${extId}`,
+      timeoutMs: 10,
+    });
+    expect(afterSwap).toMatchObject({ id: 4, uniqueId: "u-4-new" });
+
+    // Destroying the active uniqueId clears it.
+    hub.handleDebuggerEvent({ tabId: 11 }, "Runtime.executionContextDestroyed", {
+      executionContextId: 4,
+      executionContextUniqueId: "u-4-new",
+    });
     const afterDestroy = await hub.findExtensionContext(11, {
       expectedOrigin: `chrome-extension://${extId}`,
       timeoutMs: 10,
     });
     expect(afterDestroy).toBeUndefined();
 
-    // Main-frame navigation clears cached contexts and accepts the new context id.
+    // Main-frame navigation clears cached contexts and accepts the new context uniqueId.
     hub.handleDebuggerEvent({ tabId: 11 }, "Page.frameNavigated", {
       frame: { id: "MAIN-FRAME", url: "https://app.test/next" },
     });
     hub.handleDebuggerEvent({ tabId: 11 }, "Runtime.executionContextCreated", {
-      context: { id: 9, origin: `chrome-extension://${extId}`, auxData: { isDefault: false, type: "isolated", frameId: "MAIN-FRAME" } },
+      context: { id: 9, uniqueId: "u-9", origin: `chrome-extension://${extId}`, auxData: { isDefault: false, type: "isolated", frameId: "MAIN-FRAME" } },
     });
     const afterNav = await hub.findExtensionContext(11, {
       expectedOrigin: `chrome-extension://${extId}`,
       timeoutMs: 10,
     });
-    expect(afterNav).toBe(9);
+    expect(afterNav).toMatchObject({ id: 9, uniqueId: "u-9" });
 
+    await hub.detachAll();
+  });
+
+  test("S1: findExtensionContext refuses to match when target frameId cannot be determined", async () => {
+    const extId = "gdoaemlogkgnnojmjcgjfaphohadilcf";
+    const fake = makeFakeChrome({
+      extensionId: extId,
+      windows: [{ id: 1, type: "normal", state: "normal", focused: true }],
+      tabs: [{ id: 12, windowId: 1, url: "https://app.test", active: true, groupId: -1 }],
+    });
+
+    const hub = createDebuggerHub({ chrome: fake.chrome, idleMs: 60_000 });
+    fake.debuggerHandlers.sendCommand = async (target, method) => {
+      if (method === "Page.getFrameTree") {
+        throw new Error("Frame tree unavailable");
+      }
+      if (method === "Runtime.enable") {
+        hub.handleDebuggerEvent(target, "Runtime.executionContextCreated", {
+          context: { id: 4, uniqueId: "u-4", origin: `chrome-extension://${extId}`, auxData: { isDefault: false, type: "isolated", frameId: "SOME-FRAME" } },
+        });
+      }
+      return {};
+    };
+
+    const ctx = await hub.findExtensionContext(12, { expectedOrigin: `chrome-extension://${extId}`, timeoutMs: 20 });
+    expect(ctx).toBeUndefined();
     await hub.detachAll();
   });
 
@@ -536,6 +579,46 @@ describe("JS dialogs on extension tabs", () => {
 
     await hub.detachAll();
   });
+
+  test("S4: first handleJavaScriptDialog response does not erase a second dialog opened before the response arrived", async () => {
+    const fake = makeFakeChrome({
+      windows: [{ id: 1, type: "normal", state: "normal", focused: true }],
+      tabs: [{ id: 25, windowId: 1, url: "https://dialog.test", active: true, groupId: -1 }],
+    });
+
+    const hub = createDebuggerHub({
+      chrome: fake.chrome,
+      idleMs: 60_000,
+      enablePageOnAttach: true,
+    });
+
+    await hub.ensureAttached(25);
+    hub.handleDebuggerEvent({ tabId: 25 }, "Page.javascriptDialogOpening", {
+      type: "confirm",
+      message: "first",
+      url: "https://dialog.test",
+    });
+
+    fake.debuggerHandlers.sendCommand = async (_target, method) => {
+      if (method === "Page.handleJavaScriptDialog") {
+        // Chrome closes dialog 1 and opens chained dialog 2 before returning the response.
+        hub.handleDebuggerEvent({ tabId: 25 }, "Page.javascriptDialogClosed", { result: true });
+        hub.handleDebuggerEvent({ tabId: 25 }, "Page.javascriptDialogOpening", {
+          type: "alert",
+          message: "second",
+          url: "https://dialog.test",
+        });
+        return {};
+      }
+      return {};
+    };
+
+    await hub.sendCommand(25, "Page.handleJavaScriptDialog", { accept: true });
+    expect(hub.getOpenDialog(25)?.message).toBe("second");
+
+    await expect(hub.sendCommand(25, "Runtime.evaluate", { expression: "1" })).rejects.toThrow(/DIALOG_OPEN:.*second/);
+    await hub.detachAll();
+  });
 });
 
 describe("handoff end refocuses user's previous tab and re-collapses Agents group", () => {
@@ -632,6 +715,91 @@ describe("handoff end refocuses user's previous tab and re-collapses Agents grou
     fake.tabMap.delete(1);
     const restored = await wg.restoreAfterHandoff(2, prev);
     expect(restored).toBeNull();
+  });
+
+  test("S5: starting on the already-focused handoff tab does not capture an unrelated window", async () => {
+    const fake = makeFakeChrome({
+      windows: [
+        { id: 1, type: "normal", state: "normal", focused: true },
+        { id: 2, type: "normal", state: "normal", focused: false },
+      ],
+      tabs: [
+        { id: 10, windowId: 1, url: "https://agent.test", active: true, groupId: -1 },
+        { id: 20, windowId: 2, url: "https://unrelated.test", active: true, groupId: -1 },
+      ],
+    });
+
+    const wg = createWindowGroups({
+      chrome: fake.chrome,
+      getSettings: () => ({ tabGroupMode: "shared", autoCollapse: true }),
+      isAgentTab: (id: number) => id === 10,
+    });
+
+    const prev = await wg.captureActiveTabForRestore(10);
+    expect(prev).toBeNull();
+  });
+
+  test("S5: restoreAfterHandoff does not override a tab or window switch made by the user during handoff", async () => {
+    // 1. User switches to another tab in the same window during handoff.
+    const sameWin = makeFakeChrome({
+      windows: [{ id: 1, type: "normal", state: "normal", focused: true }],
+      tabs: [
+        { id: 1, windowId: 1, url: "https://docs.user.test", active: true, groupId: -1 },
+        { id: 2, windowId: 1, url: "https://agent.test", active: false, groupId: -1 },
+        { id: 3, windowId: 1, url: "https://mail.user.test", active: false, groupId: -1 },
+      ],
+    });
+    const inHandoff = new Set<number>();
+    const wg1 = createWindowGroups({
+      chrome: sameWin.chrome,
+      getSettings: () => ({ tabGroupMode: "shared", autoCollapse: true }),
+      isAgentTab: (id: number) => id === 2,
+      isTabInHandoff: (id: number) => inHandoff.has(id),
+    });
+    const groupId = await wg1.addTabToAgentGroup(2);
+    const prev1 = await wg1.captureActiveTabForRestore(2);
+    expect(prev1).toEqual({ tabId: 1, windowId: 1 });
+    inHandoff.add(2);
+    await wg1.expandGroupForTab(2);
+
+    // User switches to tab 3 while handoff is open.
+    await sameWin.chrome.tabs.update(3, { active: true });
+    inHandoff.delete(2);
+    const res1 = await wg1.restoreAfterHandoff(2, prev1);
+    expect(res1).toBeNull();
+    expect(sameWin.tabMap.get(3)?.active).toBe(true);
+    expect(sameWin.tabMap.get(1)?.active).toBe(false);
+    expect(sameWin.groupMap.get(groupId!)?.collapsed).toBe(true);
+
+    // 2. User switches to another window during handoff.
+    const multiWin = makeFakeChrome({
+      windows: [
+        { id: 1, type: "normal", state: "normal", focused: true },
+        { id: 2, type: "normal", state: "normal", focused: false },
+        { id: 3, type: "normal", state: "normal", focused: false },
+      ],
+      tabs: [
+        { id: 10, windowId: 1, url: "https://user-orig.test", active: true, groupId: -1 },
+        { id: 20, windowId: 2, url: "https://agent.test", active: true, groupId: -1 },
+        { id: 30, windowId: 3, url: "https://user-next.test", active: true, groupId: -1 },
+      ],
+    });
+    const wg2 = createWindowGroups({
+      chrome: multiWin.chrome,
+      getSettings: () => ({ tabGroupMode: "shared", autoCollapse: true }),
+      isAgentTab: (id: number) => id === 20,
+    });
+    const prev2 = await wg2.captureActiveTabForRestore(20);
+    expect(prev2).toEqual({ tabId: 10, windowId: 1 });
+    await wg2.expandGroupForTab(20);
+    expect(multiWin.winMap.get(2)?.focused).toBe(true);
+
+    // User switches focus to window 3 during handoff.
+    await multiWin.chrome.windows.update(3, { focused: true });
+    const res2 = await wg2.restoreAfterHandoff(20, prev2);
+    expect(res2).toBeNull();
+    expect(multiWin.winMap.get(3)?.focused).toBe(true);
+    expect(multiWin.winMap.get(1)?.focused).toBe(false);
   });
 });
 
@@ -738,6 +906,284 @@ describe("debuggerHub idle detach deferral while dialog is open", () => {
 
     await new Promise((r) => setTimeout(r, 70));
     expect(hub.attachedTabs.has(31)).toBe(false);
+  });
+
+  test("S2: unanswered dialog detaches once the fixed dialog deferral deadline expires", async () => {
+    const fake = makeFakeChrome({
+      windows: [{ id: 1, type: "normal", state: "normal", focused: true }],
+      tabs: [{ id: 32, windowId: 1, url: "https://dialog.test", active: true, groupId: -1 }],
+    });
+
+    const hub = createDebuggerHub({
+      chrome: fake.chrome,
+      idleMs: 25,
+      dialogDeferMs: 80,
+      enablePageOnAttach: true,
+    });
+
+    await hub.ensureAttached(32);
+    hub.handleDebuggerEvent({ tabId: 32 }, "Page.javascriptDialogOpening", {
+      type: "alert",
+      message: "unanswered",
+      url: "https://dialog.test",
+    });
+
+    // Still attached after first idle tick (25ms), before dialogDeferMs (80ms).
+    await new Promise((r) => setTimeout(r, 45));
+    expect(hub.attachedTabs.has(32)).toBe(true);
+
+    // Detached after dialogDeferMs expires even though dialog was never answered.
+    await new Promise((r) => setTimeout(r, 80));
+    expect(hub.attachedTabs.has(32)).toBe(false);
+  });
+});
+
+function makeBackgroundChrome(opts: {
+  extensionId?: string;
+  tabs?: FakeTab[];
+  executeScript?: (details: unknown) => Promise<unknown>;
+  sendCommand?: (
+    target: { tabId: number; sessionId?: string },
+    method: string,
+    params: unknown,
+    emitDebuggerEvent: (source: { tabId: number }, method: string, params: unknown) => void,
+  ) => Promise<Record<string, unknown>>;
+}) {
+  const fake = makeFakeChrome({
+    extensionId: opts.extensionId ?? "gdoaemlogkgnnojmjcgjfaphohadilcf",
+    windows: [{ id: 1, type: "normal", state: "normal", focused: true }],
+    tabs: opts.tabs ?? [{ id: 7, windowId: 1, url: "https://app.test", active: true, groupId: -1 }],
+  });
+  const noopListener = { addListener: () => {}, removeListener: () => {} };
+  const debuggerEventListeners: Array<(source: { tabId: number }, method: string, params: unknown) => void> = [];
+  const messageListeners: Array<
+    (msg: Record<string, unknown>, sender: unknown, sendResponse: (res: unknown) => void) => unknown
+  > = [];
+  const emitDebuggerEvent = (source: { tabId: number }, method: string, params: unknown) => {
+    for (const fn of debuggerEventListeners) fn(source, method, params);
+  };
+  const sendRuntimeMessage = (msg: Record<string, unknown>) =>
+    new Promise((resolve) => {
+      for (const fn of messageListeners) fn(msg, {}, resolve);
+    });
+
+  const cdpCalls: Array<{ method: string; params: Record<string, unknown> }> = [];
+  const executeScriptCalls: unknown[] = [];
+
+  fake.debuggerHandlers.sendCommand = async (target, method, params) => {
+    cdpCalls.push({ method, params: (params ?? {}) as Record<string, unknown> });
+    if (opts.sendCommand) {
+      return opts.sendCommand(target, method, params, emitDebuggerEvent);
+    }
+    return {};
+  };
+
+  const fullChrome = {
+    ...fake.chrome,
+    action: { setBadgeText: () => {}, setBadgeBackgroundColor: () => {} },
+    alarms: { create: () => {}, onAlarm: noopListener },
+    notifications: { create: async () => {}, clear: async () => {}, onClicked: noopListener, onButtonClicked: noopListener },
+    scripting: {
+      executeScript: async (details: unknown) => {
+        executeScriptCalls.push(details);
+        if (opts.executeScript) return opts.executeScript(details);
+        return [{ result: true }];
+      },
+    },
+    runtime: {
+      ...fake.chrome.runtime,
+      getURL: (p: string) => `chrome-extension://${fake.chrome.runtime.id}/${p}`,
+      getManifest: () => ({ version: "2.0.0" }),
+      onMessage: { addListener: (fn: (typeof messageListeners)[number]) => messageListeners.push(fn) },
+      onStartup: noopListener,
+      onInstalled: noopListener,
+    },
+    debugger: {
+      ...fake.chrome.debugger,
+      onEvent: { addListener: (fn: (typeof debuggerEventListeners)[number]) => debuggerEventListeners.push(fn) },
+      onDetach: noopListener,
+    },
+    tabs: {
+      ...fake.chrome.tabs,
+      onActivated: noopListener,
+      onUpdated: noopListener,
+      onRemoved: noopListener,
+      onReplaced: noopListener,
+      sendMessage: async () => ({ ok: true }),
+    },
+    webNavigation: { onCreatedNavigationTarget: noopListener },
+    storage: { ...fake.chrome.storage, onChanged: noopListener },
+  };
+
+  return { fullChrome, cdpCalls, executeScriptCalls, emitDebuggerEvent, sendRuntimeMessage };
+}
+
+async function withBackgroundModule<T>(
+  tag: string,
+  fullChrome: unknown,
+  fn: (bg: {
+    resolveBcNode: (tabId: number, refOrSelector: string, opts?: Record<string, unknown>) => Promise<Record<string, unknown>>;
+    runBcSilent: (tabId: number, steps: unknown[], opts?: Record<string, unknown>) => Promise<unknown>;
+  }) => Promise<T>,
+): Promise<T> {
+  const prevChrome = (globalThis as Record<string, unknown>)["chrome"];
+  (globalThis as Record<string, unknown>)["chrome"] = fullChrome;
+  try {
+    const bg = (await import(`../extension/background.js?${tag}`)) as {
+      resolveBcNode: (tabId: number, refOrSelector: string, opts?: Record<string, unknown>) => Promise<Record<string, unknown>>;
+      runBcSilent: (tabId: number, steps: unknown[], opts?: Record<string, unknown>) => Promise<unknown>;
+    };
+    return await fn(bg);
+  } finally {
+    if (prevChrome === undefined) {
+      delete (globalThis as Record<string, unknown>)["chrome"];
+    } else {
+      (globalThis as Record<string, unknown>)["chrome"] = prevChrome;
+    }
+  }
+}
+
+describe("background.js resolveBcNode & runBcSilent review fixes (S1, S3, S6, S7)", () => {
+  test("S1 & S7: resolveBcNode evaluates with uniqueContextId (not contextId), primes DOM.getDocument, and skips redundant DOM.requestNode", async () => {
+    const extId = "gdoaemlogkgnnojmjcgjfaphohadilcf";
+    const env = makeBackgroundChrome({
+      extensionId: extId,
+      sendCommand: async (target, method, _params, emit) => {
+        if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "MAIN-FRAME" } } };
+        if (method === "Runtime.enable") {
+          emit(target, "Runtime.executionContextCreated", {
+            context: {
+              id: 4,
+              uniqueId: "unique-ext-ctx-4",
+              origin: `chrome-extension://${extId}`,
+              auxData: { isDefault: false, type: "isolated", frameId: "MAIN-FRAME" },
+            },
+          });
+          return {};
+        }
+        if (method === "Runtime.evaluate") {
+          return { result: { objectId: "obj-el-42", subtype: "node" } };
+        }
+        return {};
+      },
+    });
+
+    await withBackgroundModule("s1-s7", env.fullChrome, async (bg) => {
+      const resolved = await bg.resolveBcNode(7, "e4", { mode: "ref" });
+      expect(resolved).toEqual({ objectId: "obj-el-42" });
+
+      const evalCall = env.cdpCalls.find((c) => c.method === "Runtime.evaluate");
+      expect(evalCall?.params["uniqueContextId"]).toBe("unique-ext-ctx-4");
+      expect(evalCall?.params["contextId"]).toBeUndefined();
+      expect(env.cdpCalls.some((c) => c.method === "DOM.getDocument")).toBe(true);
+      expect(env.cdpCalls.some((c) => c.method === "DOM.requestNode")).toBe(false);
+    });
+  });
+
+  test("S3: revoking tab grant during context lookup prevents direct script injection and DOM stamping", async () => {
+    let revokeNow: (() => Promise<void>) | undefined;
+    let revokeOnSecondLookup = false;
+    let frameTreeCalls = 0;
+
+    // 1. Revoked during first lookup -> blocks initial ISOLATED world executeScript.
+    const env1 = makeBackgroundChrome({
+      sendCommand: async (_target, method) => {
+        if (method === "Page.getFrameTree") {
+          await revokeNow?.();
+          return { frameTree: { frame: { id: "MAIN-FRAME" } } };
+        }
+        return {};
+      },
+    });
+    await withBackgroundModule("s3-first", env1.fullChrome, async (bg) => {
+      await env1.sendRuntimeMessage({ type: "setMode", mode: "lent" });
+      await env1.sendRuntimeMessage({ type: "toggleLend", tabId: 7 });
+      revokeNow = async () => {
+        await env1.sendRuntimeMessage({ type: "toggleLend", tabId: 7 });
+      };
+      await expect(bg.resolveBcNode(7, "#box", { mode: "selector" })).rejects.toThrow(/REFUSED/);
+      expect(env1.executeScriptCalls.length).toBe(0);
+    });
+
+    // 2. Revoked after initial world-ensure injection -> blocks fallback DOM stamp executeScript.
+    const env2 = makeBackgroundChrome({
+      executeScript: async () => {
+        revokeOnSecondLookup = true;
+        return [{ result: true }];
+      },
+      sendCommand: async (_target, method) => {
+        if (method === "Page.getFrameTree") {
+          frameTreeCalls++;
+          if (revokeOnSecondLookup && frameTreeCalls >= 2) {
+            await revokeNow?.();
+          }
+          return {}; // No frame id so context lookup returns undefined and reaches fallback
+        }
+        return {};
+      },
+    });
+    await withBackgroundModule("s3-fallback", env2.fullChrome, async (bg) => {
+      await env2.sendRuntimeMessage({ type: "setMode", mode: "lent" });
+      await env2.sendRuntimeMessage({ type: "toggleLend", tabId: 7 });
+      revokeNow = async () => {
+        await env2.sendRuntimeMessage({ type: "toggleLend", tabId: 7 });
+      };
+      await expect(bg.resolveBcNode(7, "#box", { mode: "selector" })).rejects.toThrow(/REFUSED/);
+      // Only the initial world-ensure executeScript ran before revocation; the DOM stamp never ran.
+      expect(env2.executeScriptCalls.length).toBe(1);
+    });
+  });
+
+  test("S6: runBcSilent probes early for a pre-existing dialog on an unattached tab, while allowing slow non-dialog scripts to finish", async () => {
+    // 1. Pre-existing dialog on unattached tab -> early probe attaches, triggers Page.enable, fails fast with DIALOG_OPEN.
+    const envDialog = makeBackgroundChrome({
+      executeScript: () => new Promise(() => {}),
+      sendCommand: async (target, method, _params, emit) => {
+        if (method === "Page.enable") {
+          setTimeout(() => {
+            emit(target, "Page.javascriptDialogOpening", {
+              type: "confirm",
+              message: "pre-existing",
+              url: "https://app.test",
+            });
+          }, 5);
+          return new Promise(() => {});
+        }
+        if (method === "Runtime.evaluate") return new Promise(() => {});
+        return {};
+      },
+    });
+
+    await withBackgroundModule("s6-dialog", envDialog.fullChrome, async (bg) => {
+      const t0 = Date.now();
+      await expect(
+        bg.runBcSilent(7, [{ kind: "href" }], { timeoutMs: 10_000, dialogProbeDelayMs: 40 }),
+      ).rejects.toThrow(/DIALOG_OPEN:.*pre-existing/);
+      expect(Date.now() - t0).toBeLessThan(500);
+    });
+
+    // 2. Slow legitimate script with no dialog -> early probe sees no dialog and lets script finish within budget.
+    let callIdx = 0;
+    const envSlow = makeBackgroundChrome({
+      executeScript: async () => {
+        callIdx++;
+        if (callIdx === 1) {
+          await new Promise((r) => setTimeout(r, 120));
+          return [{ result: true }];
+        }
+        return [{ result: { ok: true, values: ["https://app.test/slow"] } }];
+      },
+      sendCommand: async (_target, method) => {
+        if (method === "Runtime.evaluate") return { result: { value: 1 } };
+        return {};
+      },
+    });
+
+    await withBackgroundModule("s6-slow", envSlow.fullChrome, async (bg) => {
+      const values = await bg.runBcSilent(7, [{ kind: "href" }], { timeoutMs: 5_000, dialogProbeDelayMs: 30 });
+      expect(values).toEqual(["https://app.test/slow"]);
+      expect(envSlow.cdpCalls.some((c) => c.method === "Page.enable")).toBe(true);
+    });
   });
 });
 

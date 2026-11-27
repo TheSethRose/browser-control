@@ -366,68 +366,75 @@ export function createWindowGroups({
   /**
    * Snapshot the tab the user currently has active before a handoff steals focus,
    * so `restoreAfterHandoff` can return them to it once the handoff ends.
+   * Returns `null` when the user is already on the handoff tab (never captures an unrelated window).
    */
   async function captureActiveTabForRestore(handoffTabId) {
     const handoffTab = await chromeApi.tabs.get(handoffTabId).catch(() => null);
+    if (!handoffTab || typeof handoffTab.windowId !== "number") return null;
 
+    // Prefer the actually focused normal window so cross-window handoff returns to it,
+    // but return null if that window's active tab is already the handoff tab.
     try {
-      const focusedWin = await findTargetWindow(chromeApi);
+      const allWins = (await chromeApi.windows?.getAll?.({ populate: false })) || [];
+      const focusedWin = allWins.find((w) => w && w.type === "normal" && w.state !== "minimized" && w.focused);
       if (focusedWin && typeof focusedWin.id === "number") {
         const activeInFocused = (await chromeApi.tabs.query({ active: true, windowId: focusedWin.id })) || [];
-        const picked = activeInFocused.find((t) => typeof t.id === "number" && t.id !== handoffTabId);
-        if (picked) {
-          return { tabId: picked.id, windowId: picked.windowId };
-        }
+        const activeTab = activeInFocused.find((t) => typeof t.id === "number");
+        if (!activeTab || activeTab.id === handoffTabId) return null;
+        return { tabId: activeTab.id, windowId: activeTab.windowId };
       }
     } catch {
-      /* fall through */
+      /* fall through to handoff tab's window */
     }
 
-    if (typeof handoffTab?.windowId === "number") {
-      try {
-        const activeInSame = (await chromeApi.tabs.query({ active: true, windowId: handoffTab.windowId })) || [];
-        const picked = activeInSame.find((t) => typeof t.id === "number" && t.id !== handoffTabId);
-        if (picked) {
-          return { tabId: picked.id, windowId: picked.windowId };
-        }
-      } catch {
-        /* fall through */
-      }
-    }
-
+    // No focused normal window (e.g. backgrounded browser or headless): only capture the active tab
+    // in the handoff tab's own window if it isn't the handoff tab itself.
     try {
-      const allActive = (await chromeApi.tabs.query({ active: true })) || [];
-      const picked =
-        allActive.find(
-          (t) => typeof t.id === "number" && t.id !== handoffTabId && t.windowId === handoffTab?.windowId,
-        ) || allActive.find((t) => typeof t.id === "number" && t.id !== handoffTabId);
-      if (picked) {
-        return { tabId: picked.id, windowId: picked.windowId };
-      }
+      const activeInSame = (await chromeApi.tabs.query({ active: true, windowId: handoffTab.windowId })) || [];
+      const activeTab = activeInSame.find((t) => typeof t.id === "number");
+      if (!activeTab || activeTab.id === handoffTabId) return null;
+      return { tabId: activeTab.id, windowId: activeTab.windowId };
     } catch {
-      /* fall through */
+      return null;
     }
-
-    if (typeof handoffTab?.windowId === "number") {
-      const tracked = currentActiveByWindow.get(handoffTab.windowId);
-      if (typeof tracked === "number" && tracked !== handoffTabId) {
-        return { tabId: tracked, windowId: handoffTab.windowId };
-      }
-    }
-    return null;
   }
 
   /**
    * After a handoff ends (done, cleared, or timeout), reactivate the user's previously
-   * active tab (if it still exists) and re-collapse the "Agents · N" group.
+   * active tab only while the handoff tab still has focus, and re-collapse the "Agents · N" group.
    */
   async function restoreAfterHandoff(handoffTabId, previous = null) {
+    const handoffTab = await chromeApi.tabs.get(handoffTabId).catch(() => null);
+    const handoffWinId = handoffTab?.windowId;
+    let handoffStillFocused = Boolean(handoffTab && handoffTab.active && typeof handoffWinId === "number");
+
+    if (handoffStillFocused && typeof chromeApi.windows?.get === "function") {
+      const handoffWin = await chromeApi.windows.get(handoffWinId).catch(() => null);
+      if (handoffWin && handoffWin.focused === false) {
+        const allWins = (await chromeApi.windows?.getAll?.({ populate: false }).catch(() => null)) || null;
+        if (Array.isArray(allWins) && allWins.some((w) => w && w.focused === true)) {
+          // User switched to another browser window during handoff.
+          handoffStillFocused = false;
+        } else if (typeof chromeApi.windows?.getLastFocused === "function") {
+          const last = await chromeApi.windows.getLastFocused({ windowTypes: ["normal"] }).catch(() => null);
+          if (last && typeof last.id === "number" && last.id !== handoffWinId) {
+            handoffStillFocused = false;
+          }
+        }
+      }
+    }
+
     let restoredTab = null;
-    if (previous && typeof previous.tabId === "number" && previous.tabId !== handoffTabId) {
+    if (
+      handoffStillFocused &&
+      previous &&
+      typeof previous.tabId === "number" &&
+      previous.tabId !== handoffTabId
+    ) {
       const prevTab = await chromeApi.tabs.get(previous.tabId).catch(() => null);
       if (prevTab) {
         const prevWinId = typeof prevTab.windowId === "number" ? prevTab.windowId : previous.windowId;
-        if (typeof prevWinId === "number") {
+        if (typeof prevWinId === "number" && prevWinId !== handoffWinId) {
           await chromeApi.windows?.update?.(prevWinId, { focused: true }).catch(() => {});
         }
         await chromeApi.tabs.update(prevTab.id, { active: true }).catch(() => {});
@@ -438,8 +445,6 @@ export function createWindowGroups({
       }
     }
 
-    const handoffTab = await chromeApi.tabs.get(handoffTabId).catch(() => null);
-    const handoffWinId = handoffTab?.windowId;
     if (typeof handoffWinId === "number") {
       let activeInHandoffWin =
         restoredTab && restoredTab.windowId === handoffWinId ? restoredTab.id : undefined;

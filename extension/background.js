@@ -476,14 +476,26 @@ export async function completeHandoff(tabId, expectedHandoffId) {
 
 export { handoffTabs };
 
+const BC_DIALOG_PROBE_DELAY_MS = 1_500;
+
+function assertTabAllowed(tabId) {
+  if (!tabAllowed(tabId)) {
+    throw new Error(`REFUSED: tab ${tabId} is not lent to Browser Control`);
+  }
+}
+
 // Probe whether an unresponsive tab is blocked by an open JavaScript dialog.
-async function probeDialogOnTimeout(tabId, fallbackMessage) {
+// When `allowUnconfirmed` is false (early probe during bc_call), only a confirmed dialog event
+// triggers DIALOG_OPEN so slow legitimate scripts continue within their normal timeout budget.
+async function probeOpenDialog(tabId, { allowUnconfirmed = false, waitMs = 1_000 } = {}) {
   const known = debuggerHub.getOpenDialog(tabId);
   if (known) {
     return new Error(debuggerHub.formatDialogError(tabId, known));
   }
+  if (!tabAllowed(tabId)) return null;
   try {
     await restoreReady;
+    if (!tabAllowed(tabId)) return null;
     await debuggerHub.ensureAttached(tabId, { skipFocusEmulation: true });
     // Trigger Page.enable without awaiting forever; if Chrome announces an open dialog, catch it.
     let unsubscribe;
@@ -501,7 +513,7 @@ async function probeDialogOnTimeout(tabId, fallbackMessage) {
       .catch(() => null);
     let timer;
     const wait = new Promise((resolve) => {
-      timer = setTimeout(() => resolve(null), 1_000);
+      timer = setTimeout(() => resolve(null), waitMs);
     });
     const dialog = await Promise.race([dialogSeen, evalProbe, wait]);
     clearTimeout(timer);
@@ -510,7 +522,7 @@ async function probeDialogOnTimeout(tabId, fallbackMessage) {
     if (afterKnown) {
       return new Error(debuggerHub.formatDialogError(tabId, afterKnown));
     }
-    if (!probeResponded) {
+    if (allowUnconfirmed && !probeResponded) {
       const alive = await chrome.tabs.get(tabId).catch(() => null);
       if (alive) {
         return new Error(
@@ -519,47 +531,77 @@ async function probeDialogOnTimeout(tabId, fallbackMessage) {
       }
     }
   } catch {
-    /* ignore probe errors and fall back to timeout message */
+    /* ignore probe errors and fall back to caller behavior */
   }
-  return new Error(fallbackMessage);
+  return null;
 }
 
 // Silent Tier: run __bc v7 methods in Chrome's ISOLATED content-script world (no yellow debugger banner).
-async function runBcSilent(tabId, steps, opts = {}) {
-  if (!tabAllowed(tabId)) {
-    throw new Error(`REFUSED: tab ${tabId} is not lent to Browser Control`);
-  }
+export async function runBcSilent(tabId, steps, opts = {}) {
+  assertTabAllowed(tabId);
   const open = debuggerHub.getOpenDialog(tabId);
   if (open) {
     throw new Error(debuggerHub.formatDialogError(tabId, open));
   }
   const timeoutMs = Number(opts.timeoutMs) > 0 ? Number(opts.timeoutMs) : 30_000;
+  const probeDelayMs =
+    Number(opts.dialogProbeDelayMs) > 0 ? Number(opts.dialogProbeDelayMs) : BC_DIALOG_PROBE_DELAY_MS;
   let unsubscribe;
   let timer;
+  let probeTimer;
+  let settled = false;
   let timedOut = false;
   const dialogPromise = new Promise((_, reject) => {
     unsubscribe = debuggerHub.subscribeDialogOpening(tabId, (dialog) => {
       reject(new Error(debuggerHub.formatDialogError(tabId, dialog)));
     });
   });
+  dialogPromise.catch(() => {});
   const timeoutPromise = new Promise((_, reject) => {
     timer = setTimeout(() => {
       timedOut = true;
       reject(new Error("__BC_TIMEOUT__"));
     }, timeoutMs);
   });
+  let rejectEarlyDialog;
+  const earlyProbePromise = new Promise((_, reject) => {
+    rejectEarlyDialog = reject;
+  });
+  earlyProbePromise.catch(() => {});
+
+  if (probeDelayMs < timeoutMs) {
+    probeTimer = setTimeout(() => {
+      if (settled || !tabAllowed(tabId)) return;
+      probeOpenDialog(tabId, {
+        allowUnconfirmed: false,
+        waitMs: Math.min(1_000, Math.max(200, timeoutMs - probeDelayMs)),
+      })
+        .then((dialogErr) => {
+          if (!settled && dialogErr) rejectEarlyDialog(dialogErr);
+        })
+        .catch(() => {});
+    }, probeDelayMs);
+  }
+
+  const stepsPromise = runBcSteps(tabId, steps, opts.frameId);
+  stepsPromise.catch(() => {});
   try {
-    return await Promise.race([runBcSteps(tabId, steps, opts.frameId), dialogPromise, timeoutPromise]);
+    return await Promise.race([stepsPromise, dialogPromise, earlyProbePromise, timeoutPromise]);
   } catch (err) {
     if (timedOut || String(err?.message || "") === "__BC_TIMEOUT__") {
-      throw await probeDialogOnTimeout(
-        tabId,
-        `EXECUTION_FAILED: tab ${tabId} got no answer in ${timeoutMs} ms (a JavaScript dialog may be blocking the page)`,
+      const dialogErr = await probeOpenDialog(tabId, { allowUnconfirmed: true, waitMs: 1_000 });
+      throw (
+        dialogErr ||
+        new Error(
+          `EXECUTION_FAILED: tab ${tabId} got no answer in ${timeoutMs} ms (a JavaScript dialog may be blocking the page)`,
+        )
       );
     }
     throw scriptingError(err, tabId);
   } finally {
+    settled = true;
     clearTimeout(timer);
+    clearTimeout(probeTimer);
     unsubscribe?.();
   }
 }
@@ -617,69 +659,74 @@ async function runBcSteps(tabId, steps, frameId) {
   return payload.values;
 }
 
-// Bridge a ref or selector from the silent ISOLATED world to a CDP objectId/nodeId for upload and styles.
-// Primary: Runtime.enable + exact chrome-extension://<runtime.id> content-script context + Runtime.evaluate(returnByValue:false).
+// Bridge a ref or selector from the silent ISOLATED world to a CDP objectId for upload and styles.
+// Primary: Runtime.enable + exact chrome-extension://<runtime.id> content-script context + Runtime.evaluate(uniqueContextId, returnByValue:false).
 // Works inside open shadow roots without touching the DOM.
 // Fallback: one-shot data-bc-resolve attribute stamp + DOM.querySelector (used only if context lookup fails).
 export async function resolveBcNode(tabId, refOrSelector, opts = {}) {
-  if (!tabAllowed(tabId)) throw new Error(`REFUSED: tab ${tabId} is not lent to Browser Control`);
+  assertTabAllowed(tabId);
   const target = String(refOrSelector ?? "").trim();
   if (!target) throw new Error("INPUT_INVALID: ref or selector is required");
   const isRef = opts.mode === "ref" || (opts.mode !== "selector" && /^@?e\d+$/.test(target));
   const expectedOrigin = `chrome-extension://${chrome.runtime.id}`;
   const cdpFrameId = typeof opts.cdpFrameId === "string" && opts.cdpFrameId !== "" ? opts.cdpFrameId : undefined;
+  const isNonMainFrameWithoutCdpId = typeof opts.frameId === "number" && opts.frameId !== 0 && !cdpFrameId;
 
   await restoreReady;
 
-  const evalInExtensionContext = async (contextId) => {
+  const evalInExtensionContext = async (ctx) => {
     const expression = isRef
       ? `globalThis.__bc?.el(${JSON.stringify(target)})`
       : `document.querySelector(${JSON.stringify(target)})`;
     return debuggerHub.sendCommand(tabId, "Runtime.evaluate", {
-      contextId,
+      uniqueContextId: ctx.uniqueId,
       expression,
       returnByValue: false,
     });
   };
 
-  let contextId = await debuggerHub.findExtensionContext(tabId, {
-    expectedOrigin,
-    frameId: cdpFrameId,
-    timeoutMs: 300,
-  });
-
-  if (contextId === undefined) {
-    // Ensure the extension's ISOLATED world exists on the page (e.g. selector lookup before any bc_call).
-    await chrome.scripting
-      .executeScript({
-        target: scriptTarget(tabId, opts.frameId),
-        world: "ISOLATED",
-        func: () => true,
-      })
-      .catch(() => {});
-    contextId = await debuggerHub.findExtensionContext(tabId, {
+  let context;
+  if (!isNonMainFrameWithoutCdpId) {
+    context = await debuggerHub.findExtensionContext(tabId, {
       expectedOrigin,
       frameId: cdpFrameId,
-      timeoutMs: 500,
+      timeoutMs: 300,
     });
+
+    if (context === undefined) {
+      // Ensure the extension's ISOLATED world exists on the page (e.g. selector lookup before any bc_call).
+      assertTabAllowed(tabId);
+      await chrome.scripting
+        .executeScript({
+          target: scriptTarget(tabId, opts.frameId),
+          world: "ISOLATED",
+          func: () => true,
+        })
+        .catch(() => {});
+      context = await debuggerHub.findExtensionContext(tabId, {
+        expectedOrigin,
+        frameId: cdpFrameId,
+        timeoutMs: 500,
+      });
+    }
+
+    if (context === undefined) {
+      context = await debuggerHub.findExtensionContext(tabId, {
+        expectedOrigin,
+        frameId: cdpFrameId,
+        timeoutMs: 500,
+        forceRefresh: true,
+      });
+    }
   }
 
-  if (contextId === undefined) {
-    contextId = await debuggerHub.findExtensionContext(tabId, {
-      expectedOrigin,
-      frameId: cdpFrameId,
-      timeoutMs: 500,
-      forceRefresh: true,
-    });
-  }
-
-  if (contextId !== undefined) {
+  if (context !== undefined) {
     let evalRes;
     try {
-      evalRes = await evalInExtensionContext(contextId);
+      evalRes = await evalInExtensionContext(context);
     } catch (err) {
       if (/Cannot find context|Execution context was destroyed/i.test(String(err?.message || err))) {
-        debuggerHub.invalidateExtensionContext(tabId, contextId);
+        debuggerHub.invalidateExtensionContext(tabId, context.uniqueId);
         const refreshed = await debuggerHub.findExtensionContext(tabId, {
           expectedOrigin,
           frameId: cdpFrameId,
@@ -687,17 +734,17 @@ export async function resolveBcNode(tabId, refOrSelector, opts = {}) {
           forceRefresh: true,
         });
         if (refreshed !== undefined) {
-          contextId = refreshed;
-          evalRes = await evalInExtensionContext(contextId);
+          context = refreshed;
+          evalRes = await evalInExtensionContext(context);
         } else {
-          contextId = undefined;
+          context = undefined;
         }
       } else {
         throw err;
       }
     }
 
-    if (contextId !== undefined) {
+    if (context !== undefined) {
       if (evalRes?.exceptionDetails) {
         const detail =
           evalRes.exceptionDetails.exception?.description ||
@@ -711,17 +758,12 @@ export async function resolveBcNode(tabId, refOrSelector, opts = {}) {
       }
       // Populate Chrome's DOM agent document map so a subsequent DOM.requestNode({ objectId }) succeeds.
       await debuggerHub.sendCommand(tabId, "DOM.getDocument", { depth: 0 }).catch(() => {});
-      const reqNode = await debuggerHub
-        .sendCommand(tabId, "DOM.requestNode", { objectId: obj.objectId })
-        .catch(() => null);
-      return {
-        objectId: obj.objectId,
-        ...(typeof reqNode?.nodeId === "number" && reqNode.nodeId > 0 ? { nodeId: reqNode.nodeId } : {}),
-      };
+      return { objectId: obj.objectId };
     }
   }
 
   // Fallback: one-shot data-bc-resolve stamp + DOM.querySelector (does not pierce shadow roots).
+  assertTabAllowed(tabId);
   const marker = `bc-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   const stamped = await chrome.scripting.executeScript({
     target: scriptTarget(tabId, opts.frameId),

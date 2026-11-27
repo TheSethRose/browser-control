@@ -6,6 +6,7 @@
 
 export const DEFAULT_DEBUGGER_IDLE_MS = 30_000;
 export const MAX_HOLD_MS = 600_000;
+export const MAX_DIALOG_DEFER_MS = 300_000;
 export const MAX_FOREIGN_FRAME_RETRIES = 2;
 export const ATTACHED_STORAGE_KEY = "bc_attached_tabs";
 export const POST_ATTACH_SETUP_TIMEOUT_MS = 1_500;
@@ -63,6 +64,7 @@ function getPersistStorage(chromeApi) {
 export function createDebuggerHub({
   chrome: chromeApi = globalThis.chrome,
   idleMs = DEFAULT_DEBUGGER_IDLE_MS,
+  dialogDeferMs = MAX_DIALOG_DEFER_MS,
   enablePageOnAttach = false,
   postAttachTimeoutMs = POST_ATTACH_SETUP_TIMEOUT_MS,
   isTabAllowed = () => true,
@@ -76,7 +78,8 @@ export function createDebuggerHub({
   const inFlightAttach = new Map(); // tabId -> Promise<entry>
   const inFlightDetach = new Map(); // tabId -> Promise<void>
   const lastDetachReason = new Map(); // tabId -> string
-  const openDialogs = new Map(); // tabId -> { type, message, url }
+  const openDialogs = new Map(); // tabId -> { id, type, message, url, openedAt, deferUntil }
+  let dialogSeq = 0;
   const dialogWaiters = new Map(); // tabId -> Set<(dialog) => void>
   const contextWaiters = new Map(); // tabId -> Set<(ctx) => void>
   const enqueuePersist = createSerialQueue();
@@ -92,7 +95,7 @@ export function createDebuggerHub({
       runtimeEnabled: false,
       postAttachTimedOut: false,
       mainFrameId: undefined,
-      extensionContexts: new Map(), // contextId -> { id, origin, frameId, type, isDefault }
+      extensionContexts: new Map(), // uniqueId -> { id, uniqueId, origin, frameId, type, isDefault }
     };
   }
 
@@ -193,18 +196,36 @@ export function createDebuggerHub({
     });
   }
 
-  function touchTimer(tabId) {
+  function scheduleIdleTimer(tabId, delayMs) {
     const entry = attachedTabs.get(tabId);
     if (!entry) return;
     if (entry.timer) clearTimeout(entry.timer);
-    const ms = Math.max(idleMs, (entry.holdUntil || 0) - Date.now());
     entry.timer = setTimeout(() => {
-      if (openDialogs.has(tabId)) {
-        touchTimer(tabId);
+      const cur = attachedTabs.get(tabId);
+      if (!cur || cur !== entry) return;
+      const now = Date.now();
+      const holdRemaining = (cur.holdUntil || 0) - now;
+      if (holdRemaining > 0) {
+        scheduleIdleTimer(tabId, holdRemaining);
         return;
       }
+      const dialog = openDialogs.get(tabId);
+      if (dialog) {
+        const deferRemaining = dialog.deferUntil - now;
+        if (deferRemaining > 0) {
+          scheduleIdleTimer(tabId, Math.min(idleMs, deferRemaining));
+          return;
+        }
+      }
       detachTab(tabId).catch(() => {});
-    }, ms);
+    }, Math.max(1, delayMs));
+  }
+
+  function touchTimer(tabId) {
+    const entry = attachedTabs.get(tabId);
+    if (!entry) return;
+    const ms = Math.max(idleMs, (entry.holdUntil || 0) - Date.now());
+    scheduleIdleTimer(tabId, ms);
   }
 
   async function runPostAttachSetup(tabId, entry) {
@@ -395,6 +416,7 @@ export function createDebuggerHub({
         throw new Error(formatDialogError(tabId, openDialogs.get(tabId)));
       }
       lastDetachReason.delete(tabId);
+      const handledDialog = isDialogHandler ? openDialogs.get(tabId) : undefined;
       try {
         const shouldAbortOnDialog =
           !isDialogHandler &&
@@ -428,10 +450,14 @@ export function createDebuggerHub({
           }
           if (method === "Page.enable") entry.pageEnabled = true;
           if (isDialogHandler) {
-            openDialogs.delete(tabId);
-            entry.postAttachTimedOut = false;
-            if (!entry.focusEmulationEnabled || (enablePageOnAttach && !entry.pageEnabled)) {
-              runPostAttachSetup(tabId, entry).catch(() => {});
+            if (handledDialog && openDialogs.get(tabId) === handledDialog) {
+              openDialogs.delete(tabId);
+            }
+            if (!openDialogs.has(tabId)) {
+              entry.postAttachTimedOut = false;
+              if (!entry.focusEmulationEnabled || (enablePageOnAttach && !entry.pageEnabled)) {
+                runPostAttachSetup(tabId, entry).catch(() => {});
+              }
             }
           } else {
             entry.postAttachTimedOut = false;
@@ -532,36 +558,42 @@ export function createDebuggerHub({
   }
 
   function matchExtensionContext(entry, expectedOrigin, targetFrameId) {
-    if (!entry) return undefined;
-    let fallback;
+    if (!entry || !targetFrameId) return undefined;
+    let matched;
     for (const ctx of entry.extensionContexts.values()) {
       if (ctx.origin !== expectedOrigin) continue;
-      if (targetFrameId) {
-        if (ctx.frameId === targetFrameId) return ctx.id;
-      } else {
-        fallback = ctx.id;
-      }
+      if (ctx.frameId !== targetFrameId) continue;
+      if (!ctx.uniqueId) continue;
+      matched = ctx;
     }
-    return targetFrameId ? undefined : fallback;
+    return matched;
   }
 
   /**
    * Locate this extension's content-script execution context on `tabId` by exact
-   * `origin === "chrome-extension://" + chrome.runtime.id` (and `auxData.frameId`).
+   * `origin === "chrome-extension://" + chrome.runtime.id` and a known `auxData.frameId`.
+   * Returns `{ id, uniqueId, origin, frameId, type, isDefault }` so callers evaluate by
+   * `uniqueContextId` instead of a recyclable numeric `contextId`.
    */
   async function findExtensionContext(tabId, { expectedOrigin, frameId, timeoutMs = 400, forceRefresh = false } = {}) {
     const origin = expectedOrigin || (chromeApi?.runtime?.id ? `chrome-extension://${chromeApi.runtime.id}` : "");
     if (!origin) return undefined;
     const entry = await ensureAttached(tabId);
 
-    let targetFrameId = typeof frameId === "string" && frameId !== "" ? frameId : entry.mainFrameId;
+    let targetFrameId =
+      typeof frameId === "string" && frameId !== ""
+        ? frameId
+        : forceRefresh
+          ? undefined
+          : entry.mainFrameId;
     if (!targetFrameId) {
       const tree = await sendCommand(tabId, "Page.getFrameTree", {}).catch(() => null);
-      if (typeof tree?.frameTree?.frame?.id === "string") {
+      if (typeof tree?.frameTree?.frame?.id === "string" && tree.frameTree.frame.id !== "") {
         entry.mainFrameId = tree.frameTree.frame.id;
         targetFrameId = entry.mainFrameId;
       }
     }
+    if (!targetFrameId) return undefined;
 
     if (forceRefresh && entry.runtimeEnabled) {
       await sendCommand(tabId, "Runtime.disable", {}).catch(() => {});
@@ -578,17 +610,18 @@ export function createDebuggerHub({
     return new Promise((resolve) => {
       let settled = false;
       let timer;
-      const done = (id) => {
+      const done = (ctx) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
         unsubscribe();
-        resolve(id);
+        resolve(ctx);
       };
       const unsubscribe = subscribeContextCreated(tabId, (ctx) => {
         if (ctx.origin !== origin) return;
-        if (targetFrameId && ctx.frameId !== targetFrameId) return;
-        done(ctx.id);
+        if (ctx.frameId !== targetFrameId) return;
+        if (!ctx.uniqueId) return;
+        done(ctx);
       });
       timer = setTimeout(() => {
         done(matchExtensionContext(entry, origin, targetFrameId));
@@ -598,13 +631,31 @@ export function createDebuggerHub({
     });
   }
 
-  function invalidateExtensionContext(tabId, contextId) {
+  function invalidateExtensionContext(tabId, contextKey) {
     const entry = attachedTabs.get(tabId);
     if (!entry) return;
-    if (contextId === undefined) {
+    if (contextKey === undefined) {
       entry.extensionContexts.clear();
-    } else {
-      entry.extensionContexts.delete(contextId);
+      return;
+    }
+    if (typeof contextKey === "string") {
+      entry.extensionContexts.delete(contextKey);
+      return;
+    }
+    if (typeof contextKey === "number") {
+      for (const [key, info] of entry.extensionContexts) {
+        if (info.id === contextKey) entry.extensionContexts.delete(key);
+      }
+      return;
+    }
+    if (contextKey && typeof contextKey === "object") {
+      if (typeof contextKey.uniqueId === "string" && contextKey.uniqueId) {
+        entry.extensionContexts.delete(contextKey.uniqueId);
+      } else if (typeof contextKey.id === "number") {
+        for (const [key, info] of entry.extensionContexts) {
+          if (info.id === contextKey.id) entry.extensionContexts.delete(key);
+        }
+      }
     }
   }
 
@@ -614,22 +665,31 @@ export function createDebuggerHub({
     if (!source.sessionId && entry) {
       if (method === "Runtime.executionContextCreated") {
         const ctx = params?.context;
-        if (ctx && typeof ctx.id === "number") {
+        const uniqueId = typeof ctx?.uniqueId === "string" ? ctx.uniqueId : "";
+        if (ctx && typeof ctx.id === "number" && uniqueId) {
           const info = {
             id: ctx.id,
+            uniqueId,
             origin: String(ctx.origin || ""),
             frameId: ctx.auxData?.frameId ? String(ctx.auxData.frameId) : "",
             type: String(ctx.auxData?.type || ""),
             isDefault: Boolean(ctx.auxData?.isDefault),
           };
-          entry.extensionContexts.set(ctx.id, info);
+          entry.extensionContexts.set(uniqueId, info);
           notifyContextCreated(source.tabId, info);
         }
       } else if (method === "Runtime.executionContextDestroyed") {
+        const uniqueId = typeof params?.executionContextUniqueId === "string" ? params.executionContextUniqueId : "";
         const ctxId = params?.executionContextId;
-        if (typeof ctxId === "number") {
-          entry.extensionContexts.delete(ctxId);
-          if (entry.isolatedContextId === ctxId) entry.isolatedContextId = undefined;
+        if (uniqueId) {
+          entry.extensionContexts.delete(uniqueId);
+        } else if (typeof ctxId === "number") {
+          for (const [key, info] of entry.extensionContexts) {
+            if (info.id === ctxId) entry.extensionContexts.delete(key);
+          }
+        }
+        if (typeof ctxId === "number" && entry.isolatedContextId === ctxId) {
+          entry.isolatedContextId = undefined;
         }
       } else if (method === "Runtime.executionContextsCleared") {
         entry.extensionContexts.clear();
@@ -647,18 +707,22 @@ export function createDebuggerHub({
             persistAttached().catch(() => {});
           }
         } else if (typeof params?.frame?.id === "string") {
-          for (const [id, ctx] of entry.extensionContexts) {
-            if (ctx.frameId === params.frame.id) entry.extensionContexts.delete(id);
+          for (const [key, ctx] of entry.extensionContexts) {
+            if (ctx.frameId === params.frame.id) entry.extensionContexts.delete(key);
           }
         }
       }
     }
 
     if (method === "Page.javascriptDialogOpening") {
+      const openedAt = Date.now();
       const info = {
+        id: ++dialogSeq,
         type: String(params?.type || "dialog"),
         message: String(params?.message || ""),
         url: String(params?.url || ""),
+        openedAt,
+        deferUntil: openedAt + dialogDeferMs,
       };
       openDialogs.set(source.tabId, info);
       notifyDialogOpening(source.tabId, info);
