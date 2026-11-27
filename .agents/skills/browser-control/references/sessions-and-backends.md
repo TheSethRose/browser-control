@@ -34,9 +34,9 @@ Other `extension` subcommands:
 
 | Command | What it does |
 | --- | --- |
-| `extension status` | Relay port, connected browsers, protocol and helper versions, pairing state. |
+| `extension status` | Relay port, connected browsers, protocol and helper versions, pairing state, and any pending/rejected handshakes with a fix line. |
 | `extension browsers` | Connected browsers and their slugs (for `--browser`). |
-| `extension diagnostics` | The extension's recent log plus the daemon's relay state. Use it for bug reports. |
+| `extension diagnostics` | The extension's recent log plus the daemon's relay state (including pending/rejected handshakes and fix line). Use it for bug reports. |
 | `extension enable` | Clear `<daemon dir>/backends` (including any older `extension,cdp` or `cdp` override) so the default (`extension` when paired), `BROWSER_CONTROL_BACKENDS`, or `~/.config/browser-control/backends` applies. |
 | `extension disable` | Write `cdp` to `<daemon dir>/backends` (DevTools only). |
 | `extension pair`, `extension revoke` | Not built yet. They wait for a later Web Store build and return an error saying so. |
@@ -44,7 +44,7 @@ Other `extension` subcommands:
 If the extension doesn't connect:
 
 - The first call after a fresh daemon start can wait up to 35 s while Chrome wakes the extension. The daemon prints why it is waiting. Later calls are instant.
-- Run `extension status`. If no browser is connected, ask the user to check that the extension is loaded and turned on in `chrome://extensions`.
+- Run `extension status`. If no browser is connected, check its `fix` line (for example a helper version mismatch from your paired extension, or a rejected handshake from another client); otherwise ask the user to check that the extension is loaded and turned on in `chrome://extensions`.
 - In Claude Code's sandbox, the relay needs `allowLocalBinding: true`. The daemon socket folder needs `allowUnixSockets`. Without them the relay can't open its port.
 
 ## 3. Browsers and profiles
