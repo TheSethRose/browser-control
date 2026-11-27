@@ -94,6 +94,9 @@ export interface NaturalSwitchOptions {
 
 export const DEFAULT_VIEWPORT: Viewport = { width: 1280, height: 800 };
 
+/** Minimum forward room past the target before an overshoot leg is worth adding. */
+const OVERSHOOT_MIN_ROOM_PX = 4;
+
 /** 32-bit Mulberry32 PRNG returning values in [0, 1). */
 export function createSeededRng(seed: number): () => number {
   let a = seed >>> 0;
@@ -179,8 +182,36 @@ export function isNaturalEnabled(
 }
 
 /**
+ * Pick one axis of a synthesized start: `minMag`–`maxMag` px from `to`, on a side that has
+ * room for the minimum offset. When neither side has room, use the farthest in-viewport point.
+ */
+function synthesizeAxis(
+  to: number,
+  lo: number,
+  hi: number,
+  minMag: number,
+  maxMag: number,
+  rng: () => number,
+): number {
+  const plusRoom = hi - to;
+  const minusRoom = to - lo;
+  const canPlus = plusRoom >= minMag;
+  const canMinus = minusRoom >= minMag;
+  if (!canPlus && !canMinus) return plusRoom >= minusRoom ? hi : lo; // also covers an off-screen `to`
+
+  let sign = rng() < 0.5 ? -1 : 1;
+  if (!canPlus) sign = -1;
+  else if (!canMinus) sign = 1;
+
+  const room = sign === 1 ? plusRoom : minusRoom;
+  const mag = randBetween(rng, minMag, Math.min(maxMag, room));
+  return Math.min(hi, Math.max(lo, to + sign * mag));
+}
+
+/**
  * Synthesize a realistic interior starting pointer when a tab has no prior pointer position.
- * Starts 120–280 px horizontally and 80–180 px vertically from `to`, clamped inside viewport, never (0, 0).
+ * Starts 120–280 px horizontally and 80–180 px vertically from `to` when a side has room,
+ * otherwise at the farthest in-viewport point on that axis; never (0, 0).
  */
 export function synthesizeStartPoint(
   to: Point2D,
@@ -194,22 +225,8 @@ export function synthesizeStartPoint(
   const minY = Math.max(1, padY);
   const maxY = Math.max(minY, viewport.height - padY);
 
-  const magX = randBetween(rng, 120, 280);
-  const magY = randBetween(rng, 80, 180);
-  let signX = rng() < 0.5 ? -1 : 1;
-  let signY = rng() < 0.5 ? -1 : 1;
-
-  // Prefer the direction that stays inside the viewport without collapsing onto the target.
-  const candX = to.x + signX * magX;
-  const altX = to.x - signX * magX;
-  if ((candX < minX || candX > maxX) && altX >= minX && altX <= maxX) signX = -signX;
-
-  const candY = to.y + signY * magY;
-  const altY = to.y - signY * magY;
-  if ((candY < minY || candY > maxY) && altY >= minY && altY <= maxY) signY = -signY;
-
-  let x = round1(clamp(to.x + signX * magX, minX, maxX));
-  let y = round1(clamp(to.y + signY * magY, minY, maxY));
+  let x = round1(synthesizeAxis(to.x, minX, maxX, 120, 280, rng));
+  let y = round1(synthesizeAxis(to.y, minY, maxY, 80, 180, rng));
   if (x === 0 && y === 0) {
     x = Math.min(12, Math.max(1, viewport.width - 1));
     y = Math.min(12, Math.max(1, viewport.height - 1));
@@ -267,6 +284,7 @@ function distributeDelays(
  * - Cubic Bezier bow: ±(5–16%) * d, capped at 110 px.
  * - Step cadence: 12–20 ms, max 24 main arc steps.
  * - Overshoot: 18% when d >= 220 px (0 below); 4–11 px past target, 3–5 return steps over 45–85 ms.
+ *   Skipped when viewport clamping leaves under 4 px of forward room, so no empty return leg.
  */
 export function planPointerPath(opts: PointerPathOptions): PointerPathPlan {
   const rng = opts.rng ?? Math.random;
@@ -277,7 +295,8 @@ export function planPointerPath(opts: PointerPathOptions): PointerPathPlan {
   const start = opts.from
     ? clampToViewport(opts.from, viewport)
     : synthesizeStartPoint(opts.to, viewport, rng);
-  const to = { x: round1(opts.to.x), y: round1(opts.to.y) };
+  const dest = opts.to;
+  const to = { x: round1(dest.x), y: round1(dest.y) };
 
   const dx = to.x - start.x;
   const dy = to.y - start.y;
@@ -286,7 +305,7 @@ export function planPointerPath(opts: PointerPathOptions): PointerPathPlan {
   if (distance < 3) {
     return {
       start,
-      steps: [{ x: to.x, y: to.y, delayMs: 0 }],
+      steps: [{ x: dest.x, y: dest.y, delayMs: 0 }],
       durationMs: 0,
       overshootDurationMs: 0,
       totalDurationMs: 0,
@@ -313,7 +332,7 @@ export function planPointerPath(opts: PointerPathOptions): PointerPathPlan {
   const c1 = { x: start.x + dx * t1 + nx * bowPx, y: start.y + dy * t1 + ny * bowPx };
   const c2 = { x: start.x + dx * t2 + nx * bow2, y: start.y + dy * t2 + ny * bow2 };
 
-  const overshot = distance >= 220 && overshootProb > 0 && rng() < overshootProb;
+  let overshot = distance >= 220 && overshootProb > 0 && rng() < overshootProb;
   let arcEnd = to;
   if (overshot) {
     let tx = to.x - c2.x;
@@ -327,7 +346,16 @@ export function planPointerPath(opts: PointerPathOptions): PointerPathPlan {
       ty = dy / distance;
     }
     const overDist = randBetween(rng, 4, 11);
-    arcEnd = clampToViewport({ x: to.x + tx * overDist, y: to.y + ty * overDist }, viewport);
+    // Viewport clamping can erase the forward overshoot, which would leave a pointless
+    // return leg. Measure the room left along the approach direction first.
+    const rawX = clamp(to.x + tx * overDist, 0, Math.max(0, viewport.width - 1));
+    const rawY = clamp(to.y + ty * overDist, 0, Math.max(0, viewport.height - 1));
+    const forwardRoom = (rawX - to.x) * tx + (rawY - to.y) * ty;
+    if (forwardRoom < OVERSHOOT_MIN_ROOM_PX) {
+      overshot = false;
+    } else {
+      arcEnd = { x: round1(rawX), y: round1(rawY) };
+    }
   }
 
   const arcSteps = clamp(Math.round(durationMs / 16), Math.ceil(durationMs / 20), Math.min(maxSteps, Math.floor(durationMs / 12)));
@@ -341,7 +369,8 @@ export function planPointerPath(opts: PointerPathOptions): PointerPathPlan {
     elapsed += delayMs;
     const isLast = i === arcStepCount - 1;
     if (isLast) {
-      steps.push({ x: arcEnd.x, y: arcEnd.y, delayMs });
+      // The arc ends at the overshoot point, or exactly on the supplied destination when there is none.
+      steps.push(overshot ? { x: arcEnd.x, y: arcEnd.y, delayMs } : { x: dest.x, y: dest.y, delayMs });
       continue;
     }
     const u = elapsed / durationMs;
@@ -377,12 +406,12 @@ export function planPointerPath(opts: PointerPathOptions): PointerPathPlan {
       backElapsed += delayMs;
       const isLast = j === overshootSteps - 1;
       if (isLast) {
-        steps.push({ x: to.x, y: to.y, delayMs });
+        steps.push({ x: dest.x, y: dest.y, delayMs });
         continue;
       }
       const s = minimumJerk(backElapsed / overshootDurationMs);
       const pt = clampToViewport(
-        { x: arcEnd.x + (to.x - arcEnd.x) * s, y: arcEnd.y + (to.y - arcEnd.y) * s },
+        { x: arcEnd.x + (dest.x - arcEnd.x) * s, y: arcEnd.y + (dest.y - arcEnd.y) * s },
         viewport,
       );
       steps.push({ x: pt.x, y: pt.y, delayMs });
@@ -454,7 +483,8 @@ export function planKeyHold(rng: () => number = Math.random): number {
 /**
  * Distribute a single wheel flick's `deltaY` across `eventCount` eased events
  * using cubic ease-out `1 - (1 - t)^3` (MIT-adapted from anomalyco/browse) so the
- * integer event deltas sum to `Math.round(deltaY)` exactly.
+ * integer event deltas sum to `Math.round(deltaY)` exactly. Zero-delta events are dropped so a
+ * short flick never sends a wheel event that moves nothing.
  */
 function buildFlickEvents(
   deltaY: number,
@@ -481,9 +511,11 @@ function buildFlickEvents(
     const cumulative = i === count - 1 ? target : Math.round(target * eased);
     const stepDelta = cumulative - emitted;
     emitted = cumulative;
+    // Short flicks round early events to zero; a zero-delta wheel event would just be a pause.
+    if (stepDelta === 0) continue;
     events.push({ deltaY: stepDelta, delayMs: delays[i]! });
   }
-  return { events, durationMs: delays.reduce((a, b) => a + b, 0) };
+  return { events, durationMs: events.reduce((a, e) => a + e.delayMs, 0) };
 }
 
 const FLICK_MIN_PX = 280;
