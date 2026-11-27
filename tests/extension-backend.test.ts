@@ -873,6 +873,20 @@ describe("Phase 2 slice B: BrowserLinks and chunked frames", () => {
     expect(evs2.events.map((e) => e.params.from)).toEqual([2]);
   });
 
+  test("offline: named nav stays on the extension and targeted event reads fail", async () => {
+    const backend = createExtensionBackend({ ...allocPortWindow(), token: randomBytes(32).toString("hex"), waitConnectMs: 50 });
+    disposables.push(backend);
+    await backend.start!();
+    expect(backend.handles("navigate", { url: "https://x", browser: "chrome-abc123" }, false)).toBe(true);
+    await expect(backend.invoke("navigate", { url: "https://x", browser: "chrome-abc123" })).rejects.toThrow(
+      /BACKEND_UNAVAILABLE/,
+    );
+    await expect(backend.invoke("read_events", { targetId: "extension:42" })).rejects.toThrow(/not connected/);
+    await expect(
+      backend.invoke("wait_for_event", { method: "x", targetId: "extension:42", timeoutMs: 10 }),
+    ).rejects.toThrow(/not connected/);
+  });
+
   test("an event waiter keeps matching after a second browser connects", async () => {
     const token = randomBytes(32).toString("hex");
     const backend = createExtensionBackend({ ...allocPortWindow(), token, waitConnectMs: 1_000 });

@@ -1464,6 +1464,13 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
     return requestOnLink(resolved.link, op, { ...rest, tabId: resolved.tabId }, timeoutMs);
   }
 
+  // An explicit target must never widen into "all events" while no browser is connected.
+  function eventTarget(targetId: unknown): { link: BrowserLink; tabId: number } | undefined {
+    if (links.size > 0) return resolveTarget(targetId);
+    if (targetId !== undefined) throw new BackendUnavailable(NAME, "extension is not connected");
+    return undefined;
+  }
+
   async function bcCall(input: BcCallInput): Promise<{ value: unknown }> {
     await waitForConnection();
     const resolved = resolveTarget(input.targetId);
@@ -1525,9 +1532,8 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
         if (isBrowserLevelMethod(method)) return false;
       }
       if (extensionTabOf(input["targetId"]) !== undefined) return true;
-      if (op === "navigate" && typeof input["browser"] === "string" && findLinkBySlug(input["browser"])) {
-        return true;
-      }
+      // A named browser is always ours; invoke reports it if that browser is offline.
+      if (op === "navigate" && typeof input["browser"] === "string") return true;
       if (input["targetId"] !== undefined) return false;
       return op === "navigate" ? isActive || activeTab === undefined : isActive && activeTab !== undefined;
     },
@@ -1768,7 +1774,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
         }
 
         case "read_events": {
-          const resolved = links.size > 0 ? resolveTarget(input["targetId"]) : undefined;
+          const resolved = eventTarget(input["targetId"]);
           const sessionId =
             typeof input["sessionId"] === "string"
               ? input["sessionId"]
@@ -1796,7 +1802,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
         case "wait_for_event": {
           const method = typeof input["method"] === "string" ? input["method"] : "";
           if (!method) throw new Error("INPUT_INVALID: method is required");
-          const resolved = links.size > 0 ? resolveTarget(input["targetId"]) : undefined;
+          const resolved = eventTarget(input["targetId"]);
           const sessionId =
             typeof input["sessionId"] === "string"
               ? input["sessionId"]
@@ -1889,7 +1895,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
         ...(startError ? { reason: startError } : {}),
         activeTargetId:
           activeTab && links.has(activeTab.profileId)
-            ? (links.size > 1 ? `${NAME}:${activeTab.slug}:${activeTab.tabId}` : `${NAME}:${activeTab.tabId}`)
+            ? formatTargetId(activeTab, activeTab.tabId)
             : null,
       };
     },
