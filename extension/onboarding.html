@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Pair Browser Control</title>
+  <style>
+    :root { color-scheme: light dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    body { margin: 0; padding: 32px 20px; display: flex; justify-content: center; font-size: 14px; }
+    main { width: 100%; max-width: 400px; }
+    h1 { margin: 0 0 8px; font-size: 18px; }
+    p { margin: 0 0 16px; line-height: 1.45; opacity: 0.8; }
+    .status { padding: 10px 12px; border-radius: 8px; margin-bottom: 16px; font-weight: 500; border: 1px solid #8884; }
+    .status.ok { border-color: #16a34a88; background: #16a34a1a; color: #16a34a; }
+    .status.err { border-color: #dc262688; background: #dc26261a; color: #dc2626; }
+    form { display: flex; gap: 8px; }
+    input { flex: 1; padding: 8px 10px; border-radius: 6px; border: 1px solid #8886; background: transparent; font-size: 14px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: 0.08em; text-transform: uppercase; }
+    button { padding: 8px 14px; border-radius: 6px; border: 1px solid #2563eb; background: #2563eb; color: #fff; font-weight: 600; cursor: pointer; font-size: 13px; }
+    button:disabled { opacity: 0.5; cursor: default; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Pair Browser Control</h1>
+    <p>Enter the one-time 8-character code printed by <code>extension-pair</code>, or open the onboarding link directly.</p>
+    <div id="status" class="status">Ready to pair.</div>
+    <form id="pairForm">
+      <input id="codeInput" type="text" placeholder="XXXX-XXXX" autocomplete="off" spellcheck="false" maxlength="12" />
+      <button id="pairBtn" type="submit">Pair</button>
+    </form>
+  </main>
+  <script type="module" src="onboarding.js"></script>
+</body>
+</html>
