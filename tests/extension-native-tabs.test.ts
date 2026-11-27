@@ -547,6 +547,81 @@ describe("window-groups", () => {
     expect(claimed).toEqual([2]);
   });
 
+  test("after losing session storage, an existing Agents · N group is reused instead of duplicated", async () => {
+    const fake = makeFakeChrome({
+      windows: [{ id: 1, type: "normal", state: "normal", focused: true }],
+      tabs: [
+        { id: 1, windowId: 1, url: "https://user.test", active: true, index: 0, groupId: -1 },
+        { id: 2, windowId: 1, url: "https://agent1.test", active: false, index: 1, groupId: 99 },
+        { id: 3, windowId: 1, url: "https://agent2.test", active: false, index: 2, groupId: -1 },
+      ],
+      groups: [{ id: 99, windowId: 1, title: "Agents · 1", color: "blue", collapsed: false }],
+    });
+    const agentTabs = new Set([2, 3]);
+    const wg = createWindowGroups({
+      chrome: fake.chrome,
+      getSettings: () => ({ tabGroupMode: "shared", autoCollapse: true }),
+      isAgentTab: (id: number) => agentTabs.has(id),
+    });
+
+    const groupId = await wg.addTabToAgentGroup(3);
+
+    expect(groupId).toBe(99);
+    expect(fake.groupMap.size).toBe(1);
+    expect(fake.groupMap.get(99)?.title).toBe("Agents · 2");
+    expect(fake.sessionStore.get(AGENT_GROUPS_STORAGE_KEY)).toEqual([99]);
+  });
+
+  test("two concurrent addTabToAgentGroup calls in one window make a single group", async () => {
+    const fake = makeFakeChrome({
+      windows: [{ id: 1, type: "normal", state: "normal", focused: true }],
+      tabs: [
+        { id: 1, windowId: 1, url: "https://user.test", active: true, index: 0, groupId: -1 },
+        { id: 2, windowId: 1, url: "https://agent1.test", active: false, index: 1, groupId: -1 },
+        { id: 3, windowId: 1, url: "https://agent2.test", active: false, index: 2, groupId: -1 },
+      ],
+    });
+    const agentTabs = new Set([2, 3]);
+    const wg = createWindowGroups({
+      chrome: fake.chrome,
+      getSettings: () => ({ tabGroupMode: "shared", autoCollapse: true }),
+      isAgentTab: (id: number) => agentTabs.has(id),
+    });
+
+    const [first, second] = await Promise.all([wg.addTabToAgentGroup(2), wg.addTabToAgentGroup(3)]);
+
+    expect(first).toBe(second);
+    expect(fake.groupMap.size).toBe(1);
+    expect(fake.groupMap.get(first!)?.title).toBe("Agents · 2");
+    expect(fake.tabMap.get(2)?.groupId).toBe(first!);
+    expect(fake.tabMap.get(3)?.groupId).toBe(first!);
+  });
+
+  test("a group the user renamed away from Agents · N is never adopted", async () => {
+    const fake = makeFakeChrome({
+      windows: [{ id: 1, type: "normal", state: "normal", focused: true }],
+      tabs: [
+        { id: 1, windowId: 1, url: "https://user.test", active: true, index: 0, groupId: -1 },
+        { id: 2, windowId: 1, url: "https://agent1.test", active: false, index: 1, groupId: -1 },
+        { id: 3, windowId: 1, url: "https://notes.test", active: false, index: 2, groupId: 99 },
+      ],
+      groups: [{ id: 99, windowId: 1, title: "Notes · 1", color: "pink", collapsed: false }],
+    });
+    const agentTabs = new Set([2]);
+    const wg = createWindowGroups({
+      chrome: fake.chrome,
+      getSettings: () => ({ tabGroupMode: "shared", autoCollapse: true }),
+      isAgentTab: (id: number) => agentTabs.has(id),
+    });
+
+    const groupId = await wg.addTabToAgentGroup(2);
+
+    expect(groupId).not.toBe(99);
+    expect(fake.groupMap.get(99)?.title).toBe("Notes · 1");
+    expect(fake.tabMap.get(3)?.groupId).toBe(99);
+    expect(fake.calls.some((c) => c.api === "tabGroups.update" && c.args[0] === 99)).toBe(false);
+  });
+
   test("skips popup adoption while opener tab is in handoff", async () => {
     const fake = makeFakeChrome({
       windows: [{ id: 1, type: "normal", state: "normal", focused: true }],
