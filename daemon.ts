@@ -28,6 +28,7 @@ import {
   extensionDiagnosticsReport,
   extensionStatusReport,
   getRegisteredExtensionBackend,
+  sessionKeyOf,
 } from "./src/backends/extension";
 import { backendOrder, backendOrderSource, setDaemonBackendsFile, withAutoConnect } from "./src/backends/router";
 import { prefixOf } from "./src/backends/types";
@@ -237,6 +238,7 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
     // The wrapper resolves its caller's natural switch and sends only on/off, so status and dispatch agree.
     const natHeader = request.headers.get("x-bc-natural");
     const callerNatural = natHeader === "on" || natHeader === "off" ? { _natural: natHeader === "on" } : {};
+    const sessionKey = sessionKeyOf(request.headers.get("x-bc-session"));
     const wrap = boundariesDefault && url.searchParams.get("raw") !== "1";
 
     switch (route) {
@@ -266,6 +268,8 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
                 snap: url.searchParams.get("snap") === "1",
                 newWindow: url.searchParams.get("new_window") === "1",
                 keepOpen: url.searchParams.get("keep_open") === "1",
+                ...(url.searchParams.get("new_tab") === "1" ? { newTab: true } : {}),
+                ...(sessionKey ? { sessionKey } : {}),
                 ...(url.searchParams.get("fast") === "1" ? { fast: true } : {}),
                 ...callerNatural,
               },

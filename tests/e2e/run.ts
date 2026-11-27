@@ -231,8 +231,13 @@ async function main(): Promise<number> {
   const servers: ReturnType<typeof Bun.serve>[] = [];
   let browser: Subprocess | undefined;
   let cdp: Cdp | undefined;
+  // The caller's agent session must not key these runs; the session cases set their own.
+  const inherited: Record<string, string | undefined> = { ...process.env };
+  for (const k of ["BROWSER_CONTROL_SESSION", "CLAUDE_CODE_SESSION_ID", "T3CODE_THREAD_ID", "CODEX_THREAD_ID", "CODEX_SESSION_ID"]) {
+    delete inherited[k];
+  }
   const env = {
-    ...process.env,
+    ...inherited,
     XDG_CONFIG_HOME: xdg,
     BROWSER_CONTROL_BACKENDS: "extension",
     // Natural (human-paced) input on explicitly, whatever the caller's shell says.
@@ -241,8 +246,8 @@ async function main(): Promise<number> {
     [RELAY_PORTS_ENV]: `${relayPort}-${relayPort}`,
   };
 
-  const bc = async (args: string[], timeoutMs = 45_000): Promise<string> => {
-    const proc = spawn([WRAPPER, ...args], { env, stdout: "pipe", stderr: "pipe", cwd: tmp });
+  const bc = async (args: string[], timeoutMs = 45_000, extraEnv: Record<string, string> = {}): Promise<string> => {
+    const proc = spawn([WRAPPER, ...args], { env: { ...env, ...extraEnv }, stdout: "pipe", stderr: "pipe", cwd: tmp });
     const timer = setTimeout(() => proc.kill(), timeoutMs);
     const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
     await proc.exited;
@@ -513,6 +518,21 @@ async function main(): Promise<number> {
       tabsAfterClose === tabsBeforeClose - 1 && openedId !== "" && !tabsAfterCloseList.includes(openedId),
       `before=${tabsBeforeClose} after=${tabsAfterClose} id=${openedId}`,
     );
+
+    // Session reuse: one session's tab-less navs share a tab; another session or --new-tab gets its own.
+    const tabOf = (out: string) => /"targetId":"(extension:[^"]+)"/.exec(out)?.[1] ?? "";
+    const sessA = { BROWSER_CONTROL_SESSION: "e2e-session-a" };
+    const navs = [
+      await bc(["nav", `${base}/`], 45_000, sessA),
+      await bc(["nav", `${base}/form`], 45_000, sessA),
+      await bc(["nav", `${base}/`], 45_000, { BROWSER_CONTROL_SESSION: "e2e-session-b" }),
+      await bc(["nav", `${base}/`, "--new-tab"], 45_000, sessA),
+    ];
+    const [idA1, idA2, idB1, idANew] = navs.map(tabOf);
+    record("session-tab-reused", idA1 !== "" && idA1 === idA2 && /reused this session's tab/.test(navs[1]!), `${navs[0]}\n${navs[1]}`);
+    record("session-tab-separate", idB1 !== "" && idB1 !== idA1, `${idA1} ${idB1}`);
+    record("session-new-tab", idANew !== "" && idANew !== idA1 && idANew !== idB1, `${idA1} ${idANew}`);
+    for (const id of new Set([idA1, idB1, idANew])) if (id) await bc(["close", id]);
 
     // Fresh tab, nav, then an immediate natural 10-field fill, five times; every field must read back exactly.
     const steps = JSON.stringify([

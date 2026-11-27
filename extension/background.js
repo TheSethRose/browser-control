@@ -19,6 +19,8 @@ import {
   relayProofMessage,
   verifyHmacHex,
 } from "./lib/pairing.js";
+import { createSessionTabs, validSessionKey } from "./lib/session-tabs.js";
+import { createTabBusy } from "./lib/tab-busy.js";
 import { createTabCleanup } from "./lib/tab-cleanup.js";
 import { createWindowGroups, normalizeNavigateUrl } from "./lib/window-groups.js";
 
@@ -52,6 +54,7 @@ let lastError = "";
 const lentTabs = new Set();
 const agentTabs = new Set();
 const handoffTabs = new Map(); // tabId -> { handoffId, message, origin, notifId }
+const tabBusy = createTabBusy();
 const connections = new Map(); // port -> { port, ws, state, extNonce, instanceId, keepaliveTimer, touchedTabs }
 
 let scanTimer = null;
@@ -338,6 +341,7 @@ const windowGroups = createWindowGroups({
   isTabInHandoff: (tabId) => handoffTabs.has(tabId),
   stateReady: () => tabSetsReady,
   onUserClaimTab: async (tabId) => {
+    sessionTabs.forget(tabId).catch(() => {});
     if (agentTabs.delete(tabId)) {
       await saveTabSets().catch(() => {});
     }
@@ -382,11 +386,19 @@ const tabCleanup = createTabCleanup({
     }
     debuggerHub.forgetTab(tabId);
     windowGroups.handleTabRemoved(tabId);
+    sessionTabs.forget(tabId).catch(() => {});
     for (const conn of connections.values()) {
       conn.touchedTabs.delete(tabId);
     }
     updateBadge();
   },
+});
+
+const sessionTabs = createSessionTabs({
+  chrome,
+  isAgentTab: (tabId) => agentTabs.has(tabId),
+  isTabInHandoff: (tabId) => handoffTabs.has(tabId),
+  isTabBusy: (tabId) => tabBusy.isBusy(tabId),
 });
 
 // Tab ids are reused after a browser restart, so lent/agent tab sets and idle metadata live in session storage only.
@@ -1168,6 +1180,16 @@ function stripHash(url) {
   return idx >= 0 ? String(url).slice(0, idx) : String(url || "");
 }
 
+// Reuse survives only on the tab's freshest facts: the user can claim or pin it while the request waits.
+async function assertReusable(tabIdToCheck, opts) {
+  if (!opts.revalidate) return;
+  const tab = await chrome.tabs.get(tabIdToCheck).catch(() => null);
+  if (opts.revalidate(tab, tabIdToCheck)) return;
+  const err = new Error("STALE_TAB: the session's tab is no longer ours to reuse");
+  err.code = "STALE_TAB";
+  throw err;
+}
+
 async function navigateTab(tabId, rawUrl, until, timeoutMs, opts = {}) {
   const url = normalizeNavigateUrl(rawUrl);
   const wantDcl = until === "domcontentloaded";
@@ -1178,6 +1200,7 @@ async function navigateTab(tabId, rawUrl, until, timeoutMs, opts = {}) {
     if (opts.keepOpen === true && agentTabs.has(tabId)) tabCleanup.markKeepOpen(tabId, true);
     const existing = await chrome.tabs.get(tabId).catch(() => null);
     if (existing?.url && url.includes("#") && stripHash(existing.url) === stripHash(url) && existing.url !== url) {
+      await assertReusable(tabId, opts);
       await chrome.tabs.update(tabId, { url });
       const updated = await chrome.tabs.get(tabId).catch(() => null);
       return { tabId, loaded: true, url: updated?.url || url, title: updated?.title || "" };
@@ -1257,6 +1280,7 @@ async function navigateTab(tabId, rawUrl, until, timeoutMs, opts = {}) {
         }
       }
     } else {
+      await assertReusable(tid, opts);
       await chrome.tabs.update(tid, { url });
       if (!done) {
         const cur = await chrome.tabs.get(tid).catch(() => null);
@@ -1316,6 +1340,7 @@ async function handleRequest(msg) {
       });
       if (typeof tab?.id === "number") {
         await trackNewAgentTab(tab.id, { keepOpen: params.keepOpen === true });
+        await sessionTabs.remember(params.sessionKey, tab.id);
       }
       return { tabId: tab?.id, url: tab?.url || url, title: tab?.title || "" };
     }
@@ -1360,10 +1385,43 @@ async function handleRequest(msg) {
 
     case "navigate": {
       const timeoutMs = Number(params.timeoutMs) || 30_000;
-      return await navigateTab(tabId, params.url, params.until, timeoutMs, {
-        newWindow: params.newWindow === true,
-        keepOpen: params.keepOpen === true,
-      });
+      const sessionKey = validSessionKey(params.sessionKey);
+      const forceNew = params.newTab === true || params.newWindow === true;
+      // reserve() takes the tab in one synchronous step, so two calls for one session can't share it.
+      const reserved =
+        tabId === undefined && sessionKey && !forceNew ? await sessionTabs.reserve(sessionKey) : undefined;
+      const baseOpts = { newWindow: params.newWindow === true, keepOpen: params.keepOpen === true };
+      let target = tabId ?? reserved;
+      if (reserved !== undefined) tabCleanup.touchTab(reserved);
+      const releaseBusy = tabBusy.hold(target);
+      try {
+        // The user can claim or pin the tab while this request waits; then it is not ours to reuse.
+        if (reserved !== undefined && !(await sessionTabs.confirm(sessionKey, reserved))) target = undefined;
+        let res;
+        if (target !== undefined) {
+          try {
+            const opts =
+              reserved !== undefined && target === reserved
+                ? { ...baseOpts, revalidate: (tab) => sessionTabs.confirmSync(sessionKey, reserved, tab) }
+                : baseOpts;
+            res = await navigateTab(target, params.url, params.until, timeoutMs, opts);
+          } catch (err) {
+            // Claimed or pinned between the check and the update: let the tab go and open a new one.
+            if (reserved === undefined || err?.code !== "STALE_TAB") throw err;
+            target = undefined;
+            releaseBusy();
+            sessionTabs.release(reserved);
+          }
+        }
+        if (res === undefined) {
+          res = await navigateTab(undefined, params.url, params.until, timeoutMs, baseOpts);
+        }
+        if (sessionKey && typeof res?.tabId === "number") await sessionTabs.remember(sessionKey, res.tabId);
+        return reserved !== undefined && res?.tabId === reserved ? { ...res, reused: true } : res;
+      } finally {
+        releaseBusy();
+        if (reserved !== undefined) sessionTabs.release(reserved);
+      }
     }
 
     case "bc_call": {
@@ -1688,11 +1746,14 @@ async function openRelaySocket(port, versionInfo) {
     }
 
     if (entry.state === "ready" && msg.type === "req" && msg.id !== undefined) {
+      const releaseBusy = tabBusy.hold(msg.params && msg.params.tabId !== undefined ? Number(msg.params.tabId) : undefined);
       try {
         await tabSetsReady;
         if (msg.params && msg.params.tabId !== undefined) {
           entry.touchedTabs.add(Number(msg.params.tabId));
         }
+        // Released only when this command settles: a hung command keeps its tab busy, so it is never
+        // reused and the session gets a new tab instead.
         const result = await handleRequest(msg);
         if (result && typeof result.tabId === "number") {
           entry.touchedTabs.add(result.tabId);
@@ -1700,6 +1761,8 @@ async function openRelaySocket(port, versionInfo) {
         sendJsonTo(entry, { type: "res", id: msg.id, ok: true, result });
       } catch (err) {
         sendJsonTo(entry, { type: "res", id: msg.id, ok: false, error: String(err?.message || err) });
+      } finally {
+        releaseBusy();
       }
     }
   });
@@ -1773,7 +1836,27 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 
 chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
-  tabCleanup.handleTabReplaced(addedTabId, removedTabId);
+  // Chrome swapped a tab id. replace() registers the swap synchronously, so a purge of the old id can
+  // never drop the session mapping while we wait.
+  sessionTabs.replace(addedTabId, removedTabId).catch(() => {});
+  // A worker start may still be restoring from storage. Reading ownership or keepOpen first sees an
+  // empty set, transfers nothing, and the purge then loses the live tab's state for good.
+  tabSetsReady
+    .then(() => {
+      const wasAgent = agentTabs.has(removedTabId);
+      if (wasAgent) {
+        agentTabs.add(addedTabId);
+        tabCleanup.touchTab(addedTabId);
+        if (tabCleanup.keepOpenTabs.has(removedTabId)) tabCleanup.markKeepOpen(addedTabId, true);
+        tabCleanup.protect(addedTabId).catch(() => {});
+        for (const conn of connections.values()) {
+          if (conn.touchedTabs.has(removedTabId)) conn.touchedTabs.add(addedTabId);
+        }
+        saveTabSets().catch(() => {});
+      }
+      tabCleanup.handleTabReplaced(addedTabId, removedTabId);
+    })
+    .catch(() => {});
 });
 
 chrome.tabs.onActivated.addListener((activeInfo) => {
