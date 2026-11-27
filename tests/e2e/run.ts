@@ -6,7 +6,7 @@ import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Glob } from "bun";
 import { E2E_PORT_END, E2E_PORT_START, patchExtensionPorts, pickRelayPort, RELAY_PORTS_ENV } from "./relay-port";
-import { runPacingCheck } from "./pacing";
+import { runPacingCheck, type NavEntry } from "./pacing";
 import { runStaleExtensionCheck } from "./stale-extension";
 
 const REPO = resolve(import.meta.dir, "../..");
@@ -267,9 +267,15 @@ async function main(): Promise<number> {
 
   try {
     // Fixture servers: two origins (different ports and hostnames) so the iframes are cross-origin.
+    // Every request is stamped so the pacing check can measure nav dispatch gaps at the server.
+    const navLog: NavEntry[] = [];
     const read = (f: string) => readFileSync(join(FIXTURES, f), "utf8");
     const html = { headers: { "content-type": "text/html; charset=utf-8" } };
-    const frameServer = Bun.serve({ port: 0, hostname: "localhost", fetch: () => new Response(read("frame.html"), html) });
+    const frameServer = Bun.serve({
+      port: 0,
+      hostname: "localhost",
+      fetch: (req) => (navLog.push({ path: new URL(req.url).pathname, t: Date.now() }), new Response(read("frame.html"), html)),
+    });
     servers.push(frameServer);
     const frameUrl = `http://localhost:${frameServer.port}/frame`;
     const pageServer = Bun.serve({
@@ -277,9 +283,13 @@ async function main(): Promise<number> {
       hostname: "127.0.0.1",
       fetch(req) {
         const path = new URL(req.url).pathname;
+        navLog.push({ path, t: Date.now() });
         if (path === "/challenge") return new Response(read("challenge.html"), { ...html, status: 403 });
         if (path === "/popup") return new Response(read("popup.html"), html);
         if (path === "/pacing") return new Response(read("pacing.html"), html);
+        if (path === "/pacing-short") return new Response(read("pacing-short.html"), html);
+        if (path === "/pacing-long") return new Response(read("pacing-long.html"), html);
+        if (path.startsWith("/paging-")) return new Response(read("pacing-short.html"), html);
         if (path === "/pacing-wall") return new Response(read("pacing-wall.html"), html);
         return new Response(read("page.html").replaceAll("__FRAME__", frameUrl), html);
       },
@@ -467,7 +477,7 @@ async function main(): Promise<number> {
     await check("enable", ["extension", "enable"], /"orderFile":"removed"/);
     record("enable-deleted-file", !existsSync(backendsFile), backendsFile);
     await check("enabled-works", ["eval", "document.title", tid], /E2E Fixture/);
-    await runPacingCheck(bc, base, record);
+    await runPacingCheck(bc, base, record, { navLog, frameUrl });
     await runStaleExtensionCheck(chrome, record);
     return results.some((r) => !r.ok) ? 1 : 0;
   } catch (error) {

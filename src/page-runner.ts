@@ -103,6 +103,9 @@ const DEFAULT_HANDOFF_TIMEOUT_MS = 10 * 60 * 1000;
 const CHALLENGE_WAIT_MAX_MS = 8_000;
 const CHALLENGE_POLL_MS = 500;
 const CHALLENGE_PROBE_RESERVE_MS = 250;
+/** Before step 1: at most two probe tries inside this budget; past it the page state stays unknown. */
+const PRE_STEP_PROBE_TRIES = 2;
+const PRE_STEP_PROBE_BUDGET_MS = 1_500;
 const CHALLENGE_PROBE_SEP = "\n__BC_CHALLENGE_SEP__\n";
 const CHALLENGE_PROBE_EXPR = buildChallengeProbeExpression(false);
 const FAST_VENDOR_CSS = fastVendorSelectors.join(",");
@@ -141,8 +144,24 @@ type ProbeReadResult =
   | { kind: "probe"; probe: ChallengeProbe }
   | { kind: "error" };
 
+/** Parse a readback of {@link CHALLENGE_PROBE_EXPR}: `{skip,url}` or `{skip:false,probe}`, else "skip". */
+function parseProbeReadback(raw: string): ProbeReadResult {
+  if (!raw || !raw.startsWith("{")) return { kind: "skip" };
+  try {
+    const parsed = JSON.parse(raw) as { skip?: boolean; url?: string; probe?: ChallengeProbe };
+    if (parsed.skip) return { kind: "skip", url: typeof parsed.url === "string" ? parsed.url : undefined };
+    if (parsed.probe && typeof parsed.probe === "object") return { kind: "probe", probe: parsed.probe };
+    return { kind: "skip" };
+  } catch {
+    return { kind: "skip" };
+  }
+}
+
 type ChallengeCheckResult =
   | { status: "clear"; waited: boolean; url?: string }
+  // Only `checkChallenge(..., { unknownOnError: true })` produces this: the probe failed, so the page
+  // state is not known to be clear. Callers that guard an action treat it as "do not act".
+  | { status: "unknown"; waited: false; url?: string }
   | {
       status: "interactive" | "block" | "non-interactive-timeout";
       detection: ChallengeDetection;
@@ -2476,16 +2495,24 @@ export function createPageHelperHandler(
       failure("EXECUTION_FAILED", "CHALLENGE_PROBE_TIMEOUT"),
     );
     if (!res.ok) return { kind: "error" };
-    const raw = valueOf(res);
-    if (!raw || !raw.startsWith("{")) return { kind: "skip" };
-    try {
-      const parsed = JSON.parse(raw) as { skip?: boolean; url?: string; probe?: ChallengeProbe };
-      if (parsed.skip) return { kind: "skip", url: typeof parsed.url === "string" ? parsed.url : undefined };
-      if (parsed.probe && typeof parsed.probe === "object") return { kind: "probe", probe: parsed.probe };
-      return { kind: "skip" };
-    } catch {
-      return { kind: "skip" };
-    }
+    return parseProbeReadback(valueOf(res));
+  }
+
+  /**
+   * Read the same probe on a `browse:<n>` tab. browse has no `__bc` helper and no wall probe, but its
+   * `eval` tool is read-only and already the route for `evaluate` on these tabs, so the self-contained
+   * probe expression runs there unchanged and feeds the same classifier.
+   */
+  async function readChallengeProbeBrowse(browseTab: number, timeoutMs = 4_000, deadline?: number): Promise<ProbeReadResult> {
+    const budget = deadline !== undefined ? Math.min(timeoutMs, deadline - Date.now()) : timeoutMs;
+    if (budget <= 0) return { kind: "error" };
+    const res = await raceDeadline(
+      callBrowse("eval", { tab: browseTab, expression: CHALLENGE_PROBE_EXPR, timeout: Math.max(1, Math.floor(budget)) }, budget),
+      deadline,
+      failure("EXECUTION_FAILED", "CHALLENGE_PROBE_TIMEOUT"),
+    );
+    if (!res.ok) return { kind: "error" };
+    return parseProbeReadback(valueOf(res));
   }
 
   /**
@@ -2501,6 +2528,10 @@ export function createPageHelperHandler(
   ): Promise<ProbeReadResult> {
     const remaining = (cap: number): number =>
       opts.deadline !== undefined ? Math.min(cap, opts.deadline - Date.now()) : cap;
+
+    // browse tabs have no `__bc` helper; their read-only `eval` runs the same self-contained probe.
+    const browseTab = browseTabNumber(targetId);
+    if (browseTab !== undefined) return readChallengeProbeBrowse(browseTab, opts.reprobe ? 1_500 : 4_000, opts.deadline);
 
     if (extensionTabOf(targetId) !== undefined) {
       const baseTimeout = opts.reprobe ? 1_500 : 4_000;
@@ -2620,13 +2651,18 @@ export function createPageHelperHandler(
   /**
    * Run the challenge classifier; auto-wait boundedly (~8 s) on `non-interactive` interstitials,
    * and immediately report `interactive` or `block` without retrying.
+   * `unknownOnError` makes a failed first probe "unknown" instead of "clear", for guards that must
+   * not act on a page they could not read; `deadline` bounds the probe itself.
    */
   async function checkChallenge(
     targetId: string | undefined,
-    opts: { wallHint?: string; knownUrl?: string } = {},
+    opts: { wallHint?: string; knownUrl?: string; unknownOnError?: boolean; deadline?: number } = {},
   ): Promise<ChallengeCheckResult> {
-    const first = await readChallengeProbe(targetId, { wallHint: opts.wallHint });
+    const first = await readChallengeProbe(targetId, { wallHint: opts.wallHint, deadline: opts.deadline });
     if (first.kind !== "probe") {
+      if (first.kind === "error" && opts.unknownOnError === true) {
+        return { status: "unknown", waited: false, url: opts.knownUrl };
+      }
       return { status: "clear", waited: false, url: first.kind === "skip" ? first.url : opts.knownUrl };
     }
     let lastProbe = first.probe;
@@ -2680,6 +2716,25 @@ export function createPageHelperHandler(
       url: lastProbe.url || opts.knownUrl || "",
       waited: true,
     };
+  }
+
+  /**
+   * The pre-step-1 challenge guard. A probe error there is not "clear": step 1 must not run on a page
+   * whose state could not be read. Two tries inside a short budget, then it stays unknown. The budget is
+   * wall-clock, like the probe's own deadline (the probe reads use `Date.now()` for their timeouts).
+   */
+  async function probeChallengeBeforeStep1(
+    targetId: string | undefined,
+    wallHint: string,
+    knownUrl: string,
+  ): Promise<ChallengeCheckResult> {
+    const deadline = Date.now() + PRE_STEP_PROBE_BUDGET_MS;
+    let result: ChallengeCheckResult = { status: "unknown", waited: false, url: knownUrl };
+    for (let attempt = 0; attempt < PRE_STEP_PROBE_TRIES; attempt++) {
+      result = await checkChallenge(targetId, { wallHint, knownUrl, unknownOnError: true, deadline });
+      if (result.status !== "unknown" || Date.now() >= deadline) break;
+    }
+    return result;
   }
 
   async function handlePage(action: string, input: Json, rawTargetId?: string): Promise<InvokeResult> {
@@ -2828,22 +2883,36 @@ export function createPageHelperHandler(
         const challengeBackend = challengeBackendOf(targetId);
         const naturalPacing = isNatural(input);
         // Nothing looks at the page until a step has run, so a batch would act on a challenge page before the
-        // post-step check could see it. Probe once up front on the same terms as that check: a wall or challenge
-        // stops the batch with every step unrun. Attach-free: one bc_call read plus the silent probe.
-        if (browseTab === undefined) {
-          const before = await evalHelper(
+        // post-step check could see it. Probe up front on the same terms as that check: a wall, a challenge, a
+        // page that could not be read, or a redirect off the start host stops the batch with every step unrun.
+        // Attach-free on DevTools tabs (one bc_call read plus the silent probe); on browse tabs the href read
+        // and the read-only `eval` probe are the equivalent.
+        const readPreStepState = async (): Promise<{ url: string; wall: string }> => {
+          if (browseTab !== undefined) {
+            const href = await readProperty("href", targetId);
+            return { url: href.ok ? valueOf(href) : "", wall: "" };
+          }
+          const state = await evalHelper(
             { steps: [{ kind: "href" }, { kind: "bc", method: "wall", fallback: "" }], join: "\n" },
             targetId,
             4_000,
           );
-          let preWall = "";
-          if (before.ok) {
-            const [beforeUrl = "", beforeWall = ""] = valueOf(before).split("\n");
-            if (beforeUrl) prevUrl = beforeUrl;
-            preWall = beforeWall;
-          }
-          const challenge = await checkChallenge(targetId, { wallHint: preWall, knownUrl: prevUrl || startUrl });
-          if (challenge.status === "block" || challenge.status === "interactive" || challenge.status === "non-interactive-timeout") {
+          if (!state.ok) return { url: "", wall: "" };
+          const [url = "", wall = ""] = valueOf(state).split("\n");
+          return { url: url ?? "", wall: wall ?? "" };
+        };
+        {
+          const pre = await readPreStepState();
+          if (pre.url) prevUrl = pre.url;
+          let preWall = pre.wall;
+          const challenge = await probeChallengeBeforeStep1(targetId, preWall, prevUrl || startUrl);
+          if (challenge.status === "unknown") {
+            stopped = "page state unknown before step 1";
+          } else if (
+            challenge.status === "block" ||
+            challenge.status === "interactive" ||
+            challenge.status === "non-interactive-timeout"
+          ) {
             challengeReport = formatChallengeOutput(challenge.detection, challenge.url || prevUrl, {
               backend: challengeBackend,
               untrustedBoundary: true,
@@ -2854,20 +2923,17 @@ export function createPageHelperHandler(
                 : `${challenge.detection.vendor} challenge before step 1`;
           } else {
             if (challenge.waited) {
-              const after = await evalHelper(
-                { steps: [{ kind: "href" }, { kind: "bc", method: "wall", fallback: "" }], join: "\n" },
-                targetId,
-                4_000,
-              );
-              if (after.ok) {
-                const [afterUrl = "", afterWall = ""] = valueOf(after).split("\n");
-                if (afterUrl) prevUrl = afterUrl;
-                preWall = afterWall;
-              } else if (challenge.url) prevUrl = challenge.url;
+              const after = await readPreStepState();
+              if (after.url) prevUrl = after.url;
+              else if (challenge.url) prevUrl = challenge.url;
+              preWall = after.wall;
             }
             // A captcha or rate-limit wall the probe could not classify still stops the batch unrun.
             if (preWall === "captcha" || preWall === "rate-limit") {
               stopped = `the page is a ${preWall} wall before step 1`;
+            } else if (prevUrl && startUrl && hostOf(prevUrl) !== hostOf(startUrl)) {
+              // A cleared challenge can leave the tab on another host, so re-apply the post-step boundary.
+              stopped = `the page left ${hostOf(startUrl)} for ${hostOf(prevUrl)} before step 1`;
             }
           }
         }

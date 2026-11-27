@@ -4,6 +4,8 @@
 
 export type Bc = (args: string[], timeoutMs?: number) => Promise<string>;
 export type PacingRecord = (name: string, ok: boolean, detail: string) => void;
+/** One request the fixture server answered, stamped when it arrived. */
+export type NavEntry = { path: string; t: number };
 
 // [type, epoch ms, isTrusted, x, y, deltaY, scrollY, target id], as fixtures/pacing.html logs it.
 type Ev = [string, number, boolean, number | null, number | null, number | null, number, string];
@@ -16,10 +18,22 @@ const TOL = 60;
 // focus or pointer planning: several relay round-trips) before its first event. A typing step ends at its last
 // keyup; a pointer-led step (click after type) measured up to 478 ms, at the edge of a 480 ms limit.
 const STEP_START = 150;
-// Fast and natural-off steps still pay settle + start-up (140-180 ms typical, one-offs up to 262 ms measured); a
-// think pause would add at least 160 ms to every gap. Single gaps flaked at 250 ms, so the fill checks use the
-// median of the 9 gaps, which a pause in each gap would push past 300 ms.
-const NO_PAUSE_MAX = 250;
+// Fast and natural-off steps still pay settle + start-up (140-180 ms typical, one-offs up to 262 ms measured);
+// a think pause would add at least 160 ms to every gap, so the fill checks use the median of the 9 gaps, which
+// a pause in each gap pushes past 300 ms. The whole baseline moves with the host: the median was 253-262 ms
+// over all 9 gaps on a machine at load ~4, so the cap is 340. pacing-pause-sum backs it up: a pause leaking
+// into a fast run shrinks those deltas and fails the sum.
+const NO_PAUSE_MAX = 340;
+// planThinkPause floors at 160 ms and planNavDwell at 220 ms; both subtract the time already elapsed. A
+// settle is one 40 ms tick plus the relay hop (60-130 ms idle), so a single boundary's natural-minus-fast
+// delta can be 0: measured 97-250 ms idle and -8..152 ms at host load ~4. The pause floor is therefore an
+// aggregate one (summed over every boundary) and the per-boundary bound is the ceiling only.
+const MIN_PAUSE = 160;
+const MIN_DWELL = 220;
+const THINK_SETTLE_CAP = 130;
+const THINK_FLOOR = MIN_PAUSE - THINK_SETTLE_CAP;
+const THINK_CEILING = 420;
+const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 const median = (xs: number[]) => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)] ?? NaN;
 
 // `fill` is a batch of `type` steps, so its 10 fields are the typeable ones; the select, checkbox and radio
@@ -46,7 +60,12 @@ const fmt = (n: number) => Math.round(n);
 const between = (v: number, lo: number, hi: number, up = TOL) => v >= lo - TOL && v <= hi + up;
 const stepGap = (v: number) => between(v, 160, 420, TOL + STEP_START);
 
-export async function runPacingCheck(bc: Bc, base: string, record: PacingRecord): Promise<void> {
+export async function runPacingCheck(
+  bc: Bc,
+  base: string,
+  record: PacingRecord,
+  opts: { navLog: NavEntry[]; frameUrl: string } = { navLog: [], frameUrl: "" },
+): Promise<void> {
   const evalJson = async <T>(expr: string): Promise<T> => {
     const out = await bc(["eval", `"@@"+JSON.stringify(${expr})+"@@"`]);
     const m = /@@([\s\S]*)@@/.exec(out);
@@ -69,6 +88,9 @@ export async function runPacingCheck(bc: Bc, base: string, record: PacingRecord)
   const allTrusted: Ev[] = [];
   const keep = (evs: Ev[]) => (allTrusted.push(...evs), evs);
   const timing: Record<string, { natural?: number; fast?: number }> = {};
+  /** Runs that set a value in the page: each emits one untrusted input+change pair (see check 6). */
+  let dateSets = 0;
+  let selectSets = 0;
 
   /** Gap from the last keystroke of each field to the first lead event of the next field. */
   const fieldGaps = (evs: Ev[], ids: string[]) =>
@@ -95,6 +117,7 @@ export async function runPacingCheck(bc: Bc, base: string, record: PacingRecord)
     await reset();
     const r = await timed(["fill", ...(fast ? ["--fast"] : []), fillArg]);
     const evs = keep(await events());
+    dateSets++; // one `type` into the date field per fill run
     await dump(`fill-${name}`, { out: r.out, evs });
     const values = await readBack();
     const submitted = await evalJson<number>("window.__submitted");
@@ -119,6 +142,18 @@ export async function runPacingCheck(bc: Bc, base: string, record: PacingRecord)
   const span = (xs: number[]) => `${fmt(Math.min(...xs))}-${fmt(Math.max(...xs))}`;
   console.log(`NOTE pacing gaps natural=${span(fillN.gaps)} fast=${span(fillF.gaps)} tails natural=${fmt(fillN.tail)} fast=${fmt(fillF.tail)}`);
 
+  // Every think pause has to show between a step's last keystroke and the next step's first event. Comparing
+  // the matched natural and fast runs cancels the start-up, locate and settle both pay, so the difference is
+  // the pause itself. The planner subtracts the settle it just spent, so one boundary can legitimately land
+  // near 0: each delta is ceiling-bounded here and the floors are aggregated after the do run.
+  const pauseDeltas: number[] = [];
+  const pauseDelta = (d: number) => d <= THINK_CEILING + TOL;
+  const fillDeltas = fillN.gaps.map((g, i) => g - (fillF.gaps[i] ?? NaN));
+  pauseDeltas.push(...fillDeltas);
+  console.log(`NOTE pacing pause deltas fill10=${fillDeltas.map(fmt).join(",")}`);
+  const gapList = (xs: number[]) => xs.map(fmt).join(",");
+  record("pacing-fill10-pause-per-step", fillDeltas.length === 9 && fillDeltas.every(pauseDelta), `natural=${gapList(fillN.gaps)} fast=${gapList(fillF.gaps)}`);
+
   // 2. do(5) with a wait step: pause between steps, none after `wait`, none after the last step.
   const steps = JSON.stringify([
     { type: ["First name", "Grace"] },
@@ -132,6 +167,7 @@ export async function runPacingCheck(bc: Bc, base: string, record: PacingRecord)
     await reset();
     const r = await timed(["do", ...(fast ? ["--fast"] : []), steps]);
     const evs = keep(await events());
+    selectSets++; // one `select` step per do run
     await dump(`do-${fast ? "fast" : "natural"}`, { out: r.out, evs });
     const lastOf = (pred: (e: Ev) => boolean) => Math.max(...evs.filter(pred).map((e) => e[1]));
     const leadAfter = (t: number, prev: string) => evs.find((e) => e[1] > t && LEAD.has(e[0]) && !(e[0] === "focus" && e[7] === prev))?.[1] ?? NaN;
@@ -164,6 +200,20 @@ export async function runPacingCheck(bc: Bc, base: string, record: PacingRecord)
   record("pacing-do5-no-trailing-pause", doN.tail <= doF.tail + TOL + 100, `natural tail=${fmt(doN.tail)} fast tail=${fmt(doF.tail)}`);
   record("pacing-do5-fast-gaps", doF.gap12 < NO_PAUSE_MAX && doF.gap45 < NO_PAUSE_MAX, `gap12=${fmt(doF.gap12)} gap45=${fmt(doF.gap45)}`);
   timing["do5"] = { natural: doN.r.ms, fast: doF.r.ms };
+  // Same matched-delta rule as fill, including the boundary across the wait (one pause after the click).
+  const doDeltas = { gap12: doN.gap12 - doF.gap12, gap45: doN.gap45 - doF.gap45, wait: doN.gap24 - doF.gap24 };
+  pauseDeltas.push(doDeltas.gap12, doDeltas.gap45, doDeltas.wait);
+  console.log(`NOTE pacing pause deltas do5 gap12=${fmt(doDeltas.gap12)} gap45=${fmt(doDeltas.gap45)} wait=${fmt(doDeltas.wait)}`);
+  record("pacing-do5-pause-per-step", pauseDelta(doDeltas.gap12) && pauseDelta(doDeltas.gap45), `gap12=${fmt(doDeltas.gap12)} gap45=${fmt(doDeltas.gap45)}`);
+  record("pacing-do5-wait-pause", pauseDelta(doDeltas.wait), `wait boundary delta=${fmt(doDeltas.wait)}`);
+  // The floors, over all 12 boundaries of the two batches: the summed deltas must carry the summed minimum
+  // pause and no boundary may exceed the plan's ceiling. Removing the pause drops the sum to ~0 (measured -6);
+  // the idle and loaded runs measured 1997 and 817.
+  const pauseSum = pauseDeltas.filter(Number.isFinite).reduce((a, b) => a + b, 0);
+  const pauseFloor = pauseDeltas.length * THINK_FLOOR;
+  console.log(`NOTE pacing pause sum=${fmt(pauseSum)} floor=${pauseFloor}`);
+  record("pacing-pause-no-stacking", pauseDeltas.length === 12 && pauseDeltas.every(pauseDelta), `deltas=${gapList(pauseDeltas)} ceiling=${THINK_CEILING + TOL}ms`);
+  record("pacing-pause-sum", pauseDeltas.length === 12 && pauseSum >= pauseFloor, `sum=${fmt(pauseSum)}ms floor=${pauseFloor}ms`);
 
   // 3 + 4. nav dwell, then a natural click on the target.
   const box = async (id: string) =>
@@ -178,10 +228,6 @@ export async function runPacingCheck(bc: Bc, base: string, record: PacingRecord)
   };
   await Bun.sleep(4_100); // leave the 4 s same-host pagination window so the timing shows dwell, not a pagination gap
   const ncN = await navClick(false);
-  const firstInput = ncN.evs.find((e) => e[0] !== "scroll")?.[1] ?? NaN;
-  // Dwell is owed from the daemon's nav record, which is just before `nav` returns: the first input lands at
-  // least 220 ms after it, less the wrapper's exit and the next call's start-up (both inside the window).
-  record("pacing-nav-dwell", firstInput - ncN.nav.end >= 220 - TOL, `first input ${fmt(firstInput - ncN.nav.end)}ms after nav returned`);
 
   const moves = (evs: Ev[]) => {
     const down = evs.findIndex((e) => e[0] === "mousedown");
@@ -210,6 +256,31 @@ export async function runPacingCheck(bc: Bc, base: string, record: PacingRecord)
     const inside = x > b.l && x < b.r && y > b.t && y < b.b;
     const offCenter = Math.abs(x - (b.l + b.r) / 2) > 0.5 || Math.abs(y - (b.t + b.b) / 2) > 0.5;
     record("pacing-click-point", inside && offCenter, `point=${x},${y} box=${JSON.stringify(b)}`);
+  }
+
+  // 3. The dwell scales with the page's text length: clamp(220 + 0.08*chars*rand(0.8,1.25), 220, 850). The
+  // natural measure lands on the plan: the daemon's nav record sits ~100 ms before `nav` returns (wrapper
+  // exit) and the next call's start-up adds about the same. Both ends are asserted, so a missing or
+  // text-blind dwell fails the low end and an over-long one the high end. No TIMING entry here, because the
+  // natural nav also reads the body length, so the two calls' durations do not isolate the dwell.
+  const dwellRun = async (path: string, fast: boolean) => {
+    const flag = fast ? ["--fast"] : [];
+    const nav = await timed(["nav", ...flag, `${base}${path}`]);
+    const chars = await evalJson<number>("document.body.textContent.length"); // a read pays no dwell
+    await timed(["click", ...flag, "Pacing target"]); // spends it
+    const evs = keep(await events());
+    const first = evs.find((e) => e[0] !== "scroll")?.[1] ?? NaN;
+    return { dwell: first - nav.end, chars };
+  };
+  for (const [name, path] of [["short", "/pacing-short"], ["long", "/pacing-long"]] as const) {
+    const slow = await dwellRun(path, false);
+    const quick = await dwellRun(path, true);
+    const floor = clamp(220 + 0.08 * slow.chars * 0.8, 220, 850);
+    const ceiling = clamp(220 + 0.08 * slow.chars * 1.25, 220, 850);
+    const seen = `chars=${slow.chars} planned=${fmt(floor)}-${fmt(ceiling)} natural=${fmt(slow.dwell)} fast=${fmt(quick.dwell)}`;
+    console.log(`NOTE pacing dwell ${name} ${seen}`);
+    record(`pacing-nav-dwell-${name}`, between(slow.dwell, floor, ceiling), seen);
+    record(`pacing-nav-dwell-${name}-fast`, quick.dwell < floor - TOL, `fast dwell=${fmt(quick.dwell)}ms, planned floor ${fmt(floor)}ms`);
   }
 
   // 3b. Reads right after nav pay no dwell: snap and text cost the same as after a fast nav.
@@ -268,31 +339,88 @@ export async function runPacingCheck(bc: Bc, base: string, record: PacingRecord)
   await Bun.sleep(4_100); // outside the 4 s pagination window, as the natural nav above was
   const ncF = await navClick(true);
   timing["nav-click"] = { natural: ncN.ms, fast: ncF.ms };
-  for (const [name, t] of Object.entries(timing)) {
-    console.log(`TIMING ${name} natural=${t.natural} fast=${t.fast}`);
-    record(`pacing-timing-${name}`, t.natural !== undefined && t.fast !== undefined, `natural=${t.natural} fast=${t.fast}`);
+
+  // 10. Pagination: a second same-host nav on the same tab waits 1.6-2.8 s before it dispatches. Measured on
+  // the fixture server's request log, so the gap is between the two requests rather than two calls. Per-page
+  // /favicon.ico fetches are skipped so a gap is always between the two navigations themselves.
+  const reqsSince = (from: number) => opts.navLog.slice(from).filter((r) => r.path !== "/favicon.ico");
+  const showReqs = (reqs: NavEntry[]) => reqs.map((r) => `${r.path}@${r.t - (reqs[0]?.t ?? r.t)}`).join(" ");
+  const gapBetween = (a: string, b: string) => {
+    const at = (p: string) => opts.navLog.filter((r) => r.path === p).at(-1)?.t;
+    const [ta, tb] = [at(a), at(b)];
+    return ta !== undefined && tb !== undefined ? tb - ta : NaN;
+  };
+  await Bun.sleep(4_200); // start outside the 4 s window, so only the second nav of a pair may wait
+  {
+    const from = opts.navLog.length;
+    await bc(["nav", `${base}/paging-a`]);
+    const second = await timed(["nav", `${base}/paging-b`]);
+    const gap = gapBetween("/paging-a", "/paging-b");
+    record("pacing-pagination-gap", between(gap, 1600, 2800) && second.ms >= 1600 - TOL,
+      `requests ${showReqs(reqsSince(from))} dispatch gap=${fmt(gap)}ms call=${fmt(second.ms)}ms`);
+  }
+  {
+    // A nav onto another host is not pagination, and neither is the nav back off it: the host changes on
+    // both sides of the pair, so nothing waits.
+    const from = opts.navLog.length;
+    await bc(["nav", opts.frameUrl]);
+    const back = await timed(["nav", `${base}/paging-c`]);
+    const gap = gapBetween("/frame", "/paging-c");
+    record("pacing-pagination-cross-host", gap < 1600 - TOL && back.ms < 1600 - TOL,
+      `requests ${showReqs(reqsSince(from))} cross-host gap=${fmt(gap)}ms call=${fmt(back.ms)}ms`);
+  }
+  {
+    // The previous nav on this tab is more than 4 s old, so there is nothing to wait for.
+    await Bun.sleep(4_200);
+    const from = opts.navLog.length;
+    const nav = await timed(["nav", `${base}/paging-d`]);
+    const gap = gapBetween("/paging-c", "/paging-d");
+    record("pacing-pagination-idle-window", nav.ms < 1600 - TOL && gap >= 4000,
+      `requests ${showReqs(reqsSince(from))} idle gap=${fmt(gap)}ms call=${fmt(nav.ms)}ms`);
   }
 
-  // 6. Every event these commands dispatch is trusted input. `select` and `type` into a date field set the value
-  // in the page by design, so the input/change echo on those two controls is untrusted; it is counted and printed,
-  // and every pointer, key, wheel, focus and scroll event must still be trusted.
-  const valueSet = (e: Ev) => (e[0] === "input" || e[0] === "change") && (e[7] === "country" || e[7] === "start");
-  const untrusted = allTrusted.filter((e) => e[2] !== true && !valueSet(e));
-  const echoes = allTrusted.filter((e) => e[2] !== true && valueSet(e)).length;
-  console.log(`NOTE pacing: ${echoes} untrusted input/change echoes from select/date value sets`);
-  record("pacing-all-trusted", allTrusted.length > 0 && untrusted.length === 0, `${allTrusted.length} events, untrusted=${JSON.stringify(untrusted.slice(0, 3))}`);
+  // 11. Wall-clock totals must separate natural from fast by at least the pauses they add: one think pause per
+  // step boundary (9 for fill10, 3 for do5, since none follows `wait` or the last step) and one nav dwell per
+  // nav-then-input pair. Each floor is the planner's own minimum minus TOL per boundary; the totals also carry
+  // the slower natural typing and pointer work, which keeps them far above that floor.
+  const timingFloor: Record<string, number> = {
+    fill10: 9 * (MIN_PAUSE - TOL),
+    do5: 3 * (MIN_PAUSE - TOL),
+    "nav-click": MIN_DWELL - TOL,
+  };
+  for (const [name, t] of Object.entries(timing)) {
+    const floor = timingFloor[name] ?? 0;
+    const slowBy = (t.natural ?? NaN) - (t.fast ?? NaN);
+    console.log(`TIMING ${name} natural=${t.natural} fast=${t.fast} floor=${floor}`);
+    record(`pacing-timing-${name}`, t.natural !== undefined && t.fast !== undefined && slowBy >= floor,
+      `natural=${t.natural} fast=${t.fast} slow by ${fmt(slowBy)}ms, floor ${floor}ms`);
+  }
 
-  // 8. A challenge page stops fill/do before any field is set or anything is pressed.
-  const wallState = () => evalJson<{ v: string; p: number }>("({v:document.getElementById('wall-field').value,p:window.__pressed||0})");
+  // 6. Every event these commands dispatch is trusted input, with one exception: `select` and `type` into a
+  // date field set the value in the page by design, so each such run emits exactly one untrusted input+change
+  // pair on that control. Any other untrusted event, or a second echo, fails.
+  const expected: Record<string, number> = { "input:country": selectSets, "change:country": selectSets, "input:start": dateSets, "change:start": dateSets };
+  const counted: Record<string, number> = {};
+  for (const e of allTrusted) if (e[2] !== true) counted[`${e[0]}:${e[7]}`] = (counted[`${e[0]}:${e[7]}`] ?? 0) + 1;
+  const diff = [...new Set([...Object.keys(counted), ...Object.keys(expected)])].filter((k) => (counted[k] ?? 0) !== (expected[k] ?? 0));
+  console.log(`NOTE pacing: untrusted echoes ${JSON.stringify(counted)}`);
+  record("pacing-all-trusted", allTrusted.length > 0 && diff.length === 0,
+    `${allTrusted.length} events; untrusted=${JSON.stringify(counted)} expected=${JSON.stringify(expected)} diff=${diff.join(",")}`);
+
+  // 8. A challenge page stops fill/do before a field is set, a button is pressed, or the form submits.
+  type Wall = { v: string; submitted: number; pressed: number; typed: number };
+  const wallState = () => evalJson<Wall>("({v:document.getElementById('wall-field').value,submitted:window.__submitted||0,pressed:window.__pressed||0,typed:window.__typed||0})");
+  const wallStop = (out: string, steps: number) => /STOPPED: .*before step 1/.test(out) && new RegExp(`\\b${steps} step\\(s\\) not run`).test(out);
+  const wallUntouched = (s: Wall) => s.v === "" && s.submitted === 0 && s.pressed === 0 && s.typed === 0;
   const wallNav = await bc(["nav", `${base}/pacing-wall`]);
   record("pacing-wall-nav", /CHALLENGE:|WALL:/.test(wallNav), wallNav);
   const wallFill = await bc(["fill", JSON.stringify({ "Wall field": "nope" })]);
   const afterFill = await wallState();
   await dump("wall", { wallNav, wallFill, afterFill });
-  record("pacing-wall-fill-stops", /CHALLENGE:|WALL:/.test(wallFill) && afterFill.v === "", `${JSON.stringify(afterFill)} ${wallFill}`);
+  record("pacing-wall-fill-stops", /CHALLENGE:|WALL:/.test(wallFill) && wallStop(wallFill, 1) && wallUntouched(afterFill), `${JSON.stringify(afterFill)} ${wallFill}`);
   await bc(["eval", "document.getElementById('wall-field').value='';1"]);
   const wallDo = await bc(["do", JSON.stringify([{ click: "Wall button" }, { type: ["Wall field", "nope"] }])]);
   const afterDo = await wallState();
   await dump("wall-do", { wallDo, afterDo });
-  record("pacing-wall-do-stops", /CHALLENGE:|WALL:/.test(wallDo) && afterDo.v === "" && afterDo.p === 0, `${JSON.stringify(afterDo)} ${wallDo}`);
+  record("pacing-wall-do-stops", /CHALLENGE:|WALL:/.test(wallDo) && wallStop(wallDo, 2) && wallUntouched(afterDo), `${JSON.stringify(afterDo)} ${wallDo}`);
 }

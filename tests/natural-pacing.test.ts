@@ -24,6 +24,8 @@ type MockOptions = {
   locate?: Record<string, string>;
   /** Runs inside the mocked `navigate`, so a test can advance its fake clock over a slow load. */
   onNavigate?: () => void;
+  /** Fail this many challenge-probe reads (the self-contained probe expression) before answering. */
+  probeErrors?: number;
 };
 
 /**
@@ -34,12 +36,21 @@ function makeMock(options: MockOptions = {}) {
   const calls: Call[] = [];
   let url = options.url ?? "https://a.test/1";
   let installed = false;
+  let probeErrors = options.probeErrors ?? 0;
   const ok = (value: unknown): InvokeResult => ({ ok: true, data: { value } });
 
   const evaluate = (input: Record<string, unknown>): InvokeResult => {
     const expr = String(input["expression"] ?? "");
     if (expr.includes(PAGE_HELPERS_SOURCE)) installed = true;
     if (!installed && expr.includes("__BC_NEED_INSTALL__")) return ok("__BC_NEED_INSTALL__");
+    // The self-contained challenge probe (src/challenges.ts) is recognised by a marker unique to it.
+    if (expr.includes("const fastHit")) {
+      if (probeErrors > 0) {
+        probeErrors--;
+        return { ok: false, error: { code: "EXECUTION_FAILED", message: "RELAY: probe timed out" } };
+      }
+      return ok(JSON.stringify({ skip: true, url }));
+    }
     if (expr.includes("__bc.locate")) {
       const label = /__bc\.locate\("([^"]*)"/.exec(expr)?.[1] ?? "";
       const ref = options.locate?.[label];
@@ -255,6 +266,41 @@ describe("do/fill think pauses", () => {
     if (res.ok) throw new Error("expected a failure");
     expect(res.error.code).toBe("INPUT_VALIDATION_FAILED");
     expect(res.error.message).toContain("INPUT_INVALID");
+  });
+});
+
+describe("pre-step-1 challenge guard", () => {
+  const probeReads = (calls: Array<{ op: string; input: Record<string, unknown> }>) =>
+    calls.filter((c) => c.op === "evaluate" && String(c.input["expression"] ?? "").includes("const fastHit"));
+  const inputCalls = (calls: Array<{ op: string; input: Record<string, unknown> }>) =>
+    calls.filter((c) => c.op === "execute_cdp" && String(c.input["method"] ?? "").startsWith("Input."));
+
+  test("a probe error on every try stops before step 1 and dispatches nothing", async () => {
+    const { mock, handle } = pane({ probeErrors: 2 });
+    const res = await handle("do", { steps: [{ key: "Tab" }], quiet: true });
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("expected a stop");
+    expect(res.error.message).toContain("page state unknown before step 1");
+    expect(res.error.message).toContain("1 step(s) not run");
+    expect(probeReads(mock.calls)).toHaveLength(2); // bounded: two tries, never more
+    expect(inputCalls(mock.calls)).toHaveLength(0);
+
+    // fill is a batch of type steps, so it stops the same way with every field unrun.
+    const fill = pane({ probeErrors: 2 });
+    const filled = await fill.handle("do", { fill: { Email: "a@b.co", City: "London" }, quiet: true });
+    expect(filled.ok).toBe(false);
+    if (filled.ok) throw new Error("expected a stop");
+    expect(filled.error.message).toContain("page state unknown before step 1");
+    expect(filled.error.message).toContain("2 step(s) not run");
+    expect(inputCalls(fill.mock.calls)).toHaveLength(0);
+  });
+
+  test("an error on the first try then a clear page runs the step", async () => {
+    const { mock, handle } = pane({ probeErrors: 1 });
+    const res = await handle("do", { steps: [{ key: "Tab" }], quiet: true });
+    expect(res.ok).toBe(true);
+    expect(probeReads(mock.calls)).toHaveLength(2);
+    expect(inputCalls(mock.calls).length).toBeGreaterThan(0);
   });
 });
 

@@ -2,6 +2,18 @@
 <body>
 <div id="challenge-running">Checking your browser before accessing this site.</div>
 <div class="cf-turnstile" style="width:300px;height:65px;border:1px solid #ccc">Verify you are human</div>
-<label for="wall-field">Wall field</label><input id="wall-field" type="text">
-<button id="wall-button" type="button" onclick="window.__pressed=(window.__pressed||0)+1">Wall button</button>
+<form id="wall-form" action="/pacing-wall" method="get"
+      onsubmit="event.preventDefault(); window.__submitted=(window.__submitted||0)+1;">
+  <label for="wall-field">Wall field</label><input id="wall-field" type="text">
+  <button id="wall-button" type="submit">Wall button</button>
+</form>
+<script>
+  // A real submit path plus click and input counters, so "nothing was pressed or typed" is measured
+  // rather than inferred from an empty field.
+  window.__submitted = 0;
+  window.__pressed = 0;
+  window.__typed = 0;
+  document.getElementById('wall-button').addEventListener('click', () => { window.__pressed++; }, true);
+  document.getElementById('wall-field').addEventListener('input', () => { window.__typed++; }, true);
+</script>
 </body></html>
