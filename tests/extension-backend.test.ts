@@ -2438,7 +2438,7 @@ describe("relay handshake tracking, fix lines, and timeout", () => {
       expect(closedTabIds).toEqual([91, 92]);
 
       // 4. Extension returns no tab id (claims created) while tab 5 is selected -> never closes tab 5.
-      const noIdRes = await handlePage("nav", { url: "chrome://no-id", newWindow: true });
+      const noIdRes = await handlePage("nav", { url: "chrome://no-id", newWindow: true, targetId: "extension:5" });
       expect(noIdRes.ok).toBe(false);
       expect(closedTabIds).toEqual([91, 92]);
 
