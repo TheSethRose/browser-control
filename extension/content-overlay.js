@@ -22,7 +22,7 @@
     "[id^='bitwarden-']",
   ];
 
-  let activeHandoff = null; // { host, observer, promoteScheduled, message, origin }
+  let activeHandoff = null; // { host, observer, promoteScheduled, handoffId, message, origin }
 
   function evictForeignExtensionFrames() {
     const ownOrigin =
@@ -112,7 +112,7 @@
     }
   }
 
-  function mountHandoffOverlay(message, originLabel) {
+  function mountHandoffOverlay(message, originLabel, handoffId) {
     teardownHandoff();
 
     const host = document.createElement("div");
@@ -258,9 +258,10 @@
       // Gate completion strictly on trusted user/input clicks so page scripts cannot dismiss handoff.
       if (!ev.isTrusted) return;
       ev.stopPropagation();
+      const doneId = activeHandoff?.handoffId;
       teardownHandoff();
       try {
-        chrome.runtime.sendMessage({ type: "bc:handoff-done" }).catch(() => {});
+        chrome.runtime.sendMessage({ type: "bc:handoff-done", handoffId: doneId }).catch(() => {});
       } catch {
         /* ignore */
       }
@@ -279,7 +280,7 @@
     root.appendChild(host);
     showTopLayer(host);
 
-    const state = { host, observer: null, promoteScheduled: false, message, origin: originLabel };
+    const state = { host, observer: null, promoteScheduled: false, handoffId, message, origin: originLabel };
 
     const schedulePromote = () => {
       if (!activeHandoff || activeHandoff !== state || state.promoteScheduled) return;
@@ -338,13 +339,17 @@
       return false;
     }
     if (msg.type === "bc:handoff-start") {
-      mountHandoffOverlay(msg.message, msg.origin);
+      mountHandoffOverlay(msg.message, msg.origin, msg.handoffId);
       sendResponse({ ok: true });
       return false;
     }
     if (msg.type === "bc:handoff-clear") {
+      if (msg.handoffId && activeHandoff?.handoffId && msg.handoffId !== activeHandoff.handoffId) {
+        sendResponse({ ok: true, cleared: false });
+        return false;
+      }
       teardownHandoff();
-      sendResponse({ ok: true });
+      sendResponse({ ok: true, cleared: true });
       return false;
     }
     return false;

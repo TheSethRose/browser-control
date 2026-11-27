@@ -47,6 +47,7 @@ export function createDebuggerHub({
 } = {}) {
   const attachedTabs = new Map(); // tabId -> { timer, holdUntil, isolatedContextId, url }
   const inFlightAttach = new Map(); // tabId -> Promise<entry>
+  const inFlightDetach = new Map(); // tabId -> Promise<void>
   const lastDetachReason = new Map(); // tabId -> string
   const enqueuePersist = createSerialQueue();
 
@@ -119,6 +120,9 @@ export function createDebuggerHub({
     }
 
     const work = (async () => {
+      while (inFlightDetach.has(tabId)) {
+        await inFlightDetach.get(tabId).catch(() => {});
+      }
       lastDetachReason.delete(tabId);
       await chromeApi.debugger.attach({ tabId }, "1.3");
       const tab = await chromeApi.tabs?.get?.(tabId).catch(() => null);
@@ -143,17 +147,30 @@ export function createDebuggerHub({
   }
 
   async function detachTab(tabId) {
+    if (inFlightDetach.has(tabId)) {
+      return inFlightDetach.get(tabId);
+    }
     const entry = attachedTabs.get(tabId);
     if (!entry) return;
     if (entry.timer) clearTimeout(entry.timer);
     attachedTabs.delete(tabId);
-    await persistAttached();
-    try {
-      await chromeApi.debugger.detach({ tabId });
-    } catch {
-      /* already detached */
-    }
-    onBadgeChange();
+
+    const work = (async () => {
+      await persistAttached();
+      try {
+        await chromeApi.debugger.detach({ tabId });
+      } catch {
+        /* already detached */
+      }
+      onBadgeChange();
+    })().finally(() => {
+      if (inFlightDetach.get(tabId) === work) {
+        inFlightDetach.delete(tabId);
+      }
+    });
+
+    inFlightDetach.set(tabId, work);
+    return work;
   }
 
   async function detachAll() {

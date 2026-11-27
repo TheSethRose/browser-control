@@ -1,7 +1,7 @@
 // Background non-minimized tab placement, collapsed "Agents · N" tab groups, and popup adoption.
 // Patterns adapted from anomalyco/browse (MIT License).
 
-const AGENT_GROUP_TITLE_RE = /^Agents(?:\s*·\s*\d+)?$/;
+export const AGENT_GROUPS_STORAGE_KEY = "bc_agent_group_ids";
 const TAB_GROUP_ID_NONE = -1;
 
 /** Strip `#...` from `about:blank#...` before navigate (avoids Chrome/Vivaldi crash). */
@@ -128,6 +128,44 @@ export function createWindowGroups({
   const currentActiveByWindow = new Map();
   const previousActiveByWindow = new Map();
 
+  let persistTail = Promise.resolve();
+  function persistKnownGroups() {
+    const storage = chromeApi?.storage?.session;
+    if (!storage || typeof storage.set !== "function") return Promise.resolve();
+    const ids = [...knownGroupIds];
+    const run = async () => {
+      try {
+        await storage.set({ [AGENT_GROUPS_STORAGE_KEY]: ids });
+      } catch {
+        /* ignore storage errors */
+      }
+    };
+    const next = persistTail.then(run, run);
+    persistTail = next.catch(() => {});
+    return next;
+  }
+
+  async function restoreKnownGroups() {
+    const storage = chromeApi?.storage?.session;
+    if (!storage || typeof storage.get !== "function") return;
+    try {
+      const stored = await storage.get([AGENT_GROUPS_STORAGE_KEY]);
+      const ids = stored?.[AGENT_GROUPS_STORAGE_KEY];
+      if (Array.isArray(ids)) {
+        for (const raw of ids) {
+          const id = Number(raw);
+          if (Number.isInteger(id) && id !== TAB_GROUP_ID_NONE) {
+            knownGroupIds.add(id);
+          }
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  const knownGroupsReady = restoreKnownGroups().catch(() => {});
+
   function beginInternalGroupOp(tabId) {
     internalGroupOps.add(tabId);
   }
@@ -150,32 +188,31 @@ export function createWindowGroups({
   }
 
   async function findAgentGroupInWindow(windowId) {
+    await knownGroupsReady;
     if (!chromeApi.tabGroups?.query) return null;
     try {
       const groups = (await chromeApi.tabGroups.query({ windowId })) || [];
-      const found =
-        groups.find((g) => knownGroupIds.has(g.id)) ||
-        groups.find((g) => AGENT_GROUP_TITLE_RE.test(String(g.title || "")));
-      if (found) knownGroupIds.add(found.id);
-      return found || null;
+      return groups.find((g) => knownGroupIds.has(g.id)) || null;
     } catch {
       return null;
     }
   }
 
   async function syncGroup(groupId, { allowCollapse = false } = {}) {
+    await knownGroupsReady;
     if (!chromeApi.tabGroups?.update || typeof groupId !== "number" || groupId === TAB_GROUP_ID_NONE) {
       return;
     }
+    if (!knownGroupIds.has(groupId)) return;
     let groupTabs = [];
     try {
       groupTabs = (await chromeApi.tabs.query({ groupId })) || [];
     } catch {
-      knownGroupIds.delete(groupId);
+      if (knownGroupIds.delete(groupId)) await persistKnownGroups();
       return;
     }
     if (groupTabs.length === 0) {
-      knownGroupIds.delete(groupId);
+      if (knownGroupIds.delete(groupId)) await persistKnownGroups();
       return;
     }
     const settings = getSettings();
@@ -200,12 +237,21 @@ export function createWindowGroups({
   }
 
   async function refreshAllAgentGroups() {
+    await knownGroupsReady;
     if (!chromeApi.tabGroups?.query) return;
     try {
       const groups = (await chromeApi.tabGroups.query({})) || [];
+      const liveIds = new Set(groups.map((g) => g.id));
+      let pruned = false;
+      for (const id of [...knownGroupIds]) {
+        if (!liveIds.has(id)) {
+          knownGroupIds.delete(id);
+          pruned = true;
+        }
+      }
+      if (pruned) await persistKnownGroups();
       for (const g of groups) {
-        if (knownGroupIds.has(g.id) || AGENT_GROUP_TITLE_RE.test(String(g.title || ""))) {
-          knownGroupIds.add(g.id);
+        if (knownGroupIds.has(g.id)) {
           await syncGroup(g.id, { allowCollapse: false });
         }
       }
@@ -215,6 +261,7 @@ export function createWindowGroups({
   }
 
   async function addTabToAgentGroup(tabId, { preferredGroupId } = {}) {
+    await knownGroupsReady;
     const settings = getSettings();
     if (settings.tabGroupMode === "none" || !chromeApi.tabGroups || typeof chromeApi.tabs?.group !== "function") {
       return null;
@@ -225,7 +272,11 @@ export function createWindowGroups({
     beginInternalGroupOp(tabId);
     try {
       let targetGroupId = null;
-      if (typeof preferredGroupId === "number" && preferredGroupId !== TAB_GROUP_ID_NONE) {
+      if (
+        typeof preferredGroupId === "number" &&
+        preferredGroupId !== TAB_GROUP_ID_NONE &&
+        knownGroupIds.has(preferredGroupId)
+      ) {
         const winGroups = (await chromeApi.tabGroups.query?.({ windowId: tab.windowId }).catch(() => [])) || [];
         if (winGroups.some((g) => g.id === preferredGroupId)) {
           targetGroupId = preferredGroupId;
@@ -241,7 +292,10 @@ export function createWindowGroups({
           ? await chromeApi.tabs.group({ groupId: targetGroupId, tabIds: [tabId] })
           : await chromeApi.tabs.group({ createProperties: { windowId: tab.windowId }, tabIds: [tabId] });
 
-      knownGroupIds.add(groupId);
+      if (!knownGroupIds.has(groupId)) {
+        knownGroupIds.add(groupId);
+        await persistKnownGroups();
+      }
       groupedAgentTabs.add(tabId);
 
       // Position the agent group right after pinned tabs in this window.
@@ -275,7 +329,7 @@ export function createWindowGroups({
     if (!group) return;
     const groupTabs = (await chromeApi.tabs.query({ groupId: group.id }).catch(() => [])) || [];
     if (groupTabs.length === 0) {
-      knownGroupIds.delete(group.id);
+      if (knownGroupIds.delete(group.id)) await persistKnownGroups();
       return;
     }
     if (groupTabs.some((t) => t.id === activatedTabId) || groupTabs.some((t) => isTabInHandoff(t.id))) {
@@ -285,9 +339,15 @@ export function createWindowGroups({
   }
 
   async function expandGroupForTab(tabId) {
+    await knownGroupsReady;
     const tab = await chromeApi.tabs.get(tabId).catch(() => null);
     if (!tab) return;
-    if (chromeApi.tabGroups?.update && typeof tab.groupId === "number" && tab.groupId !== TAB_GROUP_ID_NONE) {
+    if (
+      chromeApi.tabGroups?.update &&
+      typeof tab.groupId === "number" &&
+      tab.groupId !== TAB_GROUP_ID_NONE &&
+      knownGroupIds.has(tab.groupId)
+    ) {
       await chromeApi.tabGroups.update(tab.groupId, { collapsed: false }).catch(() => {});
     }
     if (typeof tab.windowId === "number") {
@@ -325,6 +385,7 @@ export function createWindowGroups({
     }
 
     if (changeInfo && "groupId" in changeInfo && !internalGroupOps.has(tabId)) {
+      await knownGroupsReady;
       const nextGroupId = changeInfo.groupId;
       if (groupedAgentTabs.has(tabId) && !knownGroupIds.has(nextGroupId)) {
         groupedAgentTabs.delete(tabId);
@@ -361,6 +422,7 @@ export function createWindowGroups({
     const tabId = details?.tabId;
     if (typeof sourceTabId !== "number" || typeof tabId !== "number") return false;
     if (!isAgentTab(sourceTabId)) return false;
+    if (isTabInHandoff(sourceTabId)) return false;
 
     const openerTab = await chromeApi.tabs.get(sourceTabId).catch(() => null);
     const popupTab = await chromeApi.tabs.get(tabId).catch(() => null);
@@ -418,5 +480,7 @@ export function createWindowGroups({
     handleCreatedNavigationTarget,
     knownGroupIds,
     groupedAgentTabs,
+    knownGroupsReady,
+    restoreKnownGroups,
   };
 }

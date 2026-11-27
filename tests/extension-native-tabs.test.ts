@@ -5,7 +5,7 @@ import { ATTACHED_STORAGE_KEY, createDebuggerHub, createSerialQueue, isForeignFr
 // @ts-expect-error Plain ES module in extension/lib without .d.ts
 import { closeTabSafely, createTabCleanup, protectAgentTab, sweepIdleAgentTabs, unmuteIfOurs } from "../extension/lib/tab-cleanup.js";
 // @ts-expect-error Plain ES module in extension/lib without .d.ts
-import { createWindowGroups, findTargetWindow, normalizeNavigateUrl, openAgentTab, waitForBlankTabReady } from "../extension/lib/window-groups.js";
+import { AGENT_GROUPS_STORAGE_KEY, createWindowGroups, findTargetWindow, normalizeNavigateUrl, openAgentTab, waitForBlankTabReady } from "../extension/lib/window-groups.js";
 import { createPageHelperHandler } from "../src/page-runner";
 
 type FakeTab = {
@@ -411,6 +411,7 @@ describe("window-groups", () => {
       ],
       groups: [{ id: 10, windowId: 1, title: "Agents · 1", color: "blue", collapsed: true }],
     });
+    fake.sessionStore.set(AGENT_GROUPS_STORAGE_KEY, [10]);
     const agentTabs = new Set([2]);
     const adoptedEvents: unknown[] = [];
 
@@ -442,6 +443,96 @@ describe("window-groups", () => {
     expect(fake.groupMap.get(10)?.title).toBe("Agents · 2");
     expect(agentTabs.has(3)).toBe(true);
     expect(adoptedEvents).toEqual([{ openerTabId: 2, tabId: 3, url: "https://popup.test" }]);
+  });
+
+  test("user group titled Agents is never touched and extension group ids persist across SW restart", async () => {
+    const fake = makeFakeChrome({
+      windows: [{ id: 1, type: "normal", state: "normal", focused: true }],
+      tabs: [
+        { id: 1, windowId: 1, url: "https://user.test", active: true, index: 0, groupId: 99 },
+        { id: 2, windowId: 1, url: "https://agent1.test", active: false, index: 1, groupId: -1 },
+        { id: 3, windowId: 1, url: "https://agent2.test", active: false, index: 2, groupId: -1 },
+      ],
+      groups: [{ id: 99, windowId: 1, title: "Agents", color: "pink", collapsed: false }],
+    });
+    const agentTabs = new Set([2, 3]);
+
+    const wg1 = createWindowGroups({
+      chrome: fake.chrome,
+      getSettings: () => ({ tabGroupMode: "shared", autoCollapse: true }),
+      isAgentTab: (id: number) => agentTabs.has(id),
+    });
+
+    const extGroupId = await wg1.addTabToAgentGroup(2);
+    expect(typeof extGroupId).toBe("number");
+    expect(extGroupId).not.toBe(99);
+    expect(fake.sessionStore.get(AGENT_GROUPS_STORAGE_KEY)).toEqual([extGroupId]);
+
+    await wg1.refreshAllAgentGroups();
+    await wg1.collapseAgentGroupInWindow(1, 1);
+    await wg1.syncGroup(99, { allowCollapse: true });
+
+    // User's own "Agents" group must remain completely untouched.
+    expect(fake.groupMap.get(99)).toEqual({ id: 99, windowId: 1, title: "Agents", color: "pink", collapsed: false });
+    expect(fake.calls.some((c) => c.api === "tabGroups.update" && c.args[0] === 99)).toBe(false);
+    expect(fake.calls.some((c) => c.api === "tabGroups.move" && c.args[0] === 99)).toBe(false);
+
+    // After a service-worker restart, a new manager restores the persisted id and reuses it.
+    const wg2 = createWindowGroups({
+      chrome: fake.chrome,
+      getSettings: () => ({ tabGroupMode: "shared", autoCollapse: true }),
+      isAgentTab: (id: number) => agentTabs.has(id),
+    });
+    const reusedGroupId = await wg2.addTabToAgentGroup(3);
+    expect(reusedGroupId).toBe(extGroupId);
+    expect(fake.groupMap.get(extGroupId!)?.title).toBe("Agents · 2");
+    expect(fake.groupMap.get(99)?.title).toBe("Agents");
+  });
+
+  test("skips popup adoption while opener tab is in handoff", async () => {
+    const fake = makeFakeChrome({
+      windows: [{ id: 1, type: "normal", state: "normal", focused: true }],
+      tabs: [
+        { id: 1, windowId: 1, url: "https://user.test", active: false, index: 0, groupId: -1 },
+        { id: 2, windowId: 1, url: "https://agent.test", active: false, index: 1, groupId: 10 },
+        { id: 3, windowId: 1, url: "https://sso.example/login", active: true, index: 2, groupId: -1 },
+      ],
+      groups: [{ id: 10, windowId: 1, title: "Agents · 1", color: "blue", collapsed: false }],
+    });
+    fake.sessionStore.set(AGENT_GROUPS_STORAGE_KEY, [10]);
+    const agentTabs = new Set([2]);
+    const handoffTabs = new Set([2]);
+    const adoptedEvents: unknown[] = [];
+
+    const wg = createWindowGroups({
+      chrome: fake.chrome,
+      getSettings: () => ({ tabGroupMode: "shared", autoCollapse: true }),
+      isAgentTab: (id: number) => agentTabs.has(id),
+      isTabInHandoff: (id: number) => handoffTabs.has(id),
+      onAdoptPopup: async ({ tabId }: { tabId: number }) => {
+        agentTabs.add(tabId);
+        await protectAgentTab(tabId, { mute: true }, fake.chrome);
+      },
+      onPopupAdoptedEvent: (ev: unknown) => adoptedEvents.push(ev),
+    });
+
+    await wg.handleTabActivated({ tabId: 1, windowId: 1 });
+    await wg.handleTabActivated({ tabId: 3, windowId: 1 });
+    fake.calls.length = 0;
+
+    const handled = await wg.handleCreatedNavigationTarget({
+      sourceTabId: 2,
+      tabId: 3,
+      url: "https://sso.example/login",
+    });
+
+    expect(handled).toBe(false);
+    expect(agentTabs.has(3)).toBe(false);
+    expect(fake.tabMap.get(3)?.active).toBe(true);
+    expect(fake.tabMap.get(3)?.groupId).toBe(-1);
+    expect(fake.tabMap.get(3)?.mutedInfo?.muted).toBeUndefined();
+    expect(adoptedEvents).toEqual([]);
+    expect(fake.calls).toEqual([]);
   });
 });
 
@@ -578,6 +669,98 @@ describe("tab-cleanup", () => {
     cleanup.handleTabRemoved(21);
     expect(agentTabs.has(21)).toBe(false);
     expect(purged).toEqual([20, 21]);
+  });
+
+  test("concurrent closeTabSafely calls serialize so closing the last two tabs keeps the last window open", async () => {
+    const fake = makeFakeChrome({
+      windows: [{ id: 1, type: "normal", state: "normal", focused: true }],
+      tabs: [
+        { id: 11, windowId: 1, url: "https://first.test", active: false, groupId: -1 },
+        { id: 12, windowId: 1, url: "https://second.test", active: true, groupId: -1 },
+      ],
+    });
+    const origGetAll = fake.chrome.windows.getAll;
+    fake.chrome.windows.getAll = async (opts?: { populate?: boolean }) => {
+      await new Promise((r) => setTimeout(r, 15));
+      return origGetAll(opts);
+    };
+
+    const [r1, r2] = await Promise.all([
+      closeTabSafely(11, {}, fake.chrome),
+      closeTabSafely(12, {}, fake.chrome),
+    ]);
+
+    expect(r1).toEqual({ closed: true, replacement: null });
+    expect(r2).toEqual({ closed: true, replacement: "tab" });
+    expect(fake.tabMap.size).toBe(1);
+    const remaining = [...fake.tabMap.values()][0]!;
+    expect(remaining.url).toBe("about:blank");
+    expect(remaining.windowId).toBe(1);
+  });
+
+  test("persists and restores lastUsedAt and keepOpen across SW restart and treats unrestored tabs as fresh", async () => {
+    const now = 20_000_000;
+    const fake = makeFakeChrome({
+      windows: [{ id: 1, type: "normal", state: "normal", focused: true }],
+      tabs: [
+        { id: 10, windowId: 1, url: "https://fresh.test", active: false, groupId: -1 },
+        { id: 11, windowId: 1, url: "https://keep.test", active: false, groupId: -1 },
+        { id: 12, windowId: 1, url: "https://stale.test", active: false, groupId: -1 },
+      ],
+    });
+
+    const agentTabs1 = new Set([10, 11, 12]);
+    const lentTabs1 = new Set<number>();
+    const cleanup1 = createTabCleanup({
+      chrome: fake.chrome,
+      agentTabs: agentTabs1,
+      lentTabs: lentTabs1,
+      getSettings: () => ({ idleCleanupMinutes: 30, muteAgentTabs: false }),
+    });
+    cleanup1.touchTab(10, now - 5 * 60_000);
+    cleanup1.touchTab(11, now - 60 * 60_000);
+    cleanup1.markKeepOpen(11, true);
+    cleanup1.touchTab(12, now - 35 * 60_000);
+    await cleanup1.persistState();
+
+    // Simulate service worker restart: fresh empty sets restore from chrome.storage.session.
+    const agentTabs2 = new Set<number>();
+    const lentTabs2 = new Set<number>();
+    const closed: number[] = [];
+    const cleanup2 = createTabCleanup({
+      chrome: fake.chrome,
+      agentTabs: agentTabs2,
+      lentTabs: lentTabs2,
+      getSettings: () => ({ idleCleanupMinutes: 30, muteAgentTabs: false }),
+      onCloseTab: async (tabId: number) => {
+        closed.push(tabId);
+        cleanup2.purge(tabId);
+      },
+    });
+
+    const swept = await cleanup2.runIdleSweep(now);
+    expect(swept).toEqual([12]);
+    expect(closed).toEqual([12]);
+    expect(agentTabs2.has(10)).toBe(true);
+    expect(agentTabs2.has(11)).toBe(true);
+    expect(cleanup2.keepOpenTabs.has(11)).toBe(true);
+
+    // Even if a sweep runs directly on restored agentTabs before timestamps exist, treat them as fresh (now).
+    const unrestoredLastUsed = new Map<number, number>();
+    const directClosed: number[] = [];
+    const directSwept = await sweepIdleAgentTabs({
+      agentTabs: new Set([44]),
+      keepOpenTabs: new Set(),
+      lastUsedAt: unrestoredLastUsed,
+      idleCleanupMinutes: 30,
+      closeTab: async (id: number) => {
+        directClosed.push(id);
+      },
+      now,
+    });
+    expect(directSwept).toEqual([]);
+    expect(directClosed).toEqual([]);
+    expect(unrestoredLastUsed.get(44)).toBe(now);
   });
 });
 
@@ -752,22 +935,105 @@ describe("debugger-hub", () => {
 
     await hub.detachAll();
   });
+
+  test("new CDP command awaits an in-flight detach before re-attaching", async () => {
+    const fake = makeFakeChrome({
+      windows: [{ id: 1, type: "normal", state: "normal", focused: true }],
+      tabs: [{ id: 5, windowId: 1, url: "https://example.test", active: true, groupId: -1 }],
+    });
+
+    let chromeAttached = false;
+    let releaseDetach!: () => void;
+    const detachStarted = new Promise<void>((resolve) => {
+      const origDetach = fake.debuggerHandlers.detach;
+      fake.debuggerHandlers.detach = async (target) => {
+        resolve();
+        await new Promise<void>((r) => {
+          releaseDetach = r;
+        });
+        chromeAttached = false;
+        await origDetach(target);
+      };
+    });
+    const order: string[] = [];
+    fake.debuggerHandlers.attach = async (target) => {
+      if (chromeAttached) {
+        throw new Error(`Another debugger is already attached to tab ${target.tabId}`);
+      }
+      chromeAttached = true;
+      order.push("attach");
+    };
+    const origDetachWrapper = fake.debuggerHandlers.detach;
+    fake.debuggerHandlers.detach = async (target) => {
+      order.push("detach-start");
+      await origDetachWrapper(target);
+      order.push("detach-end");
+    };
+    fake.debuggerHandlers.sendCommand = async (_target, method) => {
+      if (method !== "Emulation.setFocusEmulationEnabled") order.push(`cmd:${method}`);
+      return { ok: true };
+    };
+
+    const hub = createDebuggerHub({ chrome: fake.chrome, idleMs: 60_000 });
+    await hub.sendCommand(5, "Runtime.enable", {});
+    expect(chromeAttached).toBe(true);
+
+    const detachPromise = hub.detachTab(5);
+    await detachStarted;
+
+    // A new command arrives while Chrome is still completing the detach.
+    const cmdPromise = hub.sendCommand(5, "DOM.getDocument", {});
+    await new Promise((r) => setTimeout(r, 15));
+    expect(order).toEqual(["attach", "cmd:Runtime.enable", "detach-start"]);
+
+    releaseDetach();
+    const res = await cmdPromise;
+    await detachPromise;
+
+    expect(res).toEqual({ ok: true });
+    expect(order).toEqual([
+      "attach",
+      "cmd:Runtime.enable",
+      "detach-start",
+      "detach-end",
+      "attach",
+      "cmd:DOM.getDocument",
+    ]);
+
+    // Restore normal detach so detachAll finishes immediately.
+    fake.debuggerHandlers.detach = async () => {
+      chromeAttached = false;
+    };
+    await hub.detachAll();
+  });
 });
 
 describe("page-runner handoff command", () => {
   test("handoff calls handoff_start and resolves to 'handoff: done' on bc.handoffDone", async () => {
     const calls: Array<{ op: string; input: Record<string, unknown> }> = [];
+    let startedId = "";
     const invoke = async (op: string, input: Record<string, unknown> = {}): Promise<InvokeResult> => {
       calls.push({ op, input });
       if (op === "read_events") return { ok: true, data: { events: [] } };
-      if (op === "execute_cdp") return { ok: true, data: { result: { ok: true, tabId: 42 } } };
+      if (op === "execute_cdp") {
+        const params = input["params"] as Record<string, unknown>;
+        startedId = String(params["handoffId"] ?? "");
+        return { ok: true, data: { result: { ok: true, tabId: 42, handoffId: startedId } } };
+      }
       if (op === "wait_for_event") {
         expect(input["method"]).toBe("bc.handoffDone");
         expect(input["targetId"]).toBe("extension:42");
-        expect(input["timeoutMs"]).toBe(600_000);
+        expect(input["match"]).toEqual({ handoffId: startedId });
+        expect(typeof input["timeoutMs"]).toBe("number");
+        expect(input["timeoutMs"] as number).toBeGreaterThan(590_000);
+        expect(input["timeoutMs"] as number).toBeLessThanOrEqual(600_000);
         return {
           ok: true,
-          data: { found: true, event: { method: "bc.handoffDone", params: { tabId: 42 } }, timedOut: false },
+          data: {
+            found: true,
+            event: { method: "bc.handoffDone", params: { tabId: 42, handoffId: startedId } },
+            timedOut: false,
+          },
         };
       }
       return { ok: true, data: {} };
@@ -777,21 +1043,27 @@ describe("page-runner handoff command", () => {
     const res = await handle("handoff", { message: "Sign in to continue" }, "extension:42");
     expect(res.ok).toBe(true);
     expect(res.ok ? (res.data as { value: string }).value : "").toBe("handoff: done");
+    expect(startedId).not.toBe("");
 
     const startCall = calls.find((c) => c.op === "execute_cdp");
     expect(startCall?.input).toEqual({
       method: "bc.handoffStart",
-      params: { message: "Sign in to continue" },
+      params: { message: "Sign in to continue", handoffId: startedId },
       targetId: "extension:42",
     });
   });
 
   test("handoff clears overlay and returns clean timeout when wait_for_event times out", async () => {
     const calls: Array<{ op: string; input: Record<string, unknown> }> = [];
+    let startedId = "";
     const invoke = async (op: string, input: Record<string, unknown> = {}): Promise<InvokeResult> => {
       calls.push({ op, input });
       if (op === "read_events") return { ok: true, data: { events: [] } };
-      if (op === "execute_cdp") return { ok: true, data: { result: { ok: true } } };
+      if (op === "execute_cdp") {
+        const params = input["params"] as Record<string, unknown>;
+        if (input["method"] === "bc.handoffStart") startedId = String(params["handoffId"] ?? "");
+        return { ok: true, data: { result: { ok: true } } };
+      }
       if (op === "wait_for_event") {
         return { ok: true, data: { found: false, timedOut: true, waitedMs: 2_000 } };
       }
@@ -803,7 +1075,175 @@ describe("page-runner handoff command", () => {
     expect(res.ok).toBe(false);
     expect(res.ok ? "" : res.error.message).toBe("HANDOFF_TIMEOUT: handoff timed out after 2s");
 
-    const cdpMethods = calls.filter((c) => c.op === "execute_cdp").map((c) => c.input["method"]);
-    expect(cdpMethods).toEqual(["bc.handoffStart", "bc.handoffClear"]);
+    const cdpCalls = calls.filter((c) => c.op === "execute_cdp");
+    expect(cdpCalls.map((c) => c.input["method"])).toEqual(["bc.handoffStart", "bc.handoffClear"]);
+    expect((cdpCalls[1]?.input["params"] as Record<string, unknown>)?.["handoffId"]).toBe(startedId);
+  });
+
+  test("rejects overlapping handoff on the same tab and ignores mismatched handoffId completion", async () => {
+    let startedId = "";
+    let waitCallCount = 0;
+    let releaseFirstWait!: (res: InvokeResult) => void;
+    let waitStarted!: () => void;
+    const firstWaitReady = new Promise<void>((r) => {
+      waitStarted = r;
+    });
+
+    const cdpStarts: string[] = [];
+    const invoke = async (op: string, input: Record<string, unknown> = {}): Promise<InvokeResult> => {
+      if (op === "read_events") return { ok: true, data: { events: [] } };
+      if (op === "execute_cdp") {
+        const params = input["params"] as Record<string, unknown>;
+        if (input["method"] === "bc.handoffStart") {
+          startedId = String(params["handoffId"] ?? "");
+          cdpStarts.push(startedId);
+        }
+        return { ok: true, data: { result: { ok: true, handoffId: startedId } } };
+      }
+      if (op === "wait_for_event") {
+        waitCallCount += 1;
+        if (waitCallCount === 1) {
+          waitStarted();
+          return new Promise<InvokeResult>((resolve) => {
+            releaseFirstWait = resolve;
+          });
+        }
+        return {
+          ok: true,
+          data: {
+            found: true,
+            event: { method: "bc.handoffDone", params: { tabId: 42, handoffId: startedId } },
+            timedOut: false,
+          },
+        };
+      }
+      return { ok: true, data: {} };
+    };
+
+    const handle = createPageHelperHandler(invoke);
+    const firstPromise = handle("handoff", { message: "First step", timeout: 5 }, "extension:42");
+    await firstWaitReady;
+
+    // Second overlapping handoff on the same tab must fail cleanly without calling handoffStart again.
+    const secondRes = await handle("handoff", { message: "Second step", timeout: 5 }, "extension:42");
+    expect(secondRes.ok).toBe(false);
+    expect(secondRes.ok ? "" : secondRes.error.message).toMatch(/HANDOFF_IN_PROGRESS/);
+    expect(cdpStarts).toHaveLength(1);
+
+    // A completion event with a wrong handoffId must NOT complete the active handoff.
+    releaseFirstWait({
+      ok: true,
+      data: {
+        found: true,
+        event: { method: "bc.handoffDone", params: { tabId: 42, handoffId: "wrong-id" } },
+        timedOut: false,
+      },
+    });
+
+    const firstRes = await firstPromise;
+    expect(firstRes.ok).toBe(true);
+    expect(firstRes.ok ? (firstRes.data as { value: string }).value : "").toBe("handoff: done");
+    expect(waitCallCount).toBe(2);
+  });
+});
+
+describe("background handoff lifecycle", () => {
+  test("handoffStart rolls back handoff entry on overlay injection failure and enforces handoffId on clear/complete", async () => {
+    const fake = makeFakeChrome({
+      windows: [{ id: 1, type: "normal", state: "normal", focused: true }],
+      tabs: [{ id: 7, windowId: 1, url: "chrome://settings", active: true, groupId: -1 }],
+    });
+    let badgeText = "";
+    let injectError: Error | null = new Error("Cannot access a chrome:// URL");
+    const noopListener = { addListener: () => {}, removeListener: () => {} };
+
+    const fullChrome = {
+      ...fake.chrome,
+      action: {
+        setBadgeText: ({ text }: { text: string }) => {
+          badgeText = text;
+        },
+        setBadgeBackgroundColor: () => {},
+      },
+      alarms: {
+        create: () => {},
+        onAlarm: noopListener,
+      },
+      notifications: {
+        create: async () => {},
+        clear: async () => {},
+        onClicked: noopListener,
+        onButtonClicked: noopListener,
+      },
+      scripting: {
+        executeScript: async () => {
+          if (injectError) throw injectError;
+          return [{ result: true }];
+        },
+      },
+      runtime: {
+        ...fake.chrome.runtime,
+        getURL: (p: string) => `chrome-extension://test/${p}`,
+        getManifest: () => ({ version: "2.0.0" }),
+        onMessage: noopListener,
+        onStartup: noopListener,
+        onInstalled: noopListener,
+      },
+      debugger: {
+        ...fake.chrome.debugger,
+        onEvent: noopListener,
+        onDetach: noopListener,
+      },
+      tabs: {
+        ...fake.chrome.tabs,
+        onActivated: noopListener,
+        onReplaced: noopListener,
+        sendMessage: async () => ({ ok: true }),
+      },
+      webNavigation: {
+        onCreatedNavigationTarget: noopListener,
+      },
+      storage: {
+        ...fake.chrome.storage,
+        onChanged: noopListener,
+      },
+    };
+
+    const prevChrome = (globalThis as Record<string, unknown>)["chrome"];
+    (globalThis as Record<string, unknown>)["chrome"] = fullChrome;
+    try {
+      // @ts-expect-error Plain ES module in extension/ without .d.ts
+      const bg = await import("../extension/background.js");
+
+      // S7: overlay injection failure must reject AND roll back handoffTabs + badge.
+      await expect(bg.handoffStart(7, "Sign in", "hid-fail")).rejects.toThrow(/RESTRICTED_PAGE/);
+      expect(bg.handoffTabs.has(7)).toBe(false);
+      expect(badgeText).not.toBe("!");
+
+      // Once injectable, a subsequent handoff on the same tab succeeds (was not left stuck).
+      injectError = null;
+      fake.tabMap.get(7)!.url = "https://example.com/login";
+      const started = await bg.handoffStart(7, "Sign in", "hid-1");
+      expect(started).toEqual({ ok: true, tabId: 7, handoffId: "hid-1" });
+      expect(bg.handoffTabs.has(7)).toBe(true);
+      expect(badgeText).toBe("!");
+
+      // S6 extension-side: overlapping handoff fails; wrong handoffId cannot clear or complete.
+      await expect(bg.handoffStart(7, "Second", "hid-2")).rejects.toThrow(/HANDOFF_IN_PROGRESS/);
+      expect(await bg.handoffClear(7, "wrong-id")).toEqual({ ok: true, tabId: 7, cleared: false });
+      expect(bg.handoffTabs.has(7)).toBe(true);
+      expect(await bg.completeHandoff(7, "wrong-id")).toEqual({ ok: true, completed: false });
+      expect(bg.handoffTabs.has(7)).toBe(true);
+
+      // Matching handoffId completes and clears the handoff.
+      expect(await bg.completeHandoff(7, "hid-1")).toEqual({ ok: true, completed: true, handoffId: "hid-1" });
+      expect(bg.handoffTabs.has(7)).toBe(false);
+    } finally {
+      if (prevChrome === undefined) {
+        delete (globalThis as Record<string, unknown>)["chrome"];
+      } else {
+        (globalThis as Record<string, unknown>)["chrome"] = prevChrome;
+      }
+    }
   });
 });

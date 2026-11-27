@@ -216,6 +216,8 @@ export function createPageHelperHandler(
   const browseCache = new Map<number, Map<string, BrowseEntry>>();
   /** Non-secret typed values remembered per tab for `flow save` parameterization. */
   const recentTyped = new Map<string, Record<string, string>>();
+  /** Active human handoff id per extension tab id (at most one active handoff per tab). */
+  const activeHandoffs = new Map<number, string>();
 
   async function runBcCall(call: ReturnType<typeof normalizeHelperCall>, targetId: string, timeoutMs?: number): Promise<InvokeResult> {
     const fn = options.bcCall ?? (backendOrder().includes("extension") ? getRegisteredExtensionBcCall() : undefined);
@@ -1571,29 +1573,58 @@ export function createPageHelperHandler(
       return invoke("execute_cdp", { method, params, targetId: extTarget });
     };
 
-    // Drop any stale handoff completion events for this tab before showing the overlay.
-    await invoke("read_events", { method: "bc.handoffDone", targetId: extTarget, clear: true }).catch(() => {});
-
-    const started = await callExtensionHandoff("handoff_start", { message });
-    if (!started.ok) return started;
-
-    const waited = await invoke("wait_for_event", {
-      method: "bc.handoffDone",
-      targetId: extTarget,
-      timeoutMs,
-      consumeBuffer: true,
-    });
-    if (!waited.ok) {
-      await callExtensionHandoff("handoff_clear", {}).catch(() => {});
-      return waited;
+    if (activeHandoffs.has(extTabId)) {
+      return failure(
+        "EXECUTION_FAILED",
+        `HANDOFF_IN_PROGRESS: tab ${extTarget} already has an active handoff`,
+      );
     }
 
-    const found = (waited.data as Json | undefined)?.["found"] === true;
-    if (found) return success("handoff: done");
+    const handoffId = randomUUID();
+    activeHandoffs.set(extTabId, handoffId);
 
-    await callExtensionHandoff("handoff_clear", {}).catch(() => {});
-    const secs = Math.max(1, Math.round(timeoutMs / 1000));
-    return failure("EXECUTION_FAILED", `HANDOFF_TIMEOUT: handoff timed out after ${secs}s`);
+    try {
+      // Drop any stale handoff completion events for this tab before showing the overlay.
+      await invoke("read_events", { method: "bc.handoffDone", targetId: extTarget, clear: true }).catch(() => {});
+
+      const started = await callExtensionHandoff("handoff_start", { message, handoffId });
+      if (!started.ok) return started;
+
+      const deadline = Date.now() + timeoutMs;
+      while (true) {
+        const remainingMs = Math.max(1, deadline - Date.now());
+        const waited = await invoke("wait_for_event", {
+          method: "bc.handoffDone",
+          targetId: extTarget,
+          match: { handoffId },
+          timeoutMs: remainingMs,
+          consumeBuffer: true,
+        });
+        if (!waited.ok) {
+          await callExtensionHandoff("handoff_clear", { handoffId }).catch(() => {});
+          return waited;
+        }
+
+        const data = waited.data as Json | undefined;
+        if (data?.["found"] === true) {
+          const eventParams = (data["event"] as Json | undefined)?.["params"] as Json | undefined;
+          if (eventParams?.["handoffId"] === handoffId) {
+            return success("handoff: done");
+          }
+          if (Date.now() >= deadline) break;
+          continue;
+        }
+        break;
+      }
+
+      await callExtensionHandoff("handoff_clear", { handoffId }).catch(() => {});
+      const secs = Math.max(1, Math.round(timeoutMs / 1000));
+      return failure("EXECUTION_FAILED", `HANDOFF_TIMEOUT: handoff timed out after ${secs}s`);
+    } finally {
+      if (activeHandoffs.get(extTabId) === handoffId) {
+        activeHandoffs.delete(extTabId);
+      }
+    }
   }
 
   async function handlePage(action: string, input: Json, rawTargetId?: string): Promise<InvokeResult> {

@@ -51,7 +51,7 @@ let settings = { ...DEFAULT_SETTINGS };
 let lastError = "";
 const lentTabs = new Set();
 const agentTabs = new Set();
-const handoffTabs = new Map(); // tabId -> { message, origin }
+const handoffTabs = new Map(); // tabId -> { handoffId, message, origin, notifId }
 const connections = new Map(); // port -> { port, ws, state, extNonce, instanceId, keepaliveTimer, touchedTabs }
 
 let scanTimer = null;
@@ -170,18 +170,6 @@ async function loadConfig() {
   settings = normalizeSettings(stored);
   scheduleIdleSweepTimer();
   return config;
-}
-
-// Tab ids are reused after a browser restart, so lent and agent tabs live in session storage only.
-async function loadTabSets() {
-  const stored = await chrome.storage.session.get(["lentTabs", "agentTabs"]);
-  for (const id of stored.lentTabs || []) lentTabs.add(Number(id));
-  for (const id of stored.agentTabs || []) agentTabs.add(Number(id));
-}
-const tabSetsReady = loadTabSets().catch(() => {});
-
-async function saveTabSets() {
-  await chrome.storage.session.set({ lentTabs: [...lentTabs], agentTabs: [...agentTabs] });
 }
 
 function scriptTarget(tabId, frameId) {
@@ -313,8 +301,11 @@ const tabCleanup = createTabCleanup({
   },
   onPurgeTab: (tabId, { wasAgent, wasLent }) => {
     if (wasAgent || wasLent) saveTabSets().catch(() => {});
+    const prevHandoff = handoffTabs.get(tabId);
     handoffTabs.delete(tabId);
-    chrome.notifications?.clear?.(`${HANDOFF_NOTIF_PREFIX}${tabId}`)?.catch?.(() => {});
+    if (prevHandoff?.notifId) {
+      chrome.notifications?.clear?.(prevHandoff.notifId)?.catch?.(() => {});
+    }
     debuggerHub.forgetTab(tabId);
     windowGroups.handleTabRemoved(tabId);
     for (const conn of connections.values()) {
@@ -324,12 +315,22 @@ const tabCleanup = createTabCleanup({
   },
 });
 
+// Tab ids are reused after a browser restart, so lent/agent tab sets and idle metadata live in session storage only.
+const tabSetsReady = tabCleanup.stateReady;
+
+function saveTabSets() {
+  return tabCleanup.persistState();
+}
+
 windowGroups.seedActiveTabs().catch(() => {});
 
 async function closeTabInternal(tabId) {
   await debuggerHub.detachTab(tabId);
+  const prevHandoff = handoffTabs.get(tabId);
   handoffTabs.delete(tabId);
-  chrome.notifications?.clear?.(`${HANDOFF_NOTIF_PREFIX}${tabId}`)?.catch?.(() => {});
+  if (prevHandoff?.notifId) {
+    chrome.notifications?.clear?.(prevHandoff.notifId)?.catch?.(() => {});
+  }
   await tabCleanup.closeSafely(tabId);
   tabCleanup.purge(tabId);
 }
@@ -351,11 +352,12 @@ function originOfUrl(rawUrl) {
   }
 }
 
-async function sendHandoffOverlay(tabId, message, origin) {
+async function sendHandoffOverlay(tabId, message, origin, handoffId) {
   try {
     await ensureOverlayInjected(tabId);
     await chrome.tabs.sendMessage(tabId, {
       type: "bc:handoff-start",
+      handoffId,
       message,
       origin,
     });
@@ -364,27 +366,44 @@ async function sendHandoffOverlay(tabId, message, origin) {
   }
 }
 
-async function handoffStart(tabId, rawMessage) {
+export async function handoffStart(tabId, rawMessage, rawHandoffId) {
   if (!tabAllowed(tabId)) {
     throw new Error(`REFUSED: tab ${tabId} is not lent to Browser Control`);
   }
-  const tab = await chrome.tabs.get(tabId);
+  if (handoffTabs.has(tabId)) {
+    throw new Error(`HANDOFF_IN_PROGRESS: tab ${tabId} already has an active handoff`);
+  }
   const message = String(rawMessage || "Complete this step in the browser, then click Continue.");
-  const origin = originOfUrl(tab?.url || "");
+  const handoffId =
+    typeof rawHandoffId === "string" && rawHandoffId.trim() !== ""
+      ? rawHandoffId.trim()
+      : crypto.randomUUID();
+  const notifId = `${HANDOFF_NOTIF_PREFIX}${tabId}:${handoffId}`;
+  const entry = { handoffId, message, origin: "", notifId };
 
-  handoffTabs.set(tabId, { message, origin });
-  tabCleanup.touchTab(tabId);
-  await windowGroups.expandGroupForTab(tabId);
-  await sendHandoffOverlay(tabId, message, origin);
+  handoffTabs.set(tabId, entry);
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    entry.origin = originOfUrl(tab?.url || "");
+    tabCleanup.touchTab(tabId);
+    await windowGroups.expandGroupForTab(tabId);
+    await sendHandoffOverlay(tabId, message, entry.origin, handoffId);
+  } catch (err) {
+    if (handoffTabs.get(tabId) === entry) {
+      handoffTabs.delete(tabId);
+    }
+    updateBadge();
+    throw err;
+  }
   updateBadge();
 
   if (chrome.notifications?.create) {
     try {
-      await chrome.notifications.create(`${HANDOFF_NOTIF_PREFIX}${tabId}`, {
+      await chrome.notifications.create(notifId, {
         type: "basic",
         iconUrl: HANDOFF_ICON_DATA_URL,
         title: "Browser Control — Your turn",
-        message: origin ? `${origin}\n${message}` : message,
+        message: entry.origin ? `${entry.origin}\n${message}` : message,
         buttons: [{ title: "Continue" }],
         requireInteraction: true,
       });
@@ -393,34 +412,46 @@ async function handoffStart(tabId, rawMessage) {
     }
   }
 
-  return { ok: true, tabId };
+  return { ok: true, tabId, handoffId };
 }
 
-async function handoffClear(tabId) {
+export async function handoffClear(tabId, expectedHandoffId) {
+  const current = handoffTabs.get(tabId);
+  if (!current) return { ok: true, tabId, cleared: false };
+  if (typeof expectedHandoffId !== "string" || expectedHandoffId === "" || current.handoffId !== expectedHandoffId) {
+    return { ok: true, tabId, cleared: false };
+  }
   handoffTabs.delete(tabId);
-  if (chrome.notifications?.clear) {
+  if (chrome.notifications?.clear && current.notifId) {
     try {
-      await chrome.notifications.clear(`${HANDOFF_NOTIF_PREFIX}${tabId}`);
+      await chrome.notifications.clear(current.notifId);
     } catch {
       /* ignore */
     }
   }
-  await chrome.tabs.sendMessage(tabId, { type: "bc:handoff-clear" }).catch(() => {});
+  await chrome.tabs.sendMessage(tabId, { type: "bc:handoff-clear", handoffId: current.handoffId }).catch(() => {});
   updateBadge();
-  return { ok: true, tabId };
+  return { ok: true, tabId, handoffId: current.handoffId, cleared: true };
 }
 
-async function completeHandoff(tabId) {
-  if (!handoffTabs.has(tabId)) return { ok: true, completed: false };
-  await handoffClear(tabId);
+export async function completeHandoff(tabId, expectedHandoffId) {
+  const current = handoffTabs.get(tabId);
+  if (!current) return { ok: true, completed: false };
+  if (typeof expectedHandoffId !== "string" || expectedHandoffId === "" || current.handoffId !== expectedHandoffId) {
+    return { ok: true, completed: false };
+  }
+  const { handoffId } = current;
+  await handoffClear(tabId, handoffId);
   broadcastEventToTouched(tabId, {
     type: "event",
     tabId,
     method: "bc.handoffDone",
-    params: { tabId },
+    params: { tabId, handoffId },
   });
-  return { ok: true, completed: true };
+  return { ok: true, completed: true, handoffId };
 }
+
+export { handoffTabs };
 
 // Silent Tier: run __bc v7 methods in Chrome's ISOLATED content-script world (no yellow debugger banner).
 async function runBcSilent(tabId, steps, opts = {}) {
@@ -733,11 +764,11 @@ async function handleRequest(msg) {
     }
 
     case "handoff_start": {
-      return await handoffStart(tabId, params.message);
+      return await handoffStart(tabId, params.message, params.handoffId);
     }
 
     case "handoff_clear": {
-      return await handoffClear(tabId);
+      return await handoffClear(tabId, params.handoffId);
     }
 
     case "navigate": {
@@ -791,11 +822,11 @@ async function handleRequest(msg) {
       const method = String(params.method || "");
       // Silent relay-op pass-throughs for daemons that route via execute_cdp without attaching debugger.
       if (method === "bc.handoffStart") {
-        const result = await handoffStart(tabId, params.params?.message);
+        const result = await handoffStart(tabId, params.params?.message, params.params?.handoffId);
         return { result };
       }
       if (method === "bc.handoffClear") {
-        const result = await handoffClear(tabId);
+        const result = await handoffClear(tabId, params.params?.handoffId);
         return { result };
       }
       if (isBlockedCdp(method)) {
@@ -1102,7 +1133,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     const info = handoffTabs.get(tabId);
     const origin = originOfUrl(tab?.url || info.origin);
     info.origin = origin;
-    sendHandoffOverlay(tabId, info.message, origin).catch(() => {});
+    sendHandoffOverlay(tabId, info.message, origin, info.handoffId).catch(() => {});
   }
 });
 
@@ -1114,23 +1145,27 @@ if (chrome.webNavigation?.onCreatedNavigationTarget) {
   });
 }
 
-function tabIdFromNotificationId(notifId) {
+function parseHandoffNotificationId(notifId) {
   if (typeof notifId !== "string" || !notifId.startsWith(HANDOFF_NOTIF_PREFIX)) return null;
-  const tabId = Number(notifId.slice(HANDOFF_NOTIF_PREFIX.length));
-  return Number.isInteger(tabId) ? tabId : null;
+  const rest = notifId.slice(HANDOFF_NOTIF_PREFIX.length);
+  const sep = rest.indexOf(":");
+  if (sep < 0) return null;
+  const tabId = Number(rest.slice(0, sep));
+  const handoffId = rest.slice(sep + 1);
+  return Number.isInteger(tabId) && handoffId !== "" ? { tabId, handoffId } : null;
 }
 
 if (chrome.notifications?.onClicked) {
   chrome.notifications.onClicked.addListener((notifId) => {
-    const tabId = tabIdFromNotificationId(notifId);
-    if (tabId !== null) completeHandoff(tabId).catch(() => {});
+    const parsed = parseHandoffNotificationId(notifId);
+    if (parsed) completeHandoff(parsed.tabId, parsed.handoffId).catch(() => {});
   });
 }
 
 if (chrome.notifications?.onButtonClicked) {
   chrome.notifications.onButtonClicked.addListener((notifId) => {
-    const tabId = tabIdFromNotificationId(notifId);
-    if (tabId !== null) completeHandoff(tabId).catch(() => {});
+    const parsed = parseHandoffNotificationId(notifId);
+    if (parsed) completeHandoff(parsed.tabId, parsed.handoffId).catch(() => {});
   });
 }
 
@@ -1159,7 +1194,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg?.type === "bc:handoff-done") {
       const tabId = typeof sender?.tab?.id === "number" ? sender.tab.id : Number(msg.tabId);
       if (Number.isInteger(tabId)) {
-        await completeHandoff(tabId);
+        await completeHandoff(tabId, msg.handoffId);
       }
       sendResponse({ ok: true });
       return;
@@ -1171,7 +1206,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const ports = connectedPorts();
       const activeHandoffs = [];
       for (const [tid, info] of handoffTabs) {
-        activeHandoffs.push({ tabId: tid, message: info.message, origin: info.origin });
+        activeHandoffs.push({ tabId: tid, handoffId: info.handoffId, message: info.message, origin: info.origin });
       }
       sendResponse({
         connected: ports.length > 0,
@@ -1196,7 +1231,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       scheduleIdleSweepTimer();
       sendResponse({ ok: true, settings: { ...settings } });
     } else if (msg.type === "completeHandoff" && typeof msg.tabId === "number") {
-      const res = await completeHandoff(msg.tabId);
+      const expectedId =
+        typeof msg.handoffId === "string" && msg.handoffId !== ""
+          ? msg.handoffId
+          : handoffTabs.get(msg.tabId)?.handoffId;
+      const res = await completeHandoff(msg.tabId, expectedId);
       sendResponse(res);
     } else if (msg.type === "toggleLend" && typeof msg.tabId === "number") {
       if (lentTabs.has(msg.tabId)) {
