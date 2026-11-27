@@ -505,3 +505,23 @@ test("the extension pins the same page-helpers VERSION the relay expects", async
   const bg = await Bun.file(new URL("../extension/background.js", import.meta.url)).text();
   expect(Number(/^const PAGE_HELPERS_VERSION = (\d+);$/m.exec(bg)?.[1])).toBe(PAGE_HELPERS_VERSION);
 });
+
+test("S2: a frame keeps recent ownership tags so overlapping lookups don't erase each other's", async () => {
+  const src = await Bun.file(new URL("../src/page-helpers.js.txt", import.meta.url)).text();
+  const parent = {};
+  let onMessage: ((e: unknown) => void) | undefined;
+  const fake: Record<string, unknown> = {
+    parent,
+    addEventListener: (type: string, fn: (e: unknown) => void) => {
+      if (type === "message") onMessage = fn;
+    },
+  };
+  new Function("globalThis", src)(fake);
+  const bc = fake["__bc"] as { frameTag: (tags?: string[]) => string };
+  onMessage?.({ source: parent, data: { __bcFrameTag: "aaa" } });
+  onMessage?.({ source: parent, data: { __bcFrameTag: "bbb" } });
+  onMessage?.({ source: {}, data: { __bcFrameTag: "forged" } });
+  expect(bc.frameTag(["aaa", "zzz"])).toBe("aaa");
+  expect(bc.frameTag(["bbb"])).toBe("bbb");
+  expect(bc.frameTag(["forged"])).toBe("");
+});

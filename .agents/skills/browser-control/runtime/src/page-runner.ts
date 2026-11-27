@@ -791,12 +791,12 @@ export function createPageHelperHandler(
     // Pair each <iframe> with the frame it really hosts: post a random tag into every iframe, then ask
     // each frame which tag it got. URLs can't do this (a frame may have navigated to a sibling's src),
     // so an iframe whose frame doesn't report its tag stays unbound instead of guessed.
-    const readTags = async () =>
+    const readTags = async (mine?: string[]) =>
       new Map(
         (
           await Promise.all(
             pool.map(async (t) => {
-              const r = await evalHelper({ kind: "bc", method: "frameTag" }, t.targetId, 2_000);
+              const r = await evalHelper({ kind: "bc", method: "frameTag", ...(mine ? { args: [mine] } : {}) }, t.targetId, 2_000);
               return [r.ok ? valueOf(r) : "", t.targetId] as const;
             }),
           )
@@ -806,10 +806,10 @@ export function createPageHelperHandler(
     const tags = first8.map(() => randomUUID().replaceAll("-", ""));
     const sent = await evalHelper({ kind: "bc", method: "tagFrames", args: [tags, first8.map((f) => f.src)] }, targetId);
     if (!sent.ok) return first8;
-    let owners = await readTags();
+    let owners = await readTags(tags);
     if (tags.some((t) => !owners.has(t))) {
       await new Promise((r) => setTimeout(r, 50));
-      owners = await readTags();
+      owners = await readTags(tags);
     }
     return first8.map((f, k) => {
       const target = owners.get(tags[k]!);
