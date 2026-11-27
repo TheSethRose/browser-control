@@ -148,8 +148,17 @@ describe("wrapper v2 page commands", () => {
     expect(JSON.parse(r.body)).toEqual({ sub: "accept", text: "-" });
   });
 
+  test("dialog accept keeps trailing newlines in prompt text", async () => {
+    const r = await call("dialog", "accept", "line\n\n");
+    expect(JSON.parse(r.body)).toEqual({ sub: "accept", text: "line\n\n" });
+  });
+
   test("hover --xy rejects a coordinate without a leading digit", async () => {
     const before = seen.length;
+    for (const bad of [".5,20", "08,20"]) {
+      const r = await bc("hover", "--xy", bad);
+      expect(r.code).not.toBe(0);
+    }
     const res = await bc("hover", "--xy", ".5,20");
     expect(res.code).not.toBe(0);
     expect(seen.slice(before).filter((r) => r.path !== "/status")).toHaveLength(0);

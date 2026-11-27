@@ -363,7 +363,7 @@ case "$cmd" in
     ;;
   hover)
     if [[ -n "$xy" ]]; then
-      [[ "$xy" =~ ^[0-9]+(\.[0-9]+)?,[0-9]+(\.[0-9]+)?$ ]] || fail INPUT_INVALID "--xy takes x,y in CSS pixels, e.g. --xy 120,240"
+      [[ "$xy" =~ ^(0|[1-9][0-9]*)(\.[0-9]+)?,(0|[1-9][0-9]*)(\.[0-9]+)?$ ]] || fail INPUT_INVALID "--xy takes x,y in CSS pixels, e.g. --xy 120,240"
       run POST "page/hover$(query "$(arg 0)")" '{"xy":['"$xy"']}'
     else
       [[ -n "$(arg 0)" ]] || fail INPUT_INVALID "usage: browser-control-daemon hover <ref|label> [targetId] | hover --xy x,y [targetId]"
@@ -380,7 +380,7 @@ case "$cmd" in
     if [[ "$sub" == dismiss ]]; then
       run POST "page/dialog$(query "$(arg 1)")" "$input}"
     else
-      [[ -z "$(arg 1)" ]] || input+=',"text":'"$(json_str "$(arg 1)")"
+      [[ -z "${args[1]:-}" ]] || input+=',"text":'"$(json_str "${args[1]}")"
       run POST "page/dialog$(query "$(arg 2)")" "$input}"
     fi
     ;;
