@@ -42,6 +42,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 type Result = { name: string; ok: boolean; detail: string };
 const results: Result[] = [];
+const REQUIRED = process.env["BC_E2E_REQUIRED"] === "1";
 const skips: { name: string; reason: string }[] = [];
 function record(name: string, ok: boolean, detail: string) {
   results.push({ name, ok, detail });
@@ -193,16 +194,16 @@ async function interactWithHandoff(
 async function main(): Promise<number> {
   const chrome = findChrome();
   if (!chrome) {
-    console.log("SKIP e2e: Chrome for Testing not found (set BC_E2E_CHROME to its binary).");
     // A required run (CI gate) must never pass on a missing browser.
-    if (process.env["BC_E2E_REQUIRED"] === "1") {
-      console.log("FAIL e2e :: BC_E2E_REQUIRED=1 but Chrome for Testing was not found");
+    if (REQUIRED) {
+      record("e2e", false, "BC_E2E_REQUIRED=1 but Chrome for Testing was not found (set BC_E2E_CHROME to its binary)");
       return 1;
     }
+    recordSkip("e2e", "Chrome for Testing not found (set BC_E2E_CHROME to its binary)");
     return 0;
   }
   if (!existsSync(WRAPPER)) {
-    console.log(`FAIL setup :: wrapper missing at ${WRAPPER}`);
+    record("setup", false, `wrapper missing at ${WRAPPER}`);
     return 1;
   }
 
@@ -276,7 +277,10 @@ async function main(): Promise<number> {
       console.log(`SUMMARY ${pass} pass, ${fail} fail`);
     })());
   for (const [sig, code] of [["SIGINT", 130], ["SIGTERM", 143]] as const) {
-    process.on(sig, () => void cleanup().finally(() => process.exit(code)));
+    process.on(sig, () => void cleanup().finally(() => {
+      printTotals();
+      process.exit(code);
+    }));
   }
 
   try {
@@ -487,6 +491,7 @@ async function main(): Promise<number> {
         stderr: "ignore",
       }).exited) === 0;
     if (hasOldCommit) await runStaleExtensionCheck(chrome, record);
+    else if (REQUIRED) record("stale-extension", false, `commit ${oldCommit} not present in this clone (fetch full history)`);
     else recordSkip("stale-extension", `commit ${oldCommit} not present in this clone (fetch full history)`);
     return results.some((r) => !r.ok) ? 1 : 0;
   } catch (error) {
@@ -497,6 +502,13 @@ async function main(): Promise<number> {
   }
 }
 
-const code = await main();
-printTotals();
+// One finalizer: totals print for normal completion and for setup/cleanup exceptions alike.
+let code = 1;
+try {
+  code = await main();
+} catch (error) {
+  record("runner", false, String(error instanceof Error ? error.stack : error));
+} finally {
+  printTotals();
+}
 process.exit(code);

@@ -69,6 +69,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: browser-control
+          persist-credentials: false
           # Full history: the stale-extension check archives the pre-PR #10 build.
           fetch-depth: 0
 
@@ -142,7 +143,6 @@ jobs:
             sudo chown root:root "$sandbox"
             sudo chmod 4755 "$sandbox"
           fi
-          "$BC_E2E_CHROME" --version
 
       # Fail fast if Chrome cannot start at all; the e2e runner discards Chrome's stderr.
       - name: Probe Chrome launch
