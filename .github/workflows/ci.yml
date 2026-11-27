@@ -130,6 +130,24 @@ jobs:
             echo "BROWSER_CONTROL_BACKENDS=extension"
           } >> "$GITHUB_ENV"
 
+      # Ubuntu 23.10+ restricts unprivileged user namespaces, so Chrome needs its setuid sandbox helper.
+      - name: Enable Chrome sandbox helper
+        run: |
+          sandbox="$(dirname "$BC_E2E_CHROME")/chrome_sandbox"
+          if [ -f "$sandbox" ]; then
+            sudo chown root:root "$sandbox"
+            sudo chmod 4755 "$sandbox"
+          fi
+          "$BC_E2E_CHROME" --version
+
+      # Surface Chrome's own stderr when a launch fails, since the e2e runner discards it.
+      - name: Probe Chrome launch
+        run: |
+          profile="$(mktemp -d)"
+          "$BC_E2E_CHROME" --headless=new --use-mock-keychain --password-store=basic \
+            --user-data-dir="$profile" --no-first-run --no-default-browser-check \
+            --dump-dom about:blank 2>&1 | tail -20 || true
+
       - name: E2E
         working-directory: browser-control
         run: bun run test:e2e
