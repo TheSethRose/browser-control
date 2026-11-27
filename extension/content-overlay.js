@@ -112,6 +112,23 @@
     }
   }
 
+  const HAND_ICON = ["M18 11V6a2 2 0 0 0-4 0v5", "M14 10V4a2 2 0 0 0-4 0v6", "M10 10.5V6a2 2 0 0 0-4 0v8a8 8 0 0 0 16 0v-2a2 2 0 0 0-4 0"];
+  const ARROW_ICON = ["M5 12h14", "M13 6l6 6-6 6"];
+
+  function svgIcon(paths, size) {
+    const NS = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(NS, "svg");
+    for (const [k, v] of Object.entries({ width: size, height: size, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", "stroke-width": "2", "stroke-linecap": "round", "stroke-linejoin": "round", "aria-hidden": "true" })) {
+      svg.setAttribute(k, String(v));
+    }
+    for (const d of paths) {
+      const p = document.createElementNS(NS, "path");
+      p.setAttribute("d", d);
+      svg.appendChild(p);
+    }
+    return svg;
+  }
+
   function mountHandoffOverlay(message, originLabel, handoffId) {
     teardownHandoff();
 
@@ -142,87 +159,98 @@
     style.textContent = `
       :host {
         color-scheme: light dark;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        --bg: #ffffff;
+        --text: #14171c;
+        --muted: #5b6370;
+        --accent: #2563eb;
+        --accent-hover: #1d4ed8;
+        --accent-text: #1d4ed8;
+        --on-accent: #ffffff;
+        --focus: #2563eb;
+      }
+      @media (prefers-color-scheme: dark) {
+        :host {
+          --bg: #16181d;
+          --text: #eceef2;
+          --muted: #a3aab6;
+          --accent-hover: #3b6ff0;
+          --accent-text: #9dbbff;
+          --focus: #9dbbff;
+        }
       }
       .edge {
         position: fixed;
         inset: 0;
         pointer-events: none;
-        box-shadow: inset 0 0 0 3px #2563eb;
+        box-shadow: inset 0 0 0 3px var(--accent);
       }
       .card {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
         position: fixed;
         right: 16px;
         bottom: 16px;
         width: 320px;
         max-width: calc(100vw - 32px);
         pointer-events: auto;
-        border-radius: 10px;
-        border: 1px solid rgba(37, 99, 235, 0.45);
-        background: #ffffff;
-        color: #111827;
-        box-shadow: 0 12px 32px rgba(0, 0, 0, 0.22);
-        padding: 14px 16px;
+        border-radius: 12px;
+        border: 2px solid var(--accent);
+        background: var(--bg);
+        color: var(--text);
+        box-shadow: 0 12px 32px rgba(0, 0, 0, 0.24);
+        padding: 14px 16px 16px;
         box-sizing: border-box;
-      }
-      @media (prefers-color-scheme: dark) {
-        .card {
-          background: #18181b;
-          color: #f4f4f5;
-          border-color: rgba(59, 130, 246, 0.6);
-        }
-        .origin {
-          color: #a1a1aa;
-        }
       }
       .header {
         display: flex;
         align-items: center;
-        justify-content: space-between;
         gap: 8px;
-        margin-bottom: 4px;
+        margin-bottom: 2px;
+      }
+      .header svg {
+        flex: none;
+        color: var(--accent-text);
       }
       .title {
-        font-size: 14px;
+        font-size: 15px;
         font-weight: 700;
         letter-spacing: -0.01em;
-        color: #2563eb;
-      }
-      @media (prefers-color-scheme: dark) {
-        .title { color: #60a5fa; }
+        color: var(--accent-text);
       }
       .origin {
-        font-size: 11px;
-        color: #6b7280;
-        margin-bottom: 8px;
-        word-break: break-all;
+        font-size: 12px;
+        color: var(--muted);
+        margin: 0 0 10px 26px;
+        overflow-wrap: anywhere;
       }
       .msg {
-        font-size: 13px;
-        line-height: 1.4;
-        margin: 0 0 12px;
+        font-size: 14px;
+        line-height: 1.45;
+        margin: 0 0 14px;
         white-space: pre-wrap;
-        word-break: break-word;
+        overflow-wrap: anywhere;
       }
       .btn {
         display: inline-flex;
         align-items: center;
         justify-content: center;
+        gap: 6px;
         width: 100%;
+        min-height: 36px;
         padding: 8px 14px;
         border: 0;
-        border-radius: 7px;
-        background: #2563eb;
-        color: #ffffff;
-        font-size: 13px;
+        border-radius: 8px;
+        background: var(--accent);
+        color: var(--on-accent);
+        font: inherit;
+        font-size: 14px;
         font-weight: 600;
         cursor: pointer;
       }
       .btn:hover {
-        background: #1d4ed8;
+        background: var(--accent-hover);
       }
       .btn:focus-visible {
-        outline: 2px solid #93c5fd;
+        outline: 2px solid var(--focus);
         outline-offset: 2px;
       }
     `;
@@ -240,6 +268,7 @@
     const title = document.createElement("div");
     title.className = "title";
     title.textContent = "Your turn";
+    header.appendChild(svgIcon(HAND_ICON, 18));
     header.appendChild(title);
 
     const origin = document.createElement("div");
@@ -254,6 +283,7 @@
     btn.className = "btn";
     btn.type = "button";
     btn.textContent = "Continue";
+    btn.appendChild(svgIcon(ARROW_ICON, 16));
     btn.addEventListener("click", (ev) => {
       // Gate completion strictly on trusted user/input clicks so page scripts cannot dismiss handoff.
       if (!ev.isTrusted) return;

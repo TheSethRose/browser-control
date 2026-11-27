@@ -182,10 +182,35 @@ describe("wrapper v2 page commands", () => {
     expect(JSON.parse(r.body)).toEqual({ message: "x", timeout: 8 });
   });
 
+  test("--new-window and --keep-open are rejected outside nav", async () => {
+    for (const flag of ["--new-window", "--keep-open"]) {
+      for (const cmd of [["click", "e1"], ["snap"], ["eval", "1"]]) {
+        const before = seen.length;
+        const res = await bc(...cmd, flag);
+        expect(res.code).not.toBe(0);
+        expect(res.stdout).toContain("INPUT_INVALID");
+        expect(res.stdout).toContain(`unknown flag: ${flag}`);
+        expect(seen.slice(before).filter((r) => r.path !== "/status")).toHaveLength(0);
+      }
+    }
+  });
+
   test("help lists the new commands", async () => {
     const res = await bc("help");
     expect(res.code).toBe(0);
-    for (const line of ["hover <ref|label>", "dialog accept", "emulate [--viewport", "handoff <message>", "--browser <slug>"]) {
+    for (const line of [
+      "hover <ref|label>",
+      "dialog accept",
+      "emulate [--viewport",
+      "handoff <message>",
+      "--browser <slug>",
+      "extension setup [extensionDir]",
+      "extension status",
+      "extension browsers",
+      "extension diagnostics",
+      "extension enable | disable",
+      "extension pair | revoke",
+    ]) {
       expect(res.stdout).toContain(line);
     }
   });

@@ -258,18 +258,42 @@ function broadcastEventToTouched(tabId, payload) {
   }
 }
 
+const ACTION_ICONS = {
+  off: { 16: "icons/state-off-16.png", 32: "icons/state-off-32.png" },
+  on: { 16: "icons/icon-16.png", 32: "icons/icon-32.png" },
+  attached: { 16: "icons/state-attached-16.png", 32: "icons/state-attached-32.png" },
+  handoff: { 16: "icons/state-handoff-16.png", 32: "icons/state-handoff-32.png" },
+};
+let actionState = "";
+
+function currentActionState() {
+  if (handoffTabs.size > 0) return "handoff";
+  if (debuggerHub.size() > 0) return "attached";
+  return isAnyConnected() ? "on" : "off";
+}
+
 function updateBadge() {
-  if (handoffTabs.size > 0) {
-    chrome.action.setBadgeText({ text: "!" });
-    chrome.action.setBadgeBackgroundColor({ color: "#d97706" });
-  } else if (debuggerHub.size() > 0) {
-    chrome.action.setBadgeText({ text: String(debuggerHub.size()) });
-    chrome.action.setBadgeBackgroundColor({ color: "#2563eb" });
-  } else if (isAnyConnected()) {
-    chrome.action.setBadgeText({ text: "ON" });
-    chrome.action.setBadgeBackgroundColor({ color: "#16a34a" });
-  } else {
-    chrome.action.setBadgeText({ text: "" });
+  const state = currentActionState();
+  const attached = debuggerHub.size();
+  const title = {
+    handoff: "Browser Control: your turn",
+    attached: `Browser Control: debugger on ${attached} tab${attached === 1 ? "" : "s"}`,
+    on: "Browser Control: connected",
+    off: "Browser Control: not connected",
+  }[state];
+  try {
+    chrome.action.setTitle?.({ title })?.catch?.(() => {});
+  } catch {
+    /* ignore */
+  }
+  if (state === actionState) return;
+  actionState = state;
+  try {
+    chrome.action.setIcon?.({ path: ACTION_ICONS[state] })?.catch?.(() => {
+      actionState = "";
+    });
+  } catch {
+    /* ignore */
   }
 }
 
@@ -1280,6 +1304,26 @@ async function handleRequest(msg) {
     case "detach_all": {
       await debuggerHub.detachAll();
       return { ok: true };
+    }
+
+    case "diagnostics": {
+      // Never include the token or nonces: this output goes into bug reports.
+      return {
+        extensionVersion: chrome.runtime.getManifest().version,
+        protocolVersion: PROTOCOL_VERSION,
+        hasToken: Boolean(config.token),
+        mode: config.mode,
+        settings: { ...settings },
+        lastError,
+        connections: [...connections.values()].map((c) => ({
+          port: c.port,
+          state: c.state,
+          instanceId: c.instanceId ?? null,
+        })),
+        attachedCount: debuggerHub.size(),
+        lentTabs: lentTabs.size,
+        handoffs: handoffTabs.size,
+      };
     }
 
     default:

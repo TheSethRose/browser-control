@@ -1536,7 +1536,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
     }));
   }
 
-  return {
+  const backend: ExtensionBackend = {
     name: NAME,
     instanceId,
 
@@ -1979,4 +1979,122 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
       activeTab = undefined;
     },
   };
+  if (options.registerGlobal) (globalThis as Record<symbol, unknown>)[EXTENSION_BACKEND_SYMBOL] = backend;
+  return backend;
+}
+
+// ---------------------------------------------------------------------------
+// `extension status|browsers|diagnostics` reports (wrapper subcommands). Never include secrets.
+// ---------------------------------------------------------------------------
+
+const EXTENSION_BACKEND_SYMBOL = Symbol.for("browser-control.extension-backend");
+
+/** The daemon's extension backend (set when created with `registerGlobal`). */
+export function getRegisteredExtensionBackend(): ExtensionBackend | undefined {
+  return (globalThis as Record<symbol, unknown>)[EXTENSION_BACKEND_SYMBOL] as ExtensionBackend | undefined;
+}
+
+export type ExtensionReportBackend = Pick<
+  ExtensionBackend,
+  "instanceId" | "status" | "getConnectedBrowsers" | "request" | "waitForConnection"
+>;
+
+/** `paired` when the relay token file exists, is private, and is valid. */
+export async function relayPairingState(tokenFile: string = defaultTokenFilePath()): Promise<"paired" | "missing" | "bad"> {
+  try {
+    const read = await readPrivateToken(tokenFile);
+    return "token" in read ? "paired" : read.state;
+  } catch {
+    return "bad";
+  }
+}
+
+const SECRET_KEY_RE = /token|secret|nonce|proof|password|hmac|cookie|key$/i;
+
+/** Replace secret-looking values (by key name, or any 64-hex string) with "[redacted]". Booleans stay. */
+export function redactSecrets(value: unknown): unknown {
+  if (typeof value === "string") return HEX_64_RE.test(value) ? "[redacted]" : value;
+  if (Array.isArray(value)) return value.map(redactSecrets);
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) {
+      out[k] = SECRET_KEY_RE.test(k) && typeof v !== "boolean" && v !== null ? "[redacted]" : redactSecrets(v);
+    }
+    return out;
+  }
+  return value;
+}
+
+const offMessage = "INPUT_INVALID: the extension backend is off for this daemon; run: browser-control-daemon extension enable";
+
+export async function extensionStatusReport(
+  backend: ExtensionReportBackend | undefined,
+  order: string[],
+  tokenFile?: string,
+  waitMs = 2000,
+): Promise<Record<string, unknown>> {
+  const enabled = order.includes(NAME) && backend !== undefined;
+  const pairing = await relayPairingState(tokenFile);
+  const base: Record<string, unknown> = {
+    enabled,
+    backends: order.join(","),
+    paired: pairing === "paired",
+    ...(pairing === "bad" ? { pairingProblem: "relay token file is not private or not valid; run: extension setup" } : {}),
+  };
+  if (!enabled) return { ...base, listening: false, port: null, browsers: 0 };
+  let s = (await backend.status()) as Record<string, unknown>;
+  // A relay that just started needs a moment for the extension to find it.
+  if (s["listening"] && backend.getConnectedBrowsers().length === 0 && waitMs > 0) {
+    await backend.waitForConnection(waitMs).catch(() => {});
+    s = (await backend.status()) as Record<string, unknown>;
+  }
+  return {
+    ...base,
+    listening: Boolean(s["listening"]),
+    port: s["port"] ?? null,
+    protocolVersion: s["protocolVersion"] ?? PROTOCOL_VERSION,
+    relayVersion: RELAY_VERSION,
+    browsers: Array.isArray(s["browsers"]) ? s["browsers"].length : 0,
+    ...(typeof s["reason"] === "string" ? { reason: s["reason"] } : {}),
+  };
+}
+
+export type ExtensionBrowserRow = { slug: string; brand: string; browser: string; extensionVersion: string };
+
+/** Connected browsers; waits up to `waitMs` for a first connection when none is up yet. */
+export async function extensionBrowsersReport(
+  backend: ExtensionReportBackend | undefined,
+  order: string[],
+  waitMs = 3000,
+): Promise<ExtensionBrowserRow[]> {
+  if (!order.includes(NAME) || !backend) throw new Error(offMessage);
+  await backend.status();
+  if (backend.getConnectedBrowsers().length === 0) await backend.waitForConnection(waitMs).catch(() => {});
+  return backend.getConnectedBrowsers().map((b) => ({
+    slug: b.slug,
+    brand: browserSlugPrefix(b.browser),
+    browser: b.browser,
+    extensionVersion: b.extensionVersion,
+  }));
+}
+
+/** Daemon relay state plus each connected browser's `diagnostics` op, with secrets redacted. */
+export async function extensionDiagnosticsReport(
+  backend: ExtensionReportBackend | undefined,
+  order: string[],
+  options: { tokenFile?: string; timeoutMs?: number; waitMs?: number } = {},
+): Promise<unknown> {
+  const daemon = await extensionStatusReport(backend, order, options.tokenFile, options.waitMs ?? 2000);
+  if (!daemon["enabled"] || !backend) return redactSecrets({ daemon, browsers: [] });
+  const rows = await extensionBrowsersReport(backend, order, options.waitMs ?? 3000);
+  const browsers = await Promise.all(
+    rows.map(async (row) => {
+      try {
+        return { ...row, diagnostics: await backend.request("diagnostics", {}, options.timeoutMs ?? 5000, row.slug) };
+      } catch (error) {
+        return { ...row, error: (error as Error).message };
+      }
+    }),
+  );
+  return redactSecrets({ daemon: { ...daemon, instanceId: backend.instanceId }, browsers });
 }
