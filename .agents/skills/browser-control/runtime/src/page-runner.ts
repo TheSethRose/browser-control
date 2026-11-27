@@ -508,9 +508,11 @@ export function createPageHelperHandler(
   }
 
   async function cdp(method: string, params: Json, targetId?: string, timeoutMs?: number): Promise<InvokeResult> {
+    // Resolve the pointer-state slot before awaiting, so a concurrent request that switches the
+    // implicit target cannot make this event land under another tab.
+    const st = method === "Input.dispatchMouseEvent" ? motionOf(targetId) : undefined;
     const res = await invoke("execute_cdp", { method, params, ...(targetId ? { targetId } : {}), ...(timeoutMs ? { timeoutMs } : {}) });
-    if (method === "Input.dispatchMouseEvent") {
-      const st = motionOf(targetId);
+    if (st) {
       if (!res.ok) delete st.pointer;
       else if (params["type"] === "mouseMoved" && typeof params["x"] === "number" && typeof params["y"] === "number") st.pointer = { x: params["x"], y: params["y"] };
     }
