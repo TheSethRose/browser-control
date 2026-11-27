@@ -16,7 +16,7 @@ import {
   isBackendUnavailable,
   isExtensionOnlyOrder,
 } from "./backends/router";
-import { extensionFrameTarget, extensionTabOf, getRegisteredExtensionBcCall, type BcCallFn } from "./backends/extension";
+import { extensionFrameTarget, extensionTabOf, getRegisteredExtensionBcCall, parseExtensionTargetId, type BcCallFn } from "./backends/extension";
 import {
   SHORT_PAGE_CHARS,
   buildChallengeProbeExpression,
@@ -300,14 +300,11 @@ export function createPageHelperHandler(
   const pause = options.sleep ?? sleep;
   const rng = options.rng ?? Math.random;
   const now = options.now ?? (() => Date.now());
-  /** `_natural` carries the wrapper caller's env value and config file, so status and dispatch agree. */
-  const isNatural = (input: Json): boolean => {
-    const caller = input["_natural"] as { env?: unknown; file?: unknown } | undefined;
-    const fromCaller = typeof caller?.file === "string"
-      ? { env: { BROWSER_CONTROL_NATURAL: typeof caller.env === "string" ? caller.env : undefined }, configFile: caller.file }
-      : {};
-    return isNaturalEnabled(input, { defaultEnabled: options.naturalDefault, ...fromCaller });
-  };
+  /** `_natural` is the wrapper caller's resolved on/off switch, so status and dispatch agree. */
+  const isNatural = (input: Json): boolean =>
+    input["fast"] !== true && typeof input["_natural"] === "boolean"
+      ? (input["_natural"] as boolean)
+      : isNaturalEnabled(input, { defaultEnabled: options.naturalDefault });
   /** Per-tab pointer state keyed by resolved top-level target id (without frame suffix). */
   const motionByTab = new Map<string, { pointer?: Point2D; viewport?: Viewport }>();
   let implicitCdpTarget: string | undefined;
@@ -321,11 +318,30 @@ export function createPageHelperHandler(
     }
     return st;
   };
+  /** A tab pinned before dispatch: extension tabs key by tab number so short and browser-qualified ids agree. */
+  type ReleaseTab = { key: string; target?: string; slug?: string };
+  const releaseTabOf = (targetId?: string): ReleaseTab => {
+    const ext = parseExtensionTargetId(targetId);
+    const target = targetId ?? implicitCdpTarget;
+    return ext ? { key: `extension:${ext.tabId}`, target, slug: ext.slug } : { key: tabKeyOf(target), target };
+  };
+  /** Releases the extension refused before dispatch because a dialog was open; `dialog accept|dismiss` sends them. */
+  type HeldRelease = { method: string; params: Json; tab: ReleaseTab; unload: boolean };
+  const pendingReleases = new Map<string, HeldRelease[]>();
+  const takeReleases = (targetId?: string): HeldRelease[] => {
+    const tab = releaseTabOf(targetId);
+    const same = (r: HeldRelease): boolean => !r.tab.slug || !tab.slug || r.tab.slug === tab.slug;
+    const all = pendingReleases.get(tab.key) ?? [];
+    const rest = all.filter((r) => !same(r));
+    if (rest.length > 0) pendingReleases.set(tab.key, rest);
+    else pendingReleases.delete(tab.key);
+    return all.filter(same);
+  };
+  /** Navigation and tab close start a new document, so held releases for the old one are dropped. */
   const resetMotion = (targetId?: string): void => {
     motionByTab.delete(tabKeyOf(targetId));
+    takeReleases(targetId);
   };
-  /** Button/key releases a dialog blocked, per tab; `dialog accept|dismiss` sends them so nothing stays held. */
-  const pendingReleases = new Map<string, Json[]>();
   /** Cross-origin iframe targets from the last snap of each tab: f1 is index 0. */
   const frameTargets = new Map<string, string[]>();
   /** Last isolated-world executionContextId seen per target, used by upload/styles. */
@@ -1059,6 +1075,7 @@ export function createPageHelperHandler(
   }
 
   async function pressKey(name: string, targetId?: string, holdMs = 0): Promise<InvokeResult> {
+    const tab = releaseTabOf(targetId);
     const spec = KEYS[name];
     if (!spec) {
       return failure("INPUT_VALIDATION_FAILED", `INPUT_INVALID: key must be ${Object.keys(KEYS).join(", ")}`);
@@ -1068,11 +1085,11 @@ export function createPageHelperHandler(
       ? await cdp("Input.dispatchKeyEvent", { type: "keyDown", ...base, text: spec.text }, targetId, INPUT_TIMEOUT_MS)
       : await cdp("Input.dispatchKeyEvent", { type: "rawKeyDown", ...base }, targetId, INPUT_TIMEOUT_MS);
     if (!down.ok) {
-      await sendRelease("Input.dispatchKeyEvent", { type: "keyUp", ...base }, targetId);
+      if (!blockedBeforeDispatch(down)) await sendRelease("Input.dispatchKeyEvent", { type: "keyUp", ...base }, tab);
       return down;
     }
     if (holdMs > 0) await pause(holdMs);
-    return sendRelease("Input.dispatchKeyEvent", { type: "keyUp", ...base }, targetId, INPUT_TIMEOUT_MS);
+    return sendRelease("Input.dispatchKeyEvent", { type: "keyUp", ...base }, tab, INPUT_TIMEOUT_MS);
   }
 
   async function dispatchText(
@@ -1158,15 +1175,17 @@ export function createPageHelperHandler(
   const withChanges = async (line: string, before: string | undefined, quiet: boolean, targetId?: string): Promise<InvokeResult> =>
     success(quiet ? line : `${line}\n${await changes(before, targetId)}`);
 
+  /** The extension marks a command it refused because a dialog was already open; it never reached the page. */
+  const blockedBeforeDispatch = (res: InvokeResult): boolean => /DIALOG_OPEN:[^\n]*\(command not sent\)/.test(messageOf(res));
   const inputFailed = (res: InvokeResult, what: string): InvokeResult =>
     messageOf(res).startsWith("CDP_TIMEOUT") ? success(`${what}: delivered_unverified (${DIALOG_HINT})`) : res;
 
-  /** Send a mouse/key release; if it fails (a dialog is open), queue it for the next `dialog accept|dismiss`. */
-  async function sendRelease(method: string, params: Json, targetId?: string, timeoutMs = 2_000): Promise<InvokeResult> {
-    const res = await cdp(method, params, targetId, timeoutMs).catch((err: unknown) => failure("EXECUTION_FAILED", String(err)));
-    if (!res.ok) {
-      const key = tabKeyOf(targetId);
-      pendingReleases.set(key, [...(pendingReleases.get(key) ?? []), { method, params }]);
+  /** Send a mouse/key release to its pinned tab; queue it only when the extension refused it before dispatch. */
+  async function sendRelease(method: string, params: Json, tab: ReleaseTab, timeoutMs = 2_000): Promise<InvokeResult> {
+    const res = await cdp(method, params, tab.target, timeoutMs).catch((err: unknown) => failure("EXECUTION_FAILED", String(err)));
+    if (blockedBeforeDispatch(res)) {
+      const held = { method, params, tab, unload: /beforeunload dialog/.test(messageOf(res)) };
+      pendingReleases.set(tab.key, [...(pendingReleases.get(tab.key) ?? []), held]);
     }
     return res;
   }
@@ -1456,6 +1475,7 @@ export function createPageHelperHandler(
     };
 
     const natural = isNatural(input);
+    const tab = releaseTabOf(targetId);
     let html5Dropped = false;
     let dragIntercepted: { data?: Json } | undefined;
     let mouseDown = false;
@@ -1469,7 +1489,7 @@ export function createPageHelperHandler(
         if (!m0.ok) { dragErr = m0; return inputFailed(m0, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
         mouseDown = true;
         const mp = await cdp("Input.dispatchMouseEvent", { type: "mousePressed", x: info.sx, y: info.sy, button: "left", buttons: 1, clickCount: 1 }, targetId, INPUT_TIMEOUT_MS);
-        if (!mp.ok) { dragErr = mp; return inputFailed(mp, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
+        if (!mp.ok) { mouseDown = !blockedBeforeDispatch(mp); dragErr = mp; return inputFailed(mp, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
         const mx = Math.round((info.sx + info.dx) / 2);
         const my = Math.round((info.sy + info.dy) / 2);
         if (info.draggable) {
@@ -1496,7 +1516,7 @@ export function createPageHelperHandler(
         await pause(planClickTiming(1, rng).dwellMs);
         mouseDown = true;
         const mp = await cdp("Input.dispatchMouseEvent", { type: "mousePressed", x: info.sx, y: info.sy, button: "left", buttons: 1, clickCount: 1 }, targetId, INPUT_TIMEOUT_MS);
-        if (!mp.ok) { dragErr = mp; return inputFailed(mp, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
+        if (!mp.ok) { mouseDown = !blockedBeforeDispatch(mp); dragErr = mp; return inputFailed(mp, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
         await pause(Math.round(60 + rng() * 50));
 
         const state = motionOf(targetId);
@@ -1554,7 +1574,7 @@ export function createPageHelperHandler(
         await cdp("Input.dispatchDragEvent", { type: "dragCancel", x: info.dx, y: info.dy, data: dragIntercepted.data ?? { items: [], dragOperationsMask: 1 } }, targetId, 2_000).catch(() => {});
       }
       if (mouseDown) {
-        const rel = await sendRelease("Input.dispatchMouseEvent", { type: "mouseReleased", x: info.dx, y: info.dy, button: "left", buttons: 0, clickCount: 1 }, targetId);
+        const rel = await sendRelease("Input.dispatchMouseEvent", { type: "mouseReleased", x: info.dx, y: info.dy, button: "left", buttons: 0, clickCount: 1 }, tab);
         if (rel.ok && !dragErr) motionOf(targetId).pointer = { x: info.dx, y: info.dy };
         else if (!dragErr) dragErr = rel;
       }
@@ -2094,11 +2114,19 @@ export function createPageHelperHandler(
       }
       return res;
     }
-    const queued = pendingReleases.get(tabKeyOf(targetId)) ?? [];
-    pendingReleases.delete(tabKeyOf(targetId));
-    for (const q of queued) await cdp(String(q["method"]), q["params"] as Json, targetId, 2_000).catch(() => undefined);
-    if (accept) return success(typeof params["promptText"] === "string" ? `dialog accept: accepted with prompt text ${js(params["promptText"])}` : "dialog accept: accepted");
-    return success("dialog dismiss: dismissed");
+    // Accepting beforeunload leaves the document, so its held releases are dropped, not replayed.
+    const notes: string[] = [];
+    let still = 0;
+    for (const r of takeReleases(targetId).filter((h) => !(accept && h.unload))) {
+      const sent = await sendRelease(r.method, r.params, r.tab);
+      if (blockedBeforeDispatch(sent)) still++;
+      else if (!sent.ok) notes.push(`release ${String(r.params["type"])} failed: ${messageOf(sent).split("\n")[0]}`);
+    }
+    if (still > 0) notes.push(`${still} release(s) still held by another dialog; run dialog accept|dismiss again`);
+    const head = accept
+      ? typeof params["promptText"] === "string" ? `dialog accept: accepted with prompt text ${js(params["promptText"])}` : "dialog accept: accepted"
+      : "dialog dismiss: dismissed";
+    return success([head, ...notes].join("\n"));
   }
 
   const mediaByTarget = new Map<string, Map<string, string>>();
@@ -3198,9 +3226,11 @@ export function createPageHelperHandler(
     invoke("evaluate", { expression, ...(tid ? { targetId: tid } : {}) }),
   );
 
-  return async function handlePageWithRemedies(action: string, input: Json, targetId?: string): Promise<InvokeResult> {
+  const handlePageWithRemedies = async (action: string, input: Json, targetId?: string): Promise<InvokeResult> => {
     const res = await handlePage(action, input, targetId);
     if (!res.ok) return failure(res.error.code, withRemedy(res.error.message));
     return res;
   };
+  /** The daemon calls this after closing a tab so its pointer state and held releases go too. */
+  return Object.assign(handlePageWithRemedies, { forgetTab: resetMotion });
 }

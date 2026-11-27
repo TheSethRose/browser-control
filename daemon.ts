@@ -234,9 +234,9 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
       targetId = tab.targetId;
     }
     const quiet = url.searchParams.get("q") === "1";
-    // The wrapper sends its caller's natural switch so `natural status` and dispatch read the same setting.
-    const naturalFile = request.headers.get("x-bc-natural-file");
-    const callerNatural = naturalFile ? { _natural: { file: naturalFile, env: request.headers.get("x-bc-natural") ?? undefined } } : {};
+    // The wrapper resolves its caller's natural switch and sends only on/off, so status and dispatch agree.
+    const natHeader = request.headers.get("x-bc-natural");
+    const callerNatural = natHeader === "on" || natHeader === "off" ? { _natural: natHeader === "on" } : {};
     const wrap = boundariesDefault && url.searchParams.get("raw") !== "1";
 
     switch (route) {
@@ -247,12 +247,17 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
       }
       case "eval":
         return text(await invoke("evaluate", { expression: body, targetId }), (data) => data.value, wrap);
-      case "close":
+      case "close": {
+        const closed = await invoke("close_target", targetId ? { targetId } : {});
+        const done = closed.ok ? (closed.data as { closed?: unknown; targetId?: unknown }) : undefined;
+        const closedId = done?.targetId;
+        if (done && done.closed !== false) handlePage.forgetTab(typeof closedId === "string" ? closedId : targetId);
         return text(
-          await invoke("close_target", targetId ? { targetId } : {}),
+          closed,
           (data) => (data.closed === false ? `not closed ${data.targetId ?? ""}` : `closed ${data.targetId ?? ""}`).trim(),
           false,
         );
+      }
       case "nav": {
         const browser = url.searchParams.get("browser")?.trim() || undefined;
         const navScope = browser ? { browser, explicitTargetId: targetId } : undefined;
@@ -297,7 +302,7 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
         const shouldWrap = wrap && UNTRUSTED_PAGE_ACTIONS.has(operation) && !parsed.value["out"];
         return text(
           await requestBrowser.run(navScope, () =>
-            handlePage(operation, { ...parsed.value, ...callerNatural, ...(quiet ? { quiet: true } : {}) }, explicitTargetId),
+            handlePage(operation, { ...parsed.value, _natural: undefined, ...callerNatural, ...(quiet ? { quiet: true } : {}) }, explicitTargetId),
           ),
           (data) => data.value,
           shouldWrap,

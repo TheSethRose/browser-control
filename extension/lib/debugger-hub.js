@@ -33,10 +33,12 @@ function isDialogAbortable(method) {
   return DIALOG_ABORTABLE_PREFIXES.includes(method);
 }
 
-function formatDialogError(tabId, dialog) {
+// `notSent` marks a command refused before dispatch, so callers know it never reached the page.
+function formatDialogError(tabId, dialog, notSent = false) {
   const type = dialog?.type || "dialog";
   const msg = dialog?.message ? ` ("${String(dialog.message).slice(0, 200)}")` : "";
-  return `DIALOG_OPEN: a JavaScript ${type} dialog is open${msg} on tab ${tabId}\nremedy: run dialog accept|dismiss`;
+  const tail = notSent ? " (command not sent)" : "";
+  return `DIALOG_OPEN: a JavaScript ${type} dialog is open${msg} on tab ${tabId}${tail}\nremedy: run dialog accept|dismiss`;
 }
 
 /**
@@ -384,7 +386,7 @@ export function createDebuggerHub({
     const skipFocusEmulation = opts.skipFocusEmulation === true || DIALOG_SAFE_METHODS.has(method);
 
     if (!isDialogHandler && opts.allowWhileDialog !== true && openDialogs.has(tabId)) {
-      throw new Error(formatDialogError(tabId, openDialogs.get(tabId)));
+      throw new Error(formatDialogError(tabId, openDialogs.get(tabId), true));
     }
 
     for (let attempt = 0; attempt <= MAX_FOREIGN_FRAME_RETRIES; attempt++) {
@@ -417,7 +419,7 @@ export function createDebuggerHub({
         unsubscribe?.();
       }
       if (!isDialogHandler && opts.allowWhileDialog !== true && openDialogs.has(tabId)) {
-        throw new Error(formatDialogError(tabId, openDialogs.get(tabId)));
+        throw new Error(formatDialogError(tabId, openDialogs.get(tabId), true));
       }
       lastDetachReason.delete(tabId);
       const handledDialog = isDialogHandler ? openDialogs.get(tabId) : undefined;

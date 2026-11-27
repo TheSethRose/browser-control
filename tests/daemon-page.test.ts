@@ -226,51 +226,38 @@ describe("daemon page helpers", () => {
   });
 
   test("type defaults to human keystrokes with pauses and supports --fast and --keys", async () => {
-    const prevNatural = process.env["BROWSER_CONTROL_NATURAL"];
-    const prevXdg = process.env["XDG_CONFIG_HOME"];
-    const emptyCfg = await mkdtemp(join(tmpdir(), "bc-cfg-"));
-    tempDirs.push(emptyCfg);
-    delete process.env["BROWSER_CONTROL_NATURAL"];
-    process.env["XDG_CONFIG_HOME"] = emptyCfg;
-    try {
-      const pauses: number[] = [];
-      const { calls, invoke } = makeFakeInvoker({ readback: "hello" });
-      const handle = createPageHelperHandler(invoke, undefined, undefined, {
-        sleep: async (ms) => {
-          pauses.push(ms);
-        },
-        rng: () => 0.5, // deterministic, no typo triggered at 0.5 >= 0.045
-      });
+    const pauses: number[] = [];
+    const { calls, invoke } = makeFakeInvoker({ readback: "hello" });
+    const handle = createPageHelperHandler(invoke, undefined, undefined, {
+      sleep: async (ms) => {
+        pauses.push(ms);
+      },
+      rng: () => 0.5, // deterministic, no typo triggered at 0.5 >= 0.045
+    });
 
-      const human = await handle("type", { ref: "e2", text: "hello", quiet: true });
-      expect(text(human)).toContain("delivered (read back matches)");
-      const humanKeys = calls.filter((c) => c.op === "execute_cdp" && c.input["method"] === "Input.dispatchKeyEvent");
-      expect(humanKeys).toHaveLength(10); // 5 chars * (keyDown + keyUp)
-      expect((humanKeys[0]!.input["params"] as Record<string, unknown>)["code"]).toBe("KeyH");
-      expect(pauses.length).toBeGreaterThanOrEqual(9); // hold + inter-key pauses
+    const human = await handle("type", { ref: "e2", text: "hello", quiet: true, _natural: true });
+    expect(text(human)).toContain("delivered (read back matches)");
+    const humanKeys = calls.filter((c) => c.op === "execute_cdp" && c.input["method"] === "Input.dispatchKeyEvent");
+    expect(humanKeys).toHaveLength(10); // 5 chars * (keyDown + keyUp)
+    expect((humanKeys[0]!.input["params"] as Record<string, unknown>)["code"]).toBe("KeyH");
+    expect(pauses.length).toBeGreaterThanOrEqual(9); // hold + inter-key pauses
 
-      const fastMock = makeFakeInvoker({ readback: "hello" });
-      const fastHandle = createPageHelperHandler(fastMock.invoke);
-      const fastRes = await fastHandle("type", { ref: "e2", text: "hello", fast: true, quiet: true });
-      expect(text(fastRes)).toContain("delivered (read back matches)");
-      expect(cdpMethods(fastMock.calls).slice(-3)).toEqual([
-        "Input.insertText",
-        "Input.dispatchKeyEvent",
-        "Input.dispatchKeyEvent",
-      ]);
+    const fastMock = makeFakeInvoker({ readback: "hello" });
+    const fastHandle = createPageHelperHandler(fastMock.invoke);
+    const fastRes = await fastHandle("type", { ref: "e2", text: "hello", fast: true, quiet: true });
+    expect(text(fastRes)).toContain("delivered (read back matches)");
+    expect(cdpMethods(fastMock.calls).slice(-3)).toEqual([
+      "Input.insertText",
+      "Input.dispatchKeyEvent",
+      "Input.dispatchKeyEvent",
+    ]);
 
-      const keysMock = makeFakeInvoker({ readback: "ab" });
-      const keysHandle = createPageHelperHandler(keysMock.invoke, undefined, undefined, { sleep: async () => {}, rng: () => 0.5 });
-      const keysRes = await keysHandle("type", { ref: "e2", text: "ab", keys: true, quiet: true });
-      expect(text(keysRes)).toContain("delivered (read back matches)");
-      const keyEvents = keysMock.calls.filter((c) => c.op === "execute_cdp" && c.input["method"] === "Input.dispatchKeyEvent");
-      expect(keyEvents).toHaveLength(4);
-    } finally {
-      if (prevNatural === undefined) delete process.env["BROWSER_CONTROL_NATURAL"];
-      else process.env["BROWSER_CONTROL_NATURAL"] = prevNatural;
-      if (prevXdg === undefined) delete process.env["XDG_CONFIG_HOME"];
-      else process.env["XDG_CONFIG_HOME"] = prevXdg;
-    }
+    const keysMock = makeFakeInvoker({ readback: "ab" });
+    const keysHandle = createPageHelperHandler(keysMock.invoke, undefined, undefined, { sleep: async () => {}, rng: () => 0.5 });
+    const keysRes = await keysHandle("type", { ref: "e2", text: "ab", keys: true, quiet: true, _natural: true });
+    expect(text(keysRes)).toContain("delivered (read back matches)");
+    const keyEvents = keysMock.calls.filter((c) => c.op === "execute_cdp" && c.input["method"] === "Input.dispatchKeyEvent");
+    expect(keyEvents).toHaveLength(4);
   });
 
   test("buildHumanKeystrokes emits QWERTY neighbor typos + Backspace and always reconstructs text", () => {
@@ -549,38 +536,25 @@ describe("picture pages and daemon script flags", () => {
   });
 
   test("type --focused defaults to human keystrokes and supports --fast", async () => {
-    const prevNatural = process.env["BROWSER_CONTROL_NATURAL"];
-    const prevXdg = process.env["XDG_CONFIG_HOME"];
-    const emptyCfg = await mkdtemp(join(tmpdir(), "bc-cfg-"));
-    tempDirs.push(emptyCfg);
-    delete process.env["BROWSER_CONTROL_NATURAL"];
-    process.env["XDG_CONFIG_HOME"] = emptyCfg;
-    try {
-      const { calls, invoke } = makeFakeInvoker();
-      const handle = createPageHelperHandler(invoke, undefined, async () => [], {
-        sleep: async () => {},
-        rng: () => 0.5,
-      });
-      const res = await handle("type", { focused: true, text: "hi", quiet: true });
-      expect(text(res)).toStartWith("type --focused: sent");
-      expect(cdpMethods(calls)).toEqual([
-        "Input.dispatchKeyEvent",
-        "Input.dispatchKeyEvent",
-        "Input.dispatchKeyEvent",
-        "Input.dispatchKeyEvent",
-      ]);
+    const { calls, invoke } = makeFakeInvoker();
+    const handle = createPageHelperHandler(invoke, undefined, async () => [], {
+      sleep: async () => {},
+      rng: () => 0.5,
+    });
+    const res = await handle("type", { focused: true, text: "hi", quiet: true, _natural: true });
+    expect(text(res)).toStartWith("type --focused: sent");
+    expect(cdpMethods(calls)).toEqual([
+      "Input.dispatchKeyEvent",
+      "Input.dispatchKeyEvent",
+      "Input.dispatchKeyEvent",
+      "Input.dispatchKeyEvent",
+    ]);
 
-      const fastMock = makeFakeInvoker();
-      const fastHandle = createPageHelperHandler(fastMock.invoke, undefined, async () => []);
-      const fastRes = await fastHandle("type", { focused: true, text: "hi", fast: true, quiet: true });
-      expect(text(fastRes)).toStartWith("type --focused: sent");
-      expect(cdpMethods(fastMock.calls)).toEqual(["Input.insertText"]);
-    } finally {
-      if (prevNatural === undefined) delete process.env["BROWSER_CONTROL_NATURAL"];
-      else process.env["BROWSER_CONTROL_NATURAL"] = prevNatural;
-      if (prevXdg === undefined) delete process.env["XDG_CONFIG_HOME"];
-      else process.env["XDG_CONFIG_HOME"] = prevXdg;
-    }
+    const fastMock = makeFakeInvoker();
+    const fastHandle = createPageHelperHandler(fastMock.invoke, undefined, async () => []);
+    const fastRes = await fastHandle("type", { focused: true, text: "hi", fast: true, quiet: true });
+    expect(text(fastRes)).toStartWith("type --focused: sent");
+    expect(cdpMethods(fastMock.calls)).toEqual(["Input.insertText"]);
   });
 
   test("browser-control-daemon rejects unknown --flags with INPUT_INVALID", async () => {

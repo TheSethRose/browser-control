@@ -15,8 +15,8 @@
 #                                     if needed. Never pass a port.
 #   default [browser]                 show or set the default browser
 #   natural [on|off|status]           show or set global natural browsing (default on; --fast opts out per call).
-#                                     Each call sends this shell's BROWSER_CONTROL_NATURAL and
-#                                     XDG_CONFIG_HOME file to the daemon, so status matches what runs
+#                                     Each call resolves it here (env, then file) and sends on/off, so status
+#                                     matches what runs
 #   ops | status | check-update [--force]
 #
 # Chrome extension (no remote-debugging prompt):
@@ -91,6 +91,23 @@ write_natural() {
   if mkdir -p "$d" && chmod 700 "$d" && [[ ! -d "$f" ]] && printf '%s\n' "$1" >"$t" && mv -f "$t" "$f"; then return 0; fi
   rm -f "$t" 2>/dev/null || true
   fail EXECUTION_FAILED "could not write $f"
+}
+# Resolve natural browsing like src/natural.ts: env, then the config file, then on. Sets nat_val and nat_src.
+natural_word() {
+  local v="$1" r=""
+  v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+  shopt -s nocasematch
+  case "$v" in 0 | false | off | no) r=off ;; 1 | true | on | yes) r=on ;; esac
+  shopt -u nocasematch
+  printf '%s' "$r"
+}
+resolve_natural() {
+  local f="${XDG_CONFIG_HOME:-$HOME/.config}/browser-control/natural" w
+  nat_val=on; nat_src=default
+  w="$(natural_word "${BROWSER_CONTROL_NATURAL:-}")"
+  if [[ -n "$w" ]]; then nat_val="$w"; nat_src=env; return; fi
+  [[ -f "$f" ]] && w="$(natural_word "$(cat "$f" 2>/dev/null)")"
+  if [[ -n "$w" ]]; then nat_val="$w"; nat_src=file; fi
 }
 
 # True when `$1` has the shape of a targetId: extension:<n>, extension:<slug>:<n>, browse:<n>,
@@ -185,9 +202,8 @@ req() {
   local rc=0 mt=""
   # A long-running call (handoff) sets max_time so curl gives up just after the server would.
   [[ -z "${max_time:-}" ]] || mt="--max-time $max_time"
-  local nat=(-H "x-bc-natural-file: ${XDG_CONFIG_HOME:-$HOME/.config}/browser-control/natural")
-  [[ -z "${BROWSER_CONTROL_NATURAL:-}" ]] || nat+=(-H "x-bc-natural: ${BROWSER_CONTROL_NATURAL//[$'\r\n']/}")
-  printf '%s' "${3:-}" | curl -sS --fail-with-body ${mt} "${nat[@]}" --unix-socket "$sock" -X "$1" \
+  resolve_natural
+  printf '%s' "${3:-}" | curl -sS --fail-with-body ${mt} -H "x-bc-natural: $nat_val" --unix-socket "$sock" -X "$1" \
     --data-binary @- "http://daemon/$2" 2>/dev/null || rc=$?
   case $rc in 0) ;; 22) return 1 ;; 7) return 7 ;; *) return 9 ;; esac
 }
@@ -635,12 +651,8 @@ case "$cmd" in
         printf '%s\n' '{"ok":true,"data":{"natural":'"$(json_str "$sub")"',"file":'"$(json_str "$file")"'}}'
         ;;
       "" | status)
-        env_raw="$(printf '%s' "${BROWSER_CONTROL_NATURAL:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
-        file_raw="$(tr -d '[:space:]' 2>/dev/null <"$file" | tr '[:upper:]' '[:lower:]' || true)"
-        val="on"; src="default"
-        case "$file_raw" in 0|false|off|no) val="off"; src="file" ;; 1|true|on|yes) val="on"; src="file" ;; esac
-        case "$env_raw" in 0|false|off|no) val="off"; src="env" ;; 1|true|on|yes) val="on"; src="env" ;; esac
-        printf '%s\n' '{"ok":true,"data":{"natural":'"$(json_str "$val")"',"source":'"$(json_str "$src")"',"file":'"$(json_str "$file")"'}}'
+        resolve_natural
+        printf '%s\n' '{"ok":true,"data":{"natural":'"$(json_str "$nat_val")"',"source":'"$(json_str "$nat_src")"',"file":'"$(json_str "$file")"'}}'
         ;;
       *) fail INPUT_INVALID "usage: browser-control-daemon natural [on|off|status]" ;;
     esac

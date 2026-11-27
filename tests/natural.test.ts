@@ -606,137 +606,146 @@ describe("page-runner natural motion integration", () => {
   test("off-screen target wheels from the resting pointer when already inside the viewport", async () => {
     await withNaturalOn(async () => {
       const mock = makeNaturalMock({ inView: false });
-      const handler = createPageHelperHandler(mock.invoke, undefined, undefined, {
-        sleep: async (ms) => { mock.sleeps.push(ms); },
-        rng: createSeededRng(123),
-        now: () => 0,
-      });
-
-      // Establish a resting pointer inside the viewport over the document scroller (x >= 200), far from
-      // scroller.point (640, 400); pageScrollPoint confirms it, so the wheel reuses it without moving.
+      const handler = mock.handler(123);
+      // A resting pointer over the document scroller (x >= 200) is reused by the wheel without moving.
       expect((await handler("hover", { xy: [240, 260], quiet: true })).ok).toBe(true);
       const beforeClick = mock.cdpCalls.length;
-
-      const res = await handler("click", { ref: "e1", quiet: true });
-      expect(res.ok).toBe(true);
-
-      const clickMouse = mock.cdpCalls
-        .slice(beforeClick)
-        .filter((c) => c.method === "Input.dispatchMouseEvent");
-      const firstWheelIdx = clickMouse.findIndex((c) => c.params["type"] === "mouseWheel");
-      expect(firstWheelIdx).toBe(0);
-      expect(clickMouse[0]!.params["x"]).toBe(240);
-      expect(clickMouse[0]!.params["y"]).toBe(260);
-      // Zero mouseMoved events between the last pointer position and the first mouseWheel.
-      expect(clickMouse.slice(0, firstWheelIdx).filter((c) => c.params["type"] === "mouseMoved")).toHaveLength(0);
-      // Still moves to the scrolled-into-view target and clicks it afterward.
-      expect(clickMouse.slice(firstWheelIdx).some((c) => c.params["type"] === "mouseMoved")).toBe(true);
-      expect(clickMouse.some((c) => c.params["type"] === "mousePressed")).toBe(true);
-      expect(clickMouse.some((c) => c.params["type"] === "mouseReleased")).toBe(true);
+      expect((await handler("click", { ref: "e1", quiet: true })).ok).toBe(true);
+      const types = mock.cdpCalls.slice(beforeClick).filter((c) => c.method === "Input.dispatchMouseEvent");
+      expect(types[0]!.params).toMatchObject({ type: "mouseWheel", x: 240, y: 260 });
+      const rest = types.slice(1).map((c) => c.params["type"]);
+      expect(rest).toContain("mouseMoved");
+      expect(rest.slice(-2)).toEqual(["mousePressed", "mouseReleased"]);
     });
   });
 
   test("natural hover, drag, key hold, dialog abort, and typing switch-off behave per spec", async () => {
     await withNaturalOn(async () => {
-      // Hover: multiple moves, zero presses.
+      const mouse = (m: ReturnType<typeof makeNaturalMock>) => m.cdpCalls.filter((c) => c.method === "Input.dispatchMouseEvent");
       const hov = makeNaturalMock({ inView: true });
-      const hHov = createPageHelperHandler(hov.invoke, undefined, undefined, {
-        sleep: async (ms) => { hov.sleeps.push(ms); },
-        rng: createSeededRng(88),
-        now: () => 0,
-      });
-      expect((await hHov("hover", { xy: [500, 300], quiet: true })).ok).toBe(true);
-      const hovEvents = hov.cdpCalls.filter((c) => c.method === "Input.dispatchMouseEvent");
-      expect(hovEvents.length).toBeGreaterThanOrEqual(4);
-      expect(hovEvents.every((e) => e.params["type"] === "mouseMoved")).toBe(true);
+      expect((await hov.handler(88)("hover", { xy: [500, 300], quiet: true })).ok).toBe(true);
+      expect(mouse(hov).length).toBeGreaterThanOrEqual(4);
+      expect(mouse(hov).every((e) => e.params["type"] === "mouseMoved")).toBe(true);
 
-      // Drag: path to source, press, curved drag moves with buttons: 1, release.
       const drg = makeNaturalMock({ inView: true, draggable: false });
-      const hDrg = createPageHelperHandler(drg.invoke, undefined, undefined, {
-        sleep: async (ms) => { drg.sleeps.push(ms); },
-        rng: createSeededRng(99),
-        now: () => 0,
-      });
-      expect((await hDrg("drag", { from: "e1", to: "e2", quiet: true })).ok).toBe(true);
-      const drgEvents = drg.cdpCalls.filter((c) => c.method === "Input.dispatchMouseEvent");
-      const pressIdx = drgEvents.findIndex((e) => e.params["type"] === "mousePressed");
-      const relIdx = drgEvents.findIndex((e) => e.params["type"] === "mouseReleased");
+      expect((await drg.handler(99)("drag", { from: "e1", to: "e2", quiet: true })).ok).toBe(true);
+      const types = mouse(drg).map((e) => `${e.params["type"]}:${e.params["buttons"] ?? ""}`);
+      const pressIdx = types.indexOf("mousePressed:1");
+      const relIdx = types.indexOf("mouseReleased:0");
       expect(pressIdx).toBeGreaterThanOrEqual(3);
       expect(relIdx - pressIdx).toBeGreaterThanOrEqual(4);
-      for (let i = pressIdx + 1; i < relIdx; i++) {
-        expect(drgEvents[i]!.params["type"]).toBe("mouseMoved");
-        expect(drgEvents[i]!.params["buttons"]).toBe(1);
-      }
+      expect(types.slice(pressIdx + 1, relIdx).every((t) => t === "mouseMoved:1")).toBe(true);
 
-      // Key: hold 35–85 ms.
       const ky = makeNaturalMock({ inView: true });
-      const hKey = createPageHelperHandler(ky.invoke, undefined, undefined, {
-        sleep: async (ms) => { ky.sleeps.push(ms); },
-        rng: createSeededRng(101),
-        now: () => 0,
-      });
-      expect((await hKey("key", { key: "Enter", quiet: true })).ok).toBe(true);
+      expect((await ky.handler(101)("key", { key: "Enter", quiet: true })).ok).toBe(true);
       expect(ky.sleeps).toHaveLength(1);
       expect(ky.sleeps[0]!).toBeGreaterThanOrEqual(35);
       expect(ky.sleeps[0]!).toBeLessThanOrEqual(85);
 
-      // Abort immediately on DIALOG_OPEN during trajectory.
       const dlg = makeNaturalMock({ inView: true, failAtMouseMoveIndex: 2, failMessage: "DIALOG_OPEN: alert" });
-      const hDlg = createPageHelperHandler(dlg.invoke, undefined, undefined, {
-        sleep: async (ms) => { dlg.sleeps.push(ms); },
-        rng: createSeededRng(77),
-        now: () => 0,
-      });
-      const dlgRes = await hDlg("click", { ref: "e1", quiet: true });
-      expect(dlgRes.ok).toBe(false);
-      const dlgEvents = dlg.cdpCalls.filter((c) => c.method === "Input.dispatchMouseEvent");
-      expect(dlgEvents).toHaveLength(2);
-      expect(dlgEvents.some((e) => e.params["type"] === "mousePressed")).toBe(false);
-    });
+      expect((await dlg.handler(77)("click", { ref: "e1", quiet: true })).ok).toBe(false);
+      expect(mouse(dlg).map((e) => e.params["type"])).toEqual(["mouseMoved", "mouseMoved"]);
 
-    // Global switch off also disables natural typing (uses Input.insertText instead of human keystrokes).
-    const offMock = makeNaturalMock({ inView: true });
-    const hOff = createPageHelperHandler(offMock.invoke, undefined, undefined, {
-      sleep: async (ms) => { offMock.sleeps.push(ms); },
-      rng: createSeededRng(55),
+      const off = makeNaturalMock({ inView: true });
+      expect((await off.handler(55)("type", { ref: "e1", text: "hello", quiet: true, _natural: false })).ok).toBe(true);
+      expect(off.cdpCalls.some((c) => c.method === "Input.insertText")).toBe(true);
+      expect(off.sleeps).toHaveLength(0);
     });
-    const prev = process.env["BROWSER_CONTROL_NATURAL"];
-    process.env["BROWSER_CONTROL_NATURAL"] = "off";
-    try {
-      const res = await hOff("type", { ref: "e1", text: "hello", quiet: true });
-      expect(res.ok).toBe(true);
-      expect(offMock.cdpCalls.some((c) => c.method === "Input.insertText")).toBe(true);
-      expect(offMock.sleeps).toHaveLength(0);
-    } finally {
-      if (prev === undefined) delete process.env["BROWSER_CONTROL_NATURAL"];
-      else process.env["BROWSER_CONTROL_NATURAL"] = prev;
-    }
   });
 
-  test("a dialog opened by mousedown or keydown queues the release until dialog accept", async () => {
+  const NOT_SENT = "DIALOG_OPEN: a JavaScript alert dialog is open on tab 5 (command not sent)";
+  /** `opener` opens a dialog after it is delivered; while open, input is refused before dispatch. */
+  function dialogWrap(opener: string, sent: Array<{ type: string; targetId?: string }>, s: { reopen?: number; gone?: boolean } = {}) {
+    let open = false;
+    return (next: Invoke): Invoke => async (op, inp = {}) => {
+      const method = String(inp["method"] ?? "");
+      const type = String((inp["params"] as Record<string, unknown> | undefined)?.["type"] ?? "");
+      if (op === "execute_cdp" && method === "Page.handleJavaScriptDialog") open = (s.reopen = (s.reopen ?? 0) - 1) >= 0;
+      else if (op === "execute_cdp" && method.startsWith("Input.dispatch")) {
+        if (open) return { ok: false, error: { code: "EXECUTION_FAILED", message: NOT_SENT } };
+        if (s.gone) return { ok: false, error: { code: "EXECUTION_FAILED", message: "NO_ACTIVE_TARGET: tab closed" } };
+        sent.push({ type, targetId: inp["targetId"] as string | undefined });
+        if (type === opener) {
+          open = true;
+          return { ok: false, error: { code: "EXECUTION_FAILED", message: "DIALOG_OPEN: a JavaScript alert dialog is open on tab 5" } };
+        }
+      }
+      return next(op, inp);
+    };
+  }
+  const releaseCount = (sent: Array<{ type: string }>, t: string) => sent.filter((e) => e.type === t).length;
+
+  test("N3: only a release refused before dispatch is replayed; one that opened the dialog is not resent", async () => {
     await withNaturalOn(async () => {
-      for (const [action, input, opener, release] of [
+      for (const [action, input, press, release] of [
         ["drag", { from: "e1", to: "e2", quiet: true }, "mousePressed", "mouseReleased"],
         ["key", { key: "Enter", quiet: true }, "keyDown", "keyUp"],
       ] as const) {
-        const m = makeNaturalMock({ inView: true });
-        let dialog = false;
-        const delivered: string[] = [];
-        const h = m.handler(5, (next) => async (op, inp = {}) => {
-          const method = String(inp["method"] ?? "");
-          const type = String((inp["params"] as Record<string, unknown> | undefined)?.["type"] ?? "");
-          if (op === "execute_cdp" && method === "Page.handleJavaScriptDialog") dialog = false;
-          else if (op === "execute_cdp" && method.startsWith("Input.dispatch") && (dialog || type === opener)) {
-            dialog = true;
-            return { ok: false, error: { code: "EXECUTION_FAILED", message: "DIALOG_OPEN: alert" } };
-          }
-          if (op === "execute_cdp") delivered.push(type);
-          return next(op, inp);
-        });
-        expect((await h(action, input)).ok).toBe(false);
-        expect(delivered).not.toContain(release);
-        expect((await h("dialog", { sub: "accept" })).ok).toBe(true);
-        expect(delivered.filter((t) => t === release)).toHaveLength(1);
+        for (const opener of [press, release]) {
+          const sent: Array<{ type: string }> = [];
+          const h = makeNaturalMock({ inView: true }).handler(5, dialogWrap(opener, sent));
+          expect((await h(action, input)).ok).toBe(false);
+          expect(releaseCount(sent, release)).toBe(opener === release ? 1 : 0);
+          expect((await h("dialog", { sub: "accept" })).ok).toBe(true);
+          expect(releaseCount(sent, release)).toBe(1);
+        }
+      }
+    });
+  });
+
+  test("N4: a release still blocked by the next dialog is kept, and a failed replay is reported", async () => {
+    await withNaturalOn(async () => {
+      const sent: Array<{ type: string }> = [];
+      const state = { reopen: 1, gone: false };
+      const h = makeNaturalMock({ inView: true }).handler(5, dialogWrap("keyDown", sent, state));
+      await h("key", { key: "Enter", quiet: true });
+      const first = await h("dialog", { sub: "dismiss" });
+      expect(first.ok && String((first.data as { value: unknown }).value)).toContain("1 release(s) still held");
+      expect(releaseCount(sent, "keyUp")).toBe(0);
+      state.gone = true;
+      const second = await h("dialog", { sub: "accept" });
+      expect(second.ok && String((second.data as { value: unknown }).value)).toContain("release keyUp failed: NO_ACTIVE_TARGET");
+    });
+  });
+
+  test("N2: short and browser-qualified ids share one queue; an implicit CDP release stays on its tab", async () => {
+    await withNaturalOn(async () => {
+      const sent: Array<{ type: string; targetId?: string }> = [];
+      const h = makeNaturalMock({ inView: true }).handler(5, dialogWrap("keyDown", sent));
+      await h("key", { key: "Enter", quiet: true }, "extension:5");
+      await h("dialog", { sub: "accept" }, "extension:chrome-abc123:5");
+      expect(sent.filter((e) => e.type === "keyUp").map((e) => e.targetId)).toEqual(["extension:5"]);
+
+      let active = "T1";
+      const keyUps: Array<string | undefined> = [];
+      const inv: Invoke = async (op, inp = {}) => {
+        if (op === "get_browser_status") return { ok: true, data: { connected: true, activeTargetId: active } };
+        if (op === "execute_cdp" && (inp["params"] as Record<string, unknown>)?.["type"] === "keyUp") keyUps.push(inp["targetId"] as string | undefined);
+        return { ok: true, data: { result: {} } };
+      };
+      const h2: ReturnType<typeof createPageHelperHandler> = createPageHelperHandler(inv, undefined, undefined, {
+        rng: createSeededRng(3),
+        sleep: async () => {
+          if (active === "T2") return;
+          active = "T2";
+          await h2("key", { key: "Tab", quiet: true, fast: true });
+        },
+      });
+      await h2("key", { key: "Enter", quiet: true });
+      expect(keyUps).toEqual(["T2", "T1"]);
+    });
+  });
+
+  test("N5: navigation and tab close drop held releases", async () => {
+    await withNaturalOn(async () => {
+      for (const drop of ["nav", "close"] as const) {
+        const sent: Array<{ type: string }> = [];
+        const h = makeNaturalMock({ inView: true }).handler(5, dialogWrap("keyDown", sent));
+        await h("key", { key: "Enter", quiet: true }, "extension:5");
+        if (drop === "nav") await h("nav", { url: "https://b.test/" }, "extension:5");
+        else h.forgetTab("extension:5");
+        await h("dialog", { sub: "accept" }, "extension:5");
+        expect(releaseCount(sent, "keyUp")).toBe(0);
       }
     });
   });
@@ -769,15 +778,15 @@ describe("page-runner natural motion integration", () => {
     });
   });
 
-  test("the caller's natural file and env sent by the wrapper override the daemon's", async () => {
+  test("N1: only a boolean _natural from the wrapper counts; a file path is never read", async () => {
     await withNaturalOn(async () => {
       const xdg = await mkdtemp(join(tmpdir(), "bc-nat-caller-"));
       tempDirs.push(xdg);
       await writeFile(join(xdg, "natural"), "off\n");
       const m = makeNaturalMock({ inView: true });
-      expect((await m.handler(8)("key", { key: "Enter", quiet: true, _natural: { file: join(xdg, "natural") } })).ok).toBe(true);
-      expect(m.sleeps).toHaveLength(0);
-      await m.handler(8)("key", { key: "Enter", quiet: true, _natural: { file: join(xdg, "natural"), env: "on" } });
+      await m.handler(8)("key", { key: "Enter", quiet: true, _natural: { file: join(xdg, "natural") } });
+      expect(m.sleeps).toHaveLength(1);
+      await m.handler(8)("key", { key: "Enter", quiet: true, _natural: false });
       expect(m.sleeps).toHaveLength(1);
     });
   });
@@ -1137,7 +1146,16 @@ describe("wrapper --fast forwarding and natural subcommand", () => {
     const before = seen.length;
     await bc(["key", "Enter"], { BROWSER_CONTROL_NATURAL: "off", XDG_CONFIG_HOME: fresh });
     const sent = seen.slice(before).find((r) => r.path !== "/status")!;
-    expect(sent).toMatchObject({ natFile: join(fresh, "browser-control", "natural"), natEnv: "off" });
+    expect(sent).toMatchObject({ natFile: null, natEnv: "off" });
+
+    // N6: one parser for status and the sent value; inner whitespace is not a valid setting.
+    for (const [envVal, want, src] of [["o ff", "on", "default"], ["  OFF \t", "off", "env"]] as const) {
+      const st = await bc(["natural", "status"], { BROWSER_CONTROL_NATURAL: envVal, XDG_CONFIG_HOME: fresh });
+      expect(JSON.parse(st.stdout).data).toMatchObject({ natural: want, source: src });
+      const n = seen.length;
+      await bc(["key", "Enter"], { BROWSER_CONTROL_NATURAL: envVal, XDG_CONFIG_HOME: fresh });
+      expect(seen.slice(n).find((r) => r.path !== "/status")!.natEnv).toBe(want);
+    }
 
     const bad = await bc(["natural", "maybe"], { BROWSER_CONTROL_NATURAL: undefined });
     expect(bad.code).toBe(1);
