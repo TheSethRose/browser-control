@@ -1,8 +1,8 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import type { InvokeResult } from "@agent-software/core";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
   createSeededRng,
   isNaturalEnabled,
@@ -584,6 +584,115 @@ describe("page-runner natural motion integration", () => {
       expect(stagnant.evalExprs.some((e) => e.includes('__bc.point("e1", {"detail":true})'))).toBe(true);
     });
   });
+
+  test("off-screen target wheels from the resting pointer when already inside the viewport", async () => {
+    await withNaturalOn(async () => {
+      const mock = makeNaturalMock({ inView: false });
+      const handler = createPageHelperHandler(mock.invoke, undefined, undefined, {
+        sleep: async (ms) => { mock.sleeps.push(ms); },
+        rng: createSeededRng(123),
+        now: () => 0,
+      });
+
+      // Establish a resting pointer inside the viewport far from scroller.point (640, 400).
+      expect((await handler("hover", { xy: [180, 260], quiet: true })).ok).toBe(true);
+      const beforeClick = mock.cdpCalls.length;
+
+      const res = await handler("click", { ref: "e1", quiet: true });
+      expect(res.ok).toBe(true);
+
+      const clickMouse = mock.cdpCalls
+        .slice(beforeClick)
+        .filter((c) => c.method === "Input.dispatchMouseEvent");
+      const firstWheelIdx = clickMouse.findIndex((c) => c.params["type"] === "mouseWheel");
+      expect(firstWheelIdx).toBe(0);
+      expect(clickMouse[0]!.params["x"]).toBe(180);
+      expect(clickMouse[0]!.params["y"]).toBe(260);
+      // Zero mouseMoved events between the last pointer position and the first mouseWheel.
+      expect(clickMouse.slice(0, firstWheelIdx).filter((c) => c.params["type"] === "mouseMoved")).toHaveLength(0);
+      // Still moves to the scrolled-into-view target and clicks it afterward.
+      expect(clickMouse.slice(firstWheelIdx).some((c) => c.params["type"] === "mouseMoved")).toBe(true);
+      expect(clickMouse.some((c) => c.params["type"] === "mousePressed")).toBe(true);
+      expect(clickMouse.some((c) => c.params["type"] === "mouseReleased")).toBe(true);
+    });
+  });
+
+  test("natural hover, drag, key hold, dialog abort, and typing switch-off behave per spec", async () => {
+    await withNaturalOn(async () => {
+      // Hover: multiple moves, zero presses.
+      const hov = makeNaturalMock({ inView: true });
+      const hHov = createPageHelperHandler(hov.invoke, undefined, undefined, {
+        sleep: async (ms) => { hov.sleeps.push(ms); },
+        rng: createSeededRng(88),
+        now: () => 0,
+      });
+      expect((await hHov("hover", { xy: [500, 300], quiet: true })).ok).toBe(true);
+      const hovEvents = hov.cdpCalls.filter((c) => c.method === "Input.dispatchMouseEvent");
+      expect(hovEvents.length).toBeGreaterThanOrEqual(4);
+      expect(hovEvents.every((e) => e.params["type"] === "mouseMoved")).toBe(true);
+
+      // Drag: path to source, press, curved drag moves with buttons: 1, release.
+      const drg = makeNaturalMock({ inView: true, draggable: false });
+      const hDrg = createPageHelperHandler(drg.invoke, undefined, undefined, {
+        sleep: async (ms) => { drg.sleeps.push(ms); },
+        rng: createSeededRng(99),
+        now: () => 0,
+      });
+      expect((await hDrg("drag", { from: "e1", to: "e2", quiet: true })).ok).toBe(true);
+      const drgEvents = drg.cdpCalls.filter((c) => c.method === "Input.dispatchMouseEvent");
+      const pressIdx = drgEvents.findIndex((e) => e.params["type"] === "mousePressed");
+      const relIdx = drgEvents.findIndex((e) => e.params["type"] === "mouseReleased");
+      expect(pressIdx).toBeGreaterThanOrEqual(3);
+      expect(relIdx - pressIdx).toBeGreaterThanOrEqual(4);
+      for (let i = pressIdx + 1; i < relIdx; i++) {
+        expect(drgEvents[i]!.params["type"]).toBe("mouseMoved");
+        expect(drgEvents[i]!.params["buttons"]).toBe(1);
+      }
+
+      // Key: hold 35–85 ms.
+      const ky = makeNaturalMock({ inView: true });
+      const hKey = createPageHelperHandler(ky.invoke, undefined, undefined, {
+        sleep: async (ms) => { ky.sleeps.push(ms); },
+        rng: createSeededRng(101),
+        now: () => 0,
+      });
+      expect((await hKey("key", { key: "Enter", quiet: true })).ok).toBe(true);
+      expect(ky.sleeps).toHaveLength(1);
+      expect(ky.sleeps[0]!).toBeGreaterThanOrEqual(35);
+      expect(ky.sleeps[0]!).toBeLessThanOrEqual(85);
+
+      // Abort immediately on DIALOG_OPEN during trajectory.
+      const dlg = makeNaturalMock({ inView: true, failAtMouseMoveIndex: 2, failMessage: "DIALOG_OPEN: alert" });
+      const hDlg = createPageHelperHandler(dlg.invoke, undefined, undefined, {
+        sleep: async (ms) => { dlg.sleeps.push(ms); },
+        rng: createSeededRng(77),
+        now: () => 0,
+      });
+      const dlgRes = await hDlg("click", { ref: "e1", quiet: true });
+      expect(dlgRes.ok).toBe(false);
+      const dlgEvents = dlg.cdpCalls.filter((c) => c.method === "Input.dispatchMouseEvent");
+      expect(dlgEvents).toHaveLength(2);
+      expect(dlgEvents.some((e) => e.params["type"] === "mousePressed")).toBe(false);
+    });
+
+    // Global switch off also disables natural typing (uses Input.insertText instead of human keystrokes).
+    const offMock = makeNaturalMock({ inView: true });
+    const hOff = createPageHelperHandler(offMock.invoke, undefined, undefined, {
+      sleep: async (ms) => { offMock.sleeps.push(ms); },
+      rng: createSeededRng(55),
+    });
+    const prev = process.env["BROWSER_CONTROL_NATURAL"];
+    process.env["BROWSER_CONTROL_NATURAL"] = "off";
+    try {
+      const res = await hOff("type", { ref: "e1", text: "hello", quiet: true });
+      expect(res.ok).toBe(true);
+      expect(offMock.cdpCalls.some((c) => c.method === "Input.insertText")).toBe(true);
+      expect(offMock.sleeps).toHaveLength(0);
+    } finally {
+      if (prev === undefined) delete process.env["BROWSER_CONTROL_NATURAL"];
+      else process.env["BROWSER_CONTROL_NATURAL"] = prev;
+    }
+  });
 });
 
 describe("page-helpers v10 — point detail/noScroll, hitCheck, pageScrollPoint", () => {
@@ -701,6 +810,94 @@ describe("page-helpers v10 — point detail/noScroll, hitCheck, pageScrollPoint"
   });
 });
 
+describe("wrapper --fast forwarding and natural subcommand", () => {
+  const WRAPPER = resolve(import.meta.dir, "../.agents/skills/browser-control/scripts/browser-control-daemon");
+  type Recorded = { method: string; path: string; query: string; body: string };
+  const seen: Recorded[] = [];
+  let dir = "";
+  let xdg = "";
+  let server: ReturnType<typeof Bun.serve>;
+
+  beforeAll(async () => {
+    dir = await mkdtemp(join(tmpdir(), "bc-nat-wrap-"));
+    xdg = await mkdtemp(join(tmpdir(), "bc-nat-xdg-"));
+    server = Bun.serve({
+      unix: join(dir, "sock"),
+      fetch(req) {
+        const url = new URL(req.url);
+        return (async () => {
+          const body = req.method === "GET" ? "" : await req.text();
+          seen.push({ method: req.method, path: url.pathname, query: url.search, body });
+          return Response.json({ ok: true, data: { value: "ok" } });
+        })();
+      },
+    });
+  });
+
+  afterAll(async () => {
+    server.stop(true);
+    await rm(dir, { recursive: true, force: true });
+    await rm(xdg, { recursive: true, force: true });
+  });
+
+  async function bc(args: string[], extraEnv: Record<string, string | undefined> = {}) {
+    const env: Record<string, string> = {};
+    for (const [k, v] of Object.entries({ ...process.env, BROWSER_CONTROL_DAEMON_DIR: dir, XDG_CONFIG_HOME: xdg, ...extraEnv })) {
+      if (v !== undefined) env[k] = v;
+    }
+    const proc = Bun.spawn(["bash", WRAPPER, ...args], { env, stdout: "pipe", stderr: "pipe" });
+    const stdout = await new Response(proc.stdout).text();
+    const stderr = await new Response(proc.stderr).text();
+    return { code: await proc.exited, stdout, stderr };
+  }
+
+  async function call(...args: string[]): Promise<Recorded> {
+    const before = seen.length;
+    const res = await bc(args);
+    expect(res.code).toBe(0);
+    const made = seen.slice(before).filter((r) => r.path !== "/status");
+    expect(made).toHaveLength(1);
+    return made[0]!;
+  }
+
+  test("forwards --fast on click, hover, drag, key, do, nav, text, script", async () => {
+    expect(JSON.parse((await call("click", "--fast", "e1")).body)).toEqual({ ref: "e1", fast: true });
+    expect(JSON.parse((await call("click", "--fast", "--xy", "10,20")).body)).toEqual({ xy: [10, 20], fast: true });
+    expect(JSON.parse((await call("hover", "--fast", "e1")).body)).toEqual({ ref: "e1", fast: true });
+    expect(JSON.parse((await call("hover", "--fast", "--xy", "10,20")).body)).toEqual({ xy: [10, 20], fast: true });
+    expect(JSON.parse((await call("drag", "--fast", "e1", "e2")).body)).toEqual({ from: "e1", to: "e2", fast: true });
+    expect(JSON.parse((await call("key", "--fast", "Enter")).body)).toEqual({ key: "Enter", fast: true });
+    expect(JSON.parse((await call("do", "--fast", '[{"key":"Tab"}]')).body)).toEqual({ steps: [{ key: "Tab" }], fast: true });
+    expect(new URLSearchParams((await call("nav", "--fast", "https://example.test/")).query).get("fast")).toBe("1");
+    expect(JSON.parse((await call("text", "--fast", "--scroll")).body)).toEqual({ all: false, scroll: true, fast: true });
+    expect(JSON.parse((await call("script", "--fast", "return 1")).body)).toEqual({ code: "return 1", fast: true });
+  });
+
+  test("natural [on|off|status] reads and writes XDG_CONFIG_HOME/browser-control/natural atomically", async () => {
+    const stDefault = await bc(["natural", "status"], { BROWSER_CONTROL_NATURAL: undefined });
+    expect(stDefault.code).toBe(0);
+    expect(JSON.parse(stDefault.stdout).data).toMatchObject({ natural: "on", source: "default" });
+
+    const off = await bc(["natural", "off"], { BROWSER_CONTROL_NATURAL: undefined });
+    expect(off.code).toBe(0);
+    expect(JSON.parse(off.stdout).data.natural).toBe("off");
+    expect((await readFile(join(xdg, "browser-control", "natural"), "utf8")).trim()).toBe("off");
+
+    const stFile = await bc(["natural"], { BROWSER_CONTROL_NATURAL: undefined });
+    expect(JSON.parse(stFile.stdout).data).toMatchObject({ natural: "off", source: "file" });
+
+    const stEnv = await bc(["natural", "status"], { BROWSER_CONTROL_NATURAL: "on" });
+    expect(JSON.parse(stEnv.stdout).data).toMatchObject({ natural: "on", source: "env" });
+
+    const on = await bc(["natural", "on"], { BROWSER_CONTROL_NATURAL: undefined });
+    expect(on.code).toBe(0);
+    expect((await readFile(join(xdg, "browser-control", "natural"), "utf8")).trim()).toBe("on");
+
+    const bad = await bc(["natural", "maybe"], { BROWSER_CONTROL_NATURAL: undefined });
+    expect(bad.code).toBe(1);
+    expect(bad.stdout).toContain("INPUT_INVALID");
+  });
+});
 describe("synthesizeStartPoint off-screen target", () => {
   test("keeps the start inside the viewport when the destination is off-screen", () => {
     const viewport = { width: 1280, height: 720 };

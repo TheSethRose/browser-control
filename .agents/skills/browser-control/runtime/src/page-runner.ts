@@ -51,6 +51,7 @@ import {
   isNaturalEnabled,
   pickClickPoint,
   planClickTiming,
+  planKeyHold,
   planPointerPath,
   planWheelScroll,
   type Box2D,
@@ -1365,8 +1366,8 @@ export function createPageHelperHandler(
           input: {
             ref: arg[0],
             text: arg[1],
-            fast: arg[2] === "fast",
-            keys: arg[2] === "keys" || arg[2] === true,
+            ...(arg[2] === "fast" ? { fast: true } : {}),
+            ...(arg[2] === "keys" || arg[2] === true ? { keys: true } : {}),
           },
           label: `type ${js(arg[0])}`,
         });
@@ -1462,42 +1463,107 @@ export function createPageHelperHandler(
       sx: number; sy: number; dx: number; dy: number; draggable: boolean; listMeta: Json | null;
     };
 
+    const natural = isNatural(input);
     let html5Dropped = false;
     let dragIntercepted: { data?: Json } | undefined;
     let mouseDown = false;
+    let dragErr: InvokeResult | undefined;
     if (info.draggable) {
       await cdp("Input.setInterceptDrags", { enabled: true }, targetId, 4_000);
     }
     try {
-      await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: info.sx, y: info.sy }, targetId, INPUT_TIMEOUT_MS);
-      await cdp("Input.dispatchMouseEvent", { type: "mousePressed", x: info.sx, y: info.sy, button: "left", buttons: 1, clickCount: 1 }, targetId, INPUT_TIMEOUT_MS);
-      mouseDown = true;
-      const mx = Math.round((info.sx + info.dx) / 2);
-      const my = Math.round((info.sy + info.dy) / 2);
-      if (info.draggable) {
-        const waitDrag = invoke("wait_for_event", { method: "Input.dragIntercepted", timeoutMs: 1200, ...(targetId ? { targetId } : {}) });
-        await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: mx, y: my, button: "left", buttons: 1 }, targetId, INPUT_TIMEOUT_MS);
-        const ev = await waitDrag;
-        if (ev.ok && (ev.data as Json)["found"] === true) {
-          dragIntercepted = (((ev.data as Json)["event"] as Json)?.["params"] as { data?: Json }) ?? {};
-          const dragData = dragIntercepted.data ?? { items: [], dragOperationsMask: 1 };
-          await cdp("Input.dispatchDragEvent", { type: "dragEnter", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
-          await cdp("Input.dispatchDragEvent", { type: "dragOver", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
-          const dropRes = await cdp("Input.dispatchDragEvent", { type: "drop", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
-          html5Dropped = dropRes.ok;
+      if (!natural) {
+        const m0 = await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: info.sx, y: info.sy }, targetId, INPUT_TIMEOUT_MS);
+        if (!m0.ok) { dragErr = m0; return inputFailed(m0, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
+        const mp = await cdp("Input.dispatchMouseEvent", { type: "mousePressed", x: info.sx, y: info.sy, button: "left", buttons: 1, clickCount: 1 }, targetId, INPUT_TIMEOUT_MS);
+        if (!mp.ok) { dragErr = mp; return inputFailed(mp, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
+        mouseDown = true;
+        const mx = Math.round((info.sx + info.dx) / 2);
+        const my = Math.round((info.sy + info.dy) / 2);
+        if (info.draggable) {
+          const waitDrag = invoke("wait_for_event", { method: "Input.dragIntercepted", timeoutMs: 1200, ...(targetId ? { targetId } : {}) });
+          await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: mx, y: my, button: "left", buttons: 1 }, targetId, INPUT_TIMEOUT_MS);
+          const ev = await waitDrag;
+          if (ev.ok && (ev.data as Json)["found"] === true) {
+            dragIntercepted = (((ev.data as Json)["event"] as Json)?.["params"] as { data?: Json }) ?? {};
+            const dragData = dragIntercepted.data ?? { items: [], dragOperationsMask: 1 };
+            await cdp("Input.dispatchDragEvent", { type: "dragEnter", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
+            await cdp("Input.dispatchDragEvent", { type: "dragOver", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
+            const dropRes = await cdp("Input.dispatchDragEvent", { type: "drop", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
+            html5Dropped = dropRes.ok;
+          } else {
+            await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: info.dx, y: info.dy, button: "left", buttons: 1 }, targetId, INPUT_TIMEOUT_MS);
+          }
         } else {
+          await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: mx, y: my, button: "left", buttons: 1 }, targetId, INPUT_TIMEOUT_MS);
           await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: info.dx, y: info.dy, button: "left", buttons: 1 }, targetId, INPUT_TIMEOUT_MS);
         }
       } else {
-        await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: mx, y: my, button: "left", buttons: 1 }, targetId, INPUT_TIMEOUT_MS);
-        await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: info.dx, y: info.dy, button: "left", buttons: 1 }, targetId, INPUT_TIMEOUT_MS);
+        const toSrc = await movePointer({ x: info.sx, y: info.sy }, targetId);
+        if (!toSrc.ok) { dragErr = toSrc; return inputFailed(toSrc, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
+        await pause(planClickTiming(1, rng).dwellMs);
+        const mp = await cdp("Input.dispatchMouseEvent", { type: "mousePressed", x: info.sx, y: info.sy, button: "left", buttons: 1, clickCount: 1 }, targetId, INPUT_TIMEOUT_MS);
+        if (!mp.ok) { dragErr = mp; return inputFailed(mp, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
+        mouseDown = true;
+        await pause(Math.round(60 + rng() * 50));
+
+        const state = motionOf(targetId);
+        const dragPlan = planPointerPath({
+          from: { x: info.sx, y: info.sy },
+          to: { x: info.dx, y: info.dy },
+          viewport: state.viewport ?? DEFAULT_VIEWPORT,
+          maxSteps: 20,
+          overshootProb: 0,
+          rng,
+        });
+        const dispatchSteps = async (stepsSlice: typeof dragPlan.steps): Promise<InvokeResult> => {
+          const pace = createPacer();
+          for (const step of stepsSlice) {
+            await pace(step.delayMs);
+            const res = await cdp(
+              "Input.dispatchMouseEvent",
+              { type: "mouseMoved", x: step.x, y: step.y, button: "left", buttons: 1 },
+              targetId,
+              INPUT_TIMEOUT_MS,
+            );
+            if (!res.ok) return res;
+            state.pointer = { x: step.x, y: step.y };
+          }
+          return success("ok");
+        };
+
+        if (info.draggable) {
+          const waitDrag = invoke("wait_for_event", { method: "Input.dragIntercepted", timeoutMs: 1200, ...(targetId ? { targetId } : {}) });
+          let splitIdx = dragPlan.steps.findIndex((s) => Math.hypot(s.x - info.sx, s.y - info.sy) >= 10);
+          if (splitIdx < 0) splitIdx = Math.max(0, Math.floor(dragPlan.steps.length / 2) - 1);
+          const nudge = await dispatchSteps(dragPlan.steps.slice(0, splitIdx + 1));
+          if (!nudge.ok) { dragErr = nudge; return inputFailed(nudge, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
+          const ev = await waitDrag;
+          if (ev.ok && (ev.data as Json)["found"] === true) {
+            dragIntercepted = (((ev.data as Json)["event"] as Json)?.["params"] as { data?: Json }) ?? {};
+            const dragData = dragIntercepted.data ?? { items: [], dragOperationsMask: 1 };
+            await cdp("Input.dispatchDragEvent", { type: "dragEnter", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
+            await cdp("Input.dispatchDragEvent", { type: "dragOver", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
+            const dropRes = await cdp("Input.dispatchDragEvent", { type: "drop", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
+            html5Dropped = dropRes.ok;
+            state.pointer = { x: info.dx, y: info.dy };
+          } else {
+            const rest = await dispatchSteps(dragPlan.steps.slice(splitIdx + 1));
+            if (!rest.ok) { dragErr = rest; return inputFailed(rest, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
+          }
+        } else {
+          const moved = await dispatchSteps(dragPlan.steps);
+          if (!moved.ok) { dragErr = moved; return inputFailed(moved, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
+        }
+        await pause(Math.round(40 + rng() * 50));
       }
     } finally {
       if (info.draggable && dragIntercepted && !html5Dropped) {
         await cdp("Input.dispatchDragEvent", { type: "dragCancel", x: info.dx, y: info.dy, data: dragIntercepted.data ?? { items: [], dragOperationsMask: 1 } }, targetId, 2_000).catch(() => {});
       }
       if (mouseDown) {
-        await cdp("Input.dispatchMouseEvent", { type: "mouseReleased", x: info.dx, y: info.dy, button: "left", buttons: 0, clickCount: 1 }, targetId, 2_000).catch(() => {});
+        const rel = await cdp("Input.dispatchMouseEvent", { type: "mouseReleased", x: info.dx, y: info.dy, button: "left", buttons: 0, clickCount: 1 }, targetId, 2_000).catch(() => undefined);
+        if (rel?.ok && !dragErr) motionOf(targetId).pointer = { x: info.dx, y: info.dy };
       }
       if (info.draggable) {
         await cdp("Input.setInterceptDrags", { enabled: false }, targetId, 2_000).catch(() => {});
@@ -1573,8 +1639,9 @@ export function createPageHelperHandler(
           return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: text is required");
         }
         const text = input["text"];
+        const natural = isNatural(input);
         const mode: "human" | "fast" | "keys" =
-          input["fast"] === true ? "fast" : input["keys"] === true ? "keys" : "human";
+          input["fast"] === true ? "fast" : input["keys"] === true ? "keys" : natural ? "human" : "fast";
         if (browseTab !== undefined) {
           if (input["focused"] === true) {
             return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: type --focused needs a DevTools tab");
@@ -1626,14 +1693,14 @@ export function createPageHelperHandler(
             const before = quiet ? undefined : await evalHelper({ kind: "bc", method: "baseline" }, targetId);
             let editorRef = cInfo.editorRef;
             if (!editorRef) {
-              const pt = await pointOf(loc, targetId, false);
+              const pt = await pointOf(loc, targetId, false, natural);
               if (!pt.ok) return pt.res;
-              await clickAt(pt.pt, targetId, 2);
+              await clickAt(pt.pt, targetId, 2, natural, loc.kind === "dom" ? loc.ref : undefined);
               await sleep(150);
               const ed = await evalHelper({ kind: "bc", method: "cellEditor" }, fieldTarget);
               editorRef = ed.ok && /^e\d+$/.test(valueOf(ed)) ? valueOf(ed) : null;
               if (!editorRef) {
-                await pressKey("Enter", targetId);
+                await pressKey("Enter", targetId, natural ? planKeyHold(rng) : 0);
                 await sleep(150);
                 const ed2 = await evalHelper({ kind: "bc", method: "cellEditor" }, fieldTarget);
                 editorRef = ed2.ok && /^e\d+$/.test(valueOf(ed2)) ? valueOf(ed2) : null;
@@ -1644,7 +1711,7 @@ export function createPageHelperHandler(
             }
             const sent = await dispatchText(text, mode, targetId);
             if (!sent.ok) return inputFailed(sent, `type ${name}`);
-            await pressKey("Enter", targetId);
+            await pressKey("Enter", targetId, natural ? planKeyHold(rng) : 0);
             await sleep(150);
             const afterRes = await evalHelper({ kind: "bc", method: "cellRead", args: [loc.ref, cInfo.before] }, fieldTarget);
             if (afterRes.ok) {
@@ -1663,9 +1730,9 @@ export function createPageHelperHandler(
           }
         }
 
-        const at = await pointOf(loc, targetId, !quiet);
+        const at = await pointOf(loc, targetId, !quiet, natural);
         if (!at.ok) return at.res;
-        const clicked = await clickAt(at.pt, targetId);
+        const clicked = await clickAt(at.pt, targetId, 1, natural, loc.kind === "dom" ? loc.ref : undefined);
         if (!clicked.ok) return inputFailed(clicked, `type ${name}`);
         let activeRef = loc.kind === "ax" ? "" : loc.ref;
         let retargetNote = "";
@@ -1825,7 +1892,8 @@ export function createPageHelperHandler(
         const isPic = !quiet && (await picture.isPicture(targetId));
         const beforeHash = isPic ? await picture.canvasHash(targetId) : "";
         const before = quiet || isPic ? undefined : await evalHelper({ kind: "bc", method: "baseline" }, targetId);
-        const res = await pressKey(keyName, targetId);
+        const natural = isNatural(input);
+        const res = await pressKey(keyName, targetId, natural ? planKeyHold(rng) : 0);
         if (!res.ok) return inputFailed(res, `key ${keyName}`);
         if (isPic) return success(`key ${keyName}: sent\n${await picture.pictureChanges(targetId, beforeHash)}`);
         return withChanges(`key ${keyName}: sent`, before?.ok ? valueOf(before) : undefined, quiet, targetId);
@@ -1968,6 +2036,7 @@ export function createPageHelperHandler(
     browseTab: number | undefined,
   ): Promise<InvokeResult> {
     if (browseTab !== undefined) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: hover needs a DevTools tab");
+    const natural = isNatural(input);
     if (Array.isArray(input["xy"])) {
       const [x, y] = (input["xy"] as unknown[]).map(Number);
       if (!Number.isFinite(x) || !Number.isFinite(y)) {
@@ -1979,19 +2048,26 @@ export function createPageHelperHandler(
       );
       if (!hit.ok) return hit;
       const [before, what] = valueOf(hit).split("\n");
-      const moved = await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: x!, y: y! }, targetId, INPUT_TIMEOUT_MS);
+      const moved = natural
+        ? await movePointer({ x: x!, y: y! }, targetId)
+        : await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: x!, y: y! }, targetId, INPUT_TIMEOUT_MS);
       if (!moved.ok) return inputFailed(moved, `hover ${x},${y}`);
       return withChanges(`hover ${x},${y}: delivered. ${what ?? ""}`.trimEnd(), before, quiet, targetId);
     }
     const found = await locate(input["ref"], "click", targetId);
     if (!found.ok) return found.res;
-    const at = await pointOf(found.loc, targetId, !quiet);
+    const at = await pointOf(found.loc, targetId, !quiet, natural);
     if (!at.ok) return at.res;
     if (at.pt.hidden) {
       const foc = await cdp("Emulation.setFocusEmulationEnabled", { enabled: true }, targetId);
       if (!foc.ok) return foc;
     }
-    const moved = await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: at.pt.x, y: at.pt.y }, targetId, INPUT_TIMEOUT_MS);
+    const moved = natural
+      ? await movePointer({ x: at.pt.x, y: at.pt.y }, targetId, {
+          viewport: at.pt.viewport,
+          targetSize: at.pt.box ? Math.min(at.pt.box.width, at.pt.box.height) : undefined,
+        })
+      : await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: at.pt.x, y: at.pt.y }, targetId, INPUT_TIMEOUT_MS);
     if (!moved.ok) return inputFailed(moved, `hover ${nameOf(found.loc)}`);
     return withChanges(`hover ${nameOf(found.loc)} at ${at.pt.x},${at.pt.y}: delivered`, at.pt.before, quiet, targetId);
   }
@@ -2689,7 +2765,12 @@ export function createPageHelperHandler(
         let challengeReport: string | undefined;
         const challengeBackend = challengeBackendOf(targetId);
         for (const [i, step] of steps.entries()) {
-          const res = await act(step.action, { ...step.input, quiet: true }, targetId, true, browseTab, true);
+          const stepInput: Json = {
+            ...(input["fast"] === true ? { fast: true } : {}),
+            ...step.input,
+            quiet: true,
+          };
+          const res = await act(step.action, stepInput, targetId, true, browseTab, true);
           if (!res.ok) {
             out.push(`${i + 1}. ${step.label}: FAILED ${messageOf(res)}`);
             stopped = `step ${i + 1} failed`;

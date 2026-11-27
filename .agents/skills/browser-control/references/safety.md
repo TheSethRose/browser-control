@@ -5,7 +5,7 @@ This skill drives the user's real, signed-in browser. Actions land on their real
 ## Inspect and pace
 
 - **Inspect passively first.** Read the current DOM, take a screenshot, or check already-loaded data before navigating, reloading, or paginating.
-- **Go slowly.** Avoid tight scroll loops, bursts of reloads, repeated clicks, and replaying captured authenticated requests. For pagination or infinite scroll, advance one page at a time, wait at least 2 seconds, and stop after two pages add nothing new. Report the partial count and ask before continuing.
+- **Go slowly.** Avoid tight scroll loops, bursts of reloads, repeated clicks, and replaying captured authenticated requests. For pagination or infinite scroll, advance one page at a time, wait at least 2 seconds, and stop after two pages add nothing new. Report the partial count and ask before continuing. Natural browsing is on by default (`--fast` or `natural off` opts out), but it only makes input look human — it never solves CAPTCHAs or challenges, does no fingerprint spoofing beyond `emulate`, and `WALL:`, `CHALLENGE:`, and `BLOCKED:` still stop and hand off.
 
 ## Stop on warning signs and hand off
 
