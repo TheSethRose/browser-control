@@ -1,16 +1,12 @@
 /**
  * Human-like keyboard typing planner and CDP key metadata.
  *
- * The planner is pure: it takes the text plus an injected `rng` (a seeded Mulberry32 in tests)
- * and returns an ordered list of key events with millisecond delays, so tests are deterministic
- * and replaying the plan through a text editor reproduces the requested text exactly.
+ * Pure: takes the text plus an injected `rng` and returns key events with millisecond delays, so
+ * tests are deterministic and replaying a plan through a text editor reproduces the text exactly.
  *
  * Timing model: log-normal within-word gaps, wider word boundaries, occasional thinking pauses,
- * 20-40% key rollover on fast pairs, real Shift keyDown/keyUp around capitals and shifted
- * symbols, and self-corrected typos (adjacent key, transposition, doubled, dropped).
- *
- * The speed factor is per daemon session: `page-runner.ts` draws it once (0.85-1.15) from its
- * seeded rng on the first natural `type` of the session and passes it here.
+ * 20-40% key rollover on fast pairs, real Shift around capitals and shifted symbols, and
+ * self-corrected typos (adjacent key, transposition, doubled, dropped).
  */
 
 export interface CharKeySpec {
@@ -47,7 +43,6 @@ export interface TypingPlan {
   typoKinds: TypoKind[];
   chars: number;
   durationMs: number;
-  fieldKind: FieldKind;
 }
 
 const SHIFT = 8;
@@ -271,7 +266,7 @@ function planUnits(
     if (kind === "drop" && notice === 0) notice = Math.min(1, room);
     typos++;
     typoKinds.push(kind);
-    if (kind === "adjacent" && QWERTY_NEIGHBORS[ch.toLowerCase()]) {
+    if (kind === "adjacent") {
       const neighbors = QWERTY_NEIGHBORS[ch.toLowerCase()]!;
       let wrong = neighbors[Math.floor(rng() * neighbors.length)]!;
       if (ch !== ch.toLowerCase()) wrong = wrong.toUpperCase();
@@ -309,7 +304,6 @@ function planUnits(
 function gapBetween(cur: Unit, next: Unit, rng: () => number): number {
   if (cur.back) return 50 + rng() * 60; // fast repeated Backspace, 50-110 ms
   if (next.back) return 60 + rng() * 80; // notice the typo, then correct it
-  if (next.ch === "") return 60 + rng() * 80;
   if (cur.ch === " ") {
     let gap = clamp(logNormal(rng, WORD_MEDIAN, WORD_SIGMA), WORD_MIN, WORD_MAX);
     if (rng() < WORD_PAUSE_CHANCE) gap += WORD_PAUSE_MIN + rng() * (WORD_PAUSE_MAX - WORD_PAUSE_MIN);
@@ -340,7 +334,7 @@ export function planTyping(text: string, opts: HumanTypingOptions = {}): TypingP
     opts.typoRate ??
     (fieldKind === "prose" ? PROSE_TYPO_RATE : fieldKind === "structured" ? STRUCTURED_TYPO_RATE : 0);
   const maxTypos = opts.maxTypos ?? Math.max(1, Math.round(chars.length * 0.05));
-  if (chars.length === 0) return { events: [], typos: 0, typoKinds: [], chars: 0, durationMs: 0, fieldKind };
+  if (chars.length === 0) return { events: [], typos: 0, typoKinds: [], chars: 0, durationMs: 0 };
 
   const { units, typos, typoKinds } = planUnits(chars, rng, typoRate, maxTypos);
 
@@ -432,11 +426,5 @@ export function planTyping(text: string, opts: HumanTypingOptions = {}): TypingP
     typoKinds,
     chars: chars.length,
     durationMs: Math.round((out.at(-1)?.at ?? 0) / speed),
-    fieldKind,
   };
-}
-
-/** The event list alone, for dispatch. */
-export function buildHumanKeystrokes(text: string, opts: HumanTypingOptions = {}): HumanKeystroke[] {
-  return planTyping(text, opts).events;
 }
