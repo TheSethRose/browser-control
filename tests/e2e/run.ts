@@ -18,13 +18,11 @@ function findChrome(): string | undefined {
     join(homedir(), ".cache/puppeteer/chrome"),
     join(homedir(), ".cache/browser-control/cft/chrome"),
     join(homedir(), ".cache/ms-playwright"),
-    "/private/tmp/claude-501",
   ];
   const patterns = [
     `*/chrome-mac-arm64/${CFT_BINARY}`,
     `*/chrome-mac-x64/${CFT_BINARY}`,
     `*/chrome-mac/${CFT_BINARY}`,
-    `*/*/scratchpad/p0/cft/chrome/*/chrome-mac-arm64/${CFT_BINARY}`,
   ];
   for (const root of roots) {
     if (!existsSync(root)) continue;
@@ -181,6 +179,32 @@ async function main(): Promise<number> {
     record(name, expect.test(out), out);
   };
 
+  let cleaned: Promise<void> | undefined;
+  const cleanup = () =>
+    (cleaned ??= (async () => {
+      cdp?.close();
+      browser?.kill();
+      const exited = browser ? await Promise.race([browser.exited.then(() => true), sleep(5000).then(() => false)]) : true;
+      if (!exited) browser?.kill("SIGKILL");
+      // The wrapper starts a daemon on this run's private socket dir; stop only that one.
+      const pg = spawn(["pgrep", "-f", daemonDir], { stdout: "pipe" });
+      const pids = (await new Response(pg.stdout).text()).split(/\s+/).filter(Boolean);
+      for (const pid of pids) {
+        try {
+          process.kill(Number(pid), "SIGTERM");
+        } catch {}
+      }
+      for (const s of servers) s.stop(true);
+      await sleep(300);
+      rmSync(tmp, { recursive: true, force: true });
+      const pass = results.filter((r) => r.ok).length;
+      const fail = results.length - pass;
+      console.log(`SUMMARY ${pass} pass, ${fail} fail`);
+    })());
+  for (const [sig, code] of [["SIGINT", 130], ["SIGTERM", 143]] as const) {
+    process.on(sig, () => void cleanup().finally(() => process.exit(code)));
+  }
+
   try {
     // Fixture servers: two origins (different ports and hostnames) so the iframes are cross-origin.
     const read = (f: string) => readFileSync(join(FIXTURES, f), "utf8");
@@ -202,8 +226,7 @@ async function main(): Promise<number> {
     const base = `http://127.0.0.1:${pageServer.port}`;
 
     // Unpacked extension copy, paired with this run's private config dir.
-    cpSync(join(REPO, "extension"), ext, { recursive: true });
-    rmSync(join(ext, "pairing.json"), { force: true });
+    cpSync(join(REPO, "extension"), ext, { recursive: true, filter: (p) => !p.endsWith("pairing.json") });
     const setup = spawn(["bun", "./cli.ts", "extension-setup", ext], { cwd: REPO, env, stdout: "ignore", stderr: "pipe" });
     if ((await setup.exited) !== 0) {
       record("setup", false, `extension-setup failed: ${(await new Response(setup.stderr).text()).slice(0, 200)}`);
@@ -246,7 +269,7 @@ async function main(): Promise<number> {
     record("connect", /extension:/.test(tabs), tabs);
     if (!/extension:/.test(tabs)) return 1;
 
-    await check("nav", ["nav", `${base}/`], /E2E Fixture|loaded|ok/);
+    await check("nav", ["nav", `${base}/`], /E2E Fixture/);
     await checkEval("nav-title", "document.title", /E2E Fixture/);
 
     // Shadow DOM.
@@ -264,7 +287,7 @@ async function main(): Promise<number> {
     record("frame-a-not-b", !/bravo/.test(aOut), aOut);
 
     // File input.
-    await check("upload", ["upload", "Upload file", uploadFile], /e2e-upload\.txt|upload/);
+    await check("upload", ["upload", "Upload file", uploadFile], /e2e-upload\.txt/);
     await checkEval("upload-check", "document.getElementById('log').textContent", /file e2e-upload\.txt/);
 
     // Hash link.
@@ -318,23 +341,7 @@ async function main(): Promise<number> {
     record("runner", false, String(error instanceof Error ? error.stack : error));
     return 1;
   } finally {
-    cdp?.close();
-    browser?.kill();
-    await browser?.exited;
-    // The wrapper starts a daemon on this run's private socket dir; stop only that one.
-    const pg = spawn(["pgrep", "-f", daemonDir], { stdout: "pipe" });
-    const pids = (await new Response(pg.stdout).text()).split(/\s+/).filter(Boolean);
-    for (const pid of pids) {
-      try {
-        process.kill(Number(pid), "SIGTERM");
-      } catch {}
-    }
-    for (const s of servers) s.stop(true);
-    await sleep(300);
-    rmSync(tmp, { recursive: true, force: true });
-    const pass = results.filter((r) => r.ok).length;
-    const fail = results.length - pass;
-    console.log(`SUMMARY ${pass} pass, ${fail} fail`);
+    await cleanup();
   }
 }
 
