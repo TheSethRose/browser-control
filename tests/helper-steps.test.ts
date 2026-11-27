@@ -340,16 +340,17 @@ const GOLDEN_CALL_SITES: ReadonlyArray<{ name: string; call: HelperCall; golden:
     golden: "__bc.marks(false)",
   },
   {
-    name: "nav: settle + [location.href, __bc.wall() || \"\"].join(\"\\n\")",
+    name: "nav: settle + [location.href, __bc.chars() || \"\", __bc.wall() || \"\"].join(\"\\n\")",
     call: {
       steps: [
         { kind: "bc", method: "settle", discard: true },
         { kind: "href" },
+        { kind: "bc", method: "chars", fallback: "" },
         { kind: "bc", method: "wall", fallback: "" },
       ],
       join: "\n",
     },
-    golden: '(await __bc.settle(), [location.href, __bc.wall() || ""].join("\\n"))',
+    golden: '(await __bc.settle(), [location.href, __bc.chars() || "", __bc.wall() || ""].join("\\n"))',
   },
   {
     name: "verdict: verdict",
@@ -509,6 +510,7 @@ describe("page-runner emits byte-identical CDP evaluate and Runtime.evaluate exp
           if (expr.includes("__bc.focusForType")) return { ok: true, data: { value: "focused" } };
           if (expr.includes("__bc.value")) return { ok: true, data: { value: "hello" } };
           if (expr.includes("__bc.select")) return { ok: true, data: { value: "__not_native__" } };
+          if (expr.includes("location.href, __bc.chars()")) return { ok: true, data: { value: "https://a.test/\n0\n" } };
           if (expr.includes("location.href, __bc.wall()")) return { ok: true, data: { value: "https://a.test/\n" } };
           if (expr.includes("__bc.surface")) return { ok: true, data: { value: "dom" } };
           if (expr.includes("__bc.snapshot")) return { ok: true, data: { value: '# T | https://a.test/\n- button "Ok" [e1]' } };
@@ -582,6 +584,7 @@ describe("page-runner emits byte-identical CDP evaluate and Runtime.evaluate exp
       expect(evalExprs).toContain(probeOf('__bc.dragInfo("e2", "e5", "before")'));
       expect(evalExprs).toContain(probeOf('__bc.listPosition({"i":1})'));
       expect(evalExprs).toContain(probeOf('__bc.checkWait({"text":"Saved"})'));
+      // Natural pacing is off in tests, so nav skips the body-length read and keeps the wall probe.
       expect(evalExprs).toContain(probeOf('(await __bc.settle(), [location.href, __bc.wall() || ""].join("\\n"))'));
       expect(evalExprs).toContain(probeOf("__bc.form({})"));
       expect(evalExprs).toContain(probeOf('__bc.query({"selector":"a"})'));

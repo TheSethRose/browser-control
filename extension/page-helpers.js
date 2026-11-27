@@ -1,5 +1,5 @@
 (() => {
-  const VERSION = 11;
+  const VERSION = 12;
   if (globalThis.__bc && globalThis.__bc.v === VERSION) return;
 
   const INTERACTIVE = [
@@ -1745,6 +1745,9 @@
     const deadline = performance.now() + timeoutMs;
     let stagnant = 0;
     let reason = 'scrolled to the end of the list';
+    // Provided by the daemon when natural browsing is on: per-step height factor and pause.
+    const scrollPace = opts.scrollPace && typeof opts.scrollPace === 'object' ? opts.scrollPace : null;
+    let scrollIdx = 0;
 
     try {
       scroller.scrollTop = 0;
@@ -1763,9 +1766,17 @@
         if (seen.size >= limit) { reason = `reached limit of ${limit} rows`; break; }
         if (performance.now() >= deadline) { reason = `timed out after ${timeoutMs}ms`; break; }
         const prevTop = scroller.scrollTop;
-        const step = Math.max(200, Math.round((scroller === document.scrollingElement ? innerHeight : scroller.clientHeight) * 0.9));
+        const height = scroller === document.scrollingElement ? innerHeight : scroller.clientHeight;
+        // Plans are short; cycle them so a long read keeps its paced step and pause past the last entry.
+        const fLen = scrollPace && Array.isArray(scrollPace.factors) ? scrollPace.factors.length : 0;
+        const pLen = scrollPace && Array.isArray(scrollPace.pauses) ? scrollPace.pauses.length : 0;
+        const factor = fLen ? scrollPace.factors[scrollIdx % fLen] : null;
+        const pauseMs = pLen ? scrollPace.pauses[scrollIdx % pLen] : null;
+        scrollIdx++;
+        // Paced steps keep their jittered size in any scroller; the 200 px floor is for the fast path only.
+        const step = Number.isFinite(factor) ? Math.round(height * factor) : Math.max(200, Math.round(height * 0.9));
         scroller.scrollTop = prevTop + step;
-        await new Promise((r) => setTimeout(r, 120));
+        await new Promise((r) => setTimeout(r, Number.isFinite(pauseMs) ? pauseMs : 120));
         if (scroller.scrollTop === prevTop && seen.size === beforeCount) {
           stagnant++;
           if (stagnant >= 2) break;
@@ -1800,6 +1811,9 @@
     const parts = [range || total, pageOf, hasNext ? 'has Next page link' : ''].filter(Boolean);
     return parts.length ? `# scope: ${parts.join('; ')}` : '';
   };
+
+  // Body text length, used for the post-nav reading dwell (bc_call, so reads stay attach-free).
+  const chars = () => (document.body ? (document.body.textContent || '').length : 0);
 
   // The page's readable content as compact markdown. Folds noisy site navbars/filters unless --all.
   function text(opts = {}) {
@@ -1898,7 +1912,7 @@
       setTypedValue, verifyRef, healRef, armInputProbe, readInputProbe, cellInfo, cellEditor, cellRead,
       dragInfo, listPosition, select, locateOption, locateFile, el: resolve, checkWait, value,
       verdict, health, frames, tagFrames, frameTag, frameOffset, baseline, settle, diff, locate, hit, rect, viewport,
-      markBoxes, marks, form, query, readUrls, scrollRead, text,
+      markBoxes, marks, form, query, readUrls, scrollRead, text, chars,
     },
     configurable: true, enumerable: false,
   });

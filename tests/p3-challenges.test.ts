@@ -89,7 +89,7 @@ function makeCdpHarness(options: {
         const u = options.stepUrls?.[Math.min(stepUrlIdx, (options.stepUrls?.length ?? 1) - 1)] ?? options.finalUrl ?? "https://app.test/start";
         return { ok: true, data: { value: u } };
       }
-      if (expr.includes("location.href, __bc.wall()")) {
+      if (expr.includes("location.href, __bc.")) {
         const u =
           waitedOnce && options.postWaitUrl
             ? options.postWaitUrl
@@ -98,7 +98,8 @@ function makeCdpHarness(options: {
               : (options.finalUrl ?? "https://app.test/page");
         const w = waitedOnce && options.postWaitUrl ? "" : nextWall();
         const m = expr.includes("__bc.query(") && options.markerRows ? `\n${options.markerRows}` : "";
-        return { ok: true, data: { value: `${u}\n${w}${m}` } };
+        // The nav probe also carries the body length, between the URL and the wall.
+        return { ok: true, data: { value: `${u}${expr.includes("__bc.chars()") ? "\n0" : ""}\n${w}${m}` } };
       }
       if (expr.includes("__bc.baseline")) return { ok: true, data: { value: options.finalUrl ?? "https://app.test/start" } };
       if (expr.includes("__bc.locate")) {

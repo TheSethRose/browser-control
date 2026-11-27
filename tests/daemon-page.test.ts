@@ -103,6 +103,7 @@ function makeFakeInvoker(options: {
       if (expr.includes("__bc.hit")) return ok("https://a.test/x\nhit: canvas#c");
       if (expr.includes("__bc.diff")) return ok('+ button "Extra" [e9]');
       if (expr.includes("__bc.point")) return ok(expr.includes("__bc.baseline()") ? `https://a.test/x ${point}` : point);
+      if (expr.includes("location.href, __bc.chars()")) return ok(`${options.finalUrl ?? "https://a.test/x"}\n0\n${options.wall ?? ""}`);
       if (expr.includes("location.href, __bc.wall()")) return ok(`${options.finalUrl ?? "https://a.test/x"}\n${options.wall ?? ""}`);
       if (expr.includes("__bc.baseline")) return ok("https://a.test/x");
       if (expr.includes("__bc.snapshot")) return ok('# Page | /\n- button "Save" [e1]');

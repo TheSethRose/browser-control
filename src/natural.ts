@@ -610,3 +610,60 @@ export function planWheelScroll(deltaY: number, rng: () => number = Math.random)
 
   return { flicks, totalDeltaY, totalDurationMs };
 }
+
+/**
+ * Think pause between `do`/`fill` steps: 160–420 ms, minus time already spent settling.
+ *
+ * Returns 0 when the settle already took longer than the planned pause, so a slow page never
+ * stacks extra delay on top of its own latency. Callers skip the pause after a `wait` step, after
+ * the last step, and on `--fast` or a `"fast": true` step.
+ */
+export function planThinkPause(rng: () => number = Math.random, settledMs = 0): number {
+  const want = clamp(Math.round(triangular(rng, 160, 420)), 160, 420);
+  const spent = Number.isFinite(settledMs) ? Math.max(0, Math.round(settledMs)) : 0;
+  return Math.max(0, want - spent);
+}
+
+/**
+ * Post-`nav` reading dwell: `clamp(220 + 0.08 * chars * rand(0.8, 1.25), 220, 850)` ms.
+ *
+ * Applied lazily before the next input on that tab, so reads (snap, text, form, query,
+ * read-urls, nav) and slow agent turns add nothing.
+ */
+export function planNavDwell(chars: number, rng: () => number = Math.random): number {
+  const count = Number.isFinite(chars) ? Math.max(0, Math.round(chars)) : 0;
+  return clamp(Math.round(220 + 0.08 * count * randBetween(rng, 0.8, 1.25)), 220, 850);
+}
+
+/** Window in which a second same-host nav on a tab counts as pagination. */
+export const PAGINATION_WINDOW_MS = 4000;
+
+/**
+ * Jittered minimum gap between paginated navs on one tab, measured from the previous nav.
+ * 1.6–2.8 s.
+ */
+export function planPaginationGap(rng: () => number = Math.random): number {
+  return clamp(Math.round(triangular(rng, 1600, 2800)), 1600, 2800);
+}
+
+export interface TextScrollStepPlan {
+  /** Fraction of the scroller's height to advance (0.72–0.92). */
+  heightFactor: number;
+  /** Pause after this step: 140–290 ms, or 320–600 ms on roughly 10% of steps. */
+  pauseMs: number;
+}
+
+/**
+ * One `text --scroll` reading step: a jittered slice of the viewport height and a reading pause.
+ *
+ * Steps stay in-page (`scrollTop` assignment plus `setTimeout`), so the read never attaches the
+ * debugger. Plan a batch of steps up front with the injected `rng` for determinism.
+ */
+export function planTextScrollStep(rng: () => number = Math.random): TextScrollStepPlan {
+  const heightFactor = randBetween(rng, 0.72, 0.92);
+  const slow = rng() < 0.1;
+  const pauseMs = slow
+    ? clamp(Math.round(randBetween(rng, 320, 600)), 320, 600)
+    : clamp(Math.round(randBetween(rng, 140, 290)), 140, 290);
+  return { heightFactor: Math.round(heightFactor * 100) / 100, pauseMs };
+}
