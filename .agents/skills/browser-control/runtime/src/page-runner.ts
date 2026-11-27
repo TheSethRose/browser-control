@@ -77,6 +77,7 @@ import {
 import { createPictureTracker, imageWidth, resizeImage } from "./picture";
 import { classifyFieldKind, planTyping, type CharKeySpec, type FieldKind } from "./typing";
 import { didYouMean, withRemedy, wrapUntrusted } from "./safety";
+import { formatCaptchaReport, type CaptchaStatus } from "./captcha";
 import { createScriptRunner, writeOutputFile } from "./script";
 
 type Json = Record<string, unknown>;
@@ -87,21 +88,38 @@ const NEED_INSTALL = "__BC_NEED_INSTALL__";
 const INPUT_TIMEOUT_MS = 10_000;
 /** Natural typing: a dispatch this far behind its schedule is a stall, not round-trip latency. */
 const STALL_MS = 60;
+/**
+ * Chrome acks a mouse move or wheel event only once the page has handled it, which for these events waits on the
+ * next painted frame. A page that is not painting (headless CI, a throttled renderer) acks about once a second, so a
+ * 20-40 step natural path took 20-45 s. One ack slower than this, or a path past its budget, ends the human motion.
+ */
+const SLOW_INPUT_ACK_MS = 250;
+const NATURAL_MOTION_BUDGET_MS = 2_500;
 const MAX_VIEWPORT_DIM = 10_000_000;
 const DIALOG_HINT = "the page stopped responding; a JavaScript dialog is probably open (references/dom-and-input.md)";
 
 const PAGE_ACTIONS = [
   "snap", "text", "form", "query", "read-urls", "ocr", "shot", "click", "hover", "type", "select",
   "upload", "drag", "wait", "key", "fill", "do", "value", "nav", "verdict", "health",
-  "styles", "issues", "perf", "dialog", "emulate", "handoff", "notes", "flow", "script",
+  "styles", "issues", "perf", "dialog", "emulate", "handoff", "notes", "flow", "script", "solve_captcha",
 ] as const;
 
 const DEFAULT_HANDOFF_TIMEOUT_MS = 10 * 60 * 1000;
 const CHALLENGE_WAIT_MAX_MS = 8_000;
 const CHALLENGE_POLL_MS = 500;
 const CHALLENGE_PROBE_RESERVE_MS = 250;
+/** Before step 1: at most two probe tries inside this budget; past it the page state stays unknown. */
+const PRE_STEP_PROBE_TRIES = 2;
+const PRE_STEP_PROBE_BUDGET_MS = 1_500;
+/**
+ * Each try gets its own share of the budget, so a first try that times out cannot eat the retry: the
+ * probe's own timeout is wall-clock, so the whole budget on try one left nothing for try two.
+ */
+const PRE_STEP_PROBE_ATTEMPT_MS = 700;
 const CHALLENGE_PROBE_SEP = "\n__BC_CHALLENGE_SEP__\n";
 const CHALLENGE_PROBE_EXPR = buildChallengeProbeExpression(false);
+/** Same probe for verify mode: never trust a fast-path skip. */
+const CHALLENGE_PROBE_EXPR_FULL = buildChallengeProbeExpression(true);
 const FAST_VENDOR_CSS = fastVendorSelectors.join(",");
 /** One cheap querySelector-style check for known challenge markers (`# N row(s)` header). */
 const VENDOR_MARKER_STEP = {
@@ -138,8 +156,35 @@ type ProbeReadResult =
   | { kind: "probe"; probe: ChallengeProbe }
   | { kind: "error" };
 
+/**
+ * Parse a readback of {@link CHALLENGE_PROBE_EXPR}: `{skip,url}` or `{skip:false,probe}`, else "skip".
+ * `strict` is for the pre-step guard: there a readback that cannot be parsed, or that arrives without the
+ * URL the classifier and the host boundary both need, is incomplete, so it reads as "error" (unknown) and
+ * never as "skip" (clear).
+ */
+function parseProbeReadback(raw: string, strict = false): ProbeReadResult {
+  const bad = (): ProbeReadResult => (strict ? { kind: "error" } : { kind: "skip" });
+  if (!raw || !raw.startsWith("{")) return bad();
+  try {
+    const parsed = JSON.parse(raw) as { skip?: boolean; url?: string; probe?: ChallengeProbe };
+    if (parsed.skip === true) {
+      return typeof parsed.url === "string" && parsed.url !== "" ? { kind: "skip", url: parsed.url } : bad();
+    }
+    if (parsed.probe && typeof parsed.probe === "object") {
+      if (strict && !(typeof parsed.probe.url === "string" && parsed.probe.url !== "")) return { kind: "error" };
+      return { kind: "probe", probe: parsed.probe };
+    }
+    return bad();
+  } catch {
+    return bad();
+  }
+}
+
 type ChallengeCheckResult =
   | { status: "clear"; waited: boolean; url?: string }
+  // Only `checkChallenge(..., { unknownOnError: true })` produces this: the probe failed, so the page
+  // state is not known to be clear. Callers that guard an action treat it as "do not act".
+  | { status: "unknown"; waited: false; url?: string }
   | {
       status: "interactive" | "block" | "non-interactive-timeout";
       detection: ChallengeDetection;
@@ -354,6 +399,16 @@ export function createPageHelperHandler(
   const HELD_KINDS = ["key", "mouse"] as const;
   /** A held key and a held mouse button on one tab are separate records. */
   const heldSlot = (targetId: string | undefined, kind: HeldInput["kind"]): string => `${heldKeyOf(targetId)}#${kind}`;
+  /**
+   * A press the extension refused because a dialog was open may never have gone out, so it records the input as
+   * possibly down and the command stops there: nothing more is sent into the open dialog. A later dialog accept or
+   * dismiss reports the record and the caller decides.
+   */
+  const refusedPress = (res: InvokeResult, targetId: string | undefined, held: HeldInput): InvokeResult => {
+    const uncertain: HeldInput = { kind: held.kind, label: held.label.replace(/ still down$/, " may still be down") };
+    heldByTab.set(heldSlot(targetId, held.kind), uncertain);
+    return withHeld(res, uncertain);
+  };
   /** Navigation starts a new document, so pointer and held-input state for the old one are dropped. */
   const resetMotion = (targetId?: string): void => {
     motionByTab.delete(tabKeyOf(targetId));
@@ -664,22 +719,35 @@ export function createPageHelperHandler(
       overshootProb: opts.overshootProb,
       rng,
     });
+    return dispatchPath(plan.steps, {
+      ...(opts.button !== undefined ? { button: opts.button } : {}),
+      ...(opts.buttons !== undefined ? { buttons: opts.buttons } : {}),
+    }, targetId);
+  }
+
+  /**
+   * Send a planned pointer path as trusted mouseMoved events. Once a step acks slowly or the path runs past its
+   * budget, the remaining steps collapse into one move to the end point, so the pointer still lands where planned.
+   */
+  async function dispatchPath(
+    steps: ReadonlyArray<{ x: number; y: number; delayMs: number }>,
+    extra: Json,
+    targetId: string | undefined,
+    onMoved?: (at: Point2D) => void,
+  ): Promise<InvokeResult> {
     const pace = createPacer();
-    for (const step of plan.steps) {
+    const start = now();
+    for (let i = 0; i < steps.length; i++) {
+      const step = steps[i]!;
       await pace(step.delayMs);
-      const res = await cdp(
-        "Input.dispatchMouseEvent",
-        {
-          type: "mouseMoved",
-          x: step.x,
-          y: step.y,
-          ...(opts.button !== undefined ? { button: opts.button } : {}),
-          ...(opts.buttons !== undefined ? { buttons: opts.buttons } : {}),
-        },
-        targetId,
-        INPUT_TIMEOUT_MS,
-      );
+      const sent = now();
+      const res = await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: step.x, y: step.y, ...extra }, targetId, INPUT_TIMEOUT_MS);
       if (!res.ok) return res;
+      onMoved?.({ x: step.x, y: step.y });
+      const done = now();
+      if (i < steps.length - 2 && (done - sent > SLOW_INPUT_ACK_MS || done - start > NATURAL_MOTION_BUDGET_MS)) {
+        i = steps.length - 2; // the next pass sends the end point
+      }
     }
     return success("ok");
   }
@@ -731,6 +799,7 @@ export function createPageHelperHandler(
         if (!chk.ok) return chk.res ?? notActionable(opts.domRef, chk.blocked);
       }
     }
+    const HELD_MOUSE: HeldInput = { kind: "mouse", label: "mouse left button still down" };
     for (let c = 1; c <= clickCount; c++) {
       const m2 = await cdp(
         "Input.dispatchMouseEvent",
@@ -738,15 +807,19 @@ export function createPageHelperHandler(
         targetId,
         INPUT_TIMEOUT_MS,
       );
-      if (!m2.ok) return m2;
+      // A dialog refusal means the press may never have gone out: report it and send nothing into the dialog.
+      if (!m2.ok) return refusedByDialog(m2) ? refusedPress(m2, targetId, HELD_MOUSE) : m2;
       if (timing) await pause(timing.holdsMs[c - 1]!);
-      const m3 = await cdp(
+      const rel = await sendRelease(
         "Input.dispatchMouseEvent",
         { type: "mouseReleased", ...at, button: "left", buttons: 0, clickCount: c },
         targetId,
+        HELD_MOUSE,
         INPUT_TIMEOUT_MS,
       );
-      if (!m3.ok) return m3;
+      // A release nobody can vouch for comes back non-ok: report it, send nothing more, and read nothing behind it.
+      if (rel.held) return withHeld(rel.res, rel.held);
+      if (!rel.res.ok) return rel.res;
       if (timing && c < clickCount) await pause(timing.gapsMs[c - 1]!);
     }
     return success("ok");
@@ -890,11 +963,14 @@ export function createPageHelperHandler(
 
       const plan = planWheelScroll(neededDeltaY, rng);
       const pace = createPacer();
-      for (let fi = 0; fi < plan.flicks.length; fi++) {
+      const start = now();
+      let slow = false;
+      for (let fi = 0; fi < plan.flicks.length && !slow; fi++) {
         const flick = plan.flicks[fi]!;
         const prevTop = cur.rect.top;
         for (const ev of flick.events) {
           await pace(ev.delayMs);
+          const sent = now();
           const wres = await cdp(
             "Input.dispatchMouseEvent",
             { type: "mouseWheel", x: anchor.x, y: anchor.y, deltaX: 0, deltaY: ev.deltaY },
@@ -902,7 +978,14 @@ export function createPageHelperHandler(
             INPUT_TIMEOUT_MS,
           );
           if (!wres.ok) return { ok: false, res: wres };
+          const done = now();
+          // A page acking wheel events this slowly scrolls instantly below instead.
+          if (done - sent > SLOW_INPUT_ACK_MS || done - start > NATURAL_MOTION_BUDGET_MS) {
+            slow = true;
+            break;
+          }
         }
+        if (slow) break;
         const probe = await evalHelper(
           { kind: "bc", method: "point", args: [ref, { noScroll: true, detail: true }] },
           targetId,
@@ -1080,16 +1163,50 @@ export function createPageHelperHandler(
     });
   }
 
+  /** Why a page read was refused because a dialog blocks the page, or undefined when the page answered. */
+  const DIALOG_READ_BLOCKED = "a dialog opened; accept or dismiss it before reading the page";
+  const dialogRefusedRead = (res: InvokeResult): string | undefined =>
+    refusedByDialog(res) ? DIALOG_READ_BLOCKED : undefined;
+  /** Why a page read could not happen: a dialog, or a page that never answered (every read behind one times out). */
+  const dialogBlockedBy = (res: InvokeResult): string | undefined =>
+    dialogRefusedRead(res) ?? (messageOf(res).startsWith("CDP_TIMEOUT") ? DIALOG_HINT : undefined);
+
   /** Arm isolated-world event probe and read back trusted event counts after input. */
-  async function readProbe(targetId?: string): Promise<Record<string, number> | undefined> {
+  async function readProbe(targetId?: string): Promise<{ counts?: Record<string, number>; blocked?: string }> {
     const res = await evalHelper({ kind: "bc", method: "readInputProbe" }, targetId, 2_000);
-    if (!res.ok) return undefined;
+    // Only a dialog refusal blocks the probe: a slow page that merely timed out still owes the click its diff.
+    if (!res.ok) return { blocked: dialogRefusedRead(res) };
     try {
       const parsed = JSON.parse(valueOf(res)) as Record<string, number>;
-      return typeof parsed === "object" && parsed !== null && "mousedown" in parsed ? parsed : undefined;
+      return { counts: typeof parsed === "object" && parsed !== null && "mousedown" in parsed ? parsed : undefined };
     } catch {
-      return undefined;
+      return {};
     }
+  }
+
+  /**
+   * One key press and its release under the held-input rules: a refused press records the key and sends nothing more,
+   * and a release nobody can vouch for comes back non-ok so typing stops instead of writing into an open dialog.
+   */
+  async function sendKeyStroke(
+    down: Json,
+    up: Json,
+    targetId: string | undefined,
+    held: HeldInput,
+    holdMs = 0,
+  ): Promise<InvokeResult> {
+    // Pin the tab once: a tab switch during the hold cannot move the release to another page.
+    const gestureTarget = targetId ?? implicitCdpTarget;
+    const press = await cdp("Input.dispatchKeyEvent", down, gestureTarget, INPUT_TIMEOUT_MS);
+    if (!press.ok) {
+      // A dialog refusal may mean the press never went out: send nothing more into the open dialog.
+      if (refusedByDialog(press)) return refusedPress(press, gestureTarget, held);
+      const out = await sendRelease("Input.dispatchKeyEvent", up, gestureTarget, held, INPUT_TIMEOUT_MS, true);
+      return out.held ? withHeld(press, out.held) : press;
+    }
+    if (holdMs > 0) await pause(holdMs);
+    const out = await sendRelease("Input.dispatchKeyEvent", up, gestureTarget, held, INPUT_TIMEOUT_MS);
+    return out.held ? withHeld(out.res, out.held) : out.res;
   }
 
   async function pressKey(name: string, targetId?: string, holdMs = 0): Promise<InvokeResult> {
@@ -1097,22 +1214,11 @@ export function createPageHelperHandler(
     if (!spec) {
       return failure("INPUT_VALIDATION_FAILED", `INPUT_INVALID: key must be ${Object.keys(KEYS).join(", ")}`);
     }
-    // Pin the tab once: a tab switch during the hold cannot move the release to another page.
-    const gestureTarget = targetId ?? implicitCdpTarget;
-    const held: HeldInput = { kind: "key", label: `key ${name} still down` };
     const base: Json = { key: spec.key, code: spec.code, windowsVirtualKeyCode: spec.windowsVirtualKeyCode };
-    const down = spec.text !== undefined
-      ? await cdp("Input.dispatchKeyEvent", { type: "keyDown", ...base, text: spec.text }, gestureTarget, INPUT_TIMEOUT_MS)
-      : await cdp("Input.dispatchKeyEvent", { type: "rawKeyDown", ...base }, gestureTarget, INPUT_TIMEOUT_MS);
-    if (!down.ok) {
-      // The press may have landed before the page opened its dialog, so its release is attempted once either way.
-      const out = await sendRelease("Input.dispatchKeyEvent", { type: "keyUp", ...base }, gestureTarget, held, INPUT_TIMEOUT_MS, true);
-      return out.held ? withHeld(down, out.held) : down;
-    }
-    if (holdMs > 0) await pause(holdMs);
-    const up = await sendRelease("Input.dispatchKeyEvent", { type: "keyUp", ...base }, gestureTarget, held, INPUT_TIMEOUT_MS);
-    if (up.held) return withHeld(up.res, up.held);
-    return up.note ? success(up.note) : up.res;
+    const down: Json = spec.text !== undefined
+      ? { type: "keyDown", ...base, text: spec.text }
+      : { type: "rawKeyDown", ...base };
+    return sendKeyStroke(down, { type: "keyUp", ...base }, targetId, { kind: "key", label: `key ${name} still down` }, holdMs);
   }
 
   async function dispatchText(
@@ -1130,18 +1236,24 @@ export function createPageHelperHandler(
         const ins = await cdp("Input.insertText", { text: text.slice(0, -1) }, targetId, INPUT_TIMEOUT_MS);
         if (!ins.ok) return ins;
         const last = text.slice(-1);
-        const kd = await cdp("Input.dispatchKeyEvent", { type: "keyDown", key: last, text: last }, targetId, INPUT_TIMEOUT_MS);
-        if (!kd.ok) return kd;
-        return cdp("Input.dispatchKeyEvent", { type: "keyUp", key: last }, targetId, INPUT_TIMEOUT_MS);
+        return sendKeyStroke(
+          { type: "keyDown", key: last, text: last },
+          { type: "keyUp", key: last },
+          targetId,
+          { kind: "key", label: `key ${last} still down` },
+        );
       }
       return cdp("Input.insertText", { text }, targetId, INPUT_TIMEOUT_MS);
     }
     if (mode === "keys") {
       for (const ch of text) {
-        const kd = await cdp("Input.dispatchKeyEvent", { type: "keyDown", key: ch, text: ch }, targetId, INPUT_TIMEOUT_MS);
-        if (!kd.ok) return kd;
-        const ku = await cdp("Input.dispatchKeyEvent", { type: "keyUp", key: ch }, targetId, INPUT_TIMEOUT_MS);
-        if (!ku.ok) return ku;
+        const sent = await sendKeyStroke(
+          { type: "keyDown", key: ch, text: ch },
+          { type: "keyUp", key: ch },
+          targetId,
+          { kind: "key", label: `key ${ch} still down` },
+        );
+        if (!sent.ok) return sent;
       }
       return success("ok");
     }
@@ -1151,7 +1263,7 @@ export function createPageHelperHandler(
     // still released. Events run on elapsed time, absorbing round trips; a stall past STALL_MS shifts the rest.
     // Each keyUp goes out once: one that never reached the page is reported as held, never re-sent.
     const down = new Map<string, CharKeySpec>();
-    /** Keys whose keyDown a dialog refused: never confirmed sent, so a refused release leaves them possibly down. */
+    /** Keys whose keyDown a dialog refused: they may never have gone out, so they read as possibly down. */
     const refusedDown = new Set<string>();
     const stuck: string[] = [];
     let result: InvokeResult = success("ok");
@@ -1159,18 +1271,17 @@ export function createPageHelperHandler(
     let mayBeDown = false;
     const keyUp = async (spec: CharKeySpec, pressRefused = false): Promise<InvokeResult> => {
       down.delete(spec.key);
-      // After one release times out, the rest would too: they are reported held without waiting on each.
+      if (pressRefused) mayBeDown = true;
+      // After a timeout or a dialog refusal nothing more goes out: the rest are reported held, never sent.
       if (blocked) return (stuck.push(spec.key), failure("EXECUTION_FAILED", "CDP_TIMEOUT"));
       const up = await sendKey("keyUp", spec, targetId).catch((err: unknown) => failure("EXECUTION_FAILED", String(err)));
       if (!up.ok) {
         if (messageOf(up).startsWith("CDP_TIMEOUT")) blocked = true;
-        // A dialog refusal may have landed: unverified, never "still down", unless its own press was refused.
-        else if (refusedByDialog(up) && !pressRefused) {
-          return failure("EXECUTION_FAILED", `key ${spec.key} release: delivery unverified (a dialog opened)`);
-        } else {
-          stuck.push(spec.key);
-          if (pressRefused) mayBeDown = true;
-        }
+        // A dialog refusal may have landed: unverified, never "still down".
+        else if (refusedByDialog(up)) {
+          blocked = true;
+          return releaseUnverified(`key ${spec.key} release: delivery unverified (a dialog opened)`);
+        } else stuck.push(spec.key);
       }
       return up;
     };
@@ -1191,8 +1302,8 @@ export function createPageHelperHandler(
         if (step.kind !== "keyUp") {
           down.set(spec.key, spec);
           result = await sendKey(spec.text !== undefined ? "keyDown" : "rawKeyDown", spec, targetId);
-          // The press may have landed before the dialog opened, so keep it for one release attempt.
-          if (refusedByDialog(result)) refusedDown.add(spec.key);
+          // The press may never have gone out: send nothing more into the open dialog.
+          if (refusedByDialog(result)) (refusedDown.add(spec.key), (blocked = true));
         }
         if (result.ok && step.kind !== "keyDown") result = await keyUp(spec);
         if (!result.ok) break;
@@ -1241,7 +1352,8 @@ export function createPageHelperHandler(
       steps: [{ kind: "bc", method: "settle" }, { kind: "bc", method: "diff", args: [{ from: before ?? "" }] }],
     };
     let res = await evalHelper(call, targetId, 8_000);
-    if (!res.ok && messageOf(res).startsWith("CDP_TIMEOUT")) return `# ${DIALOG_HINT}`;
+    // A dialog makes every read wait out its timeout, so report it instead of retrying on a blocked page.
+    if (!res.ok && dialogBlockedBy(res)) return `# ${dialogBlockedBy(res)}`;
     if (!res.ok) {
       await waitParsed(targetId);
       res = await evalHelper(call, targetId, 8_000);
@@ -1257,17 +1369,32 @@ export function createPageHelperHandler(
    * open already (nothing was sent) or the event itself opened it (it was delivered), so the event may have landed.
    */
   const refusedByDialog = (res: InvokeResult): boolean => /^DIALOG_OPEN:/.test(messageOf(res));
-  /** Word a failed input as delivered_unverified, keeping any held-input lines it already carries. */
-  const inputFailed = (res: InvokeResult, what: string): InvokeResult =>
-    messageOf(res).startsWith("CDP_TIMEOUT")
-      ? success([`${what}: delivered_unverified (${DIALOG_HINT})`, ...messageOf(res).split("\n").filter((l) => l.startsWith("# HELD:"))].join("\n"))
-      : res;
-
-  type ReleaseOutcome = { res: InvokeResult; held?: HeldInput; note?: string };
   /**
-   * Send a release to its pinned tab; it is never retried. A timeout may have reached the page, so it reads as
-   * delivered_unverified, not held. A dialog refusal is ambiguous too, so it reads as unverified — unless the press
-   * it releases was itself refused, which leaves the input possibly still down.
+   * Word a failed input as delivered_unverified, keeping any held-input lines it already carries. A marked release is
+   * unverified rather than failed: the press landed, so the command reports what it could not confirm and stops.
+   */
+  const inputFailed = (res: InvokeResult, what: string): InvokeResult => {
+    const held = messageOf(res).split("\n").filter((l) => l.startsWith("# HELD:"));
+    if (isUnverifiedRelease(res)) {
+      const note = messageOf(res).split("\n")[0]!.slice(UNVERIFIED_RELEASE.length).trim();
+      // The note already names the input when it is a key release ("key Tab release: …"): don't name it twice.
+      return success([note.startsWith(what) ? note : `${what}: ${note}`, ...held].join("\n"));
+    }
+    return messageOf(res).startsWith("CDP_TIMEOUT")
+      ? success([`${what}: delivered_unverified (${DIALOG_HINT})`, ...held].join("\n"))
+      : res;
+  };
+
+  /** Marks a release nobody can vouch for, so no caller can read it as delivered; the command boundary words it. */
+  const UNVERIFIED_RELEASE = "UNVERIFIED_RELEASE:";
+  const releaseUnverified = (note: string): InvokeResult => failure("EXECUTION_FAILED", `${UNVERIFIED_RELEASE} ${note}`);
+  const isUnverifiedRelease = (res: InvokeResult): boolean => messageOf(res).startsWith(UNVERIFIED_RELEASE);
+
+  type ReleaseOutcome = { res: InvokeResult; held?: HeldInput };
+  /**
+   * Send a release to its pinned tab; it is never retried. A timeout may have reached the page, so it returns a
+   * marked non-ok result that reads as delivered_unverified, not held. A dialog refusal is ambiguous too, so it is
+   * unverified as well — unless the press it releases was itself refused, which leaves the input possibly still down.
    */
   async function sendRelease(
     method: string,
@@ -1286,11 +1413,11 @@ export function createPageHelperHandler(
     const what = `${held.label.replace(/ still down$/, "")} release`;
     if (messageOf(res).startsWith("CDP_TIMEOUT")) {
       heldByTab.delete(slot);
-      return { res, note: `${what}: delivered_unverified (${DIALOG_HINT})` };
+      return { res: releaseUnverified(`${what}: delivered_unverified (${DIALOG_HINT})`) };
     }
     if (refusedByDialog(res) && !pressRefused) {
       heldByTab.delete(slot);
-      return { res, note: `${what}: delivery unverified (a dialog opened)` };
+      return { res: releaseUnverified(`${what}: delivery unverified (a dialog opened)`) };
     }
     const uncertain: HeldInput = refusedByDialog(res)
       ? { kind: held.kind, label: what.replace(/ release$/, " may still be down") }
@@ -1592,12 +1719,33 @@ export function createPageHelperHandler(
     let mouseDown = false;
     let dragErr: InvokeResult | undefined;
     let releaseHeld: HeldInput | undefined;
-    let releaseNote: string | undefined;
+    let releaseUnverifiedRes: InvokeResult | undefined;
+    let refusedIntoDialog = false;
     const releaseParams: Json = { type: "mouseReleased", x: info.dx, y: info.dy, button: "left", buttons: 0, clickCount: 1 };
+    /**
+     * A drag event the dialog refused: the button may never have gone down, so the press is recorded once and nothing
+     * more — no dragCancel, no release — is sent into the open dialog.
+     */
+    const refuseDrag = (res: InvokeResult): InvokeResult => {
+      refusedIntoDialog = true;
+      mouseDown = false;
+      return refusedPress(res, targetId, held);
+    };
+    /** dragEnter, dragOver, then drop; a dialog refusal stops at once so drop never follows it. */
+    const dragToTarget = async (dragData: Json): Promise<InvokeResult | undefined> => {
+      for (const type of ["dragEnter", "dragOver", "drop"]) {
+        const res = await cdp("Input.dispatchDragEvent", { type, x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
+        if (refusedByDialog(res)) return res;
+        if (type === "drop") html5Dropped = res.ok;
+      }
+      return undefined;
+    };
     /** Release the button before an early return, so a blocked release is reported on this command's result. */
     const bail = async (res: InvokeResult, what: string): Promise<InvokeResult> => {
       const failed = inputFailed(res, what);
       if (!mouseDown) return failed;
+      // A dialog refusal means the button may never have gone down: send nothing into the open dialog.
+      if (refusedByDialog(res)) return refuseDrag(res);
       mouseDown = false;
       const out = await sendRelease("Input.dispatchMouseEvent", releaseParams, targetId, held, 2_000, true);
       return out.held ? withHeld(failed, out.held) : failed;
@@ -1611,20 +1759,24 @@ export function createPageHelperHandler(
         if (!m0.ok) { dragErr = m0; return bail(m0, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
         mouseDown = true;
         const mp = await cdp("Input.dispatchMouseEvent", { type: "mousePressed", x: info.sx, y: info.sy, button: "left", buttons: 1, clickCount: 1 }, targetId, INPUT_TIMEOUT_MS);
-        if (!mp.ok) { dragErr = mp; return bail(mp, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
+        if (!mp.ok) {
+          dragErr = mp;
+          // A dialog refusal may mean the press never went out: report it and send nothing into the dialog.
+          if (refusedByDialog(mp)) return refuseDrag(mp);
+          return bail(mp, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`);
+        }
         const mx = Math.round((info.sx + info.dx) / 2);
         const my = Math.round((info.sy + info.dy) / 2);
         if (info.draggable) {
           const waitDrag = invoke("wait_for_event", { method: "Input.dragIntercepted", timeoutMs: 1200, ...(targetId ? { targetId } : {}) });
-          await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: mx, y: my, button: "left", buttons: 1 }, targetId, INPUT_TIMEOUT_MS);
+          const mid = await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: mx, y: my, button: "left", buttons: 1 }, targetId, INPUT_TIMEOUT_MS);
+          if (!mid.ok) { dragErr = mid; return refusedByDialog(mid) ? refuseDrag(mid) : bail(mid, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
           const ev = await waitDrag;
           if (ev.ok && (ev.data as Json)["found"] === true) {
             dragIntercepted = (((ev.data as Json)["event"] as Json)?.["params"] as { data?: Json }) ?? {};
             const dragData = dragIntercepted.data ?? { items: [], dragOperationsMask: 1 };
-            await cdp("Input.dispatchDragEvent", { type: "dragEnter", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
-            await cdp("Input.dispatchDragEvent", { type: "dragOver", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
-            const dropRes = await cdp("Input.dispatchDragEvent", { type: "drop", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
-            html5Dropped = dropRes.ok;
+            const refusal = await dragToTarget(dragData);
+            if (refusal) { dragErr = refusal; return refuseDrag(refusal); }
           } else {
             await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: info.dx, y: info.dy, button: "left", buttons: 1 }, targetId, INPUT_TIMEOUT_MS);
           }
@@ -1638,7 +1790,12 @@ export function createPageHelperHandler(
         await pause(planClickTiming(1, rng).dwellMs);
         mouseDown = true;
         const mp = await cdp("Input.dispatchMouseEvent", { type: "mousePressed", x: info.sx, y: info.sy, button: "left", buttons: 1, clickCount: 1 }, targetId, INPUT_TIMEOUT_MS);
-        if (!mp.ok) { dragErr = mp; return bail(mp, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
+        if (!mp.ok) {
+          dragErr = mp;
+          // A dialog refusal may mean the press never went out: report it and send nothing into the dialog.
+          if (refusedByDialog(mp)) return refuseDrag(mp);
+          return bail(mp, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`);
+        }
         await pause(Math.round(60 + rng() * 50));
 
         const state = motionOf(targetId);
@@ -1650,21 +1807,8 @@ export function createPageHelperHandler(
           overshootProb: 0,
           rng,
         });
-        const dispatchSteps = async (stepsSlice: typeof dragPlan.steps): Promise<InvokeResult> => {
-          const pace = createPacer();
-          for (const step of stepsSlice) {
-            await pace(step.delayMs);
-            const res = await cdp(
-              "Input.dispatchMouseEvent",
-              { type: "mouseMoved", x: step.x, y: step.y, button: "left", buttons: 1 },
-              targetId,
-              INPUT_TIMEOUT_MS,
-            );
-            if (!res.ok) return res;
-            state.pointer = { x: step.x, y: step.y };
-          }
-          return success("ok");
-        };
+        const dispatchSteps = (stepsSlice: typeof dragPlan.steps): Promise<InvokeResult> =>
+          dispatchPath(stepsSlice, { button: "left", buttons: 1 }, targetId, (at) => { state.pointer = at; });
 
         if (info.draggable) {
           const waitDrag = invoke("wait_for_event", { method: "Input.dragIntercepted", timeoutMs: 1200, ...(targetId ? { targetId } : {}) });
@@ -1676,10 +1820,8 @@ export function createPageHelperHandler(
           if (ev.ok && (ev.data as Json)["found"] === true) {
             dragIntercepted = (((ev.data as Json)["event"] as Json)?.["params"] as { data?: Json }) ?? {};
             const dragData = dragIntercepted.data ?? { items: [], dragOperationsMask: 1 };
-            await cdp("Input.dispatchDragEvent", { type: "dragEnter", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
-            await cdp("Input.dispatchDragEvent", { type: "dragOver", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
-            const dropRes = await cdp("Input.dispatchDragEvent", { type: "drop", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
-            html5Dropped = dropRes.ok;
+            const refusal = await dragToTarget(dragData);
+            if (refusal) { dragErr = refusal; return refuseDrag(refusal); }
             state.pointer = { x: info.dx, y: info.dy };
           } else {
             const rest = await dispatchSteps(dragPlan.steps.slice(splitIdx + 1));
@@ -1692,16 +1834,19 @@ export function createPageHelperHandler(
         await pause(Math.round(40 + rng() * 50));
       }
     } finally {
-      if (info.draggable && dragIntercepted && !html5Dropped) {
-        await cdp("Input.dispatchDragEvent", { type: "dragCancel", x: info.dx, y: info.dy, data: dragIntercepted.data ?? { items: [], dragOperationsMask: 1 } }, targetId, 2_000).catch(() => {});
-      }
-      if (mouseDown) {
-        const out = await sendRelease("Input.dispatchMouseEvent", releaseParams, targetId, held);
-        if (out.held) {
-          releaseHeld = out.held;
-          if (!dragErr) dragErr = out.res;
-        } else if (out.note) releaseNote = out.note;
-        else if (!dragErr) motionOf(targetId).pointer = { x: info.dx, y: info.dy };
+      // A refusal means nothing more goes out: no dragCancel, no release into the open dialog.
+      if (!refusedIntoDialog) {
+        if (info.draggable && dragIntercepted && !html5Dropped) {
+          await cdp("Input.dispatchDragEvent", { type: "dragCancel", x: info.dx, y: info.dy, data: dragIntercepted.data ?? { items: [], dragOperationsMask: 1 } }, targetId, 2_000).catch(() => {});
+        }
+        if (mouseDown) {
+          const out = await sendRelease("Input.dispatchMouseEvent", releaseParams, targetId, held);
+          if (out.held) {
+            releaseHeld = out.held;
+            if (!dragErr) dragErr = out.res;
+          } else if (isUnverifiedRelease(out.res)) releaseUnverifiedRes = out.res;
+          else if (!dragErr) motionOf(targetId).pointer = { x: info.dx, y: info.dy };
+        }
       }
       if (info.draggable) {
         await cdp("Input.setInterceptDrags", { enabled: false }, targetId, 2_000).catch(() => {});
@@ -1709,7 +1854,7 @@ export function createPageHelperHandler(
     }
 
     if (dragErr) return withHeld(inputFailed(dragErr, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}: release`), releaseHeld);
-    if (releaseNote) return success(`drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}: ${releaseNote}`);
+    if (releaseUnverifiedRes) return inputFailed(releaseUnverifiedRes, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`);
     const posRes = info.listMeta
       ? await evalHelper({ kind: "bc", method: "listPosition", args: [info.listMeta] }, targetId)
       : undefined;
@@ -1769,7 +1914,9 @@ export function createPageHelperHandler(
         if (!clicked.ok) return inputFailed(clicked, `click ${nameOf(found.loc)}`);
         const probe = found.loc.kind === "dom" ? await readProbe(targetId) : undefined;
         const healPrefix = found.healedFrom ? `↻ ${found.healedFrom}->${nameOf(found.loc)} ` : "";
-        const delivery = probe && probe["mousedown"] === 0 && probe["mouseup"] === 0
+        // The click opened a dialog (or stopped the page): report it now, never wait out every later read.
+        if (probe?.blocked) return success(`${healPrefix}click ${nameOf(found.loc)} at ${at.pt.x},${at.pt.y}: delivered, then ${probe.blocked}`);
+        const delivery = probe?.counts && probe.counts["mousedown"] === 0 && probe.counts["mouseup"] === 0
           ? "delivered_unverified (no mouse events reached page)"
           : "delivered";
         return withChanges(`${healPrefix}click ${nameOf(found.loc)} at ${at.pt.x},${at.pt.y}: ${delivery}`, at.pt.before, quiet, targetId);
@@ -1838,12 +1985,15 @@ export function createPageHelperHandler(
             if (!editorRef) {
               const pt = await pointOf(loc, targetId, false, natural);
               if (!pt.ok) return pt.res;
-              await clickAt(pt.pt, targetId, 2, natural, loc.kind === "dom" ? loc.ref : undefined);
+              // The double-click opens the editor: a refused release means no editor, so stop before pressing Enter.
+              const opened = await clickAt(pt.pt, targetId, 2, natural, loc.kind === "dom" ? loc.ref : undefined);
+              if (!opened.ok) return inputFailed(opened, `type ${name}`);
               await sleep(150);
               const ed = await evalHelper({ kind: "bc", method: "cellEditor" }, fieldTarget);
               editorRef = ed.ok && /^e\d+$/.test(valueOf(ed)) ? valueOf(ed) : null;
               if (!editorRef) {
-                await pressKey("Enter", targetId, natural ? planKeyHold(rng) : 0);
+                const focused = await pressKey("Enter", targetId, natural ? planKeyHold(rng) : 0);
+                if (!focused.ok) return inputFailed(focused, `type ${name}`);
                 await sleep(150);
                 const ed2 = await evalHelper({ kind: "bc", method: "cellEditor" }, fieldTarget);
                 editorRef = ed2.ok && /^e\d+$/.test(valueOf(ed2)) ? valueOf(ed2) : null;
@@ -1855,7 +2005,8 @@ export function createPageHelperHandler(
             const cellKind = mode === "human" ? await fieldKindOf(text, fieldTarget) : undefined;
             const sent = await dispatchText(text, mode, targetId, { fieldKind: cellKind });
             if (!sent.ok) return inputFailed(sent, `type ${name}`);
-            await pressKey("Enter", targetId, natural ? planKeyHold(rng) : 0);
+            const committed = await pressKey("Enter", targetId, natural ? planKeyHold(rng) : 0);
+            if (!committed.ok) return inputFailed(committed, `type ${name}`);
             await sleep(150);
             const afterRes = await evalHelper({ kind: "bc", method: "cellRead", args: [loc.ref, cInfo.before] }, fieldTarget);
             if (afterRes.ok) {
@@ -2040,8 +2191,6 @@ export function createPageHelperHandler(
         const natural = isNatural(input);
         const res = await pressKey(keyName, targetId, natural ? planKeyHold(rng) : 0);
         if (!res.ok) return inputFailed(res, `key ${keyName}`);
-        // A release nobody can vouch for replaces "sent"; the press reached the page.
-        if (valueOf(res).startsWith(`key ${keyName} release:`)) return success(valueOf(res));
         if (isPic) return success(`key ${keyName}: sent\n${await picture.pictureChanges(targetId, beforeHash)}`);
         return withChanges(`key ${keyName}: sent`, before?.ok ? valueOf(before) : undefined, quiet, targetId);
       }
@@ -2552,16 +2701,42 @@ export function createPageHelperHandler(
     }
   }
 
+  /**
+   * Parse a readback of {@link CHALLENGE_PROBE_EXPR}: `{skip,url}` or `{skip:false,probe}`, else "skip".
+   * `strict` is for calls that must not report a page it could not read: a readback that cannot be
+   * parsed, or that arrives without the URL the classifier and the host boundary both need, is
+   * incomplete, so it reads as "error" (unknown) and never as "skip" (clear).
+   */
+  function parseProbeReadback(raw: string, strict = false): ProbeReadResult {
+    const bad = (): ProbeReadResult => (strict ? { kind: "error" } : { kind: "skip" });
+    if (!raw || !raw.startsWith("{")) return bad();
+    try {
+      const parsed = JSON.parse(raw) as { skip?: boolean; url?: string; probe?: ChallengeProbe };
+      if (parsed.skip === true) {
+        return typeof parsed.url === "string" && parsed.url !== "" ? { kind: "skip", url: parsed.url } : bad();
+      }
+      if (parsed.probe && typeof parsed.probe === "object") {
+        if (strict && !(typeof parsed.probe.url === "string" && parsed.probe.url !== "")) return { kind: "error" };
+        return { kind: "probe", probe: parsed.probe };
+      }
+      return bad();
+    } catch {
+      return bad();
+    }
+  }
+
   async function readChallengeProbeCdp(
     targetId: string | undefined,
     timeoutMs = 4_000,
     deadline?: number,
+    strict = false,
+    forceFull = false,
   ): Promise<ProbeReadResult> {
     const budget = deadline !== undefined ? Math.min(timeoutMs, deadline - Date.now()) : timeoutMs;
     if (budget <= 0) return { kind: "error" };
     const res = await raceDeadline(
       invoke("evaluate", {
-        expression: CHALLENGE_PROBE_EXPR,
+        expression: forceFull ? CHALLENGE_PROBE_EXPR_FULL : CHALLENGE_PROBE_EXPR,
         isolated: true,
         ...(targetId ? { targetId } : {}),
         timeoutMs: Math.max(1, Math.floor(budget)),
@@ -2570,16 +2745,29 @@ export function createPageHelperHandler(
       failure("EXECUTION_FAILED", "CHALLENGE_PROBE_TIMEOUT"),
     );
     if (!res.ok) return { kind: "error" };
-    const raw = valueOf(res);
-    if (!raw || !raw.startsWith("{")) return { kind: "skip" };
-    try {
-      const parsed = JSON.parse(raw) as { skip?: boolean; url?: string; probe?: ChallengeProbe };
-      if (parsed.skip) return { kind: "skip", url: typeof parsed.url === "string" ? parsed.url : undefined };
-      if (parsed.probe && typeof parsed.probe === "object") return { kind: "probe", probe: parsed.probe };
-      return { kind: "skip" };
-    } catch {
-      return { kind: "skip" };
-    }
+    return parseProbeReadback(valueOf(res), strict);
+  }
+
+  /**
+   * Read the same probe on a `browse:<n>` tab. browse has no `__bc` helper and no wall probe, but its
+   * `eval` tool is read-only and already the route for `evaluate` on these tabs, so the self-contained
+   * probe expression runs there unchanged and feeds the same classifier.
+   */
+  async function readChallengeProbeBrowse(
+    browseTab: number,
+    timeoutMs = 4_000,
+    deadline?: number,
+    strict = false,
+  ): Promise<ProbeReadResult> {
+    const budget = deadline !== undefined ? Math.min(timeoutMs, deadline - Date.now()) : timeoutMs;
+    if (budget <= 0) return { kind: "error" };
+    const res = await raceDeadline(
+      callBrowse("eval", { tab: browseTab, expression: CHALLENGE_PROBE_EXPR, timeout: Math.max(1, Math.floor(budget)) }, budget),
+      deadline,
+      failure("EXECUTION_FAILED", "CHALLENGE_PROBE_TIMEOUT"),
+    );
+    if (!res.ok) return { kind: "error" };
+    return parseProbeReadback(valueOf(res), strict);
   }
 
   /**
@@ -2591,10 +2779,16 @@ export function createPageHelperHandler(
    */
   async function readChallengeProbe(
     targetId: string | undefined,
-    opts: { wallHint?: string; reprobe?: boolean; deadline?: number } = {},
+    opts: { wallHint?: string; reprobe?: boolean; deadline?: number; strict?: boolean; forceFull?: boolean } = {},
   ): Promise<ProbeReadResult> {
     const remaining = (cap: number): number =>
       opts.deadline !== undefined ? Math.min(cap, opts.deadline - Date.now()) : cap;
+
+    // browse tabs have no `__bc` helper; their read-only `eval` runs the same self-contained probe.
+    const browseTab = browseTabNumber(targetId);
+    if (browseTab !== undefined) {
+      return readChallengeProbeBrowse(browseTab, opts.reprobe ? 1_500 : 4_000, opts.deadline, opts.strict);
+    }
 
     if (extensionTabOf(targetId) !== undefined) {
       const baseTimeout = opts.reprobe ? 1_500 : 4_000;
@@ -2618,14 +2812,18 @@ export function createPageHelperHandler(
         failure("EXECUTION_FAILED", "CHALLENGE_PROBE_TIMEOUT"),
       );
       if (!quick.ok) {
-        return opts.reprobe ? readChallengeProbeCdp(targetId, baseTimeout, opts.deadline) : { kind: "error" };
+        return opts.reprobe ? readChallengeProbeCdp(targetId, baseTimeout, opts.deadline, opts.strict, opts.forceFull) : { kind: "error" };
       }
       const rawQuick = valueOf(quick);
-      if (!rawQuick.includes(CHALLENGE_PROBE_SEP)) return { kind: "skip" };
-      const [url = "", title = "", rawText = "", rawVendor = ""] = rawQuick.split(CHALLENGE_PROBE_SEP);
+      if (!rawQuick.includes(CHALLENGE_PROBE_SEP)) return opts.strict === true ? { kind: "error" } : { kind: "skip" };
+      const quickParts = rawQuick.split(CHALLENGE_PROBE_SEP);
+      // A readback missing one of the four fields is incomplete, not a safe page: in strict mode it is unknown.
+      if (opts.strict === true && quickParts.length !== 4) return { kind: "error" };
+      const [url = "", title = "", rawText = "", rawVendor = ""] = quickParts;
       const { text, textLength } = parseBcTextForProbe(rawText);
       const hasVendor = parseBcQueryRows(rawVendor).length > 0;
       const suspicious =
+        opts.forceFull === true ||
         opts.wallHint === "captcha" ||
         opts.wallHint === "rate-limit" ||
         textLength < SHORT_PAGE_CHARS ||
@@ -2662,9 +2860,11 @@ export function createPageHelperHandler(
         opts.deadline,
         failure("EXECUTION_FAILED", "CHALLENGE_PROBE_TIMEOUT"),
       );
-      const [rawFrames = "", rawScripts = "", rawSel = "", rawVis = "", rawAws = ""] = markers.ok
-        ? valueOf(markers).split(CHALLENGE_PROBE_SEP)
-        : [];
+      const markerParts = markers.ok ? valueOf(markers).split(CHALLENGE_PROBE_SEP) : [];
+      // Five steps join into five fields. A failed or short marker read leaves every marker list empty,
+      // which is exactly what a normal page looks like, so strict mode calls it an error, never a clear.
+      if (opts.strict === true && markerParts.length !== 5) return { kind: "error" };
+      const [rawFrames = "", rawScripts = "", rawSel = "", rawVis = "", rawAws = ""] = markerParts;
       const frameUrls = parseBcQueryRows(rawFrames).map((r) => r["src"]).filter((s): s is string => Boolean(s));
       const scriptSrcs = parseBcQueryRows(rawScripts).map((r) => r["src"]).filter((s): s is string => Boolean(s));
       const hasAws = parseBcQueryRows(rawAws).length > 0;
@@ -2708,19 +2908,25 @@ export function createPageHelperHandler(
       return { kind: "probe", probe };
     }
 
-    return readChallengeProbeCdp(targetId, opts.reprobe ? 1_500 : 4_000, opts.deadline);
+    return readChallengeProbeCdp(targetId, opts.reprobe ? 1_500 : 4_000, opts.deadline, opts.strict, opts.forceFull);
   }
 
   /**
    * Run the challenge classifier; auto-wait boundedly (~8 s) on `non-interactive` interstitials,
    * and immediately report `interactive` or `block` without retrying.
+   * `unknownOnError` makes a failed first probe "unknown" instead of "clear", for guards that must
+   * not act on a page they could not read; `deadline` bounds the probe itself.
    */
   async function checkChallenge(
     targetId: string | undefined,
-    opts: { wallHint?: string; knownUrl?: string } = {},
+    opts: { wallHint?: string; knownUrl?: string; unknownOnError?: boolean; deadline?: number; forceFull?: boolean } = {},
   ): Promise<ChallengeCheckResult> {
-    const first = await readChallengeProbe(targetId, { wallHint: opts.wallHint });
+    const strict = opts.unknownOnError === true;
+    const first = await readChallengeProbe(targetId, { wallHint: opts.wallHint, deadline: opts.deadline, strict, forceFull: opts.forceFull });
     if (first.kind !== "probe") {
+      if (first.kind === "error" && strict) {
+        return { status: "unknown", waited: false, url: opts.knownUrl };
+      }
       return { status: "clear", waited: false, url: first.kind === "skip" ? first.url : opts.knownUrl };
     }
     let lastProbe = first.probe;
@@ -2748,8 +2954,13 @@ export function createPageHelperHandler(
       await pause(step);
       waitedMs += step;
       if (deadline - Date.now() <= 0) break;
-      const next = await readChallengeProbe(targetId, { reprobe: true, deadline });
-      if (next.kind === "error") continue;
+      const next = await readChallengeProbe(targetId, { reprobe: true, deadline, strict, forceFull: opts.forceFull });
+      if (next.kind === "error") {
+        // Strict reads must not poll past a page they cannot read: the deadline would end in
+        // non-interactive-timeout, which reports a challenge that was never seen.
+        if (strict) return { status: "unknown", waited: false, url: opts.knownUrl };
+        continue;
+      }
       if (next.kind === "skip") {
         return { status: "clear", waited: true, url: next.url || opts.knownUrl };
       }
@@ -2776,11 +2987,34 @@ export function createPageHelperHandler(
     };
   }
 
+  /**
+   * The pre-step-1 challenge guard. A probe error there is not "clear": step 1 must not run on a page
+   * whose state could not be read. Two tries inside a short budget, then it stays unknown. The budget is
+   * wall-clock, like the probe's own deadline (the probe reads use `Date.now()` for their timeouts), and
+   * each try is capped to its own share so a timing-out first try always leaves the second one time to run.
+   */
+  async function probeChallengeBeforeStep1(
+    targetId: string | undefined,
+    wallHint: string,
+    knownUrl: string,
+  ): Promise<ChallengeCheckResult> {
+    const deadline = Date.now() + PRE_STEP_PROBE_BUDGET_MS;
+    let result: ChallengeCheckResult = { status: "unknown", waited: false, url: knownUrl };
+    for (let attempt = 0; attempt < PRE_STEP_PROBE_TRIES; attempt++) {
+      const attemptDeadline = Math.min(deadline, Date.now() + PRE_STEP_PROBE_ATTEMPT_MS);
+      result = await checkChallenge(targetId, { wallHint, knownUrl, unknownOnError: true, deadline: attemptDeadline });
+      if (result.status !== "unknown" || Date.now() >= deadline) break;
+    }
+    return result;
+  }
+
   async function handlePage(action: string, input: Json, rawTargetId?: string): Promise<InvokeResult> {
     const resolved = await resolveTargetBackend(rawTargetId);
     const { browseTab, extensionTarget, cdpTarget } = resolved;
     if (rawTargetId === undefined) implicitCdpTarget = cdpTarget;
-    const targetId = rawTargetId ?? extensionTarget;
+    // A browse batch resolves only a tab number, so pin `browse:<n>`: the guard and every probe route by
+    // target id, and an empty id sent them to the CDP backend instead of the browse tab they act on.
+    const targetId = rawTargetId ?? extensionTarget ?? (browseTab !== undefined ? `browse:${browseTab}` : undefined);
     const quiet = input["quiet"] === true;
 
     switch (action) {
@@ -2904,6 +3138,54 @@ export function createPageHelperHandler(
       case "handoff":
         return runHandoff(input, targetId, resolved);
 
+      case "solve_captcha": {
+        const verify = input["verify"] === true;
+        // Same engine as nav/snap/do: detection is read-only; the agent acts, the tool never solves.
+        // A failed or incomplete read reports "unknown", never "clear": a read that failed did not
+        // read a clean page. The report proves detection evidence — what it does not prove is that
+        // the answer was accepted; that is what --verify is for.
+        if (verify) {
+          // One forced full read, not the fast-path skip: a long page still carrying a widget must
+          // not report clear. No wait loop — verify is a re-check after the agent answered.
+          const probe = await readChallengeProbe(targetId, { reprobe: true, strict: true, forceFull: true });
+          if (probe.kind === "error") {
+            return success(formatCaptchaReport({ status: "unknown", waited: false }, true));
+          }
+          if (probe.kind === "skip") {
+            return success(formatCaptchaReport({ status: "clear", waited: false, url: probe.url }, true));
+          }
+          const p = probe.probe;
+          const detection = classifyChallenge(p);
+          if (!detection) {
+            // The classifier ignores widgets on long pages (walls flag short pages only). A widget
+            // marker in the full probe still means the page is not a clean read: report still present.
+            const widgetSel = (p.selectors ?? [])[0];
+            const widgetFrame = (p.frameUrls ?? []).find((u) => /recaptcha|hcaptcha|turnstile/i.test(u));
+            if (widgetSel !== undefined || widgetFrame !== undefined) {
+              const reason = widgetSel !== undefined ? `widget marker ${widgetSel}` : `widget frame ${widgetFrame}`;
+              return success(
+                formatCaptchaReport(
+                  { status: "interactive", waited: false, url: p.url, detection: { vendor: "generic", kind: "interactive", reason } },
+                  true,
+                ),
+              );
+            }
+            return success(formatCaptchaReport({ status: "clear", waited: false, url: p.url }, true));
+          }
+          const status: "interactive" | "block" | "non-interactive-timeout" =
+            detection.kind === "interactive" ? "interactive" : detection.kind === "block" ? "block" : "non-interactive-timeout";
+          return success(formatCaptchaReport({ status, waited: false, url: p.url, detection }, true));
+        }
+        const res = await checkChallenge(targetId, { unknownOnError: true });
+        const report: CaptchaStatus =
+          res.status === "clear"
+            ? { status: "clear", waited: res.waited, url: res.url }
+            : res.status === "unknown"
+              ? { status: "unknown", waited: res.waited, url: res.url }
+              : { status: res.status, waited: res.waited, url: res.url, detection: res.detection };
+        return success(formatCaptchaReport(report, verify));
+      }
+
       case "do": {
         const steps = parseSteps(input);
         if (typeof steps === "string") return failure("INPUT_VALIDATION_FAILED", `INPUT_INVALID: ${steps}`);
@@ -2918,7 +3200,67 @@ export function createPageHelperHandler(
         let stopped: string | undefined;
         let challengeReport: string | undefined;
         const challengeBackend = challengeBackendOf(targetId);
+        // Nothing looks at the page until a step has run, so a batch would act on a challenge page before the
+        // post-step check could see it. Probe up front on the same terms as that check: a wall, a challenge, a
+        // page that could not be read, or a redirect off the start host stops the batch with every step unrun.
+        // Attach-free on DevTools tabs (one bc_call read plus the silent probe); on browse tabs the href read
+        // and the read-only `eval` probe are the equivalent.
+        const readPreStepState = async (): Promise<{ url: string; wall: string }> => {
+          if (browseTab !== undefined) {
+            const href = await readProperty("href", targetId);
+            return { url: href.ok ? valueOf(href) : "", wall: "" };
+          }
+          const state = await evalHelper(
+            { steps: [{ kind: "href" }, { kind: "bc", method: "wall", fallback: "" }], join: "\n" },
+            targetId,
+            4_000,
+          );
+          if (!state.ok) return { url: "", wall: "" };
+          const [url = "", wall = ""] = valueOf(state).split("\n");
+          return { url: url ?? "", wall: wall ?? "" };
+        };
+        {
+          const pre = await readPreStepState();
+          if (pre.url) prevUrl = pre.url;
+          let preWall = pre.wall;
+          const challenge = await probeChallengeBeforeStep1(targetId, preWall, prevUrl || startUrl);
+          if (challenge.status === "unknown") {
+            stopped = "page state unknown before step 1";
+          } else if (
+            challenge.status === "block" ||
+            challenge.status === "interactive" ||
+            challenge.status === "non-interactive-timeout"
+          ) {
+            challengeReport = formatChallengeOutput(challenge.detection, challenge.url || prevUrl, {
+              backend: challengeBackend,
+              untrustedBoundary: true,
+            });
+            stopped =
+              challenge.status === "block"
+                ? `blocked by ${challenge.detection.vendor} before step 1`
+                : `${challenge.detection.vendor} challenge before step 1`;
+          } else {
+            if (challenge.waited) {
+              const after = await readPreStepState();
+              if (after.url) prevUrl = after.url;
+              else if (challenge.url) prevUrl = challenge.url;
+              preWall = after.wall;
+            } else if (challenge.url) {
+              // Nothing newer was read, so the probe's own URL is the freshest: a redirect during the
+              // first probe would otherwise leave the boundary comparing the URL from before it.
+              prevUrl = challenge.url;
+            }
+            // A captcha or rate-limit wall the probe could not classify still stops the batch unrun.
+            if (preWall === "captcha" || preWall === "rate-limit") {
+              stopped = `the page is a ${preWall} wall before step 1`;
+            } else if (prevUrl && startUrl && hostOf(prevUrl) !== hostOf(startUrl)) {
+              // A cleared challenge can leave the tab on another host, so re-apply the post-step boundary.
+              stopped = `the page left ${hostOf(startUrl)} for ${hostOf(prevUrl)} before step 1`;
+            }
+          }
+        }
         for (const [i, step] of steps.entries()) {
+          if (stopped) break;
           const stepInput: Json = {
             ...(input["fast"] === true ? { fast: true } : {}),
             ...(input["_natural"] !== undefined ? { _natural: input["_natural"] } : {}),

@@ -43,7 +43,7 @@ type Json = Record<string, unknown>;
 const UNTRUSTED_PAGE_ACTIONS = new Set([
   "snap", "text", "form", "query", "read-urls", "ocr", "value", "verdict", "health",
   "styles", "issues", "perf", "click", "hover", "dialog", "type", "select", "upload", "drag", "wait", "key", "do",
-  "notes", "flow", "script",
+  "notes", "flow", "script", "solve_captcha",
 ]);
 
 const failure = (code: string, message: string): InvokeResult =>
