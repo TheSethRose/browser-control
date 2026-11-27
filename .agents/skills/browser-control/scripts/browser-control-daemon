@@ -14,6 +14,15 @@
 #                                     if needed. Never pass a port.
 #   default [browser]                 show or set the default browser
 #   ops | status | check-update [--force]
+#
+# Chrome extension (no remote-debugging prompt):
+#   extension setup [extensionDir]    pair this machine and turn the extension backend on;
+#                                     extensionDir defaults to the repo's extension/ folder
+#   extension status                  relay port, connected browsers, paired yes/no
+#   extension browsers                connected browsers: slug, brand, version
+#   extension diagnostics             relay and extension state for bug reports (no secrets)
+#   extension enable | disable        use the extension for this daemon dir, or CDP only
+#   extension pair | revoke           not available yet (Web Store build)
 #   stop --force                      ONLY when the user asks: drops every approved connection,
 #                                     so the user must click Allow again
 #
@@ -57,7 +66,7 @@ sock="$dir/sock"; log="$dir/daemon.log"; lock="$dir/starting"; build_file="$sock
 repo_url="https://github.com/TheSethRose/browser-control"
 raw_manifest_url="https://raw.githubusercontent.com/TheSethRose/browser-control/main/capability.json"
 
-fail() { echo '{"ok":false,"error":{"code":"'"$1"'","message":"'"$2"'"}}'; exit 1; }
+fail() { echo '{"ok":false,"error":{"code":"'"$1"'","message":'"$(json_str "$2")"'}}'; exit 1; }
 
 cli_build() {
   local f="$here/../runtime/cli.js"
@@ -185,7 +194,7 @@ urlencode() {
   printf '%s' "$out"
 }
 body() { if [[ "$1" == "-" ]]; then cat; else printf '%s' "$1"; fi; }
-usage() { sed -n '2,49p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; }
 
 cmd="${1:-}"; [[ $# -gt 0 ]] && shift
 
@@ -246,8 +255,10 @@ case "$cmd" in snap | text | form | query | read-urls | ocr | click | hover | ty
       --reduced-motion) reduced_motion=true; shift ;;
       --offline) offline=true; shift ;;
       --reset) reset_flag=true; shift ;;
-      --new-window) new_window=1; shift ;;
-      --keep-open) keep_open=1; shift ;;
+      --new-window | --keep-open)
+        [[ "$cmd" == nav ]] || fail INPUT_INVALID "unknown flag: $1 ($1 works only with nav)"
+        if [[ "$1" == --new-window ]]; then new_window=1; else keep_open=1; fi
+        shift ;;
       --param) params_list+=("${2:?--param needs key=value}"); shift 2 ;;
       --where) where_list+=("${2:?--where needs field=value}"); shift 2 ;;
       --) shift; while [[ $# -gt 0 ]]; do args+=("$1"); shift; done ;;
@@ -555,6 +566,32 @@ case "$cmd" in
   stop)
     [[ "$(arg 0)" == "--force" ]] || fail STOP_REFUSED "stopping drops every approved browser connection and the user must click Allow again. Nothing is fixed by restarting. Only if the user asked: stop --force"
     req POST stop >/dev/null || true; rm -f "$build_file" 2>/dev/null || true; echo '{"ok":true,"data":{"running":false}}'
+    ;;
+  extension)
+    sub="$(arg 0)"
+    case "$sub" in
+      setup)
+        ext_dir="$(arg 1)"
+        if [[ -z "$ext_dir" ]]; then
+          ext_dir="$(cd "$here/../../../.." 2>/dev/null && pwd)/extension"
+          [[ -f "$ext_dir/manifest.json" ]] || fail INPUT_INVALID "no extension/ folder next to this skill; run: browser-control-daemon extension setup <extensionDir>"
+        fi
+        [[ -f "$ext_dir/manifest.json" ]] || fail INPUT_INVALID "not an extension folder (no manifest.json): $ext_dir"
+        ext_dir="$(cd "$ext_dir" && pwd)"
+        command -v bun >/dev/null 2>&1 || { echo "browser-control-daemon: bun is required (https://bun.sh)" >&2; exit 127; }
+        bun "$here/../runtime/cli.js" extension-setup "$ext_dir" >/dev/null || fail EXECUTION_FAILED "pairing setup failed; see the error above"
+        mkdir -p "$dir"; chmod 700 "$dir"; printf '%s\n' "extension,cdp" >"$dir/backends.$$" && mv -f "$dir/backends.$$" "$dir/backends"
+        echo '{"ok":true,"data":{"paired":true,"backends":"extension,cdp","extensionDir":'"$(json_str "$ext_dir")"',"next":"In Chrome open chrome://extensions, turn on Developer mode, click Load unpacked, and pick extensionDir. Then run: browser-control-daemon extension browsers"}}'
+        ;;
+      status | browsers | diagnostics) run GET "extension/$sub" ;;
+      enable | disable)
+        order="cdp"; [[ "$sub" == disable ]] || order="extension,cdp"
+        mkdir -p "$dir"; chmod 700 "$dir"; printf '%s\n' "$order" >"$dir/backends.$$" && mv -f "$dir/backends.$$" "$dir/backends"
+        echo '{"ok":true,"data":{"backends":"'"$order"'"}}'
+        ;;
+      pair | revoke) fail INPUT_INVALID "extension $sub is not available yet: it ships with the Web Store build. Use: browser-control-daemon extension setup" ;;
+      *) fail INPUT_INVALID "usage: browser-control-daemon extension setup [extensionDir] | status | browsers | diagnostics | enable | disable" ;;
+    esac
     ;;
   help | -h | --help) usage ;;
   *) usage; exit 2 ;;

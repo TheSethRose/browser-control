@@ -1,8 +1,11 @@
 /**
- * Routes each operation to a backend. The order comes from `BROWSER_CONTROL_BACKENDS` or the
- * one-line file `~/.config/browser-control/backends` (for example `browse,cdp`), read on
- * every call so it can change without a restart. The default is `cdp` alone, which is the
- * runtime's original behavior.
+ * Routes each operation to a backend. The order comes from, first match wins:
+ * 1. the daemon's own one-line `backends` file in its daemon dir (written by the wrapper's
+ *    `extension enable|disable`),
+ * 2. `BROWSER_CONTROL_BACKENDS`,
+ * 3. the one-line file `~/.config/browser-control/backends` (for example `browse,cdp`).
+ * Files are read on every call so the order can change without a restart. The default is
+ * `cdp` alone, which is the runtime's original behavior.
  *
  * Rules:
  * - A target id with a backend prefix (`browse:12`) always goes to that backend.
@@ -32,15 +35,27 @@ const TAB_OPS = new Set([
   "wait_for_event",
 ]);
 
+let daemonBackendsFile: string | undefined;
+
+/** The daemon calls this once at startup with `<daemonDir>/backends`. */
+export function setDaemonBackendsFile(file: string | undefined): void {
+  daemonBackendsFile = file;
+}
+
+function readOneLine(file: string): string {
+  try {
+    return readFileSync(file, "utf8").trim();
+  } catch {
+    return "";
+  }
+}
+
 export function backendOrder(): string[] {
-  let raw = process.env["BROWSER_CONTROL_BACKENDS"]?.trim();
+  let raw = daemonBackendsFile ? readOneLine(daemonBackendsFile) : "";
+  if (!raw) raw = process.env["BROWSER_CONTROL_BACKENDS"]?.trim() ?? "";
   if (!raw) {
     const config = process.env["XDG_CONFIG_HOME"] || join(homedir(), ".config");
-    try {
-      raw = readFileSync(join(config, "browser-control", "backends"), "utf8").trim();
-    } catch {
-      raw = "";
-    }
+    raw = readOneLine(join(config, "browser-control", "backends"));
   }
   const names = (raw || CDP)
     .split(/[\s,]+/)
@@ -62,6 +77,8 @@ export function route(
   const enabledBackends = () => enabled().flatMap((n) => (n === CDP ? [] : [byName.get(n)!]));
 
   async function runOp(op: string, input: OpInput): Promise<unknown> {
+    // A backend removed from the order (`extension disable`) no longer owns untargeted calls.
+    if (active !== undefined && !enabled().includes(active)) active = undefined;
     // `nav --browser <slug>` names an extension browser, whatever the backend order or target.
     if (op === "navigate" && typeof input["browser"] === "string") {
       const ext = enabled().includes(EXTENSION) ? byName.get(EXTENSION) : undefined;

@@ -67,6 +67,17 @@ describe("router with browse first", () => {
     expect(log).toEqual([]);
   });
 
+  test("dropping browse from the order sends untargeted calls back to CDP", async () => {
+    const log: string[] = [];
+    const { run } = fakeBrowse({ navigate: { out: JSON.stringify({ tab: 7 }) } });
+    let order = ["browse", "cdp"];
+    const ops = route(fakeCdp(log), [createBrowseBackend(run)], () => order);
+    await ops["navigate"]!({ url: "https://x" });
+    order = ["cdp"];
+    await ops["capture_pdf"]!({});
+    expect(log).toEqual(["capture_pdf:"]);
+  });
+
   test("an operation browse lacks fails clearly on a browse tab instead of using another tab", async () => {
     const log: string[] = [];
     const { run } = fakeBrowse({ navigate: { out: JSON.stringify({ tab: 7 }) } });

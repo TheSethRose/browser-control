@@ -12,6 +12,7 @@
 //   GET  /tabs               one page per line, "*" marks the active target
 //   GET  /ops                one operation per line with its input names
 //   GET  /status             daemon pid, version, build hash + get_browser_status
+//   GET  /extension/<sub>    status | diagnostics (JSON), browsers (one per line); no secrets
 //   POST /stop               dispose and exit
 //
 // /eval, /nav and /page/* take ?t=<targetId> or ?m=<text in the tab's url or title>,
@@ -20,7 +21,14 @@ import { openStandaloneCapability, type InvokeResult } from "@agent-software/cor
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import {
+  extensionBrowsersReport,
+  extensionDiagnosticsReport,
+  extensionStatusReport,
+  getRegisteredExtensionBackend,
+} from "./src/backends/extension";
+import { backendOrder, setDaemonBackendsFile } from "./src/backends/router";
 import { disposeOcr } from "./src/ocr";
 import { createPageHelperHandler, formatAxTree, matchTab } from "./src/page-runner";
 import { imageWidth } from "./src/picture";
@@ -99,6 +107,8 @@ export function applyNavBrowserScope(
 }
 
 export async function serveDaemon(capabilityDir: string, socketPath: string): Promise<void> {
+  // `extension enable|disable` writes this file; it must be set before the runtime starts backends.
+  setDaemonBackendsFile(join(dirname(socketPath), "backends"));
   const capability = await openStandaloneCapability(capabilityDir);
   const maxChars = Number(process.env["BROWSER_CONTROL_MAX_OUTPUT"]) || 50_000;
   const boundariesDefault = process.env["BROWSER_CONTROL_CONTENT_BOUNDARIES"] !== "0";
@@ -310,11 +320,47 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
           status.ok ? { ok: true, data: { running: true, pid: process.pid, version, build, ...(status.data as Json) } } : status,
         );
       }
+      case "extension":
+        return extensionRoute(operation);
       case "stop":
         setTimeout(stop, 10);
         return json({ ok: true, data: { running: false } });
       default:
         return json(failure("OPERATION_NOT_FOUND", `unknown daemon route: /${route}`));
     }
+  }
+
+  async function extensionRoute(sub: string): Promise<Response> {
+    return handleExtensionRoute(sub, getRegisteredExtensionBackend(), backendOrder());
+  }
+}
+
+/** `GET /extension/<sub>`: the wrapper's `extension status|browsers|diagnostics`. */
+export async function handleExtensionRoute(
+  sub: string,
+  backend: Parameters<typeof extensionStatusReport>[0],
+  order: string[],
+  tokenFile?: string,
+): Promise<Response> {
+  const reply = (result: InvokeResult) =>
+    new Response(`${JSON.stringify(result)}\n`, { status: result.ok ? 200 : 400 });
+  try {
+    switch (sub) {
+      case "status":
+        return reply({ ok: true, data: await extensionStatusReport(backend, order, tokenFile) } as InvokeResult);
+      case "diagnostics":
+        return reply({ ok: true, data: await extensionDiagnosticsReport(backend, order, { tokenFile }) } as InvokeResult);
+      case "browsers": {
+        const rows = await extensionBrowsersReport(backend, order);
+        const lines = rows.map((b) => `${b.slug} ${b.brand} ${escapeControls(b.browser)} v${escapeControls(b.extensionVersion)}`);
+        return new Response(`${lines.length > 0 ? lines.join("\n") : "(no browsers connected)"}\n`);
+      }
+      default:
+        return reply(failure("INPUT_INVALID", `unknown extension subcommand: ${sub}`));
+    }
+  } catch (error) {
+    const message = (error as Error).message;
+    const code = /^([A-Z_]+):\s/.exec(message)?.[1] ?? "EXECUTION_FAILED";
+    return reply(failure(code, escapeControls(message.replace(/^[A-Z_]+:\s*/, ""))));
   }
 }

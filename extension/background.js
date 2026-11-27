@@ -1306,6 +1306,26 @@ async function handleRequest(msg) {
       return { ok: true };
     }
 
+    case "diagnostics": {
+      // Never include the token or nonces: this output goes into bug reports.
+      return {
+        extensionVersion: chrome.runtime.getManifest().version,
+        protocolVersion: PROTOCOL_VERSION,
+        hasToken: Boolean(config.token),
+        mode: config.mode,
+        settings: { ...settings },
+        lastError,
+        connections: [...connections.values()].map((c) => ({
+          port: c.port,
+          state: c.state,
+          instanceId: c.instanceId ?? null,
+        })),
+        attachedCount: debuggerHub.size(),
+        lentTabs: lentTabs.size,
+        handoffs: handoffTabs.size,
+      };
+    }
+
     default:
       throw new Error(`INPUT_INVALID: unknown extension op "${op}"`);
   }
