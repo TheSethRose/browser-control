@@ -36,15 +36,16 @@ async function refresh() {
   const s = await chrome.runtime.sendMessage({ type: "status" });
   currentTabId = s.activeTabId;
   statusEl.textContent = s.connected ? "Connected" : s.hasToken ? "Waiting for relay" : "Not paired";
-  statusEl.className = `pill ${s.connected ? "on" : "off"}`;
-  const ports = Array.isArray(s.ports) && s.ports.length > 0 ? s.ports : [s.port || 49222];
+  statusEl.className = `pill ${s.connected ? "on" : s.hasToken ? "wait" : "off"}`;
   infoEl.textContent = s.connected
-    ? `Paired on 127.0.0.1:${ports.join(", ")}. ${s.attachedCount} tab(s) with debugger attached.`
+    ? ""
     : (s.lastError && s.lastError !== "Waiting for relay" ? s.lastError : `Waiting for relay on 127.0.0.1:49222-49229`);
-  modeAll.className = s.mode === "all" ? "primary" : "";
-  modeLent.className = s.mode === "lent" ? "primary" : "";
-  lendBtn.style.display = s.mode === "lent" ? "block" : "none";
+  infoEl.hidden = s.connected;
+  modeAll.setAttribute("aria-pressed", String(s.mode === "all"));
+  modeLent.setAttribute("aria-pressed", String(s.mode === "lent"));
+  lendBtn.style.display = s.mode === "lent" ? "" : "none";
   lendBtn.textContent = s.activeTabLent ? "Revoke this tab" : "Lend this tab";
+  lendBtn.className = "wide secondary";
   portInput.value = String(s.port || 49222);
 
   const handoffs = Array.isArray(s.handoffs) ? s.handoffs : [];
