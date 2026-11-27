@@ -1243,17 +1243,17 @@ describe("background handoff lifecycle", () => {
       windows: [{ id: 1, type: "normal", state: "normal", focused: true }],
       tabs: [{ id: 7, windowId: 1, url: "chrome://settings", active: true, groupId: -1 }],
     });
-    let badgeText = "";
+    let actionIcon = "";
     let injectError: Error | null = new Error("Cannot access a chrome:// URL");
     const noopListener = { addListener: () => {}, removeListener: () => {} };
 
     const fullChrome = {
       ...fake.chrome,
       action: {
-        setBadgeText: ({ text }: { text: string }) => {
-          badgeText = text;
+        setIcon: async ({ path }: { path: Record<string, string> }) => {
+          actionIcon = path["16"] ?? "";
         },
-        setBadgeBackgroundColor: () => {},
+        setTitle: async () => {},
       },
       alarms: {
         create: () => {},
@@ -1305,10 +1305,10 @@ describe("background handoff lifecycle", () => {
       // @ts-expect-error Plain ES module in extension/ without .d.ts
       const bg = await import("../extension/background.js");
 
-      // S7: overlay injection failure must reject AND roll back handoffTabs + badge.
+      // S7: overlay injection failure must reject AND roll back handoffTabs + action icon.
       await expect(bg.handoffStart(7, "Sign in", "hid-fail")).rejects.toThrow(/RESTRICTED_PAGE/);
       expect(bg.handoffTabs.has(7)).toBe(false);
-      expect(badgeText).not.toBe("!");
+      expect(actionIcon).not.toContain("handoff");
 
       // Once injectable, a subsequent handoff on the same tab succeeds (was not left stuck).
       injectError = null;
@@ -1316,7 +1316,7 @@ describe("background handoff lifecycle", () => {
       const started = await bg.handoffStart(7, "Sign in", "hid-1");
       expect(started).toEqual({ ok: true, tabId: 7, handoffId: "hid-1" });
       expect(bg.handoffTabs.has(7)).toBe(true);
-      expect(badgeText).toBe("!");
+      expect(actionIcon).toContain("state-handoff");
 
       // S6 extension-side: overlapping handoff fails; wrong handoffId cannot clear or complete.
       await expect(bg.handoffStart(7, "Second", "hid-2")).rejects.toThrow(/HANDOFF_IN_PROGRESS/);

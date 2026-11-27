@@ -1044,7 +1044,7 @@ function makeBackgroundChrome(opts: {
 
   const fullChrome = {
     ...fake.chrome,
-    action: { setBadgeText: () => {}, setBadgeBackgroundColor: () => {} },
+    action: { setIcon: async () => {}, setTitle: async () => {} },
     alarms: { create: () => {}, onAlarm: noopListener },
     notifications: { create: async () => {}, clear: async () => {}, onClicked: noopListener, onButtonClicked: noopListener },
     scripting: {

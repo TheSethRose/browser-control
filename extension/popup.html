@@ -4,91 +4,183 @@
   <meta charset="utf-8" />
   <title>Browser Control</title>
   <style>
-    :root { color-scheme: light dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-    body { margin: 0; padding: 14px; width: 290px; font-size: 13px; }
-    h1 { margin: 0 0 8px; font-size: 14px; display: flex; align-items: center; justify-content: space-between; }
-    .pill { font-size: 11px; padding: 2px 8px; border-radius: 99px; font-weight: 600; }
-    .on { background: #16a34a22; color: #16a34a; }
-    .off { background: #dc262622; color: #dc2626; }
-    .muted { opacity: 0.72; font-size: 12px; margin: 4px 0 10px; line-height: 1.35; }
-    .row { display: flex; gap: 6px; margin-bottom: 8px; }
-    button { flex: 1; padding: 7px 10px; border-radius: 6px; border: 1px solid currentColor; background: transparent; cursor: pointer; font-size: 12px; font-weight: 500; }
-    button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
-    button.danger { color: #dc2626; border-color: #dc262688; }
-    .handoff-box { display: none; margin: 8px 0; padding: 9px 10px; border-radius: 7px; border: 1px solid #2563eb88; background: #2563eb14; }
-    .handoff-box.active { display: block; }
-    .handoff-title { font-size: 12px; font-weight: 600; color: #2563eb; margin-bottom: 3px; }
-    .handoff-msg { font-size: 12px; margin: 0 0 8px; line-height: 1.35; }
-    .section { margin-top: 8px; border-top: 1px solid #8883; padding-top: 8px; }
-    .setting { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 7px; font-size: 12px; }
-    .setting label { flex: 1; }
-    select { padding: 4px 6px; border-radius: 5px; border: 1px solid #8885; background: transparent; font-size: 12px; }
-    input[type="checkbox"] { width: auto; margin: 0; }
-    details { margin-top: 8px; border-top: 1px solid #8883; padding-top: 8px; }
-    summary { cursor: pointer; font-size: 12px; opacity: 0.8; }
-    input[type="number"], input[type="password"] { width: 100%; box-sizing: border-box; margin: 5px 0; padding: 6px 8px; border-radius: 5px; border: 1px solid #8885; background: transparent; font-size: 12px; }
+    :root {
+      color-scheme: light dark;
+      --bg: #ffffff;
+      --surface: #f4f5f7;
+      --border: #dfe2e7;
+      --text: #14171c;
+      --muted: #5b6370;
+      --accent: #2563eb;
+      --accent-hover: #1d4ed8;
+      --on-accent: #ffffff;
+      --accent-soft: #eaf0fe;
+      --accent-text: #1d4ed8;
+      --ok-bg: #e7f6ec;
+      --ok-text: #166534;
+      --warn-bg: #fdf3dc;
+      --warn-text: #8a4b08;
+      --err-bg: #fdeaea;
+      --err-text: #b42318;
+      --raised: #ffffff;
+      --focus: #2563eb;
+      --radius: 8px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #16181d;
+        --surface: #1f2228;
+        --border: #30343c;
+        --text: #eceef2;
+        --muted: #a3aab6;
+        --accent: #2563eb;
+        --accent-hover: #3b6ff0;
+        --on-accent: #ffffff;
+        --accent-soft: #1a2540;
+        --accent-text: #9dbbff;
+        --ok-bg: #11291b;
+        --ok-text: #7ee2a0;
+        --warn-bg: #33270e;
+        --warn-text: #f5c66b;
+        --err-bg: #3a1616;
+        --err-text: #ffa3a3;
+        --raised: #353a44;
+        --focus: #9dbbff;
+      }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 14px; width: 300px; font-size: 13px; line-height: 1.35; background: var(--bg); color: var(--text); }
+    svg { flex: none; }
+    header { display: flex; align-items: center; gap: 8px; }
+    header .mark { color: var(--accent); }
+    h1 { margin: 0; flex: 1; font-size: 14px; font-weight: 650; }
+    .pill { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 99px; }
+    .pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+    .on { background: var(--ok-bg); color: var(--ok-text); }
+    .wait { background: var(--warn-bg); color: var(--warn-text); }
+    .off { background: var(--err-bg); color: var(--err-text); }
+    .info { margin: 6px 0 12px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+    .handoff { display: none; margin: 0 0 12px; padding: 10px 12px; border-radius: var(--radius); border: 2px solid var(--accent); background: var(--accent-soft); }
+    .handoff.active { display: block; }
+    .handoff-title { display: flex; align-items: center; gap: 6px; font-weight: 650; color: var(--accent-text); }
+    .handoff-msg { margin: 4px 0 10px; overflow-wrap: anywhere; }
+    .label { margin: 0 0 6px; font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+    .segmented { display: grid; grid-template-columns: 1fr 1fr; padding: 3px; gap: 3px; border-radius: var(--radius); background: var(--surface); border: 1px solid var(--border); }
+    .segmented button { border: 0; background: transparent; color: var(--muted); }
+    .segmented button[aria-pressed="true"] { background: var(--raised); color: var(--text); box-shadow: 0 1px 2px rgb(0 0 0 / 0.18); }
+    button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 30px; padding: 6px 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font: inherit; font-size: 12px; font-weight: 550; cursor: pointer; }
+    button:hover { background: var(--surface); }
+    button:focus-visible, select:focus-visible, input:focus-visible, summary:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+    button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+    button.primary:hover { background: var(--accent-hover); }
+    button.secondary { border-color: var(--accent); color: var(--accent-text); }
+    button.danger { color: var(--err-text); }
+    .wide { width: 100%; }
+    #lendBtn { margin-top: 8px; }
+    .group { margin-top: 14px; }
+    .settings { border: 1px solid var(--border); border-radius: var(--radius); }
+    .setting { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 36px; padding: 4px 10px; font-size: 12px; }
+    .setting + .setting { border-top: 1px solid var(--border); }
+    .setting label { flex: 1; cursor: pointer; }
+    select { min-height: 26px; padding: 3px 6px; border-radius: 5px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font: inherit; font-size: 12px; }
+    input[type="checkbox"] { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); cursor: pointer; }
+    .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+    .actions button { white-space: nowrap; padding: 6px 8px; }
+    details { margin-top: 14px; border-top: 1px solid var(--border); padding-top: 10px; }
+    summary { display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 12px; color: var(--muted); list-style: none; }
+    summary::-webkit-details-marker { display: none; }
+    summary svg { transition: transform 0.15s; }
+    details[open] summary svg { transform: rotate(90deg); }
+    @media (prefers-reduced-motion: reduce) { summary svg { transition: none; } }
+    .pair { display: grid; gap: 6px; margin-top: 8px; }
+    .pair label { font-size: 11px; color: var(--muted); }
+    input[type="number"], input[type="password"] { width: 100%; padding: 6px 8px; border-radius: 5px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font: inherit; font-size: 12px; }
   </style>
 </head>
 <body>
-  <h1>
-    Browser Control
-    <span id="status" class="pill off">Offline</span>
-  </h1>
-  <div id="info" class="muted">Checking daemon...</div>
+  <header>
+    <svg class="mark" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="15" rx="2.5"/><path d="M3 8.5h18"/><path d="M12 12l6 2.2-2.6 1-1 2.6z" fill="currentColor"/></svg>
+    <h1>Browser Control</h1>
+    <span id="status" class="pill off" role="status">Offline</span>
+  </header>
+  <p id="info" class="info">Checking daemon...</p>
 
-  <div id="handoffBox" class="handoff-box">
-    <div class="handoff-title">Your turn</div>
+  <section id="handoffBox" class="handoff" aria-live="polite">
+    <div class="handoff-title">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 11V6a2 2 0 0 0-4 0v5"/><path d="M14 10V4a2 2 0 0 0-4 0v6"/><path d="M10 10.5V6a2 2 0 0 0-4 0v8a8 8 0 0 0 16 0v-2a2 2 0 0 0-4 0"/></svg>
+      Your turn
+    </div>
     <p id="handoffMsg" class="handoff-msg"></p>
-    <button id="handoffDoneBtn" class="primary" style="width:100%">Continue</button>
-  </div>
+    <button id="handoffDoneBtn" class="primary wide">
+      Continue
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+    </button>
+  </section>
 
-  <div class="row">
-    <button id="modeAll">All tabs</button>
-    <button id="modeLent">Lent only</button>
-  </div>
+  <section>
+    <p class="label" id="accessLabel">Agent access</p>
+    <div class="segmented" role="group" aria-labelledby="accessLabel">
+      <button id="modeAll" aria-pressed="false">All tabs</button>
+      <button id="modeLent" aria-pressed="false">Lent only</button>
+    </div>
+    <button id="lendBtn" class="wide">Lend this tab</button>
+  </section>
 
-  <div class="row">
-    <button id="lendBtn" class="primary">Lend this tab</button>
-  </div>
+  <section class="group">
+    <p class="label">Settings</p>
+    <div class="settings">
+      <div class="setting">
+        <label for="tabGroupMode">Tab group</label>
+        <select id="tabGroupMode">
+          <option value="shared">Shared (Agents)</option>
+          <option value="none">None</option>
+        </select>
+      </div>
+      <div class="setting">
+        <label for="autoCollapse">Auto-collapse group</label>
+        <input id="autoCollapse" type="checkbox" />
+      </div>
+      <div class="setting">
+        <label for="idleCleanup">Idle cleanup</label>
+        <select id="idleCleanup">
+          <option value="15">15 min</option>
+          <option value="30">30 min</option>
+          <option value="60">60 min</option>
+          <option value="120">2 hours</option>
+          <option value="0">Never</option>
+        </select>
+      </div>
+      <div class="setting">
+        <label for="muteAgentTabs">Mute agent tabs</label>
+        <input id="muteAgentTabs" type="checkbox" />
+      </div>
+    </div>
+  </section>
 
-  <div class="row">
-    <button id="detachBtn" class="danger">Detach debugger</button>
-    <button id="reconnectBtn">Reconnect</button>
-  </div>
-
-  <div class="section">
-    <div class="setting">
-      <label for="tabGroupMode">Tab group</label>
-      <select id="tabGroupMode">
-        <option value="shared">Shared (Agents)</option>
-        <option value="none">None</option>
-      </select>
-    </div>
-    <div class="setting">
-      <label for="autoCollapse">Auto-collapse group</label>
-      <input id="autoCollapse" type="checkbox" />
-    </div>
-    <div class="setting">
-      <label for="idleCleanup">Idle cleanup</label>
-      <select id="idleCleanup">
-        <option value="15">15 min</option>
-        <option value="30">30 min</option>
-        <option value="60">60 min</option>
-        <option value="120">2 hours</option>
-        <option value="0">Never</option>
-      </select>
-    </div>
-    <div class="setting">
-      <label for="muteAgentTabs">Mute agent tabs</label>
-      <input id="muteAgentTabs" type="checkbox" />
-    </div>
-  </div>
+  <section class="group actions">
+    <button id="detachBtn" class="danger">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 7 7 9a4 4 0 0 0 0 5.6l2.4 2.4a4 4 0 0 0 5.6 0l2-2"/><path d="m15 17 2-2a4 4 0 0 0 0-5.6L14.6 7A4 4 0 0 0 9 7"/><path d="M4 4l16 16"/></svg>
+      Detach debugger
+    </button>
+    <button id="reconnectBtn">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 11a8 8 0 0 0-14.3-4.9L4 8"/><path d="M4 3v5h5"/><path d="M4 13a8 8 0 0 0 14.3 4.9L20 16"/><path d="M20 21v-5h-5"/></svg>
+      Reconnect
+    </button>
+  </section>
 
   <details>
-    <summary>Manual pairing (paste relay token)</summary>
-    <input id="portInput" type="number" placeholder="Port (default 49222)" />
-    <input id="tokenInput" type="password" placeholder="Relay token from extension-relay.json" />
-    <button id="pairBtn" style="width:100%">Save &amp; Connect</button>
+    <summary>
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg>
+      Manual pairing
+    </summary>
+    <div class="pair">
+      <label for="portInput">Port</label>
+      <input id="portInput" type="number" placeholder="49222" />
+      <label for="tokenInput">Relay token</label>
+      <input id="tokenInput" type="password" autocomplete="off" />
+      <button id="pairBtn" class="wide">Save &amp; Connect</button>
+    </div>
   </details>
   <script src="popup.js"></script>
 </body>
