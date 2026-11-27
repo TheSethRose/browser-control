@@ -129,12 +129,13 @@ describe("extension setup and the global order file", () => {
   test("the rewritten global file and its backup keep the original file mode", async () => {
     const { root, daemonDir, globalFile } = await isolate("setup-mode");
     const ext = await extFolder(root);
-    await writeFile(globalFile, "cdp\n", { mode: 0o600 });
-    await chmod(globalFile, 0o600);
+    // 0640, not 0600: 0600 is also the fallback, so it couldn't prove the mode was copied.
+    await writeFile(globalFile, "cdp\n", { mode: 0o640 });
+    await chmod(globalFile, 0o640);
     const res = await setup(ext, daemonDir);
     const backup = (res.data["globalOrder"] as Record<string, string>)["backup"]!;
-    expect((await stat(globalFile)).mode & 0o777).toBe(0o600);
-    expect((await stat(backup)).mode & 0o777).toBe(0o600);
+    expect((await stat(globalFile)).mode & 0o777).toBe(0o640);
+    expect((await stat(backup)).mode & 0o777).toBe(0o640);
     const leftovers = (await readdir(join(globalFile, ".."))).filter((f) => f.includes(".tmp."));
     expect(leftovers).toEqual([]);
   });
