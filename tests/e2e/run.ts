@@ -6,6 +6,7 @@ import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Glob } from "bun";
 import { E2E_PORT_END, E2E_PORT_START, patchExtensionPorts, pickRelayPort, RELAY_PORTS_ENV } from "./relay-port";
+import { runPacingCheck } from "./pacing";
 import { runStaleExtensionCheck } from "./stale-extension";
 
 const REPO = resolve(import.meta.dir, "../..");
@@ -209,8 +210,10 @@ async function main(): Promise<number> {
   const servers: ReturnType<typeof Bun.serve>[] = [];
   let browser: Subprocess | undefined;
   let cdp: Cdp | undefined;
+  // The pacing check sets natural browsing through the per-run config file, so a caller's env must not pin it.
+  const { BROWSER_CONTROL_NATURAL: _natural, ...callerEnv } = process.env;
   const env = {
-    ...process.env,
+    ...callerEnv,
     XDG_CONFIG_HOME: xdg,
     BROWSER_CONTROL_BACKENDS: "extension",
     BROWSER_CONTROL_DAEMON_DIR: daemonDir,
@@ -276,6 +279,8 @@ async function main(): Promise<number> {
         const path = new URL(req.url).pathname;
         if (path === "/challenge") return new Response(read("challenge.html"), { ...html, status: 403 });
         if (path === "/popup") return new Response(read("popup.html"), html);
+        if (path === "/pacing") return new Response(read("pacing.html"), html);
+        if (path === "/pacing-wall") return new Response(read("pacing-wall.html"), html);
         return new Response(read("page.html").replaceAll("__FRAME__", frameUrl), html);
       },
     });
@@ -462,6 +467,7 @@ async function main(): Promise<number> {
     await check("enable", ["extension", "enable"], /"orderFile":"removed"/);
     record("enable-deleted-file", !existsSync(backendsFile), backendsFile);
     await check("enabled-works", ["eval", "document.title", tid], /E2E Fixture/);
+    await runPacingCheck(bc, base, record);
     await runStaleExtensionCheck(chrome, record);
     return results.some((r) => !r.ok) ? 1 : 0;
   } catch (error) {

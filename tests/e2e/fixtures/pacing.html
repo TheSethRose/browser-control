@@ -1,0 +1,54 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Pacing Fixture</title>
+<style>
+  body { margin: 0; font: 14px sans-serif; height: 4200px; }
+  form { position: absolute; left: 40px; top: 20px; width: 520px; }
+  .row { display: flex; align-items: center; height: 34px; }
+  .row label.k { width: 120px; }
+  .row input:not([type=checkbox]):not([type=radio]), .row select, .row textarea { width: 260px; height: 24px; }
+  #target { position: absolute; left: 700px; top: 120px; width: 180px; height: 60px; }
+  #far { position: absolute; left: 700px; top: 2000px; width: 180px; height: 60px; }
+</style>
+</head>
+<body>
+<form id="f">
+  <div class="row"><label class="k" for="first">First name</label><input id="first" type="text"></div>
+  <div class="row"><label class="k" for="email">Email</label><input id="email" type="email"></div>
+  <div class="row"><label class="k" for="country">Country</label>
+    <select id="country"><option value="">--</option><option>Canada</option><option>Mexico</option><option>Peru</option></select></div>
+  <div class="row"><label class="k" for="subscribe">Subscribe</label><input id="subscribe" type="checkbox"></div>
+  <div class="row"><span class="k" style="width:120px">Plan</span>
+    <input id="plan-basic" type="radio" name="plan" value="basic"><label for="plan-basic">Basic</label>
+    <input id="plan-pro" type="radio" name="plan" value="pro"><label for="plan-pro">Pro</label></div>
+  <div class="row"><label class="k" for="start">Start date</label><input id="start" type="date"></div>
+  <div class="row"><label class="k" for="notes">Notes</label><textarea id="notes"></textarea></div>
+  <div class="row"><label class="k" for="last">Last name</label><input id="last" type="text"></div>
+  <div class="row"><label class="k" for="age">Age</label><input id="age" type="number"></div>
+  <div class="row"><label class="k" for="phone">Phone</label><input id="phone" type="tel"></div>
+  <div class="row"><label class="k" for="website">Website</label><input id="website" type="url"></div>
+  <div class="row"><label class="k" for="city">City</label><input id="city" type="text"></div>
+  <div class="row"><label class="k" for="zip">Zip</label><input id="zip" type="text"></div>
+  <div class="row"><button id="submit" type="submit">Submit</button></div>
+</form>
+<button id="target" type="button">Pacing target</button>
+<button id="far" type="button">Far target</button>
+<script>
+  window.__events = [];
+  window.__submitted = 0;
+  const log = (e) => {
+    const t = e.target && e.target.id ? e.target.id : (e.target === document ? 'document' : (e.target && e.target.tagName) || '');
+    // [type, epoch ms, isTrusted, x, y, deltaY, scrollY, target id]
+    window.__events.push([e.type, Math.round((performance.timeOrigin + performance.now()) * 10) / 10, e.isTrusted,
+      e.clientX ?? null, e.clientY ?? null, e.deltaY ?? null, Math.round(window.scrollY), t]);
+  };
+  for (const type of ['mousemove', 'mousedown', 'mouseup', 'click', 'keydown', 'keyup', 'wheel', 'focus', 'input', 'change', 'scroll']) {
+    window.addEventListener(type, log, { capture: true, passive: true });
+  }
+  document.getElementById('submit').addEventListener('click', () => { window.__submitted++; }, true);
+  document.getElementById('f').addEventListener('submit', (e) => { e.preventDefault(); window.__submitted++; });
+</script>
+</body>
+</html>
