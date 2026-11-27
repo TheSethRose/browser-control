@@ -646,7 +646,7 @@ async function main(): Promise<number> {
     await check("enable", ["extension", "enable"], /"orderFile":"removed"/);
     record("enable-deleted-file", !existsSync(backendsFile), backendsFile);
     await check("enabled-works", ["eval", "document.title", tid], /E2E Fixture/);
-    await runPacingCheck(bc, base, record, { navLog, frameUrl });
+    await runPacingCheck(bc, base, record, { navLog, frameUrl, skip: recordSkip });
     // The stale-extension check archives the pre-PR #10 build; a shallow clone cannot, so say so out loud.
     const oldCommit = "b8b976f";
     const hasOldCommit =
