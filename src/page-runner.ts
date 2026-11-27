@@ -1561,16 +1561,15 @@ export function createPageHelperHandler(
       ((globalThis as Record<symbol, unknown>)[EXTENSION_REQUEST_SYMBOL] as ExtensionRequestFn | undefined);
 
     const callExtensionHandoff = async (op: "handoff_start" | "handoff_clear", params: Json): Promise<InvokeResult> => {
-      if (extRequest) {
-        try {
-          const result = await extRequest(op, { tabId: extTabId, ...params });
-          return { ok: true, data: { result } };
-        } catch (err) {
-          return failure("EXECUTION_FAILED", (err as Error).message);
-        }
+      if (!extRequest) {
+        return failure("EXECUTION_FAILED", "BACKEND_UNAVAILABLE: handoff requires the browser-control extension relay");
       }
-      const method = op === "handoff_start" ? "bc.handoffStart" : "bc.handoffClear";
-      return invoke("execute_cdp", { method, params, targetId: extTarget });
+      try {
+        const result = await extRequest(op, { targetId: extTarget, ...params });
+        return { ok: true, data: { result } };
+      } catch (err) {
+        return failure("EXECUTION_FAILED", (err as Error).message);
+      }
     };
 
     if (activeHandoffs.has(extTabId)) {

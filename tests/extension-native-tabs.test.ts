@@ -1103,11 +1103,6 @@ describe("page-runner handoff command", () => {
     const invoke = async (op: string, input: Record<string, unknown> = {}): Promise<InvokeResult> => {
       calls.push({ op, input });
       if (op === "read_events") return { ok: true, data: { events: [] } };
-      if (op === "execute_cdp") {
-        const params = input["params"] as Record<string, unknown>;
-        startedId = String(params["handoffId"] ?? "");
-        return { ok: true, data: { result: { ok: true, tabId: 42, handoffId: startedId } } };
-      }
       if (op === "wait_for_event") {
         expect(input["method"]).toBe("bc.handoffDone");
         expect(input["targetId"]).toBe("extension:42");
@@ -1127,18 +1122,25 @@ describe("page-runner handoff command", () => {
       return { ok: true, data: {} };
     };
 
-    const handle = createPageHelperHandler(invoke);
+    const extCalls: Array<{ op: string; params: Record<string, unknown> }> = [];
+    const extensionRequest = async (op: string, params: Record<string, unknown> = {}) => {
+      extCalls.push({ op, params });
+      startedId = String(params["handoffId"] ?? "");
+      return { ok: true, tabId: 42, handoffId: startedId };
+    };
+    const handle = createPageHelperHandler(invoke, undefined, undefined, { extensionRequest });
     const res = await handle("handoff", { message: "Sign in to continue" }, "extension:42");
     expect(res.ok).toBe(true);
     expect(res.ok ? (res.data as { value: string }).value : "").toBe("handoff: done");
     expect(startedId).not.toBe("");
 
-    const startCall = calls.find((c) => c.op === "execute_cdp");
-    expect(startCall?.input).toEqual({
-      method: "bc.handoffStart",
-      params: { message: "Sign in to continue", handoffId: startedId },
-      targetId: "extension:42",
-    });
+    expect(calls.some((c) => c.op === "execute_cdp")).toBe(false);
+    expect(extCalls).toEqual([
+      {
+        op: "handoff_start",
+        params: { targetId: "extension:42", message: "Sign in to continue", handoffId: startedId },
+      },
+    ]);
   });
 
   test("handoff clears overlay and returns clean timeout when wait_for_event times out", async () => {
@@ -1147,25 +1149,26 @@ describe("page-runner handoff command", () => {
     const invoke = async (op: string, input: Record<string, unknown> = {}): Promise<InvokeResult> => {
       calls.push({ op, input });
       if (op === "read_events") return { ok: true, data: { events: [] } };
-      if (op === "execute_cdp") {
-        const params = input["params"] as Record<string, unknown>;
-        if (input["method"] === "bc.handoffStart") startedId = String(params["handoffId"] ?? "");
-        return { ok: true, data: { result: { ok: true } } };
-      }
       if (op === "wait_for_event") {
         return { ok: true, data: { found: false, timedOut: true, waitedMs: 2_000 } };
       }
       return { ok: true, data: {} };
     };
 
-    const handle = createPageHelperHandler(invoke);
+    const extCalls: Array<{ op: string; params: Record<string, unknown> }> = [];
+    const extensionRequest = async (op: string, params: Record<string, unknown> = {}) => {
+      extCalls.push({ op, params });
+      if (op === "handoff_start") startedId = String(params["handoffId"] ?? "");
+      return { ok: true };
+    };
+    const handle = createPageHelperHandler(invoke, undefined, undefined, { extensionRequest });
     const res = await handle("handoff", { message: "Solve CAPTCHA", timeout: 2 }, "extension:42");
     expect(res.ok).toBe(false);
     expect(res.ok ? "" : res.error.message).toBe("HANDOFF_TIMEOUT: handoff timed out after 2s");
 
-    const cdpCalls = calls.filter((c) => c.op === "execute_cdp");
-    expect(cdpCalls.map((c) => c.input["method"])).toEqual(["bc.handoffStart", "bc.handoffClear"]);
-    expect((cdpCalls[1]?.input["params"] as Record<string, unknown>)?.["handoffId"]).toBe(startedId);
+    expect(calls.some((c) => c.op === "execute_cdp")).toBe(false);
+    expect(extCalls.map((c) => c.op)).toEqual(["handoff_start", "handoff_clear"]);
+    expect(extCalls[1]?.params).toEqual({ targetId: "extension:42", handoffId: startedId });
   });
 
   test("rejects overlapping handoff on the same tab and ignores mismatched handoffId completion", async () => {
@@ -1180,14 +1183,6 @@ describe("page-runner handoff command", () => {
     const cdpStarts: string[] = [];
     const invoke = async (op: string, input: Record<string, unknown> = {}): Promise<InvokeResult> => {
       if (op === "read_events") return { ok: true, data: { events: [] } };
-      if (op === "execute_cdp") {
-        const params = input["params"] as Record<string, unknown>;
-        if (input["method"] === "bc.handoffStart") {
-          startedId = String(params["handoffId"] ?? "");
-          cdpStarts.push(startedId);
-        }
-        return { ok: true, data: { result: { ok: true, handoffId: startedId } } };
-      }
       if (op === "wait_for_event") {
         waitCallCount += 1;
         if (waitCallCount === 1) {
@@ -1208,7 +1203,14 @@ describe("page-runner handoff command", () => {
       return { ok: true, data: {} };
     };
 
-    const handle = createPageHelperHandler(invoke);
+    const extensionRequest = async (op: string, params: Record<string, unknown> = {}) => {
+      if (op === "handoff_start") {
+        startedId = String(params["handoffId"] ?? "");
+        cdpStarts.push(startedId);
+      }
+      return { ok: true, handoffId: startedId };
+    };
+    const handle = createPageHelperHandler(invoke, undefined, undefined, { extensionRequest });
     const firstPromise = handle("handoff", { message: "First step", timeout: 5 }, "extension:42");
     await firstWaitReady;
 

@@ -296,7 +296,11 @@ export function encodeChunkedFrames(
 
 export type FrameSocket = {
   send(data: string): number;
+  getBufferedAmount?(): number;
 };
+
+// Bun's ServerWebSocket default; a send that would exceed it is dropped (returns 0).
+const DEFAULT_BACKPRESSURE_LIMIT = 16 * 1024 * 1024;
 
 type QueuedFrames = {
   frames: string[];
@@ -316,7 +320,10 @@ export class OutboundFrameQueue {
   private paused = false;
   private closedReason?: string;
 
-  constructor(private readonly ws: FrameSocket) {}
+  constructor(
+    private readonly ws: FrameSocket,
+    private readonly backpressureLimit: number = DEFAULT_BACKPRESSURE_LIMIT,
+  ) {}
 
   enqueue(frames: string[]): Promise<void> {
     if (this.closedReason !== undefined) {
@@ -357,6 +364,12 @@ export class OutboundFrameQueue {
       const current = this.queue[0]!;
       while (current.index < current.frames.length) {
         const frame = current.frames[current.index]!;
+        // drain() can fire while data is still buffered; wait for the next drain instead of overflowing.
+        const buffered = this.ws.getBufferedAmount?.() ?? 0;
+        if (buffered > 0 && buffered + Buffer.byteLength(frame) > this.backpressureLimit) {
+          this.paused = true;
+          return;
+        }
         let status: number;
         try {
           status = this.ws.send(frame);
@@ -705,6 +718,24 @@ export function registerExtensionBcCall(fn: BcCallFn | undefined): void {
   }
 }
 
+const EXTENSION_REQUEST_SYMBOL = Symbol.for("browser-control.extension-request");
+const TARGET_REQUEST_OPS = new Set(["handoff_start", "handoff_clear"]);
+
+export type ExtensionRequestFn = (
+  op: string,
+  params?: Record<string, unknown>,
+  timeoutMs?: number,
+) => Promise<unknown>;
+
+function registerExtensionRequest(fn: ExtensionRequestFn | undefined): void {
+  const holder = globalThis as Record<symbol, unknown>;
+  if (fn) {
+    holder[EXTENSION_REQUEST_SYMBOL] = fn;
+  } else {
+    delete holder[EXTENSION_REQUEST_SYMBOL];
+  }
+}
+
 export function getRegisteredExtensionBcCall(): BcCallFn | undefined {
   return (globalThis as Record<symbol, unknown>)[BC_CALL_SYMBOL] as BcCallFn | undefined;
 }
@@ -996,7 +1027,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
       browser,
       extensionVersion: data.extensionVersion ?? "",
       ws,
-      outbound: new OutboundFrameQueue(ws),
+      outbound: new OutboundFrameQueue(ws, options.backpressureLimit),
       pending,
       decoder,
       connectedAt: now(),
@@ -1254,6 +1285,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
           boundPort = srv.port;
           if (options.registerGlobal) {
             registerExtensionBcCall(bcCall);
+            registerExtensionRequest(targetRequest);
           }
           return;
         } catch (err) {
@@ -1383,6 +1415,23 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
       throw new BackendUnavailable(NAME, `browser "${activeTab.slug}" is not connected`);
     }
     return { link, tabId: activeTab.tabId };
+  }
+
+  async function targetRequest(
+    op: string,
+    params: Record<string, unknown> = {},
+    timeoutMs: number = DEFAULT_REQ_TIMEOUT_MS,
+  ): Promise<unknown> {
+    if (!TARGET_REQUEST_OPS.has(op)) {
+      throw new Error(`INPUT_INVALID: extension op "${op}" is not allowed`);
+    }
+    await waitForConnection();
+    const { targetId, tabId: _ignored, ...rest } = params;
+    const resolved = resolveTarget(targetId);
+    if (!resolved) {
+      throw new BackendUnavailable(NAME, "no extension tab selected");
+    }
+    return requestOnLink(resolved.link, op, { ...rest, tabId: resolved.tabId }, timeoutMs);
   }
 
   async function bcCall(input: BcCallInput): Promise<{ value: unknown }> {
@@ -1822,6 +1871,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
     async dispose() {
       if (options.registerGlobal) {
         registerExtensionBcCall(undefined);
+        registerExtensionRequest(undefined);
       }
       failConnectWaiters("relay disposed");
       for (const link of [...links.values()]) {

@@ -7,6 +7,7 @@
 // anomalyco/browse (MIT License).
 
 import { createDebuggerHub } from "./lib/debugger-hub.js";
+import { createFrameDecoder, encodeMessage } from "./lib/frames.js";
 import {
   PROTOCOL_VERSION,
   detectBrowserBrand,
@@ -27,7 +28,6 @@ const PORT_RANGE_END = 49229;
 const VERSION_PROBE_TIMEOUT_MS = 800;
 const DEBUGGER_IDLE_MS = 30_000;
 const KEEPALIVE_MS = 20_000;
-const MAX_FRAME_BYTES = 64 * 1024 * 1024;
 const PAGE_HELPERS_FILE = "page-helpers.js";
 const PAGE_HELPERS_VERSION = 7;
 const OVERLAY_FILE = "content-overlay.js";
@@ -818,15 +818,6 @@ async function handleRequest(msg) {
 
     case "cdp": {
       const method = String(params.method || "");
-      // Silent relay-op pass-throughs for daemons that route via execute_cdp without attaching debugger.
-      if (method === "bc.handoffStart") {
-        const result = await handoffStart(tabId, params.params?.message, params.params?.handoffId);
-        return { result };
-      }
-      if (method === "bc.handoffClear") {
-        const result = await handoffClear(tabId, params.params?.handoffId);
-        return { result };
-      }
       if (isBlockedCdp(method)) {
         throw new Error(`REFUSED: ${method} is blocked so browser-control never closes or crashes the user's browser`);
       }
@@ -882,22 +873,14 @@ async function handleRequest(msg) {
 
 function sendJsonTo(entry, obj) {
   if (!entry?.ws || entry.ws.readyState !== WebSocket.OPEN) return false;
-  const serialized = JSON.stringify(obj);
-  const bytes = serialized.length * 3 > MAX_FRAME_BYTES ? new TextEncoder().encode(serialized).length : serialized.length;
-  if (bytes > MAX_FRAME_BYTES) {
+  const encoded = encodeMessage(obj);
+  if (!encoded.ok) {
     if (obj.type === "res" && obj.id !== undefined) {
-      entry.ws.send(
-        JSON.stringify({
-          type: "res",
-          id: obj.id,
-          ok: false,
-          error: `EXECUTION_FAILED: Result too large (${bytes} bytes > ${MAX_FRAME_BYTES} limit)`,
-        }),
-      );
+      entry.ws.send(JSON.stringify({ type: "res", id: obj.id, ok: false, error: encoded.error }));
     }
     return false;
   }
-  entry.ws.send(serialized);
+  for (const frame of encoded.frames) entry.ws.send(frame);
   return true;
 }
 
@@ -909,6 +892,7 @@ function closeConnection(port) {
     entry.keepaliveTimer = null;
   }
   connections.delete(port);
+  entry.decoder.clear();
   try {
     entry.ws?.close();
   } catch {
@@ -953,6 +937,12 @@ async function openRelaySocket(port, versionInfo) {
     instanceId: versionInfo?.instanceId || "",
     keepaliveTimer: null,
     touchedTabs: new Set(),
+    decoder: createFrameDecoder({
+      onExpire: ({ reqId }) => {
+        if (reqId === undefined) return;
+        sendJsonTo(entry, { type: "res", id: reqId, ok: false, error: "EXECUTION_FAILED: chunked request timed out" });
+      },
+    }),
   };
   connections.set(port, entry);
 
@@ -1032,6 +1022,15 @@ async function openRelaySocket(port, versionInfo) {
 
     if (msg.type === "pong") return;
 
+    if (entry.state === "ready" && msg.type === "chunk") {
+      const decoded = entry.decoder.push(msg);
+      if (decoded.kind === "error" && decoded.reqId !== undefined) {
+        sendJsonTo(entry, { type: "res", id: decoded.reqId, ok: false, error: decoded.error });
+      }
+      if (decoded.kind !== "message") return;
+      msg = decoded.message;
+    }
+
     if (entry.state === "ready" && msg.type === "req" && msg.id !== undefined) {
       try {
         await tabSetsReady;
@@ -1050,6 +1049,7 @@ async function openRelaySocket(port, versionInfo) {
   });
 
   ws.addEventListener("close", (ev) => {
+    entry.decoder.clear();
     if (entry.keepaliveTimer) {
       clearInterval(entry.keepaliveTimer);
       entry.keepaliveTimer = null;
