@@ -586,6 +586,32 @@ describe("router with extension only (no implicit cdp fallback)", () => {
     expect(listed.targets.map((t) => t.targetId)).toEqual(["extension:5", "ABC"]);
   });
 
+  test("S8: automatic reconnect under order extension refuses unless CDP was asked for", async () => {
+    const log: string[] = [];
+    const cdp = {
+      ...fakeCdp(log),
+      connect_browser: async () => {
+        log.push("connect_browser:");
+        return { connected: true };
+      },
+    };
+    const ops = route(cdp, [fakeExtension()], () => ["extension"]);
+    await expect(withAutoConnect(() => ops["connect_browser"]!({}))).rejects.toThrow(/^EXTENSION_ONLY: the daemon would reconnect/);
+    expect(log).toEqual([]);
+    // A request that named a DevTools tab may reconnect.
+    await withAutoConnect(() => ops["connect_browser"]!({}), true);
+    expect(log).toEqual(["connect_browser:"]);
+  });
+
+  test("S9: untargeted tab op with no extension tab says no tab is selected", async () => {
+    const log: string[] = [];
+    const ext = fakeExtension();
+    ext.handles = () => false;
+    const ops = route(fakeCdp(log), [ext], () => ["extension"]);
+    await expect(ops["evaluate"]!({ expression: "1" })).rejects.toThrow(/^EXTENSION_ONLY: no extension tab is selected/);
+    expect(log).toEqual([]);
+  });
+
   test("S5: untargeted handoff with no extension tab returns EXTENSION_ONLY in extension-only mode", async () => {
     const log: string[] = [];
     let available = true;

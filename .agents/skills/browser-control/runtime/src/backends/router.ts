@@ -57,13 +57,15 @@ export function setDaemonBackendsFile(file: string | undefined): void {
   shared[DAEMON_BACKENDS_FILE] = file;
 }
 
-function autoConnectStorage(): AsyncLocalStorage<boolean> {
-  return (shared[AUTO_CONNECT] ??= new AsyncLocalStorage<boolean>()) as AsyncLocalStorage<boolean>;
+type AutoConnect = { explicitTarget: boolean };
+function autoConnectStorage(): AsyncLocalStorage<AutoConnect> {
+  return (shared[AUTO_CONNECT] ??= new AsyncLocalStorage<AutoConnect>()) as AsyncLocalStorage<AutoConnect>;
 }
 
 /** Run an automatic reconnect so the router does not pin CDP as the explicit active route. */
-export function withAutoConnect<T>(fn: () => T): T {
-  return autoConnectStorage().run(true, fn);
+/** `explicitTarget`: the failed request named a DevTools targetId, so reconnecting is asked for. */
+export function withAutoConnect<T>(fn: () => T, explicitTarget = false): T {
+  return autoConnectStorage().run({ explicitTarget }, fn);
 }
 
 function readOneLine(file: string): string {
@@ -139,9 +141,12 @@ export function extensionOnlyMessage(reason: string | Error): string {
   return `EXTENSION_ONLY: ${raw || "the extension can't handle this request"}. ${EXTENSION_ONLY_HINT}`;
 }
 
-function unhandledExtensionReason(op: string, input: OpInput): string {
+function unhandledExtensionReason(op: string, input: OpInput, tabSelected: boolean): string {
   if (op === "execute_cdp" && typeof input["method"] === "string" && isBrowserLevelMethod(input["method"])) {
     return `browser-level CDP method "${input["method"]}" can't run on the extension`;
+  }
+  if (TAB_OPS.has(op) && input["targetId"] === undefined && !tabSelected) {
+    return "no extension tab is selected; run nav <url> or pass an extension: targetId from tabs";
   }
   return `${op} isn't handled by the extension`;
 }
@@ -193,7 +198,7 @@ export function route(
     if (named) {
       if (!named.handles(op, input, active === named.name)) {
         if (named.name === EXTENSION && extensionOnly) {
-          throw new Error(extensionOnlyMessage(unhandledExtensionReason(op, input)));
+          throw new Error(extensionOnlyMessage(unhandledExtensionReason(op, input, active === EXTENSION)));
         }
         throw new Error(`INPUT_INVALID: ${op} isn't available on ${named.name} tabs; use a DevTools tab for it`);
       }
@@ -213,6 +218,11 @@ export function route(
       (active === CDP && input["targetId"] === undefined && input["browser"] === undefined);
 
     if (explicitCdp) {
+      const auto = autoConnectStorage().getStore();
+      // An automatic reconnect is CDP only by request: an active CDP route or a named DevTools tab.
+      if (op === "connect_browser" && auto && extensionOnly && active !== CDP && !auto.explicitTarget) {
+        throw new Error(extensionOnlyMessage("the daemon would reconnect over CDP, but the order is extension only"));
+      }
       const handler = cdpOps[op];
       if (!handler) throw new Error(`OPERATION_NOT_FOUND: ${op}`);
       const result = await handler(input);
@@ -265,7 +275,7 @@ export function route(
       }
     }
     if (extensionOnly) {
-      throw new Error(extensionOnlyMessage(skipped[0] ?? unhandledExtensionReason(op, input)));
+      throw new Error(extensionOnlyMessage(skipped[0] ?? unhandledExtensionReason(op, input, active === EXTENSION)));
     }
     const detail = skipped.length > 0 ? ` (${skipped.map((e) => e.message).join("; ")})` : "";
     throw new Error(`BACKEND_UNAVAILABLE: no enabled backend can run ${op}${detail}`);

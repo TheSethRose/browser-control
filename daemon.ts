@@ -29,6 +29,7 @@ import {
   getRegisteredExtensionBackend,
 } from "./src/backends/extension";
 import { backendOrder, setDaemonBackendsFile, withAutoConnect } from "./src/backends/router";
+import { prefixOf } from "./src/backends/types";
 import { disposeOcr } from "./src/ocr";
 import { createPageHelperHandler, formatAxTree, matchTab } from "./src/page-runner";
 import { imageWidth } from "./src/picture";
@@ -152,7 +153,9 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
       return result;
     }
     if (result.ok || !result.error.message.startsWith("NOT_CONNECTED")) return result;
-    const reconnected = await withAutoConnect(() => invokeOnce("connect_browser", reconnectInput));
+    const target = effectiveInput["targetId"];
+    const explicitTarget = typeof target === "string" && target.trim() !== "" && prefixOf(target) === undefined;
+    const reconnected = await withAutoConnect(() => invokeOnce("connect_browser", reconnectInput), explicitTarget);
     return reconnected.ok ? invokeOnce(operation, effectiveInput) : reconnected;
   };
 
