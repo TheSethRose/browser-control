@@ -192,8 +192,8 @@ describe("safety: boundaries, control escaping, Luhn masking, remedies, and typo
 });
 
 describe("page-helpers v7 DOM upgrades", () => {
-  test("VERSION is bumped to 11 and parses cleanly", () => {
-    expect(PAGE_HELPERS_VERSION).toBe(11);
+  test("VERSION is bumped to 12 and parses cleanly", () => {
+    expect(PAGE_HELPERS_VERSION).toBe(12);
     expect(() => new Function(PAGE_HELPERS_SOURCE)).not.toThrow();
   });
 

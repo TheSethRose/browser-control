@@ -32,6 +32,23 @@ export const PROTOCOL_VERSION = 1;
 export const PORT_RANGE_START = 49222;
 export const PORT_RANGE_END = 49229;
 
+/** Test-only relay port override: `BROWSER_CONTROL_RELAY_PORTS=<start>-<end>`. */
+export const RELAY_PORTS_ENV = "BROWSER_CONTROL_RELAY_PORTS";
+const PORT_MIN = 1024;
+const PORT_MAX = 65535;
+
+/** Parse `RELAY_PORTS_ENV`; a malformed or out-of-range value is ignored so the default range stands. */
+export function relayPortRangeFromEnv(
+  env: Record<string, string | undefined> = process.env,
+): { start: number; end: number } | undefined {
+  const match = /^(\d{1,5})-(\d{1,5})$/.exec((env[RELAY_PORTS_ENV] ?? "").trim());
+  if (!match) return undefined;
+  const start = Number(match[1]);
+  const end = Number(match[2]);
+  const valid = (n: number) => Number.isInteger(n) && n >= PORT_MIN && n <= PORT_MAX;
+  return valid(start) && valid(end) && start <= end ? { start, end } : undefined;
+}
+
 export const PRE_AUTH_MAX_BYTES = 64 * 1024;
 export const TRANSPORT_MAX_PAYLOAD_BYTES = 1024 * 1024;
 export const CHUNK_MAX_DATA_BYTES = 512 * 1024;
@@ -52,6 +69,7 @@ const DEFAULT_LIST_WAIT_MS = 5_000;
 const DEFAULT_REQ_TIMEOUT_MS = 60_000;
 const DEFAULT_MAX_FRAME_BYTES = 900 * 1024;
 const MAX_SHORT_TARGET_OWNERS = 2048;
+const MAX_SESSION_PROFILES = 512;
 
 const OPS = new Set([
   "select_target",
@@ -148,7 +166,7 @@ export async function setupExtensionPairing(
   options: { tokenFile?: string; port?: number } = {},
 ): Promise<{ tokenFile: string; pairingFile: string; port: number }> {
   const tokenFile = options.tokenFile ?? defaultTokenFilePath();
-  const port = options.port ?? PORT_RANGE_START;
+  const port = options.port ?? relayPortRangeFromEnv()?.start ?? PORT_RANGE_START;
   const token = await repairRelayToken(tokenFile);
   const resolvedDir = resolvePath(extensionDir);
   await mkdir(resolvedDir, { recursive: true });
@@ -706,6 +724,11 @@ export function parseExtensionTargetId(
   return Number.isSafeInteger(n) ? { slug: slug.toLowerCase(), tabId: n } : undefined;
 }
 
+/** A CLI-made session key (short sha256 hex prefix), or undefined. Raw session ids never pass. */
+export function sessionKeyOf(raw: unknown): string | undefined {
+  return typeof raw === "string" && /^[0-9a-f]{8,64}$/.test(raw) ? raw : undefined;
+}
+
 export function extensionTabOf(targetId: unknown): number | undefined {
   return parseExtensionTargetId(targetId)?.tabId;
 }
@@ -728,6 +751,8 @@ export type BcCallInput = {
   join?: string;
   frameId?: number;
   timeoutMs?: number;
+  /** Fail a stalled call plainly; never attach the debugger to probe for a dialog. */
+  noAttach?: boolean;
 };
 
 export type BcCallFn = (input: BcCallInput) => Promise<{ value: unknown }>;
@@ -929,6 +954,8 @@ export interface ExtensionBackend extends Backend {
   getConnectedBrowsers(): ConnectedBrowserInfo[];
   getHandshakeRecords(): RelayHandshakeRecord[];
   request(op: string, params?: Record<string, unknown>, timeoutMs?: number, browserSlug?: string): Promise<unknown>;
+  /** Canonical `extension:<slug>:<tabId>` for a target id, so a short id and its browser-qualified form agree. */
+  resolveTargetKey(targetId: unknown): string | undefined;
   bcCall(input: BcCallInput): Promise<{ value: unknown }>;
   waitForConnection(timeoutMs?: number): Promise<void>;
 }
@@ -1048,8 +1075,9 @@ async function writeArtifact(
 }
 
 export function createExtensionBackend(options: ExtensionBackendOptions = {}): ExtensionBackend {
-  const portStart = options.portStart ?? PORT_RANGE_START;
-  const portEnd = options.portEnd ?? PORT_RANGE_END;
+  const envRange = relayPortRangeFromEnv();
+  const portStart = options.portStart ?? envRange?.start ?? PORT_RANGE_START;
+  const portEnd = options.portEnd ?? envRange?.end ?? PORT_RANGE_END;
   const expectedOrigin = options.expectedOrigin ?? EXTENSION_ORIGIN;
   const handshakeTimeoutMs = options.handshakeTimeoutMs ?? HANDSHAKE_TIMEOUT_MS;
   const waitConnectMs = options.waitConnectMs ?? DEFAULT_WAIT_CONNECT_MS;
@@ -1081,6 +1109,9 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
   // Short target id (`extension:<tabId>`) -> profileId that it was issued for
   const shortTargetOwners = new Map<number, string>();
   let activeTab: ActiveTabRef | undefined;
+  // Session key -> profileId that session's tab-less navs last used. Another session switching the
+  // daemon-wide active profile must not send this one's tab-less nav to a different browser.
+  const sessionProfiles = new Map<string, string>();
   let nextReqId = 1;
   const connectWaiters = new Set<{ resolve: () => void; reject: (err: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   const events = new EventBuffer(options.eventBufferSize ?? 1000);
@@ -1126,6 +1157,20 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
 
   function connectedSlugs(): string[] {
     return [...links.values()].map((l) => l.slug);
+  }
+
+  /** The browser this session last used, while it is still connected. */
+  function sessionLink(sessionKey: string): BrowserLink | undefined {
+    const profileId = sessionProfiles.get(sessionKey);
+    return profileId === undefined ? undefined : links.get(profileId);
+  }
+
+  function rememberSessionLink(sessionKey: string, profileId: string): void {
+    sessionProfiles.delete(sessionKey);
+    sessionProfiles.set(sessionKey, profileId);
+    while (sessionProfiles.size > MAX_SESSION_PROFILES) {
+      sessionProfiles.delete(sessionProfiles.keys().next().value!);
+    }
   }
 
   function clearHandshakeTimer(ws: ServerWebSocket<WsState>): void {
@@ -1852,6 +1897,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
         steps: input.steps,
         ...frameParam(input.frameId ?? extensionFrameOf(input.targetId)),
         ...(typeof input.timeoutMs === "number" ? { timeoutMs: input.timeoutMs } : {}),
+        ...(input.noAttach ? { noAttach: true } : {}),
       },
       reqTimeout,
     )) as { values?: unknown[] };
@@ -1883,6 +1929,15 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
 
     getConnectedBrowsers,
     getHandshakeRecords,
+
+    resolveTargetKey(targetId) {
+      try {
+        const resolved = resolveTarget(targetId);
+        return resolved ? eventKey(resolved.link, resolved.tabId) : undefined;
+      } catch {
+        return undefined;
+      }
+    },
 
     start,
     waitForConnection,
@@ -1964,6 +2019,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
               ? input["browser"].trim()
               : undefined;
 
+          const sessionKey = sessionKeyOf(input["sessionKey"]);
           await waitForConnection();
 
           let targetLink: BrowserLink;
@@ -2000,22 +2056,32 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
             targetLink = resolved.link;
             tabId = resolved.tabId;
           } else {
-            const resolved = resolveTarget(undefined);
-            if (resolved) {
-              targetLink = resolved.link;
-              tabId = resolved.tabId;
-            } else {
-              const fallback = defaultLink();
-              if (!fallback) throw new BackendUnavailable(NAME, "extension is not connected");
-              targetLink = fallback;
+            // A session key's tab-less nav stays on the browser that session last used, so another
+            // session switching the daemon-wide active profile cannot move it.
+            const ownLink = sessionKey ? sessionLink(sessionKey) : undefined;
+            if (ownLink) {
+              targetLink = ownLink;
               tabId = undefined;
+            } else {
+              const resolved = resolveTarget(undefined);
+              if (resolved) {
+                targetLink = resolved.link;
+                // A session key asks the extension for that session's own tab, not the daemon-wide one.
+                tabId = sessionKey ? undefined : resolved.tabId;
+              } else {
+                const fallback = defaultLink();
+                if (!fallback) throw new BackendUnavailable(NAME, "extension is not connected");
+                targetLink = fallback;
+                tabId = undefined;
+              }
             }
           }
 
           const newWindow = input["newWindow"] === true;
           const keepOpen = input["keepOpen"] === true;
-          // A new window always means a new tab, so the resolved tab only picks the browser.
-          if (newWindow) tabId = undefined;
+          const newTab = input["newTab"] === true && input["targetId"] === undefined;
+          // A new window or --new-tab always means a new tab, so the resolved tab only picks the browser.
+          if (newWindow || newTab) tabId = undefined;
           const createdNewTab = tabId === undefined;
 
           const res = (await requestOnLink(
@@ -2027,17 +2093,23 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
               until,
               ...(newWindow ? { newWindow: true } : {}),
               ...(keepOpen ? { keepOpen: true } : {}),
+              ...(newTab ? { newTab: true } : {}),
+              ...(sessionKey ? { sessionKey } : {}),
               ...(timeoutMs !== undefined ? { timeoutMs } : {}),
             },
             (timeoutMs ?? 30_000) + 10_000,
-          )) as { tabId?: number; loaded?: boolean; url?: string; title?: string; created?: boolean };
+          )) as { tabId?: number; loaded?: boolean; url?: string; title?: string; created?: boolean; reused?: boolean };
           const tid = typeof res?.tabId === "number" ? res.tabId : tabId;
           if (tid !== undefined) {
             activeTab = { profileId: targetLink.profileId, slug: targetLink.slug, tabId: tid };
           }
+          if (sessionKey) rememberSessionLink(sessionKey, targetLink.profileId);
           // Created only when the extension returned a tab id other than the one we passed in.
           const created =
-            typeof res?.tabId === "number" && res.tabId !== tabId && (res?.created === true || createdNewTab);
+            typeof res?.tabId === "number" &&
+            res.tabId !== tabId &&
+            res?.reused !== true &&
+            (res?.created === true || createdNewTab);
           return {
             loaded: res?.loaded !== false,
             targetId: tid === undefined ? null : formatTargetId(targetLink, tid),
@@ -2046,6 +2118,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
             browser: targetLink.slug,
             backend: NAME,
             ...(created ? { created: true } : {}),
+            ...(res?.reused === true && !created ? { reused: true } : {}),
           };
         }
 

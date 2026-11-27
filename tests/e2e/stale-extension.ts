@@ -6,7 +6,7 @@
 //
 // Run standalone: BC_E2E_CHROME=<path> bun tests/e2e/stale-extension.ts
 import { spawn, type Subprocess } from "bun";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { OperationHandler } from "@agent-software/core";
@@ -19,6 +19,7 @@ import {
   type RelayHandshakeRecord,
 } from "../../src/backends/extension";
 import { route } from "../../src/backends/router";
+import { patchExtensionPorts } from "./relay-port";
 
 const REPO = resolve(import.meta.dir, "../..");
 const OLD_COMMIT = "b8b976f";
@@ -83,36 +84,9 @@ export async function runStaleExtensionCheck(
 
     // Patch the archived temp copy's background.js so it scans only the isolated test port
     // and never touches the default 49222-49229 range where a live daemon may be listening.
-    const bgPath = join(oldExt, "background.js");
-    const origBg = readFileSync(bgPath, "utf8");
-    let patchedBg = origBg;
-    const patchRules: Array<[RegExp, string]> = [
-      [/\bconst DEFAULT_PORT = 49222;/, `const DEFAULT_PORT = ${port};`],
-      [/\bconst PORT_RANGE_START = 49222;/, `const PORT_RANGE_START = ${port};`],
-      [/\bconst PORT_RANGE_END = 49229;/, `const PORT_RANGE_END = ${port};`],
-    ];
-    const missingPatches: string[] = [];
-    for (const [re, rep] of patchRules) {
-      if (!re.test(patchedBg)) missingPatches.push(re.source);
-      else patchedBg = patchedBg.replace(re, rep);
-    }
-    const nonCommentBg = patchedBg.replace(/\/\/[^\n]*/g, "");
-    const leakedDefaultPort = /\b4922[2-9]\b/.test(nonCommentBg);
-    const patchOk =
-      missingPatches.length === 0 &&
-      !leakedDefaultPort &&
-      patchedBg.includes(`const DEFAULT_PORT = ${port};`) &&
-      patchedBg.includes(`const PORT_RANGE_START = ${port};`) &&
-      patchedBg.includes(`const PORT_RANGE_END = ${port};`);
-    check(
-      "stale-port-patch",
-      patchOk,
-      patchOk
-        ? `patched background.js to port ${port} only`
-        : `failed to isolate port range (missing=${missingPatches.join(",")}, leaked=${leakedDefaultPort})`,
-    );
-    if (!patchOk) return false;
-    writeFileSync(bgPath, patchedBg, "utf8");
+    const patch = patchExtensionPorts(oldExt, port);
+    check("stale-port-patch", patch.ok, patch.detail);
+    if (!patch.ok) return false;
 
     browser = spawn(
       [
@@ -186,8 +160,17 @@ export async function runStaleExtensionCheck(
 
     // Confirm no lingering ESTABLISHED socket stays open on the isolated relay port.
     await sleep(300);
-    const lsof = spawn(["lsof", "-nP", `-iTCP:${port}`, "-sTCP:ESTABLISHED"], { stdout: "pipe", stderr: "ignore" });
-    const lsofOut = (await new Response(lsof.stdout).text()).trim();
+    // Only this run's relay (this process) and its browser; another app may use the same port number.
+    const pids = [process.pid, browser?.pid].filter((p): p is number => typeof p === "number").join(",");
+    const lsof = spawn(["lsof", "-nP", "-a", "-p", pids, `-iTCP:${port}`, "-sTCP:ESTABLISHED"], {
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    const lsofOut = (await new Response(lsof.stdout).text())
+      .split("\n")
+      .filter((line) => line.includes(`:${port}`))
+      .join("\n")
+      .trim();
     await lsof.exited;
     const stillPending = backend.getHandshakeRecords().some((r) => r.stage !== "rejected");
     check("stale-socket-closed", !stillPending && lsofOut === "", lsofOut || "no ESTABLISHED sockets");
