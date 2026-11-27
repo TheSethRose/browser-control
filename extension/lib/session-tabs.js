@@ -1,12 +1,10 @@
-// Agent session -> last agent tab. A tab-less navigate that carries a session key reuses that
-// session's tab instead of opening a new one. Keys are short hashes made by the CLI; raw session ids
-// never reach the extension. Kept in chrome.storage.session so a worker restart keeps it.
+// Agent session -> last agent tab, so a tab-less navigate can reuse its own session's tab. Keys are short
+// hashes made by the CLI; raw session ids never reach the extension. Kept in chrome.storage.session.
 
 export const SESSION_TABS_STORAGE_KEY = "bcSessionTabs";
 const SESSION_KEY_RE = /^[0-9a-f]{8,64}$/;
 const MAX_SESSIONS = 200;
-// A reserved tab is held from selection until its URL update; a Chrome call that never settles must not
-// hold one forever, so a reservation older than this is treated as free again.
+// A hung call must not pin a tab forever: a reservation older than this is treated as free again.
 export const RESERVATION_TTL_MS = 180_000;
 
 export function validSessionKey(raw) {
@@ -79,6 +77,12 @@ export function createSessionTabs({
       // Ownership and the mapping can change while Chrome answers; judge them again after the awaits.
       return isAgentTab(tabId) && !isTabInHandoff(tabId) && map.get(key) === tabId;
     },
+    /** Same judgement as confirm() on freshest caller facts, with no awaits: call it just before the update. */
+    confirmSync(sessionKey, tabId, tab) {
+      const key = validSessionKey(sessionKey);
+      if (!key || !Number.isInteger(tabId) || map.get(key) !== tabId || !tab || tab.pinned) return false;
+      return isAgentTab(tabId) && !isTabInHandoff(tabId);
+    },
     /** Drop a reservation. Idempotent, so a late finish frees a tab exactly once. */
     release(tabId) {
       if (Number.isInteger(tabId)) reserved.delete(tabId);
@@ -97,8 +101,7 @@ export function createSessionTabs({
     /** Drop every session entry for a closed or user-claimed tab. */
     async forget(tabId) {
       if (!Number.isInteger(tabId)) return;
-      // Chrome replaced this id instead of closing the tab: replace() moves the mapping to the new id,
-      // and the purge of the old id must not drop it first.
+      // Chrome replaced this id: replace() moves the mapping, and this purge must not drop it first.
       if (replaced.has(tabId)) return;
       reserved.delete(tabId);
       await ready;

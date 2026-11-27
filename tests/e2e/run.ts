@@ -522,12 +522,14 @@ async function main(): Promise<number> {
     // Session reuse: one session's tab-less navs share a tab; another session or --new-tab gets its own.
     const tabOf = (out: string) => /"targetId":"(extension:[^"]+)"/.exec(out)?.[1] ?? "";
     const sessA = { BROWSER_CONTROL_SESSION: "e2e-session-a" };
-    const a1 = await bc(["nav", `${base}/`], 45_000, sessA);
-    const a2 = await bc(["nav", `${base}/form`], 45_000, sessA);
-    const b1 = await bc(["nav", `${base}/`], 45_000, { BROWSER_CONTROL_SESSION: "e2e-session-b" });
-    const aNew = await bc(["nav", `${base}/`, "--new-tab"], 45_000, sessA);
-    const [idA1, idA2, idB1, idANew] = [a1, a2, b1, aNew].map(tabOf);
-    record("session-tab-reused", idA1 !== "" && idA1 === idA2 && /reused this session's tab/.test(a2), `${a1}\n${a2}`);
+    const navs = [
+      await bc(["nav", `${base}/`], 45_000, sessA),
+      await bc(["nav", `${base}/form`], 45_000, sessA),
+      await bc(["nav", `${base}/`], 45_000, { BROWSER_CONTROL_SESSION: "e2e-session-b" }),
+      await bc(["nav", `${base}/`, "--new-tab"], 45_000, sessA),
+    ];
+    const [idA1, idA2, idB1, idANew] = navs.map(tabOf);
+    record("session-tab-reused", idA1 !== "" && idA1 === idA2 && /reused this session's tab/.test(navs[1]!), `${navs[0]}\n${navs[1]}`);
     record("session-tab-separate", idB1 !== "" && idB1 !== idA1, `${idA1} ${idB1}`);
     record("session-new-tab", idANew !== "" && idANew !== idA1 && idANew !== idB1, `${idA1} ${idANew}`);
     for (const id of new Set([idA1, idB1, idANew])) if (id) await bc(["close", id]);

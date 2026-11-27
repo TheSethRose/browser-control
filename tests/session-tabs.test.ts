@@ -4,9 +4,9 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import type { InvokeResult } from "@agent-software/core";
 // @ts-expect-error Plain ES module in extension/lib without .d.ts
-import { SESSION_TABS_STORAGE_KEY, RESERVATION_TTL_MS, createSessionTabs, validSessionKey } from "../extension/lib/session-tabs.js";
+import { RESERVATION_TTL_MS, createSessionTabs, validSessionKey } from "../extension/lib/session-tabs.js";
 // @ts-expect-error Plain ES module in extension/lib without .d.ts
-import { createTabBusy, withDeadline } from "../extension/lib/tab-busy.js";
+import { createTabBusy } from "../extension/lib/tab-busy.js";
 import {
   EXTENSION_ORIGIN,
   PROTOCOL_VERSION,
@@ -49,17 +49,9 @@ describe("session key (CLI wrapper)", () => {
   });
 
   test("precedence: BROWSER_CONTROL_SESSION, Claude, T3, Codex thread, Codex session", () => {
-    const all = {
-      BROWSER_CONTROL_SESSION: "o",
-      CLAUDE_CODE_SESSION_ID: "c",
-      T3CODE_THREAD_ID: "t",
-      CODEX_THREAD_ID: "x",
-      CODEX_SESSION_ID: "s",
-    };
-    expect(wrapperKey(all)).toBe(sha16("o"));
-    const { BROWSER_CONTROL_SESSION: _o, ...noOverride } = all;
-    expect(wrapperKey(noOverride)).toBe(sha16("c"));
-    expect(wrapperKey({ T3CODE_THREAD_ID: "t", CODEX_THREAD_ID: "x" })).toBe(sha16("t"));
+    expect(wrapperKey({ BROWSER_CONTROL_SESSION: "o", CLAUDE_CODE_SESSION_ID: "c", T3CODE_THREAD_ID: "t" })).toBe(sha16("o"));
+    expect(wrapperKey({ CLAUDE_CODE_SESSION_ID: "c", T3CODE_THREAD_ID: "t", CODEX_THREAD_ID: "x" })).toBe(sha16("c"));
+    expect(wrapperKey({ T3CODE_THREAD_ID: "t", CODEX_THREAD_ID: "x", CODEX_SESSION_ID: "s" })).toBe(sha16("t"));
     expect(wrapperKey({ CODEX_THREAD_ID: "x", CODEX_SESSION_ID: "s" })).toBe(sha16("x"));
     expect(wrapperKey({ CODEX_SESSION_ID: "s" })).toBe(sha16("s"));
   });
@@ -79,28 +71,16 @@ describe("session key (CLI wrapper)", () => {
 
 type Tab = { id: number; windowId: number; pinned?: boolean };
 
-function makeEnv(tabs: Tab[], stored?: Record<string, number>) {
+function makeEnv(tabs: Tab[]) {
   const tabMap = new Map(tabs.map((t) => [t.id, { ...t }]));
-  const store = new Map<string, unknown>(stored ? [[SESSION_TABS_STORAGE_KEY, stored]] : []);
+  const store = new Map<string, unknown>();
   const agent = new Set(tabs.map((t) => t.id));
   const handoff = new Set<number>();
   const busy = new Set<number>();
   const windows = new Map([[1, { id: 1, type: "normal", state: "normal" }]]);
   const chrome = {
-    tabs: {
-      async get(id: number) {
-        const t = tabMap.get(id);
-        if (!t) throw new Error(`No tab with id: ${id}`);
-        return t;
-      },
-    },
-    windows: {
-      async get(id: number) {
-        const w = windows.get(id);
-        if (!w) throw new Error("no window");
-        return w;
-      },
-    },
+    tabs: { async get(id: number) { return tabMap.get(id); } },
+    windows: { async get(id: number) { return windows.get(id); } },
     storage: {
       session: {
         async get(keys: string[]) {
@@ -123,66 +103,52 @@ function makeEnv(tabs: Tab[], stored?: Record<string, number>) {
   return { tabMap, store, agent, handoff, busy, windows, chrome, make };
 }
 
+/** A one-tab environment with the session already pointing at tab 5. */
+async function ready(tabs: Tab[] = [{ id: 5, windowId: 1 }]) {
+  const env = makeEnv(tabs);
+  const st = env.make();
+  await st.remember(A, 5);
+  return { env, st };
+}
+
 const A = "aaaaaaaaaaaaaaaa";
 const B = "bbbbbbbbbbbbbbbb";
 
 describe("session tab reuse decisions (extension)", () => {
-  test("reuses the session's free agent tab; unknown sessions get none", async () => {
-    const env = makeEnv([{ id: 5, windowId: 1 }]);
-    const st = env.make();
-    await st.remember(A, 5);
+  test("reuses the session's own free agent tab and nothing else", async () => {
+    const { env, st } = await ready();
     expect(await st.reserve(A)).toBe(5);
     st.release(5);
-    expect(await st.reserve(B)).toBeUndefined();
+    expect(await st.reserve(B)).toBeUndefined(); // another session, or a raw id
     expect(await st.reserve("not-a-hash")).toBeUndefined();
-  });
 
-  test("a closed, claimed, pinned, handed-off, busy or minimized-window tab is not reused", async () => {
-    const env = makeEnv([{ id: 5, windowId: 1 }]);
-    const st = env.make();
-    await st.remember(A, 5);
+    const [first, second] = await Promise.all([st.reserve(A), st.reserve(A)]); // one caller at a time
+    expect(first).toBe(5);
+    expect(second).toBeUndefined();
+    st.release(5);
 
-    env.busy.add(5);
-    expect(await st.reserve(A)).toBeUndefined();
-    env.busy.delete(5);
-
-    env.handoff.add(5);
-    expect(await st.reserve(A)).toBeUndefined();
-    env.handoff.delete(5);
-
+    for (const block of [env.busy, env.handoff]) {
+      block.add(5);
+      expect(await st.reserve(A)).toBeUndefined();
+      block.delete(5);
+    }
     env.tabMap.get(5)!.pinned = true;
     expect(await st.reserve(A)).toBeUndefined();
     env.tabMap.get(5)!.pinned = false;
-
     env.windows.set(1, { id: 1, type: "normal", state: "minimized" });
     expect(await st.reserve(A)).toBeUndefined();
     env.windows.set(1, { id: 1, type: "normal", state: "normal" });
-
     expect(await st.reserve(A)).toBe(5);
     st.release(5);
     env.agent.delete(5); // claimed by the user
     expect(await st.reserve(A)).toBeUndefined();
     env.agent.add(5);
-
     env.tabMap.delete(5); // gone
     expect(await st.reserve(A)).toBeUndefined();
   });
 
-  test("two concurrent calls for one session never reserve the same tab", async () => {
-    const env = makeEnv([{ id: 5, windowId: 1 }]);
-    const st = env.make();
-    await st.remember(A, 5);
-    const [first, second] = await Promise.all([st.reserve(A), st.reserve(A)]);
-    expect(first).toBe(5);
-    expect(second).toBeUndefined();
-    st.release(5);
-    expect(await st.reserve(A)).toBe(5);
-  });
-
   test("a tab the user claims or pins after selection is refused at the update", async () => {
-    const env = makeEnv([{ id: 5, windowId: 1 }]);
-    const st = env.make();
-    await st.remember(A, 5);
+    const { env, st } = await ready();
     expect(await st.reserve(A)).toBe(5);
     expect(await st.confirm(A, 5)).toBe(true);
 
@@ -194,6 +160,28 @@ describe("session tab reuse decisions (extension)", () => {
     expect(await st.confirm(A, 5)).toBe(false);
     st.release(5);
     expect(await st.reserve(A)).toBeUndefined();
+  });
+
+  test("the tab is judged again on freshest facts in the same tick as the URL update", async () => {
+    const { env, st } = await ready();
+    const tab = () => env.tabMap.get(5)!;
+    expect(st.confirmSync(A, 5, tab())).toBe(true);
+
+    env.tabMap.get(5)!.pinned = true; // pinned during the awaited lookup
+    expect(st.confirmSync(A, 5, tab())).toBe(false);
+    env.tabMap.get(5)!.pinned = false;
+
+    env.agent.delete(5); // claimed during the awaited lookup
+    expect(st.confirmSync(A, 5, tab())).toBe(false);
+    env.agent.add(5);
+    env.handoff.add(5);
+    expect(st.confirmSync(A, 5, tab())).toBe(false);
+    expect(st.confirmSync(A, 5, null)).toBe(false);
+    expect(st.confirmSync(B, 5, tab())).toBe(false);
+
+    // Both URL updates in navigateTab read fresh facts and are guarded in the same tick.
+    const src = readFileSync(BACKGROUND, "utf8");
+    expect(src.match(/assertReusable\((?:tabId|tid), opts\);\n\s*await chrome\.tabs\.update\(/g)).toHaveLength(2);
   });
 
   test("a reservation a hung call never released expires instead of pinning the tab", async () => {
@@ -208,9 +196,7 @@ describe("session tab reuse decisions (extension)", () => {
   });
 
   test("sessions never share a tab: recording it for one drops it from the other", async () => {
-    const env = makeEnv([{ id: 5, windowId: 1 }, { id: 6, windowId: 1 }]);
-    const st = env.make();
-    await st.remember(A, 5);
+    const { st } = await ready([{ id: 5, windowId: 1 }, { id: 6, windowId: 1 }]);
     await st.remember(B, 5); // B targeted A's tab explicitly
     expect(await st.reserve(B)).toBe(5);
     st.release(5);
@@ -232,31 +218,29 @@ describe("session tab reuse decisions (extension)", () => {
     expect(st.snapshot()).toEqual({});
   });
 
-  test("a replacement moves the mapping before the purge of the old id can drop it", async () => {
-    const env = makeEnv([{ id: 5, windowId: 1 }, { id: 7, windowId: 1 }]);
-    const st = env.make();
-    await st.remember(A, 5);
-    // Background order: ownership transfers, replace() is registered, then the purge of tab 5 runs.
+  test("a replacement during worker startup keeps ownership, keepOpen and the mapping", async () => {
+    const { st } = await ready([{ id: 5, windowId: 1 }, { id: 7, windowId: 1 }]);
+    // Behavior: the swap is registered before the restore finishes, then the purge of the old id runs.
     await Promise.all([st.replace(7, 5), st.forget(5)]);
     expect(st.snapshot()).toEqual({ [A]: 7 });
+
+    const src = readFileSync(BACKGROUND, "utf8");
+    const block = /chrome\.tabs\.onReplaced\.addListener\([\s\S]*?\n\}\);/.exec(src)?.[0] ?? "";
+    const readyAt = block.indexOf("tabSetsReady");
+    // Registered synchronously, before the wait, so a purge of the old id cannot drop the mapping.
+    expect(block.indexOf("sessionTabs.replace(addedTabId, removedTabId)")).toBeLessThan(readyAt);
+    // Ownership, keepOpen and the purge all read state that storage restores, so all three wait for it.
+    for (const after of ["agentTabs.has(removedTabId)", "keepOpenTabs.has(removedTabId)", "handleTabReplaced"]) {
+      expect(block.indexOf(after)).toBeGreaterThan(readyAt);
+    }
+    expect(block.indexOf("agentTabs.add(addedTabId)")).toBeGreaterThan(readyAt);
   });
 
-  test("background transfers ownership and the mapping before purging the replaced tab", () => {
+  test("background releases a request's busy slot only when the command settles", () => {
     const src = readFileSync(BACKGROUND, "utf8");
-    const block =
-      /chrome\.tabs\.onReplaced\.addListener\(\(addedTabId, removedTabId\) => \{[\s\S]*?\n\}\);/.exec(src)?.[0] ?? "";
-    expect(block).toContain("agentTabs.add(addedTabId)");
-    expect(block.indexOf("sessionTabs.replace(addedTabId, removedTabId)")).toBeGreaterThan(-1);
-    expect(block.indexOf("sessionTabs.replace(addedTabId, removedTabId)")).toBeLessThan(
-      block.indexOf("tabCleanup.handleTabReplaced"),
-    );
-  });
-
-  test("background bounds every relayed request on its own busy slot", () => {
-    const src = readFileSync(BACKGROUND, "utf8");
-    expect(src).toContain("withDeadline(handleRequest(msg), requestLimitMs(msg)");
+    expect(src).not.toContain("withDeadline");
     expect(src).toContain("tabBusy.hold(");
-    expect(src).not.toContain("busyTabs");
+    expect(src).toMatch(/const releaseBusy = tabBusy\.hold\([\s\S]*?await handleRequest\(msg\);[\s\S]*?\} finally \{\n\s*releaseBusy\(\);/);
   });
 
   test("survives a worker restart through chrome.storage.session", async () => {
@@ -283,10 +267,11 @@ describe("tab busy slots (extension)", () => {
     expect(busy.count(5)).toBe(0);
   });
 
-  test("a command that never settles is bounded and frees its slot", async () => {
+  test("a command that never settles keeps its tab busy, so the tab is never reused", async () => {
     const busy = createTabBusy();
     const release = busy.hold(5);
-    await expect(withDeadline(new Promise(() => {}), 20, "navigate")).rejects.toThrow(/navigate did not finish in 20 ms/);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(busy.isBusy(5)).toBe(true); // nothing frees a slot behind a pending command
     release();
     expect(busy.count(5)).toBe(0);
   });
@@ -301,15 +286,11 @@ describe("two connected profiles (daemon)", () => {
   });
 
   async function connectProfile(port: number, token: string, profileId: string, browser: string, tabId: number) {
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/extension`, {
-      headers: { Origin: EXTENSION_ORIGIN },
-    } as unknown as string[]);
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/extension`, { headers: { Origin: EXTENSION_ORIGIN } } as unknown as string[]);
     sockets.push(ws);
     const next = () =>
       new Promise<Record<string, unknown>>((res) => {
-        ws.addEventListener("message", (ev) => res(JSON.parse(String(ev.data)) as Record<string, unknown>), {
-          once: true,
-        });
+        ws.addEventListener("message", (ev) => res(JSON.parse(String(ev.data)) as Record<string, unknown>), { once: true });
       });
     await new Promise<void>((res) => ws.addEventListener("open", () => res(), { once: true }));
     const challengeP = next();
@@ -325,14 +306,8 @@ describe("two connected profiles (daemon)", () => {
       const msg = JSON.parse(String(ev.data)) as Record<string, unknown>;
       if (msg["type"] !== "req" || typeof msg["id"] !== "number") return;
       received.push(msg);
-      ws.send(
-        JSON.stringify({
-          type: "res",
-          id: msg["id"],
-          ok: true,
-          result: { tabId, loaded: true, url: String((msg["params"] as Record<string, unknown>)?.["url"] ?? ""), title: browser },
-        }),
-      );
+      const params = msg["params"] as Record<string, unknown>;
+      ws.send(JSON.stringify({ type: "res", id: msg["id"], ok: true, result: { tabId, loaded: true, url: String(params?.["url"] ?? ""), title: browser } }));
     });
     return received;
   }
@@ -379,15 +354,15 @@ describe("nav session params (page runner)", () => {
       if (op === "navigate") return { ok: true, data: { loaded: true, backend: "extension", ...navData } } as InvokeResult;
       return { ok: true, data: { value: "" } } as InvokeResult;
     };
-    return { calls, handle: createPageHelperHandler(invoke as never) };
+    const handle = createPageHelperHandler(invoke as never);
+    const navInput = () => calls.find((c) => c.op === "navigate")!.input;
+    return { handle, navInput };
   }
-  const navInput = (calls: Array<{ op: string; input: Record<string, unknown> }>) =>
-    calls.find((c) => c.op === "navigate")!.input;
 
   test("a tab-less nav sends the session key and says when the tab was reused", async () => {
     const h = harness({ targetId: "extension:7", reused: true });
     const res = await h.handle("nav", { url: "https://a.test/", sessionKey: A });
-    const input = navInput(h.calls);
+    const input = h.navInput();
     expect(input["sessionKey"]).toBe(A);
     expect(input["targetId"]).toBeUndefined();
     expect(res.ok && String((res.data as Record<string, unknown>)["value"])).toContain(
@@ -398,11 +373,11 @@ describe("nav session params (page runner)", () => {
   test("--new-tab is sent for a tab-less nav; an explicit tab wins over it", async () => {
     const h = harness({ targetId: "extension:8", created: true });
     await h.handle("nav", { url: "https://a.test/", sessionKey: A, newTab: true });
-    expect(navInput(h.calls)["newTab"]).toBe(true);
+    expect(h.navInput()["newTab"]).toBe(true);
 
     const e = harness({ targetId: "extension:3" });
     const res = await e.handle("nav", { url: "https://a.test/", sessionKey: A, newTab: true }, "extension:3");
-    const input = navInput(e.calls);
+    const input = e.navInput();
     expect(input["targetId"]).toBe("extension:3");
     expect(input["newTab"]).toBeUndefined();
     expect(input["sessionKey"]).toBe(A);
@@ -412,6 +387,6 @@ describe("nav session params (page runner)", () => {
   test("a raw (unhashed) session id is never forwarded", async () => {
     const h = harness({ targetId: "extension:9", created: true });
     await h.handle("nav", { url: "https://a.test/", sessionKey: "raw-claude-id" });
-    expect(navInput(h.calls)["sessionKey"]).toBeUndefined();
+    expect(h.navInput()["sessionKey"]).toBeUndefined();
   });
 });

@@ -1,5 +1,6 @@
 // Per-tab in-flight request count. A hold frees its slot at most once, so a late finish after a timeout
-// can neither drive the count negative nor keep a tab busy for the life of the worker.
+// never drives the count negative. It is released only when its command settles: a hung command leaves
+// the tab busy, so the tab is never reused and the session gets a new tab.
 
 export function createTabBusy() {
   const counts = new Map(); // tabId -> in-flight request count
@@ -29,13 +30,4 @@ export function createTabBusy() {
       return usable(tabId) ? (counts.get(tabId) ?? 0) : 0;
     },
   };
-}
-
-/** Bound a call that may never settle. The timer is cleared either way, so no slot leaks. */
-export function withDeadline(promise, ms, what = "the request") {
-  let timer;
-  const limit = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`EXECUTION_FAILED: ${what} did not finish in ${ms} ms`)), ms);
-  });
-  return Promise.race([promise, limit]).finally(() => clearTimeout(timer));
 }
