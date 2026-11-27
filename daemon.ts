@@ -286,18 +286,22 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
         const backendsState = state["backends"] as Json | undefined;
         const activeBackendName = typeof backendsState?.["active"] === "string" ? (backendsState["active"] as string) : undefined;
         const activeBackendInfo = activeBackendName ? (backendsState?.[activeBackendName] as Json | undefined) : undefined;
-        const active = state["activeTargetId"] ?? activeBackendInfo?.["activeTargetId"];
+        const extInfo = backendsState?.["extension"] as Json | undefined;
+        const active =
+          activeBackendName && activeBackendName !== "cdp"
+            ? activeBackendInfo?.["activeTargetId"]
+            : (state["activeTargetId"] ?? activeBackendInfo?.["activeTargetId"]);
         const others = (state["alsoConnected"] as string[] | undefined) ?? [];
-        const extBrowsers = Array.isArray(activeBackendInfo?.["browsers"])
-          ? (activeBackendInfo!["browsers"] as Array<{ slug?: string }>)
+        const extBrowsers = Array.isArray(extInfo?.["browsers"])
+          ? (extInfo!["browsers"] as Array<{ slug?: string }>)
               .map((b) => b.slug)
               .filter((s): s is string => typeof s === "string" && s !== "")
           : [];
+        const extLabel = extBrowsers.length > 0 ? extBrowsers.join(", ") : (extInfo?.["browser"] ?? "extension");
         const browserLabel =
-          state["browser"] ??
-          (activeBackendName === "extension"
-            ? (extBrowsers.length > 0 ? extBrowsers.join(", ") : (activeBackendInfo?.["browser"] ?? "extension"))
-            : activeBackendName ?? "browser");
+          activeBackendName === "extension"
+            ? extLabel
+            : (state["browser"] ?? (extInfo ? extLabel : (activeBackendName ?? "browser")));
         const header = `# ${browserLabel}${others.length > 0 ? ` (also connected: ${others.join(", ")}; switch with: start <name>)` : ""}`;
         return text(
           targets,

@@ -1,8 +1,9 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import type { OperationHandler } from "@agent-software/core";
 import { createBrowseBackend, type Runner } from "../src/backends/browse";
 import { route } from "../src/backends/router";
-import { BackendUnavailable } from "../src/backends/types";
+import { BackendUnavailable, type Backend } from "../src/backends/types";
+import { createPageHelperHandler } from "../src/page-runner";
 
 /** A fake `browse` CLI: records calls and answers from a table keyed by tool name. */
 function fakeBrowse(answers: Record<string, { code?: number; out: string }>) {
@@ -23,6 +24,9 @@ function fakeCdp(log: string[]): Record<string, OperationHandler> {
     return data;
   };
   return {
+    connect_browser: op("connect_browser", { connected: true, browser: "Chrome" }),
+    disconnect_browser: op("disconnect_browser", { connected: false }),
+    list_browsers: op("list_browsers", { browsers: [] }),
     navigate: op("navigate"),
     evaluate: op("evaluate"),
     capture_screenshot: op("capture_screenshot"),
@@ -245,5 +249,228 @@ describe("router with extension first", () => {
       /not connected/,
     );
     expect(log).toEqual([]);
+  });
+});
+
+function fakeExtension(overrides: Partial<Backend> = {}): Backend {
+  return {
+    name: "extension",
+    handles: (op, input, active) => {
+      if (op === "select_target") return typeof input["targetId"] === "string" && input["targetId"].startsWith("extension:");
+      if (op === "execute_cdp" && typeof input["method"] === "string" && /^(Browser|Target|Extensions)\./.test(input["method"])) {
+        return false;
+      }
+      if (op === "navigate") return true;
+      if (op === "evaluate" || op === "execute_cdp" || op === "capture_screenshot") {
+        return active || (typeof input["targetId"] === "string" && input["targetId"].startsWith("extension:"));
+      }
+      return false;
+    },
+    invoke: async (op) => ({ via: "extension", op, targetId: "extension:5" }),
+    listTargets: async () => [
+      { targetId: "extension:5", type: "page", title: "Ext", url: "https://ext.test/", backend: "extension" },
+    ],
+    status: async () => ({ available: true, listening: true, activeTargetId: "extension:5" }),
+    clearActive: () => {},
+    ...overrides,
+  };
+}
+
+describe("router with extension only (no implicit cdp fallback)", () => {
+  const savedBackends = process.env["BROWSER_CONTROL_BACKENDS"];
+  afterEach(() => {
+    if (savedBackends === undefined) delete process.env["BROWSER_CONTROL_BACKENDS"];
+    else process.env["BROWSER_CONTROL_BACKENDS"] = savedBackends;
+  });
+
+  test("RESTRICTED_PAGE refuses with EXTENSION_ONLY and never calls CDP", async () => {
+    const log: string[] = [];
+    const ext = fakeExtension({
+      invoke: async (op) => {
+        if (op === "select_target") return { activeTargetId: "extension:5" };
+        throw new BackendUnavailable(
+          "extension",
+          "RESTRICTED_PAGE: the extension cannot run on tab 5 (Cannot access a chrome:// URL); use a DevTools (cdp) tab for it",
+        );
+      },
+    });
+    const ops = route(fakeCdp(log), [ext], () => ["extension"]);
+    await ops["select_target"]!({ targetId: "extension:5" });
+    await expect(ops["evaluate"]!({ expression: "document.title" })).rejects.toThrow(
+      /^EXTENSION_ONLY: chrome:\/\/ pages can't be driven by the extension\. CDP is used only when asked:/,
+    );
+    await expect(ops["evaluate"]!({ expression: "document.title", targetId: "extension:5" })).rejects.toThrow(
+      /^EXTENSION_ONLY: chrome:\/\/ pages can't be driven by the extension\./,
+    );
+    expect(log).toEqual([]);
+  });
+
+  test("BackendUnavailable (disconnected, not lent) refuses with EXTENSION_ONLY and never calls CDP", async () => {
+    const log: string[] = [];
+    const disconnected = fakeExtension({
+      invoke: async () => {
+        throw new BackendUnavailable("extension", "extension is not connected");
+      },
+      listTargets: async () => {
+        throw new BackendUnavailable("extension", "extension is not connected");
+      },
+    });
+    const opsDisconnected = route(fakeCdp(log), [disconnected], () => ["extension"]);
+    await expect(opsDisconnected["navigate"]!({ url: "https://example.com" })).rejects.toThrow(
+      /^EXTENSION_ONLY: the extension isn't connected\. CDP is used only when asked:/,
+    );
+    await expect(opsDisconnected["list_targets"]!({})).rejects.toThrow(
+      /^EXTENSION_ONLY: the extension isn't connected\./,
+    );
+
+    const notLent = fakeExtension({
+      invoke: async () => {
+        throw new BackendUnavailable("extension", "tab 5 is not lent");
+      },
+    });
+    const opsNotLent = route(fakeCdp(log), [notLent], () => ["extension"]);
+    await expect(opsNotLent["navigate"]!({ url: "https://example.com" })).rejects.toThrow(
+      /^EXTENSION_ONLY: this tab isn't lent\. CDP is used only when asked:/,
+    );
+    expect(log).toEqual([]);
+  });
+
+  test("unhandled ops and browser-level CDP ops refuse with EXTENSION_ONLY and never call CDP", async () => {
+    const log: string[] = [];
+    const ext = fakeExtension();
+    const ops = route(fakeCdp(log), [ext], () => ["extension"]);
+    await ops["select_target"]!({ targetId: "extension:5" });
+
+    await expect(ops["capture_pdf"]!({})).rejects.toThrow(
+      /^EXTENSION_ONLY: capture_pdf isn't handled by the extension\. CDP is used only when asked:/,
+    );
+    await expect(ops["list_browsers"]!({})).rejects.toThrow(
+      /^EXTENSION_ONLY: list_browsers isn't handled by the extension\./,
+    );
+    await expect(ops["execute_cdp"]!({ method: "Browser.getVersion" })).rejects.toThrow(
+      /^EXTENSION_ONLY: browser-level CDP method "Browser\.getVersion" can't run on the extension\./,
+    );
+    await expect(ops["execute_cdp"]!({ method: "Target.getTargets", targetId: "extension:5" })).rejects.toThrow(
+      /^EXTENSION_ONLY: browser-level CDP method "Target\.getTargets" can't run on the extension\./,
+    );
+    // list_targets and get_browser_status also never touch CDP in extension-only mode.
+    const listed = (await ops["list_targets"]!({})) as { targets: Array<{ targetId: string }> };
+    expect(listed.targets.map((t) => t.targetId)).toEqual(["extension:5"]);
+    const status = (await ops["get_browser_status"]!({})) as { connected: boolean; backends: { order: string[] } };
+    expect(status.connected).toBe(false);
+    expect(status.backends.order).toEqual(["extension"]);
+    expect(log).toEqual([]);
+  });
+
+  test("order extension,cdp still falls back to CDP on RESTRICTED_PAGE, BackendUnavailable, unhandled and browser-level ops", async () => {
+    const log: string[] = [];
+    const ext = fakeExtension({
+      invoke: async (op) => {
+        if (op === "navigate") throw new BackendUnavailable("extension", "extension is not connected");
+        throw new BackendUnavailable("extension", "RESTRICTED_PAGE: cannot access chrome://version");
+      },
+    });
+    const ops = route(fakeCdp(log), [ext], () => ["extension", "cdp"]);
+    expect(await ops["navigate"]!({ url: "https://x" })).toEqual({ via: "cdp" });
+    expect(await ops["evaluate"]!({ expression: "1" })).toEqual({ via: "cdp" });
+    expect(await ops["capture_pdf"]!({})).toEqual({ via: "cdp" });
+    expect(await ops["execute_cdp"]!({ method: "Browser.getVersion" })).toEqual({ via: "cdp" });
+    expect(log).toEqual(["navigate:", "evaluate:", "capture_pdf:", "execute_cdp:"]);
+  });
+
+  test("order extension with explicit connect_browser runs on CDP, keeps untargeted calls & tabs on CDP, and returns on clear_target or nav --browser", async () => {
+    const log: string[] = [];
+    const extCalls: string[] = [];
+    const ext = fakeExtension({
+      invoke: async (op, input) => {
+        extCalls.push(`${op}:${String(input["browser"] ?? "")}`);
+        return { via: "extension", targetId: "extension:5" };
+      },
+    });
+    const ops = route(fakeCdp(log), [ext], () => ["extension"]);
+
+    await ops["connect_browser"]!({ browser: "chrome" });
+    await ops["evaluate"]!({ expression: "1" });
+    const withCdp = (await ops["list_targets"]!({})) as { targets: Array<{ targetId: string }> };
+    expect(withCdp.targets.map((t) => t.targetId)).toEqual(["extension:5", "ABC"]);
+    expect(log).toEqual(["connect_browser:", "evaluate:", "list_targets:"]);
+
+    // clear_target returns untargeted calls and list_targets to the extension.
+    await ops["clear_target"]!({});
+    log.length = 0;
+    await ops["navigate"]!({ url: "https://ext.test/" });
+    const extOnly = (await ops["list_targets"]!({})) as { targets: Array<{ targetId: string }> };
+    expect(extOnly.targets.map((t) => t.targetId)).toEqual(["extension:5"]);
+    expect(extCalls).toEqual(["navigate:"]);
+    expect(log).toEqual([]);
+
+    // nav --browser <slug> also returns from an active CDP route to the extension.
+    await ops["connect_browser"]!({ browser: "chrome" });
+    log.length = 0;
+    await ops["navigate"]!({ url: "https://ext.test/", browser: "chrome-abc123" });
+    await ops["evaluate"]!({ expression: "2" });
+    const backToExt = (await ops["list_targets"]!({})) as { targets: Array<{ targetId: string }> };
+    expect(backToExt.targets.map((t) => t.targetId)).toEqual(["extension:5"]);
+    expect(extCalls).toEqual(["navigate:", "navigate:chrome-abc123", "evaluate:"]);
+    expect(log).toEqual([]);
+  });
+
+  test("order extension with an explicit DevTools targetId or select_target runs on CDP", async () => {
+    const log: string[] = [];
+    const extCalls: string[] = [];
+    const ext = fakeExtension({
+      invoke: async (op) => {
+        extCalls.push(op);
+        return { via: "extension", targetId: "extension:5" };
+      },
+    });
+    const ops = route(fakeCdp(log), [ext], () => ["extension"]);
+
+    // One-shot DevTools targetId runs on CDP without changing untargeted routing.
+    await ops["evaluate"]!({ expression: "1", targetId: "ABC" });
+    await ops["navigate"]!({ url: "https://ext.test/" });
+    expect(log).toEqual(["evaluate:ABC"]);
+    expect(extCalls).toEqual(["navigate"]);
+
+    // select_target of a DevTools target switches untargeted calls and tabs to include CDP.
+    await ops["select_target"]!({ targetId: "ABC" });
+    await ops["navigate"]!({ url: "https://cdp.test/" });
+    const listed = (await ops["list_targets"]!({})) as { targets: Array<{ targetId: string }> };
+    expect(listed.targets.map((t) => t.targetId)).toEqual(["extension:5", "ABC"]);
+    expect(log).toEqual(["evaluate:ABC", "select_target:ABC", "navigate:", "list_targets:"]);
+  });
+
+  test("page-runner nav and snap surface EXTENSION_ONLY on RESTRICTED_PAGE in extension-only mode without touching CDP", async () => {
+    process.env["BROWSER_CONTROL_BACKENDS"] = "extension";
+    const cdpLog: string[] = [];
+    const ext = fakeExtension({
+      invoke: async (op) => {
+        if (op === "navigate") return { loaded: true, targetId: "extension:5", url: "chrome://version/" };
+        throw new BackendUnavailable("extension", "RESTRICTED_PAGE: cannot access chrome://version");
+      },
+    });
+    const ops = route(fakeCdp(cdpLog), [ext], () => ["extension"]);
+    const invoke = async (op: string, input: Record<string, unknown> = {}) => {
+      try {
+        return { ok: true as const, data: await ops[op]!(input) };
+      } catch (err) {
+        return { ok: false as const, error: { code: "EXECUTION_FAILED" as const, message: (err as Error).message } };
+      }
+    };
+    const handlePage = createPageHelperHandler(invoke, undefined, undefined, {
+      bcCall: async () => {
+        throw new BackendUnavailable(
+          "extension",
+          "RESTRICTED_PAGE: the extension cannot run on tab 5 (Cannot access a chrome:// URL); use a DevTools (cdp) tab for it",
+        );
+      },
+    });
+    const navRes = await handlePage("nav", { url: "chrome://version" });
+    expect(navRes.ok).toBe(false);
+    if (!navRes.ok) expect(navRes.error.message).toMatch(/^EXTENSION_ONLY: chrome:\/\/ pages can't be driven by the extension/);
+    const snapRes = await handlePage("snap", {}, "extension:5");
+    expect(snapRes.ok).toBe(false);
+    if (!snapRes.ok) expect(snapRes.error.message).toMatch(/^EXTENSION_ONLY: chrome:\/\/ pages can't be driven by the extension/);
+    expect(cdpLog).toEqual([]);
   });
 });

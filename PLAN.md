@@ -16,7 +16,7 @@ The extension removes everything that makes direct CDP awkward:
 - Clicking "Allow remote debugging?" after every browser restart.
 - Focus-stealing tabs, background-tab throttling, password-manager debugger crashes, and clumsy login/2FA stops.
 
-Direct CDP (the v1 way) stays as a first-class fallback and for pages extensions cannot touch. The optional `browse` adapter also stays, because nothing is removed.
+Direct CDP (the v1 way) stays unchanged when no extension is paired and is used whenever asked for by name (for example for pages extensions cannot touch). The optional `browse` adapter also stays, because nothing is removed.
 
 ### Targets
 
@@ -162,7 +162,7 @@ browser-control/   (v2 branch)
 
 - Listens on `127.0.0.1` only (unless user explicitly opts into `--remote` / host binding later). Starts only when `extension` is in the backend order, so `cdp`-only users open no port.
 - **Several daemons at once** (e.g. multiple agent sandboxes): each daemon binds the first free port in `49222–49229` and exposes an unauthenticated `GET /version` returning `{ app: "browser-control", version, instanceId, protocolVersion }` (zero credentials).
-- The extension probes candidate ports via `/version` (rate-limited, 800 ms timeout) before opening a WebSocket, so it **never** sends a handshake or token to an unrelated local server. It keeps one authenticated socket per live `browser-control` daemon in `49222–49229`. A ninth daemon gets `BACKEND_UNAVAILABLE: no free relay port` and falls back to `cdp`.
+- The extension probes candidate ports via `/version` (rate-limited, 800 ms timeout) before opening a WebSocket, so it **never** sends a handshake or token to an unrelated local server. It keeps one authenticated socket per live `browser-control` daemon in `49222–49229`. A ninth daemon gets `BACKEND_UNAVAILABLE: no free relay port` (refusing with `EXTENSION_ONLY` unless `cdp` is explicitly listed in the backend order).
 - Each daemon keeps its own selected tab, as today. Agents do not share tab state.
 
 ### Sandbox evidence (Phase 0 check 1, 2026-11-26) and hub decision
@@ -282,13 +282,13 @@ The debugger needs a CDP `nodeId` / `objectId` for a ref minted in the extension
 - **Primary (verified in Phase 0):** After attach, enable `Runtime`, locate the extension's content-script execution context from `Runtime.executionContextCreated` and run `Runtime.evaluate` with `returnByValue: false` (`__bc.el(ref)`). Works inside shadow roots without touching the DOM. Match the context by **exact** `origin === "chrome-extension://" + chrome.runtime.id` (and `auxData.frameId` for child frames), never by `auxData.type === "isolated"` alone: real profiles carry many other extensions' isolated worlds (Phase 0 saw 8). Re-resolve after `Page.frameNavigated` and on `Runtime.executionContextDestroyed`.
 - **Fallback:** One-shot `data-bc-resolve` attribute stamp + `DOM.querySelector` (already implemented in `extension/background.js`). Does not pierce open or closed shadow roots (confirmed in Phase 0), so it is used only when the primary context lookup fails.
 
-### Frames, dialogs, navigation, screenshots, and CDP fallback
+### Frames, dialogs, navigation, screenshots, and opt-in CDP
 
 - **Frames:** `list_frames` returns Chrome's `webNavigation.getAllFrames` list; `bc_call` accepts `frameId`. Map frame index (`f1:e3`) by URL + order (tested with duplicate-URL iframes). Top-level trusted clicks reach child frames by coordinate; cross-origin `upload` uses child debugger `sessionId` (`Target.setAutoAttach({ autoAttach: true, waitForDebuggerOnStart: false, flatten: true })`).
 - **Dialogs:** Open `alert`/`confirm`/`beforeunload` freezes `chrome.scripting`. On `bc_call` timeout (30 s), attach the debugger, check for an open dialog, and report it with a `remedy: run dialog accept|dismiss` hint. First-class `dialog` command calls `Page.handleJavaScriptDialog`.
 - **Navigation:** Compare URLs ignoring `#hash` so hash-only navigations return immediately instead of waiting for a `complete` status that never fires. Strip `#hash` on `about:blank#...`. After navigation settles, run the lightweight `src/challenges.ts` probe on short/suspicious pages to auto-wait brief non-interactive interstitials or report `CHALLENGE:` / `BLOCKED:`.
 - **Screenshots:** `captureVisibleTab` returns device pixels (~2 calls/s Chrome quota). Phase 0 confirmed it matches `Page.captureScreenshot` scale on Retina (both device px at `dpr` 2), so both paths are interchangeable; return `dpr` with every image. Full-page capture computes explicit `Page.getLayoutMetrics` clip as v1 does.
-- **Fallback to direct CDP:** `RESTRICTED_PAGE` from the extension maps to `BackendUnavailable`, letting the router fall back to `cdp`. Raw `call` with an unsupported CDP domain (e.g. `Browser.*`) routes to `cdp` if connected, else fails with a clear reason.
+- **Restricted pages and opt-in CDP:** `RESTRICTED_PAGE` from the extension maps to `BackendUnavailable`. With the default paired order (`extension`), `BackendUnavailable`, `RESTRICTED_PAGE`, unhandled ops, and browser-level CDP methods (e.g. `Browser.*`) refuse with `EXTENSION_ONLY` naming the cause and the opt-in (`start <browser>`, a DevTools targetId, or `BROWSER_CONTROL_BACKENDS=extension,cdp`). Fallback to `cdp` happens only when `cdp` is explicitly listed in the effective order.
 
 ---
 
@@ -302,18 +302,17 @@ Read https://github.com/TheSethRose/browser-control and install its browser-cont
 
 `browser-control-daemon extension setup` does this:
 
-1. Creates or reuses the secret in `~/.config/browser-control/extension-relay.json` (`0600`).
+1. Creates or reuses the secret in `~/.config/browser-control/extension-relay.json` (`0600`, which makes the default backend order `extension`).
 2. Writes `extension/pairing.json` (`0600`, gitignored) with the token/code and port hint.
-3. Sets `~/.config/browser-control/backends` to `extension,cdp`.
-4. Prints the three clicks with the exact path to `extension/`.
-5. Waits for the extension to connect (up to 60 s), then runs `tabs` to confirm.
+3. Prints the three clicks with the exact path to `extension/`.
+4. Waits for the extension to connect (or returns so the user can load it and confirm with `extension browsers`).
 
 Additional subcommands:
 - `extension browsers` — list connected browsers and their slugs.
 - `extension pair` and `extension revoke <slug>` — deferred to **Later: Web Store build** (they need per-browser tokens).
 - `extension status` — port, connected browsers, protocol/helper versions, pairing state.
 - `extension diagnostics` — pulls the extension's ring-buffer log + daemon relay state for bug reports.
-- `extension enable` / `extension disable` — toggle `extension,cdp` vs `cdp`.
+- `extension enable` / `extension disable` — remove `<daemon dir>/backends` (returning to default `extension` or env) vs write `cdp`.
 
 ---
 
@@ -386,7 +385,7 @@ Done when: every command in section 3 runs cleanly on an extension tab against t
   3. `click`, `hover`, `type`, `upload`, `drag`, `styles`, `perf`, `emulate` attach and auto-detach after 30 s.
   4. New agent tabs open in the background without stealing focus, group cleanly, and popups don't yank focus.
   5. `handoff` expands the group, shows the "Your turn" card, lets 1Password/typing work, and resumes immediately on Continue.
-  6. "Lent only" refuses other tabs until lent; `chrome://` tabs fall back to `cdp`.
+  6. "Lent only" refuses other tabs until lent; `chrome://` tabs refuse with the `EXTENSION_ONLY` hint instead of falling back to `cdp`.
 
 Done when: `bun run build:skill`, `typecheck`, `bun test`, `tests/e2e/`, and all 6 live checks pass.
 
@@ -418,7 +417,7 @@ Deferred on 2026-11-26 ("ship it smaller"): the one-time pairing code (`extensio
 These are Chromium platform boundaries, not design flaws:
 
 - **Yellow banner while debugger is attached:** Reads avoid it completely; the 30-second idle detach clears it after writes/DevTools.
-- **Restricted pages:** `chrome://`, Chrome Web Store, other extensions' pages, built-in PDF viewer, and `file://` (unless "Allow access to file URLs" is enabled) cannot be scripted by extensions. These fall back to `cdp`.
+- **Restricted pages:** `chrome://`, Chrome Web Store, other extensions' pages, built-in PDF viewer, and `file://` (unless "Allow access to file URLs" is enabled) cannot be scripted by extensions. With order `extension`, these refuse with `EXTENSION_ONLY` (opt into `cdp` with `start <browser>`, a DevTools targetId, or `BROWSER_CONTROL_BACKENDS=extension,cdp`).
 - **Allowed CDP domains for extensions:** Accessibility, Audits, CacheStorage, Console, CSS, Database, Debugger, DOM, DOMDebugger, DOMSnapshot, Emulation, Fetch, IO, Input, Inspector, Log, Network, Overlay, Page, Performance, Runtime, Storage, Target, Tracing, WebAudio, WebAuthn. (`Browser.*` is excluded; every built-in command uses allowed domains only.)
 - **Minimized windows:** `Page.captureScreenshot` hangs and timers throttle in minimized windows; agent tabs always open in a non-minimized window.
 - **Cold-start ceiling:** Up to 30 seconds if the MV3 service worker is asleep when a daemon first starts (Chrome's minimum `chrome.alarms` period).

@@ -1123,6 +1123,9 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
         const errText = String(msg["error"] ?? "extension request failed");
         if (errText.startsWith("RESTRICTED_PAGE:")) {
           p.reject(new BackendUnavailable(NAME, errText));
+        } else if (/^Cannot access (a chrome:\/\/ URL|a chrome-extension:\/\/ URL|contents of)/i.test(errText)) {
+          // Debugger attach on a restricted page reports Chrome's raw message.
+          p.reject(new BackendUnavailable(NAME, `RESTRICTED_PAGE: ${errText}`));
         } else {
           p.reject(new Error(errText));
         }

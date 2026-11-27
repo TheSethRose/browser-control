@@ -5,7 +5,7 @@ description: Drive the user's real Chrome or Chromium browser (Edge, Brave, Arc,
 
 # Browser Control
 
-Drive the user's real Chromium browser. The default path is the Browser Control extension, which needs no remote-debugging setting. Direct CDP is the fallback, for example for `chrome://` tabs. The opencode `browse` adapter is optional. Self-contained; requires only [Bun](https://bun.sh). For isolated throwaway Playwright runs (batch submits, whole-site audits, recordings, stealth), use `browser-automation`.
+Drive the user's real Chromium browser. Once paired, commands run on the Browser Control extension alone (no remote-debugging setting); without the extension, v1 direct CDP stays the default. Direct CDP is used only when asked for by name (`start <browser>`, a DevTools targetId, or `BROWSER_CONTROL_BACKENDS=extension,cdp`), for example for `chrome://` tabs. The opencode `browse` adapter is optional. Self-contained; requires only [Bun](https://bun.sh). For isolated throwaway Playwright runs (batch submits, whole-site audits, recordings, stealth), use `browser-automation`.
 
 ## Quick start
 
@@ -55,7 +55,7 @@ Page commands take `[targetId]` last, `--match <text>`, `--quiet`, and `--no-bou
 | Command | Action |
 | --- | --- |
 | `tabs` / `start <browser>` / `default [browser]` | List tabs / switch browser (`chrome`, `beta`, `brave`, `ardia`, …) / get or set default browser. |
-| `extension setup [extensionDir]` / `status` / `browsers` / `diagnostics` / `enable` / `disable` | Pair the extension and set `extension,cdp` / relay and pairing state / connected browsers and slugs / extension log for bug reports / backend order `extension,cdp` / `cdp` only. `extension pair` and `revoke` are not built yet and return an error. |
+| `extension setup [extensionDir]` / `status` / `browsers` / `diagnostics` / `enable` / `disable` | Pair the extension (default order becomes `extension`) / relay and pairing state / connected browsers and slugs / extension log for bug reports / remove the daemon override (back to default `extension` or env) / `cdp` only. `extension pair` and `revoke` are not built yet and return an error. |
 | `nav <url> [--snap] [--until load] [--browser <slug>] [--new-window] [--keep-open]` | Navigate until parsed & quiet (`--until load` waits for all resources. `--browser <slug>` opens the tab in that browser, see `extension browsers`. `--new-window` and `--keep-open` work on extension tabs only.). Flags `# REDIRECTED:` / `# WALL:` / `CHALLENGE:` / `BLOCKED:`. |
 | `snap [--all] [--full] [--find <t>] [--within <r\|css>] [--ax] [--out <p>]` | Controls with refs (`e12`, `f2:e5` iframe, `a41` AX). Diffs repeats on same page, folds disabled runs, auto-scopes modals, shows site notes. Flags: `disabled`, `checked`, `required`, `secure`, `trap`, `payment`. |
 | `text [--all] [--within <r\|css>] [--max <n>] [--scroll] [--filter <t>] [--limit <n>] [--out <p>]` | Readable markdown (folds nav/filter sidebars unless `--all`; `--scroll` reads virtualized/infinite lists). |
@@ -118,4 +118,4 @@ Repo: [github.com/TheSethRose/browser-control](https://github.com/TheSethRose/br
 - Enable CDP domains (`Page`, `Network`) before triggering events; daemon retains them between calls.
 - Coordinates are **CSS pixels** (`shot` matches; `shot --full` / `capture_screenshot` are **device pixels**). Re-measure after scroll/resize.
 - `select_target` routes; `Target.activateTarget` foregrounds. Re-select parent tab after iframe targets.
-- Error codes: `NOT_CONNECTED`, `NO_ACTIVE_TARGET`, `CDP_TIMEOUT` (120 s; often a dialog), `JS_EXCEPTION`, `NAVIGATION_FAILED`, `INPUT_INVALID`, `ARTIFACT_WRITE_FAILED`, `WAIT_TIMEOUT`. Check `daemon.log` beside the socket when slow.
+- Error codes: `EXTENSION_ONLY`, `NOT_CONNECTED`, `NO_ACTIVE_TARGET`, `CDP_TIMEOUT` (120 s; often a dialog), `JS_EXCEPTION`, `NAVIGATION_FAILED`, `INPUT_INVALID`, `ARTIFACT_WRITE_FAILED`, `WAIT_TIMEOUT`. Check `daemon.log` beside the socket when slow.

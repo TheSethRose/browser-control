@@ -10,7 +10,13 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { runBrowse, type Runner } from "./backends/browse";
-import { backendOrder } from "./backends/router";
+import {
+  backendOrder,
+  extensionOnlyCauseFromError,
+  extensionOnlyMessage,
+  isBackendUnavailable,
+  isExtensionOnlyOrder,
+} from "./backends/router";
 import { extensionFrameTarget, extensionTabOf, getRegisteredExtensionBcCall, type BcCallFn } from "./backends/extension";
 import {
   SHORT_PAGE_CHARS,
@@ -271,9 +277,13 @@ export function createPageHelperHandler(
   const activeHandoffs = new Map<number, string>();
 
   async function runBcCall(call: ReturnType<typeof normalizeHelperCall>, targetId: string, timeoutMs?: number): Promise<InvokeResult> {
-    const fn = options.bcCall ?? (backendOrder().includes("extension") ? getRegisteredExtensionBcCall() : undefined);
+    const order = backendOrder();
+    const fn = options.bcCall ?? (order.includes("extension") ? getRegisteredExtensionBcCall() : undefined);
     if (!fn) {
-      return failure("EXECUTION_FAILED", "BACKEND_UNAVAILABLE: extension backend is not active");
+      const msg = isExtensionOnlyOrder(order)
+        ? extensionOnlyMessage("the extension backend isn't active")
+        : "BACKEND_UNAVAILABLE: extension backend is not active";
+      return failure("EXECUTION_FAILED", msg);
     }
     try {
       const data = await fn({
@@ -284,6 +294,9 @@ export function createPageHelperHandler(
       });
       return { ok: true, data };
     } catch (error) {
+      if (isBackendUnavailable(error) && isExtensionOnlyOrder(order)) {
+        return failure("EXECUTION_FAILED", extensionOnlyMessage(extensionOnlyCauseFromError(error)));
+      }
       return helperError(failure("EXECUTION_FAILED", (error as Error).message));
     }
   }
@@ -439,13 +452,17 @@ export function createPageHelperHandler(
   ): Promise<{ ok: true; objectId: string } | { ok: false; res: InvokeResult }> {
     const expr = renderElementStep(target);
     if (extensionTabOf(targetId) !== undefined) {
+      const order = backendOrder();
       const extRequest =
         options.extensionRequest ??
         ((globalThis as Record<symbol, unknown>)[EXTENSION_REQUEST_SYMBOL] as ExtensionRequestFn | undefined);
       if (!extRequest) {
+        const msg = isExtensionOnlyOrder(order)
+          ? extensionOnlyMessage("the extension backend isn't active")
+          : "BACKEND_UNAVAILABLE: extension backend is not active";
         return {
           ok: false,
-          res: failure("EXECUTION_FAILED", "BACKEND_UNAVAILABLE: extension backend is not active"),
+          res: failure("EXECUTION_FAILED", msg),
         };
       }
       const reqParams: Json =
@@ -463,6 +480,9 @@ export function createPageHelperHandler(
         }
         return { ok: true, objectId };
       } catch (err) {
+        if (isBackendUnavailable(err) && isExtensionOnlyOrder(order)) {
+          return { ok: false, res: failure("EXECUTION_FAILED", extensionOnlyMessage(extensionOnlyCauseFromError(err))) };
+        }
         return { ok: false, res: helperError(failure("EXECUTION_FAILED", (err as Error).message)) };
       }
     }
@@ -1758,13 +1778,20 @@ export function createPageHelperHandler(
       ((globalThis as Record<symbol, unknown>)[EXTENSION_REQUEST_SYMBOL] as ExtensionRequestFn | undefined);
 
     const callExtensionHandoff = async (op: "handoff_start" | "handoff_clear", params: Json): Promise<InvokeResult> => {
+      const order = backendOrder();
       if (!extRequest) {
-        return failure("EXECUTION_FAILED", "BACKEND_UNAVAILABLE: handoff requires the browser-control extension relay");
+        const msg = isExtensionOnlyOrder(order)
+          ? extensionOnlyMessage("handoff requires the browser-control extension relay")
+          : "BACKEND_UNAVAILABLE: handoff requires the browser-control extension relay";
+        return failure("EXECUTION_FAILED", msg);
       }
       try {
         const result = await extRequest(op, { targetId: extTarget, ...params });
         return { ok: true, data: { result } };
       } catch (err) {
+        if (isBackendUnavailable(err) && isExtensionOnlyOrder(order)) {
+          return failure("EXECUTION_FAILED", extensionOnlyMessage(extensionOnlyCauseFromError(err)));
+        }
         return failure("EXECUTION_FAILED", (err as Error).message);
       }
     };
@@ -2519,6 +2546,8 @@ export function createPageHelperHandler(
           let wall = "";
           if (state.ok) {
             [final = "", wall = ""] = valueOf(state).split("\n");
+          } else if (messageOf(state).startsWith("EXTENSION_ONLY:")) {
+            return state;
           }
           const challengeBackend = challengeBackendOf(tab);
           const challenge = await checkChallenge(tab, { wallHint: wall, knownUrl: final || url });

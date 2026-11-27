@@ -164,7 +164,7 @@ export const dispose: NonNullable<CapabilityModule["dispose"]> = async () => {
   for (const b of backends) await b.dispose?.();
 };
 
-/** The built-in DevTools (CDP) operations: every operation, and the fallback for other backends. */
+/** The built-in DevTools (CDP) operations: default when unpaired, explicit by name, or opt-in fallback. */
 const cdpOperations: Record<string, OperationHandler> = {
   list_browsers: async () => {
     const browsers = await detectBrowsers();
@@ -461,7 +461,7 @@ const cdpOperations: Record<string, OperationHandler> = {
   },
 };
 
-/** Extra backends (see `src/backends/`); CDP stays the fallback for whatever they lack. */
+/** Extra backends (see `src/backends/`); CDP handles explicit requests and opt-in fallback orders. */
 const backends = createBackends();
 
 export const operations: Record<string, OperationHandler> = route(cdpOperations, backends);

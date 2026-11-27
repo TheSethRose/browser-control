@@ -7,7 +7,8 @@ scroll, download files and save screenshots and PDFs.
 Version 2 adds the Browser Control extension. With it, agents reach your real Chrome without
 the remote-debugging setting and without an "Allow" click after each browser restart. Direct
 [Chrome DevTools Protocol](https://chromedevtools.github.io/devtools-protocol/) (CDP), the v1
-way, stays as the fallback. Every v1 command still works.
+way, stays unchanged when the extension isn't paired and works whenever you ask for it by name.
+Every v1 command still works.
 
 It works in your real browser, with your logins, extensions and open tabs. It doesn't use a
 headless browser or a throwaway profile. Chrome, Chromium, Edge, Brave, Arc, Vivaldi, Opera,
@@ -51,7 +52,7 @@ works from a fresh clone.
 - [Bun](https://bun.sh), the only runtime dependency.
 - A Chromium-based browser, version 125 or newer, with the Browser Control extension loaded
   (see above).
-- Or, for the CDP fallback, a Chromium-based browser with remote debugging turned on. In
+- Or, for direct CDP (when not using the extension, or when opting into CDP explicitly), a Chromium-based browser with remote debugging turned on. In
   current Chrome, open
   `chrome://inspect/#remote-debugging` and check **"Allow remote debugging for this browser
   instance"**. Other Chromium browsers have the same switch, or accept the
@@ -226,7 +227,7 @@ These environment variables are optional. None of them holds a credential.
 | Variable | What it sets |
 | --- | --- |
 | `BROWSER_CONTROL_BROWSER` | The browser to use when a connect names none (`beta`, `chrome`, …). It overrides the one-line file `~/.config/browser-control/default-browser`. |
-| `BROWSER_CONTROL_BACKENDS` | The backend order, for example `extension,cdp` or `browse,cdp`. The daemon reads the order from `<daemon dir>/backends` first (written by `extension setup`, `enable` and `disable`), then this variable, then the one-line file `~/.config/browser-control/backends`. With none of them, the order is `cdp` (DevTools only). See [Backends](#backends). |
+| `BROWSER_CONTROL_BACKENDS` | The backend order, for example `extension`, `extension,cdp`, or `browse,cdp`. The daemon reads the order from `<daemon dir>/backends` first (written by `extension disable`, removed by `extension enable`), then this variable, then the one-line file `~/.config/browser-control/backends`. With none of them, a paired extension defaults to `extension` alone; otherwise the order is `cdp` (DevTools only). See [Backends](#backends). |
 | `BROWSER_CDP_CALL_TIMEOUT_MS` | How long a CDP call waits for a reply when it sets no timeout. Default 120000. |
 | `BROWSER_CONTROL_MAX_OUTPUT` | Daemon only. The most characters `eval`, `nav` and `tabs` print. Default 50000. |
 | `BROWSER_CDP_WS_URL` | The browser's WebSocket address, when finding it automatically fails. |
@@ -253,9 +254,11 @@ Connecting by port handles both.
 
 There are three backends:
 
-- `extension` is the Browser Control extension in your browser. It is the default once
-  `extension setup` has run.
-- `cdp` is direct DevTools. It is built in, runs every operation, and is the fallback.
+- `extension` is the Browser Control extension in your browser. Once paired, it is the sole
+  default backend and never falls back to `cdp` implicitly.
+- `cdp` is direct DevTools. It is built in, runs every operation, remains the default when the
+  extension isn't paired, and runs whenever asked for by name (`start <browser>`, a DevTools
+  targetId, or `BROWSER_CONTROL_BACKENDS=extension,cdp`).
 - `browse` is the optional opencode browse adapter.
 
 The extension talks to the daemon over a WebSocket on `127.0.0.1`. Each side proves it holds
@@ -277,8 +280,9 @@ On extension tabs:
 - The popup can limit the extension to tabs you lend it (`Lent only`).
 
 The `extension` command manages the link: `extension setup [extensionDir]`,
-`extension status`, `extension browsers`, `extension diagnostics`, `extension enable` (order
-`extension,cdp`) and `extension disable` (order `cdp`). `extension pair` and
+`extension status`, `extension browsers`, `extension diagnostics`, `extension enable` (removes
+`<daemon dir>/backends` so the default `extension` or env var applies) and `extension disable`
+(writes `cdp`). `extension pair` and
 `extension revoke` wait for a later Web Store build and return an error for now.
 
 The backends other than `cdp` live in `src/backends/` (one file each) and are listed in
@@ -287,9 +291,13 @@ each call using the order from [Configuration](#configuration):
 
 - A target id with a backend prefix, like `extension:42` or `browse:12`, always goes to that
   backend.
-- When the extension can't run on a page (`RESTRICTED_PAGE`), the call falls back to `cdp`.
-- Otherwise the router tries backends in order. If a backend lacks the operation or isn't
-  available (not installed, or no browser paired), the next one gets the call.
+- Explicit CDP requests (`start <browser>`, a DevTools targetId with no backend prefix, or
+  `select_target` of a DevTools target) always run on `cdp`, even when the order is `extension`.
+- With order `extension`, nothing reaches `cdp` implicitly: a disconnected extension, a
+  restricted page (`RESTRICTED_PAGE`), an unhandled op, or a browser-level CDP op refuses with
+  `EXTENSION_ONLY` naming the cause and how to opt into `cdp`.
+- Fallback to `cdp` happens only when the effective order explicitly lists `cdp` (for example
+  `BROWSER_CONTROL_BACKENDS=extension,cdp` or `browse,cdp`).
 - While a backend's tab is selected, a tab operation that backend lacks fails with a clear
   message. It never runs on a different DevTools tab instead.
 
@@ -311,8 +319,9 @@ These are limits of Chrome itself:
 - Chrome shows a yellow banner while the debugger is attached. Reads never attach it, and it
   detaches 30 seconds after the last command that needed it.
 - Extensions can't run on `chrome://` pages, the Chrome Web Store, other extensions' pages, the
-  built-in PDF viewer, or `file://` pages (unless "Allow access to file URLs" is on). These
-  pages fall back to `cdp`.
+  built-in PDF viewer, or `file://` pages (unless "Allow access to file URLs" is on). With the
+  default `extension` order they refuse with `EXTENSION_ONLY`; opt into `cdp` with
+  `start <browser>`, a DevTools targetId, or `BROWSER_CONTROL_BACKENDS=extension,cdp`.
 - Extensions can use only some CDP domains: Accessibility, Audits, CacheStorage, Console, CSS,
   Database, Debugger, DOM, DOMDebugger, DOMSnapshot, Emulation, Fetch, IO, Input, Inspector,
   Log, Network, Overlay, Page, Performance, Runtime, Storage, Target, Tracing, WebAudio and
@@ -335,7 +344,7 @@ so run steps that depend on it one after another.
 ## Errors
 
 Each error message starts with a fixed code, inside the `EXECUTION_FAILED` envelope message.
-The codes are `NOT_CONNECTED`, `NO_ACTIVE_TARGET`, `CDP_TIMEOUT`, `JS_EXCEPTION`,
+The codes are `EXTENSION_ONLY`, `NOT_CONNECTED`, `NO_ACTIVE_TARGET`, `CDP_TIMEOUT`, `JS_EXCEPTION`,
 `NAVIGATION_FAILED`, `INPUT_INVALID` and `ARTIFACT_WRITE_FAILED`. If Chrome drops a session,
 browser-control attaches again once and retries the call. Raw CDP errors come back unchanged
 as `CDP <code>: <message>`. A `wait_for_event` timeout returns `found:false` and isn't an
