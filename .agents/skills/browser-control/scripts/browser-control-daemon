@@ -14,7 +14,9 @@
 #   start [browser]                   switch browser by name (chrome, beta, brave, ardia); opens it
 #                                     if needed. Never pass a port.
 #   default [browser]                 show or set the default browser
-#   natural [on|off|status]           show or set global natural browsing (default on; --fast opts out per call)
+#   natural [on|off|status]           show or set global natural browsing (default on; --fast opts out per call).
+#                                     Each call sends this shell's BROWSER_CONTROL_NATURAL and
+#                                     XDG_CONFIG_HOME file to the daemon, so status matches what runs
 #   ops | status | check-update [--force]
 #
 # Chrome extension (no remote-debugging prompt):
@@ -183,7 +185,9 @@ req() {
   local rc=0 mt=""
   # A long-running call (handoff) sets max_time so curl gives up just after the server would.
   [[ -z "${max_time:-}" ]] || mt="--max-time $max_time"
-  printf '%s' "${3:-}" | curl -sS --fail-with-body ${mt} --unix-socket "$sock" -X "$1" \
+  local nat=(-H "x-bc-natural-file: ${XDG_CONFIG_HOME:-$HOME/.config}/browser-control/natural")
+  [[ -z "${BROWSER_CONTROL_NATURAL:-}" ]] || nat+=(-H "x-bc-natural: ${BROWSER_CONTROL_NATURAL//[$'\r\n']/}")
+  printf '%s' "${3:-}" | curl -sS --fail-with-body ${mt} "${nat[@]}" --unix-socket "$sock" -X "$1" \
     --data-binary @- "http://daemon/$2" 2>/dev/null || rc=$?
   case $rc in 0) ;; 22) return 1 ;; 7) return 7 ;; *) return 9 ;; esac
 }
@@ -632,7 +636,7 @@ case "$cmd" in
         ;;
       "" | status)
         env_raw="$(printf '%s' "${BROWSER_CONTROL_NATURAL:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
-        file_raw="$(tr -d '[:space:]' <"$file" 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
+        file_raw="$(tr -d '[:space:]' 2>/dev/null <"$file" | tr '[:upper:]' '[:lower:]' || true)"
         val="on"; src="default"
         case "$file_raw" in 0|false|off|no) val="off"; src="file" ;; 1|true|on|yes) val="on"; src="file" ;; esac
         case "$env_raw" in 0|false|off|no) val="off"; src="env" ;; 1|true|on|yes) val="on"; src="env" ;; esac

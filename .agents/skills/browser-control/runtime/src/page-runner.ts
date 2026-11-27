@@ -300,7 +300,14 @@ export function createPageHelperHandler(
   const pause = options.sleep ?? sleep;
   const rng = options.rng ?? Math.random;
   const now = options.now ?? (() => Date.now());
-  const isNatural = (input: Json): boolean => isNaturalEnabled(input, { defaultEnabled: options.naturalDefault });
+  /** `_natural` carries the wrapper caller's env value and config file, so status and dispatch agree. */
+  const isNatural = (input: Json): boolean => {
+    const caller = input["_natural"] as { env?: unknown; file?: unknown } | undefined;
+    const fromCaller = typeof caller?.file === "string"
+      ? { env: { BROWSER_CONTROL_NATURAL: typeof caller.env === "string" ? caller.env : undefined }, configFile: caller.file }
+      : {};
+    return isNaturalEnabled(input, { defaultEnabled: options.naturalDefault, ...fromCaller });
+  };
   /** Per-tab pointer state keyed by resolved top-level target id (without frame suffix). */
   const motionByTab = new Map<string, { pointer?: Point2D; viewport?: Viewport }>();
   let implicitCdpTarget: string | undefined;
@@ -317,6 +324,8 @@ export function createPageHelperHandler(
   const resetMotion = (targetId?: string): void => {
     motionByTab.delete(tabKeyOf(targetId));
   };
+  /** Button/key releases a dialog blocked, per tab; `dialog accept|dismiss` sends them so nothing stays held. */
+  const pendingReleases = new Map<string, Json[]>();
   /** Cross-origin iframe targets from the last snap of each tab: f1 is index 0. */
   const frameTargets = new Map<string, string[]>();
   /** Last isolated-world executionContextId seen per target, used by upload/styles. */
@@ -1058,9 +1067,12 @@ export function createPageHelperHandler(
     const down = spec.text !== undefined
       ? await cdp("Input.dispatchKeyEvent", { type: "keyDown", ...base, text: spec.text }, targetId, INPUT_TIMEOUT_MS)
       : await cdp("Input.dispatchKeyEvent", { type: "rawKeyDown", ...base }, targetId, INPUT_TIMEOUT_MS);
-    if (!down.ok) return down;
+    if (!down.ok) {
+      await sendRelease("Input.dispatchKeyEvent", { type: "keyUp", ...base }, targetId);
+      return down;
+    }
     if (holdMs > 0) await pause(holdMs);
-    return cdp("Input.dispatchKeyEvent", { type: "keyUp", ...base }, targetId, INPUT_TIMEOUT_MS);
+    return sendRelease("Input.dispatchKeyEvent", { type: "keyUp", ...base }, targetId, INPUT_TIMEOUT_MS);
   }
 
   async function dispatchText(
@@ -1148,6 +1160,16 @@ export function createPageHelperHandler(
 
   const inputFailed = (res: InvokeResult, what: string): InvokeResult =>
     messageOf(res).startsWith("CDP_TIMEOUT") ? success(`${what}: delivered_unverified (${DIALOG_HINT})`) : res;
+
+  /** Send a mouse/key release; if it fails (a dialog is open), queue it for the next `dialog accept|dismiss`. */
+  async function sendRelease(method: string, params: Json, targetId?: string, timeoutMs = 2_000): Promise<InvokeResult> {
+    const res = await cdp(method, params, targetId, timeoutMs).catch((err: unknown) => failure("EXECUTION_FAILED", String(err)));
+    if (!res.ok) {
+      const key = tabKeyOf(targetId);
+      pendingReleases.set(key, [...(pendingReleases.get(key) ?? []), { method, params }]);
+    }
+    return res;
+  }
 
   /** Targets that can run helpers inside a child frame: OOPIF targets on CDP, frame ids on extension tabs. */
   async function frameTargetPool(targetId?: string): Promise<Array<{ targetId: string; url: string }>> {
@@ -1320,7 +1342,7 @@ export function createPageHelperHandler(
     }
     if (!Array.isArray(raw)) return 'do takes a JSON array of steps, e.g. [{"type":["Email","a@b.co"]},{"key":"Tab"},{"click":"Next"}]';
     for (const [i, entry] of raw.entries()) {
-      const keys = typeof entry === "object" && entry !== null ? Object.keys(entry as Json) : [];
+      const keys = typeof entry === "object" && entry !== null ? Object.keys(entry as Json).filter((k) => k !== "fast") : [];
       const verb = keys[0];
       const arg = verb ? (entry as Json)[verb] : undefined;
       if (keys.length !== 1 || !verb) return `step ${i + 1}: each step is one verb, e.g. {"click":"Save"}`;
@@ -1352,6 +1374,8 @@ export function createPageHelperHandler(
       } else {
         return `step ${i + 1}: use {"click":"<ref|label>"}, {"type":["<ref|label>","<text>"]}, {"select":["<ref|label>","<option>"]}, {"upload":["<ref|label>","<abs-path>"]}, {"drag":["<from>","<to>"]}, {"wait":"<text>"}, or {"key":"<name>"}`;
       }
+      const last = steps[steps.length - 1]!;
+      if ((entry as Json)["fast"] === true) last.input = { ...last.input, fast: true };
     }
     return steps;
   }
@@ -1443,9 +1467,9 @@ export function createPageHelperHandler(
       if (!natural) {
         const m0 = await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: info.sx, y: info.sy }, targetId, INPUT_TIMEOUT_MS);
         if (!m0.ok) { dragErr = m0; return inputFailed(m0, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
+        mouseDown = true;
         const mp = await cdp("Input.dispatchMouseEvent", { type: "mousePressed", x: info.sx, y: info.sy, button: "left", buttons: 1, clickCount: 1 }, targetId, INPUT_TIMEOUT_MS);
         if (!mp.ok) { dragErr = mp; return inputFailed(mp, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
-        mouseDown = true;
         const mx = Math.round((info.sx + info.dx) / 2);
         const my = Math.round((info.sy + info.dy) / 2);
         if (info.draggable) {
@@ -1470,9 +1494,9 @@ export function createPageHelperHandler(
         const toSrc = await movePointer({ x: info.sx, y: info.sy }, targetId);
         if (!toSrc.ok) { dragErr = toSrc; return inputFailed(toSrc, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
         await pause(planClickTiming(1, rng).dwellMs);
+        mouseDown = true;
         const mp = await cdp("Input.dispatchMouseEvent", { type: "mousePressed", x: info.sx, y: info.sy, button: "left", buttons: 1, clickCount: 1 }, targetId, INPUT_TIMEOUT_MS);
         if (!mp.ok) { dragErr = mp; return inputFailed(mp, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
-        mouseDown = true;
         await pause(Math.round(60 + rng() * 50));
 
         const state = motionOf(targetId);
@@ -1530,14 +1554,16 @@ export function createPageHelperHandler(
         await cdp("Input.dispatchDragEvent", { type: "dragCancel", x: info.dx, y: info.dy, data: dragIntercepted.data ?? { items: [], dragOperationsMask: 1 } }, targetId, 2_000).catch(() => {});
       }
       if (mouseDown) {
-        const rel = await cdp("Input.dispatchMouseEvent", { type: "mouseReleased", x: info.dx, y: info.dy, button: "left", buttons: 0, clickCount: 1 }, targetId, 2_000).catch(() => undefined);
-        if (rel?.ok && !dragErr) motionOf(targetId).pointer = { x: info.dx, y: info.dy };
+        const rel = await sendRelease("Input.dispatchMouseEvent", { type: "mouseReleased", x: info.dx, y: info.dy, button: "left", buttons: 0, clickCount: 1 }, targetId);
+        if (rel.ok && !dragErr) motionOf(targetId).pointer = { x: info.dx, y: info.dy };
+        else if (!dragErr) dragErr = rel;
       }
       if (info.draggable) {
         await cdp("Input.setInterceptDrags", { enabled: false }, targetId, 2_000).catch(() => {});
       }
     }
 
+    if (dragErr) return inputFailed(dragErr, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}: release`);
     const posRes = info.listMeta
       ? await evalHelper({ kind: "bc", method: "listPosition", args: [info.listMeta] }, targetId)
       : undefined;
@@ -2021,6 +2047,7 @@ export function createPageHelperHandler(
         ? await movePointer({ x: x!, y: y! }, targetId)
         : await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: x!, y: y! }, targetId, INPUT_TIMEOUT_MS);
       if (!moved.ok) return inputFailed(moved, `hover ${x},${y}`);
+      if (natural) await pause(planClickTiming(1, rng).dwellMs);
       return withChanges(`hover ${x},${y}: delivered. ${what ?? ""}`.trimEnd(), before, quiet, targetId);
     }
     const found = await locate(input["ref"], "click", targetId);
@@ -2038,6 +2065,7 @@ export function createPageHelperHandler(
         })
       : await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: at.pt.x, y: at.pt.y }, targetId, INPUT_TIMEOUT_MS);
     if (!moved.ok) return inputFailed(moved, `hover ${nameOf(found.loc)}`);
+    if (natural) await pause(planClickTiming(1, rng).dwellMs);
     return withChanges(`hover ${nameOf(found.loc)} at ${at.pt.x},${at.pt.y}: delivered`, at.pt.before, quiet, targetId);
   }
 
@@ -2066,6 +2094,9 @@ export function createPageHelperHandler(
       }
       return res;
     }
+    const queued = pendingReleases.get(tabKeyOf(targetId)) ?? [];
+    pendingReleases.delete(tabKeyOf(targetId));
+    for (const q of queued) await cdp(String(q["method"]), q["params"] as Json, targetId, 2_000).catch(() => undefined);
     if (accept) return success(typeof params["promptText"] === "string" ? `dialog accept: accepted with prompt text ${js(params["promptText"])}` : "dialog accept: accepted");
     return success("dialog dismiss: dismissed");
   }
@@ -2737,6 +2768,7 @@ export function createPageHelperHandler(
         for (const [i, step] of steps.entries()) {
           const stepInput: Json = {
             ...(input["fast"] === true ? { fast: true } : {}),
+            ...(input["_natural"] !== undefined ? { _natural: input["_natural"] } : {}),
             ...step.input,
             quiet: true,
           };

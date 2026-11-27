@@ -234,6 +234,9 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
       targetId = tab.targetId;
     }
     const quiet = url.searchParams.get("q") === "1";
+    // The wrapper sends its caller's natural switch so `natural status` and dispatch read the same setting.
+    const naturalFile = request.headers.get("x-bc-natural-file");
+    const callerNatural = naturalFile ? { _natural: { file: naturalFile, env: request.headers.get("x-bc-natural") ?? undefined } } : {};
     const wrap = boundariesDefault && url.searchParams.get("raw") !== "1";
 
     switch (route) {
@@ -264,6 +267,7 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
                 newWindow: url.searchParams.get("new_window") === "1",
                 keepOpen: url.searchParams.get("keep_open") === "1",
                 ...(url.searchParams.get("fast") === "1" ? { fast: true } : {}),
+                ...callerNatural,
               },
               targetId,
             ),
@@ -293,7 +297,7 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
         const shouldWrap = wrap && UNTRUSTED_PAGE_ACTIONS.has(operation) && !parsed.value["out"];
         return text(
           await requestBrowser.run(navScope, () =>
-            handlePage(operation, { ...parsed.value, ...(quiet ? { quiet: true } : {}) }, explicitTargetId),
+            handlePage(operation, { ...parsed.value, ...callerNatural, ...(quiet ? { quiet: true } : {}) }, explicitTargetId),
           ),
           (data) => data.value,
           shouldWrap,

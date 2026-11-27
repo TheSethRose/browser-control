@@ -712,6 +712,75 @@ describe("page-runner natural motion integration", () => {
       else process.env["BROWSER_CONTROL_NATURAL"] = prev;
     }
   });
+
+  test("a dialog opened by mousedown or keydown queues the release until dialog accept", async () => {
+    await withNaturalOn(async () => {
+      for (const [action, input, opener, release] of [
+        ["drag", { from: "e1", to: "e2", quiet: true }, "mousePressed", "mouseReleased"],
+        ["key", { key: "Enter", quiet: true }, "keyDown", "keyUp"],
+      ] as const) {
+        const m = makeNaturalMock({ inView: true });
+        let dialog = false;
+        const delivered: string[] = [];
+        const h = m.handler(5, (next) => async (op, inp = {}) => {
+          const method = String(inp["method"] ?? "");
+          const type = String((inp["params"] as Record<string, unknown> | undefined)?.["type"] ?? "");
+          if (op === "execute_cdp" && method === "Page.handleJavaScriptDialog") dialog = false;
+          else if (op === "execute_cdp" && method.startsWith("Input.dispatch") && (dialog || type === opener)) {
+            dialog = true;
+            return { ok: false, error: { code: "EXECUTION_FAILED", message: "DIALOG_OPEN: alert" } };
+          }
+          if (op === "execute_cdp") delivered.push(type);
+          return next(op, inp);
+        });
+        expect((await h(action, input)).ok).toBe(false);
+        expect(delivered).not.toContain(release);
+        expect((await h("dialog", { sub: "accept" })).ok).toBe(true);
+        expect(delivered.filter((t) => t === release)).toHaveLength(1);
+      }
+    });
+  });
+
+  test("do accepts step fast metadata and script --fast wins over a step fast:false", async () => {
+    await withNaturalOn(async () => {
+      const m = makeNaturalMock({ inView: true });
+      const h = m.handler(6);
+      const res = await h("do", { steps: [{ key: "Tab", fast: true }] });
+      expect(res.ok && String((res.data as { value: unknown }).value)).toContain("key Tab: sent");
+      expect(m.sleeps).toHaveLength(0);
+      expect((await h("script", { code: `await page.key("Tab", { fast: false });`, fast: true })).ok).toBe(true);
+      expect(m.sleeps).toHaveLength(0);
+    });
+  });
+
+  test("natural hover dwells 45-115 ms after the last move; --fast does not", async () => {
+    await withNaturalOn(async () => {
+      for (const input of [{ ref: "e1" }, { xy: [500, 300] }]) {
+        const m = makeNaturalMock({ inView: true });
+        const h = m.handler(7);
+        expect((await h("hover", { ...input, quiet: true })).ok).toBe(true);
+        const dwell = m.sleeps[m.sleeps.length - 1]!;
+        expect(dwell).toBeGreaterThanOrEqual(45);
+        expect(dwell).toBeLessThanOrEqual(115);
+        const fast = makeNaturalMock({ inView: true });
+        expect((await fast.handler(7)("hover", { ...input, quiet: true, fast: true })).ok).toBe(true);
+        expect(fast.sleeps).toHaveLength(0);
+      }
+    });
+  });
+
+  test("the caller's natural file and env sent by the wrapper override the daemon's", async () => {
+    await withNaturalOn(async () => {
+      const xdg = await mkdtemp(join(tmpdir(), "bc-nat-caller-"));
+      tempDirs.push(xdg);
+      await writeFile(join(xdg, "natural"), "off\n");
+      const m = makeNaturalMock({ inView: true });
+      expect((await m.handler(8)("key", { key: "Enter", quiet: true, _natural: { file: join(xdg, "natural") } })).ok).toBe(true);
+      expect(m.sleeps).toHaveLength(0);
+      await m.handler(8)("key", { key: "Enter", quiet: true, _natural: { file: join(xdg, "natural"), env: "on" } });
+      expect(m.sleeps).toHaveLength(1);
+    });
+  });
 });
 
 describe("page-helpers v10 — point detail/noScroll, hitCheck, pageScrollPoint", () => {
@@ -975,7 +1044,7 @@ describe("page-helpers v10 — point detail/noScroll, hitCheck, pageScrollPoint"
 
 describe("wrapper --fast forwarding and natural subcommand", () => {
   const WRAPPER = resolve(import.meta.dir, "../.agents/skills/browser-control/scripts/browser-control-daemon");
-  type Recorded = { method: string; path: string; query: string; body: string };
+  type Recorded = { method: string; path: string; query: string; body: string; natFile: string | null; natEnv: string | null };
   const seen: Recorded[] = [];
   let dir = "";
   let xdg = "";
@@ -990,7 +1059,10 @@ describe("wrapper --fast forwarding and natural subcommand", () => {
         const url = new URL(req.url);
         return (async () => {
           const body = req.method === "GET" ? "" : await req.text();
-          seen.push({ method: req.method, path: url.pathname, query: url.search, body });
+          seen.push({
+            method: req.method, path: url.pathname, query: url.search, body,
+            natFile: req.headers.get("x-bc-natural-file"), natEnv: req.headers.get("x-bc-natural"),
+          });
           return Response.json({ ok: true, data: { value: "ok" } });
         })();
       },
@@ -1056,6 +1128,16 @@ describe("wrapper --fast forwarding and natural subcommand", () => {
     const on = await bc(["natural", "on"], { BROWSER_CONTROL_NATURAL: undefined });
     expect(on.code).toBe(0);
     expect((await readFile(join(xdg, "browser-control", "natural"), "utf8")).trim()).toBe("on");
+
+    const fresh = await mkdtemp(join(tmpdir(), "bc-nat-fresh-"));
+    tempDirs.push(fresh);
+    const stFresh = await bc(["natural", "status"], { BROWSER_CONTROL_NATURAL: undefined, XDG_CONFIG_HOME: fresh });
+    expect(stFresh.stderr).toBe("");
+
+    const before = seen.length;
+    await bc(["key", "Enter"], { BROWSER_CONTROL_NATURAL: "off", XDG_CONFIG_HOME: fresh });
+    const sent = seen.slice(before).find((r) => r.path !== "/status")!;
+    expect(sent).toMatchObject({ natFile: join(fresh, "browser-control", "natural"), natEnv: "off" });
 
     const bad = await bc(["natural", "maybe"], { BROWSER_CONTROL_NATURAL: undefined });
     expect(bad.code).toBe(1);
