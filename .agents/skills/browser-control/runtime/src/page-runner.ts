@@ -638,15 +638,18 @@ export function createPageHelperHandler(
     return success("ok");
   }
 
+  const notActionable = (ref: string, why = "covered after hover") => failure("EXECUTION_FAILED", `NOT_ACTIONABLE: ${ref} ${why}`);
+
+  /** `res` is a helper error (stale ref, bad output) that must fail the click; `blocked` means another element is on top. */
   async function verifyHit(ref: string, pt: Point2D, where: string | undefined) {
     const hc = await evalHelper({ kind: "bc", method: "hitCheck", args: [ref, pt.x, pt.y] }, where, 2_000);
     if (!hc.ok) return { ok: false as const, res: hc };
     try {
       const p = JSON.parse(valueOf(hc)) as { ok?: boolean; reason?: string };
       if (p.ok === true) return { ok: true as const };
-      if (p.ok === false) return { ok: false as const, blocked: p.reason ?? "covered after hover" };
+      if (p.ok === false) return { ok: false as const, blocked: p.reason };
     } catch { /* fall through */ }
-    return { ok: false as const, res: failure("EXECUTION_FAILED", `NOT_ACTIONABLE: ${ref} invalid hitCheck output`) };
+    return { ok: false as const, res: notActionable(ref, "invalid hitCheck output") };
   }
 
   async function clickCoords(
@@ -656,65 +659,49 @@ export function createPageHelperHandler(
     clickCount = 1,
     opts: { natural?: boolean; box?: Box2D; viewport?: Viewport; domRef?: string } = {},
   ): Promise<InvokeResult> {
+    let at: Point2D = { x, y };
+    let timing: ReturnType<typeof planClickTiming> | undefined;
     if (!opts.natural) {
       const m1 = await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x, y }, targetId, INPUT_TIMEOUT_MS);
       if (!m1.ok) return m1;
-      for (let c = 1; c <= clickCount; c++) {
-        const m2 = await cdp(
-          "Input.dispatchMouseEvent",
-          { type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: c },
-          targetId,
-          INPUT_TIMEOUT_MS,
-        );
-        if (!m2.ok) return m2;
-        const m3 = await cdp(
-          "Input.dispatchMouseEvent",
-          { type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: c },
-          targetId,
-          INPUT_TIMEOUT_MS,
-        );
-        if (!m3.ok) return m3;
+    } else {
+      const moveOpts = { viewport: opts.viewport, targetSize: opts.box ? Math.min(opts.box.width, opts.box.height) : undefined };
+      const moved = await movePointer(at, targetId, moveOpts);
+      if (!moved.ok) return moved;
+      timing = planClickTiming(clickCount, rng);
+      await pause(timing.dwellMs);
+      if (opts.domRef) {
+        // Hover can open menus over the target: never press without a passing hit check.
+        let chk = await verifyHit(opts.domRef, at, targetId);
+        if (!chk.ok && !chk.res && opts.box) {
+          const { left, top, width, height } = opts.box;
+          const alt = await pickVerifiedPoint(opts.domRef, opts.box, { x: Math.round(left + width / 2), y: Math.round(top + height / 2) }, targetId);
+          if (!alt.ok) return alt.res;
+          const rep = await movePointer(alt.pt, targetId, { ...moveOpts, overshootProb: 0 });
+          if (!rep.ok) return rep;
+          at = alt.pt;
+          chk = await verifyHit(opts.domRef, at, targetId);
+        }
+        if (!chk.ok) return chk.res ?? notActionable(opts.domRef, chk.blocked);
       }
-      return success("ok");
-    }
-    const targetSize = opts.box ? Math.min(opts.box.width, opts.box.height) : undefined;
-    const moved = await movePointer({ x, y }, targetId, { viewport: opts.viewport, targetSize });
-    if (!moved.ok) return moved;
-    const timing = planClickTiming(clickCount, rng);
-    await pause(timing.dwellMs);
-    let cx = x, cy = y;
-    if (opts.domRef) {
-      let chk = await verifyHit(opts.domRef, { x: cx, y: cy }, targetId);
-      if (chk.res) return chk.res;
-      if (!chk.ok && opts.box) {
-        const center = { x: Math.round(opts.box.left + opts.box.width / 2), y: Math.round(opts.box.top + opts.box.height / 2) };
-        const alt = await pickVerifiedPoint(opts.domRef, opts.box, center, targetId);
-        if (!alt.ok) return alt.res;
-        const rep = await movePointer(alt.pt, targetId, { viewport: opts.viewport, targetSize, overshootProb: 0 });
-        if (!rep.ok) return rep;
-        chk = await verifyHit(opts.domRef, alt.pt, targetId);
-        if (chk.res) return chk.res;
-        cx = alt.pt.x; cy = alt.pt.y;
-      }
-      if (!chk.ok) return failure("EXECUTION_FAILED", `NOT_ACTIONABLE: ${opts.domRef} ${chk.blocked ?? "covered after hover"}`);
     }
     for (let c = 1; c <= clickCount; c++) {
       const m2 = await cdp(
         "Input.dispatchMouseEvent",
-        { type: "mousePressed", x: cx, y: cy, button: "left", buttons: 1, clickCount: c },
+        { type: "mousePressed", ...at, button: "left", buttons: 1, clickCount: c },
         targetId,
         INPUT_TIMEOUT_MS,
       );
       if (!m2.ok) return m2;
-      await pause(timing.holdsMs[c - 1]!);
+      if (timing) await pause(timing.holdsMs[c - 1]!);
       const m3 = await cdp(
         "Input.dispatchMouseEvent",
-        { type: "mouseReleased", x: cx, y: cy, button: "left", buttons: 0, clickCount: c },
+        { type: "mouseReleased", ...at, button: "left", buttons: 0, clickCount: c },
         targetId,
         INPUT_TIMEOUT_MS,
       );
       if (!m3.ok) return m3;
-      if (c < clickCount) await pause(timing.gapsMs[c - 1]!);
+      if (timing && c < clickCount) await pause(timing.gapsMs[c - 1]!);
     }
     return success("ok");
   }
@@ -797,7 +784,7 @@ export function createPageHelperHandler(
       if (chk.res) return { ok: false as const, res: chk.res };
       blocked = chk.blocked;
     }
-    return { ok: false as const, res: failure("EXECUTION_FAILED", `NOT_ACTIONABLE: ${ref} ${blocked ?? "covered after hover"}`) };
+    return { ok: false as const, res: notActionable(ref, blocked) };
   }
 
   async function wheelScrollIntoView(
@@ -838,17 +825,16 @@ export function createPageHelperHandler(
             : { x: Math.round(vw * 0.5), y: Math.round(vh * 0.5) };
         }
       } else {
+        // Reuse the resting pointer only when the page confirms it is over the document, not a nested scroller.
+        const ptrIn = ptr !== undefined && ptr.x >= 0 && ptr.x < vw && ptr.y >= 0 && ptr.y < vh;
         let docPt = scroller?.point;
-        if (docPt === undefined) {
-          const sp = await evalHelper({ kind: "bc", method: "pageScrollPoint" }, targetId, 2_000);
-          try { docPt = sp.ok ? (JSON.parse(valueOf(sp)) as Point2D | null) : null; } catch { docPt = null; }
+        if (ptrIn || !docPt) {
+          const sp = await evalHelper({ kind: "bc", method: "pageScrollPoint", ...(ptrIn ? { args: [ptr.x, ptr.y] } : {}) }, targetId, 2_000);
+          try { docPt = (sp.ok ? (JSON.parse(valueOf(sp)) as Point2D | null) : null) ?? docPt; } catch { /* keep docPt */ }
         }
-        if (docPt && typeof docPt.x === "number" && typeof docPt.y === "number") {
-          inScrollArea = Boolean(ptr && Math.hypot(ptr.x - docPt.x, ptr.y - docPt.y) < 3);
-          anchor = inScrollArea ? ptr! : docPt;
-        } else {
-          anchor = { x: Math.round(vw * (0.35 + rng() * 0.3)), y: Math.round(vh * (0.35 + rng() * 0.3)) };
-        }
+        const ok = docPt != null && typeof docPt.x === "number" && typeof docPt.y === "number";
+        inScrollArea = ok && ptrIn && docPt!.x === ptr.x && docPt!.y === ptr.y;
+        anchor = ok ? docPt! : { x: Math.round(vw * (0.35 + rng() * 0.3)), y: Math.round(vh * (0.35 + rng() * 0.3)) };
       }
 
       if (!inScrollArea) {

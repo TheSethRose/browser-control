@@ -364,116 +364,61 @@ describe("isNaturalEnabled switch precedence", () => {
 
 describe("page-runner natural motion integration", () => {
   type CdpCall = { method: string; params: Record<string, unknown>; targetId?: string };
+  type Invoke = (op: string, input?: Record<string, unknown>) => Promise<InvokeResult>;
+  const val = (value: string): InvokeResult => ({ ok: true, data: { value } });
 
-  function makeNaturalMock(opts: {
-    inView?: boolean;
-    scrollDeltaPerWheel?: number;
-    failAtMouseMoveIndex?: number;
-    failMessage?: string;
-    draggable?: boolean;
-  } = {}) {
+  /** Main-frame page with one 200x40 button (e1) in a 1280x800 viewport; off-screen targets scroll by wheel delta. */
+  function makeNaturalMock(opts: { inView?: boolean; scrollDeltaPerWheel?: number } = {}) {
     const cdpCalls: CdpCall[] = [];
     const evalExprs: string[] = [];
     const sleeps: number[] = [];
     let currentTop = opts.inView === false ? 1200 : 200;
-    let mouseMoveCount = 0;
-
     const makeDetail = (forceInView: boolean) => {
       const inView = forceInView || (currentTop >= 16 && currentTop + 40 <= 784);
       const top = forceInView ? 380 : currentTop;
       return JSON.stringify({
-        x: 350,
-        y: Math.round(top + 20),
-        hidden: false,
-        inView,
+        x: 350, y: Math.round(top + 20), hidden: false, inView,
         box: { left: 250, top: inView ? top : 0, width: 200, height: inView ? 40 : 0 },
         rect: { left: 250, top, width: 200, height: 40 },
-        viewport: { width: 1280, height: 800 },
-        stickyTop: 0,
-        stickyBottom: 0,
-        scroller: {
-          kind: "document",
-          box: { left: 0, top: 0, width: 1280, height: 800 },
-          scrollTop: 0,
-          scrollLeft: 0,
-          scrollHeight: 3000,
-          clientHeight: 800,
-          point: { x: 640, y: 400 },
-        },
+        viewport: { width: 1280, height: 800 }, stickyTop: 0, stickyBottom: 0,
+        scroller: { kind: "document", box: { left: 0, top: 0, width: 1280, height: 800 }, point: { x: 640, y: 400 } },
       });
     };
-
-    const invoke = async (op: string, input: Record<string, unknown> = {}): Promise<InvokeResult> => {
+    const invoke: Invoke = async (op, input = {}) => {
       if (op === "get_browser_status") return { ok: true, data: { connected: true } };
-      if (op === "navigate") return { ok: true, data: { loaded: true, targetId: input["targetId"] } };
-      if (op === "wait_for_event") return { ok: true, data: { found: false } };
       if (op === "evaluate") {
         const expr = String(input["expression"] ?? "");
         evalExprs.push(expr);
-        if (expr.includes("__bc.verifyRef")) return { ok: true, data: { value: "e1" } };
-        if (expr.includes("__bc.hitCheck")) return { ok: true, data: { value: JSON.stringify({ ok: true }) } };
+        const base = expr.includes("__bc.baseline()");
+        if (expr.includes("__bc.verifyRef")) return val("e1");
+        if (expr.includes("__bc.hitCheck")) return val('{"ok":true}');
+        // Points left of x=200 sit over a nested scroller; anything else is over the document.
+        const sp = /__bc\.pageScrollPoint\((\d+), (\d+)\)/.exec(expr);
+        if (sp) return val(JSON.stringify(Number(sp[1]) >= 200 ? { x: Number(sp[1]), y: Number(sp[2]) } : { x: 640, y: 400 }));
         if (expr.includes("__bc.point")) {
-          const isNoScroll = expr.includes('"noScroll":true');
-          const isDetail = expr.includes('"detail":true') || isNoScroll;
-          if (!isDetail) {
-            return {
-              ok: true,
-              data: { value: expr.includes("__bc.baseline()") ? "https://a.test/ 350 220 visible" : "350 220 visible" },
-            };
-          }
-          const detail = makeDetail(!isNoScroll);
-          return {
-            ok: true,
-            data: { value: expr.includes("__bc.baseline()") ? `https://a.test/\n${detail}` : detail },
-          };
+          const noScroll = expr.includes('"noScroll":true');
+          if (!noScroll && !expr.includes('"detail":true')) return val(base ? "https://a.test/ 350 220 visible" : "350 220 visible");
+          return val(base ? `https://a.test/\n${makeDetail(!noScroll)}` : makeDetail(!noScroll));
         }
-        if (expr.includes("__bc.dragInfo")) {
-          return {
-            ok: true,
-            data: {
-              value: JSON.stringify({
-                sx: 120,
-                sy: 200,
-                dx: 520,
-                dy: 460,
-                draggable: opts.draggable === true,
-                listMeta: null,
-              }),
-            },
-          };
-        }
-        if (expr.includes("__bc.setTypedValue")) return { ok: true, data: { value: "__not_typed__" } };
-        if (expr.includes("__bc.cellInfo")) return { ok: true, data: { value: "__not_cell__" } };
-        if (expr.includes("__bc.focusForType")) return { ok: true, data: { value: "focused" } };
-        if (expr.includes("__bc.value")) return { ok: true, data: { value: "hello" } };
-        if (expr.includes("__bc.readInputProbe")) return { ok: true, data: { value: '{"mousedown":1,"mouseup":1}' } };
-        if (expr.includes("__bc.hit(")) return { ok: true, data: { value: "https://a.test/\nhit: button#ok" } };
-        if (expr.includes("__bc.diff")) return { ok: true, data: { value: "# no visible change yet" } };
-        return { ok: true, data: { value: "ok" } };
+        if (expr.includes("__bc.readInputProbe")) return val('{"mousedown":1,"mouseup":1}');
+        if (expr.includes("__bc.hit(")) return val("https://a.test/\nhit: button#ok");
+        return val("ok");
       }
       if (op === "execute_cdp") {
-        const method = String(input["method"]);
         const params = (input["params"] ?? {}) as Record<string, unknown>;
-        cdpCalls.push({ method, params, targetId: input["targetId"] as string | undefined });
-        if (method === "Input.dispatchMouseEvent" && params["type"] === "mouseMoved") {
-          mouseMoveCount++;
-          if (opts.failAtMouseMoveIndex !== undefined && mouseMoveCount === opts.failAtMouseMoveIndex) {
-            return {
-              ok: false,
-              error: { code: "EXECUTION_FAILED", message: opts.failMessage ?? "DIALOG_OPEN: alert open" },
-            };
-          }
-        }
-        if (method === "Input.dispatchMouseEvent" && params["type"] === "mouseWheel") {
-          const delta = opts.scrollDeltaPerWheel ?? Number(params["deltaY"] ?? 0);
-          currentTop -= delta;
-        }
+        cdpCalls.push({ method: String(input["method"]), params, targetId: input["targetId"] as string | undefined });
+        if (params["type"] === "mouseWheel") currentTop -= opts.scrollDeltaPerWheel ?? Number(params["deltaY"] ?? 0);
         return { ok: true, data: { result: {} } };
       }
       return { ok: true, data: {} };
     };
-
-    return { invoke, cdpCalls, evalExprs, sleeps };
+    const ofType = (type: string, from = 0) => cdpCalls.slice(from).filter((c) => c.params["type"] === type);
+    const handler = (seed: number, wrap?: (next: Invoke) => Invoke) =>
+      createPageHelperHandler(wrap ? wrap(invoke) : invoke, undefined, undefined, {
+        sleep: async (ms) => { sleeps.push(ms); }, rng: createSeededRng(seed), now: () => 0,
+        bcCall: async () => ({ value: "https://a.test/\nhit: button#ok" }),
+      });
+    return { invoke, cdpCalls, evalExprs, sleeps, ofType, handler };
   }
 
   async function withNaturalOn<T>(fn: () => Promise<T>): Promise<T> {
@@ -495,53 +440,31 @@ describe("page-runner natural motion integration", () => {
 
   test("natural click emits multiple mouseMoved events, nonzero dwell/hold, and zero mouseWheel when in view; --fast emits legacy 3-event sequence", async () => {
     await withNaturalOn(async () => {
-      // Natural click on in-view element.
       const nat = makeNaturalMock({ inView: true });
-      const handleNat = createPageHelperHandler(nat.invoke, undefined, undefined, {
-        sleep: async (ms) => { nat.sleeps.push(ms); },
-        rng: createSeededRng(77),
-        now: () => 0,
-      });
-
-      const res = await handleNat("click", { ref: "e1", quiet: true });
-      expect(res.ok).toBe(true);
-
-      const mouseEvents = nat.cdpCalls.filter((c) => c.method === "Input.dispatchMouseEvent");
-      const moves = mouseEvents.filter((e) => e.params["type"] === "mouseMoved");
-      const presses = mouseEvents.filter((e) => e.params["type"] === "mousePressed");
-      const releases = mouseEvents.filter((e) => e.params["type"] === "mouseReleased");
-      const wheels = mouseEvents.filter((e) => e.params["type"] === "mouseWheel");
-
+      expect((await nat.handler(77)("click", { ref: "e1", quiet: true })).ok).toBe(true);
+      const moves = nat.ofType("mouseMoved");
+      const presses = nat.ofType("mousePressed");
       expect(moves.length).toBeGreaterThanOrEqual(4);
       expect(moves.length).toBeLessThanOrEqual(29);
       expect(presses).toHaveLength(1);
-      expect(releases).toHaveLength(1);
-      expect(wheels).toHaveLength(0);
-      // Last move matches pressed/released landing point inside inset box [260..440] x [208..232].
-      const lastMove = moves.at(-1)!.params;
-      expect(presses[0]!.params["x"]).toBe(lastMove["x"]);
-      expect(presses[0]!.params["y"]).toBe(lastMove["y"]);
-      expect(Number(lastMove["x"])).toBeGreaterThanOrEqual(260);
-      expect(Number(lastMove["x"])).toBeLessThanOrEqual(440);
-      expect(Number(lastMove["y"])).toBeGreaterThanOrEqual(208);
-      expect(Number(lastMove["y"])).toBeLessThanOrEqual(232);
+      expect(nat.ofType("mouseReleased")).toHaveLength(1);
+      expect(nat.ofType("mouseWheel")).toHaveLength(0);
+      // Last move matches the press point inside the inset box [260..440] x [208..232].
+      const last = moves.at(-1)!.params;
+      expect([presses[0]!.params["x"], presses[0]!.params["y"]]).toEqual([last["x"], last["y"]]);
+      expect(Number(last["x"])).toBeGreaterThanOrEqual(260);
+      expect(Number(last["x"])).toBeLessThanOrEqual(440);
+      expect(Number(last["y"])).toBeGreaterThanOrEqual(208);
+      expect(Number(last["y"])).toBeLessThanOrEqual(232);
       // Dwell + press hold are the last two sleeps.
-      const holdMs = nat.sleeps.at(-1)!;
-      const dwellMs = nat.sleeps.at(-2)!;
+      const [dwellMs, holdMs] = nat.sleeps.slice(-2) as [number, number];
       expect(dwellMs).toBeGreaterThanOrEqual(45);
       expect(dwellMs).toBeLessThanOrEqual(115);
       expect(holdMs).toBeGreaterThanOrEqual(55);
       expect(holdMs).toBeLessThanOrEqual(130);
 
-      // --fast click emits exact legacy 3-event sequence with zero sleep.
       const fast = makeNaturalMock({ inView: true });
-      const handleFast = createPageHelperHandler(fast.invoke, undefined, undefined, {
-        sleep: async (ms) => { fast.sleeps.push(ms); },
-        rng: createSeededRng(77),
-        now: () => 0,
-      });
-      const fastRes = await handleFast("click", { ref: "e1", fast: true, quiet: true });
-      expect(fastRes.ok).toBe(true);
+      expect((await fast.handler(77)("click", { ref: "e1", fast: true, quiet: true })).ok).toBe(true);
       const fastMouse = fast.cdpCalls.filter((c) => c.method === "Input.dispatchMouseEvent");
       expect(fastMouse.map((e) => e.params["type"])).toEqual(["mouseMoved", "mousePressed", "mouseReleased"]);
       expect(fastMouse[0]!.params).toEqual({ type: "mouseMoved", x: 350, y: 220 });
@@ -551,61 +474,39 @@ describe("page-runner natural motion integration", () => {
 
   test("off-screen target emits eased mouseWheel events and falls back to instant scrollIntoView when stagnant", async () => {
     await withNaturalOn(async () => {
-      // Scrollable target moves into view via mouseWheel.
-      const scrollOk = makeNaturalMock({ inView: false });
-      const h1 = createPageHelperHandler(scrollOk.invoke, undefined, undefined, {
-        sleep: async (ms) => { scrollOk.sleeps.push(ms); },
-        rng: createSeededRng(123),
-        now: () => 0,
-      });
-      const r1 = await h1("click", { ref: "e1", quiet: true });
-      expect(r1.ok).toBe(true);
-      const wheels1 = scrollOk.cdpCalls.filter(
-        (c) => c.method === "Input.dispatchMouseEvent" && c.params["type"] === "mouseWheel",
-      );
-      expect(wheels1.length).toBeGreaterThanOrEqual(4);
-      // Never needed instant scrollIntoView fallback because wheel brought it into view.
-      expect(scrollOk.evalExprs.some((e) => e.includes('__bc.point("e1", {"detail":true})'))).toBe(false);
-
-      // Stagnant page (wheel does not move rect.top) breaks after first flick and falls back to instant scrollIntoView.
-      const stagnant = makeNaturalMock({ inView: false, scrollDeltaPerWheel: 0 });
-      const h2 = createPageHelperHandler(stagnant.invoke, undefined, undefined, {
-        sleep: async (ms) => { stagnant.sleeps.push(ms); },
-        rng: createSeededRng(123),
-        now: () => 0,
-      });
-      const r2 = await h2("click", { ref: "e1", quiet: true });
-      expect(r2.ok).toBe(true);
-      const wheels2 = stagnant.cdpCalls.filter(
-        (c) => c.method === "Input.dispatchMouseEvent" && c.params["type"] === "mouseWheel",
-      );
-      expect(wheels2.length).toBeGreaterThanOrEqual(4);
-      expect(wheels2.length).toBeLessThanOrEqual(12); // stopped after 1 flick
-      expect(stagnant.evalExprs.some((e) => e.includes('__bc.point("e1", {"detail":true})'))).toBe(true);
+      const instant = (m: ReturnType<typeof makeNaturalMock>) => m.evalExprs.some((e) => e.includes('__bc.point("e1", {"detail":true})'));
+      const ok = makeNaturalMock({ inView: false });
+      expect((await ok.handler(123)("click", { ref: "e1", quiet: true })).ok).toBe(true);
+      expect(ok.ofType("mouseWheel").length).toBeGreaterThanOrEqual(4);
+      expect(instant(ok)).toBe(false);
+      // Wheel does not move the page: stop after one flick and scroll instantly.
+      const stuck = makeNaturalMock({ inView: false, scrollDeltaPerWheel: 0 });
+      expect((await stuck.handler(123)("click", { ref: "e1", quiet: true })).ok).toBe(true);
+      expect(stuck.ofType("mouseWheel").length).toBeGreaterThanOrEqual(4);
+      expect(stuck.ofType("mouseWheel").length).toBeLessThanOrEqual(12);
+      expect(instant(stuck)).toBe(true);
     });
   });
 
-  test("S1: post-hover hitCheck STALE_REF fails without press; covered hover point retries before pressing", async () => {
+  test("S1: never presses without a passing post-hover hitCheck; a covered point retries before pressing", async () => {
     await withNaturalOn(async () => {
-      let n1 = 0, n2 = 0;
-      const m1 = makeNaturalMock({ inView: true }), m2 = makeNaturalMock({ inView: true });
-      const h1 = createPageHelperHandler(async (op, inp = {}) =>
-        op === "evaluate" && String(inp["expression"] ?? "").includes("__bc.hitCheck") && ++n1 >= 2
-          ? { ok: false, error: { code: "EXECUTION_FAILED", message: "JS_EXCEPTION: Error: STALE_REF: e1 is gone" } }
-          : m1.invoke(op, inp), undefined, undefined, { sleep: async () => {}, rng: createSeededRng(7), now: () => 0 });
-      const r1 = await h1("click", { ref: "e1", quiet: true });
-      expect(r1.ok).toBe(false);
+      const hitAfter = (n: number, res: InvokeResult) => (next: Invoke): Invoke => {
+        let seen = 0;
+        return async (op, inp = {}) =>
+          op === "evaluate" && String(inp["expression"]).includes("__bc.hitCheck") && ++seen === n ? res : next(op, inp);
+      };
+      const stale = makeNaturalMock({ inView: true });
+      const gone: InvokeResult = { ok: false, error: { code: "EXECUTION_FAILED", message: "JS_EXCEPTION: Error: STALE_REF: e1 is gone" } };
+      const r1 = await stale.handler(7, hitAfter(2, gone))("click", { ref: "e1", quiet: true });
       expect(!r1.ok && r1.error.message).toContain("STALE_REF");
-      expect(m1.cdpCalls.filter((c) => c.params["type"] === "mousePressed")).toHaveLength(0);
+      expect(stale.ofType("mousePressed")).toHaveLength(0);
 
-      const h2 = createPageHelperHandler(async (op, inp = {}) =>
-        op === "evaluate" && String(inp["expression"] ?? "").includes("__bc.hitCheck") && ++n2 === 2
-          ? { ok: true, data: { value: JSON.stringify({ ok: false, reason: "covered by tooltip" }) } }
-          : m2.invoke(op, inp), undefined, undefined, { sleep: async () => {}, rng: createSeededRng(7), now: () => 0 });
-      expect((await h2("click", { ref: "e1", quiet: true })).ok).toBe(true);
-      const last = m2.cdpCalls.filter((c) => c.params["type"] === "mouseMoved").at(-1)!.params;
-      const press = m2.cdpCalls.find((c) => c.params["type"] === "mousePressed")!.params;
-      expect(n2).toBeGreaterThanOrEqual(4);
+      const covered = makeNaturalMock({ inView: true });
+      const h = covered.handler(7, hitAfter(2, val('{"ok":false,"reason":"covered by tooltip"}')));
+      expect((await h("click", { ref: "e1", quiet: true })).ok).toBe(true);
+      expect(covered.evalExprs.filter((e) => e.includes("__bc.hitCheck")).length).toBeGreaterThanOrEqual(3);
+      const last = covered.ofType("mouseMoved").at(-1)!.params;
+      const press = covered.ofType("mousePressed")[0]!.params;
       expect([press["x"], press["y"]]).toEqual([last["x"], last["y"]]);
     });
   });
@@ -614,20 +515,18 @@ describe("page-runner natural motion integration", () => {
     await withNaturalOn(async () => {
       const m = makeNaturalMock({ inView: true });
       let tag = "";
-      const h = createPageHelperHandler(async (op, inp = {}) => {
+      const h = m.handler(11, (next) => async (op, inp = {}) => {
+        const expr = String(inp["expression"] ?? "");
         if (op === "list_targets") return { ok: true, data: { targets: [{ targetId: "IF1", url: "https://x.test/", parentFrameId: "TOP" }] } };
-        if (op === "execute_cdp" && inp["method"] === "Page.getFrameTree") return { ok: true, data: { result: { frameTree: { frame: { id: "TOP" } } } } };
-        if (op === "evaluate") {
-          const expr = String(inp["expression"] ?? "");
-          if (expr.includes("__bc.snapshot")) return { ok: true, data: { value: "# P | https://a.test/\n# 1 cross-origin iframe(s)\n- button \"Go\" [e1]" } };
-          if (expr.includes("__bc.frames()")) return { ok: true, data: { value: '[{"i":1,"src":"https://x.test/","title":"X"}]' } };
-          if (expr.includes("__bc.tagFrames")) { tag = /\["([^"]+)"\]/.exec(expr)?.[1] ?? ""; return { ok: true, data: { value: "1" } }; }
-          if (expr.includes("__bc.frameTag")) return { ok: true, data: { value: tag } };
-          if (expr.includes("__bc.frameOffset")) return { ok: true, data: { value: "100 50" } };
-          if (inp["targetId"] === "IF1" && expr.includes("__bc.point")) { expect(expr).not.toContain('"detail":true'); return { ok: true, data: { value: "40 30 visible" } }; }
-        }
-        return m.invoke(op, inp);
-      }, undefined, undefined, { sleep: async (ms) => { m.sleeps.push(ms); }, rng: createSeededRng(11), now: () => 0 });
+        if (inp["method"] === "Page.getFrameTree") return { ok: true, data: { result: { frameTree: { frame: { id: "TOP" } } } } };
+        if (expr.includes("__bc.snapshot")) return val('# P | https://a.test/\n# 1 cross-origin iframe(s)\n- button "Go" [e1]');
+        if (expr.includes("__bc.frames()")) return val('[{"i":1,"src":"https://x.test/","title":"X"}]');
+        if (expr.includes("__bc.tagFrames")) { tag = /\["([^"]+)"\]/.exec(expr)?.[1] ?? ""; return val("1"); }
+        if (expr.includes("__bc.frameTag")) return val(tag);
+        if (expr.includes("__bc.frameOffset")) return val("100 50");
+        if (inp["targetId"] === "IF1" && expr.includes("__bc.point")) { expect(expr).not.toContain('"detail":true'); return val("40 30 visible"); }
+        return next(op, inp);
+      });
       await h("snap", {});
       expect((await h("click", { ref: "f1:e1", quiet: true })).ok).toBe(true);
       const mouse = m.cdpCalls.filter((c) => c.method === "Input.dispatchMouseEvent");
@@ -641,37 +540,47 @@ describe("page-runner natural motion integration", () => {
     await withNaturalOn(async () => {
       let activeTab = "TAB-A", failMove = 0;
       const m = makeNaturalMock({ inView: true });
-      const h = createPageHelperHandler(async (op, inp = {}) => {
+      const h = m.handler(19, (next) => async (op, inp = {}) => {
         if (op === "get_browser_status") return { ok: true, data: { connected: true, activeTargetId: activeTab } };
-        if (op === "execute_cdp" && (inp["params"] as any)?.type === "mouseMoved" && failMove > 0 && --failMove === 0) {
+        if ((inp["params"] as Record<string, unknown> | undefined)?.["type"] === "mouseMoved" && failMove > 0 && --failMove === 0) {
           return { ok: false, error: { code: "EXECUTION_FAILED", message: "DIALOG_OPEN: alert" } };
         }
-        return m.invoke(op, inp);
-      }, undefined, undefined, { sleep: async () => {}, rng: createSeededRng(19), now: () => 0, bcCall: async () => ({ value: "https://a.test/\nhit: button#ok" }) });
-      const movesOf = async (fn: () => Promise<InvokeResult>) => { const i = m.cdpCalls.length; const r = await fn(); return { r, moves: m.cdpCalls.slice(i).filter((c) => c.params["type"] === "mouseMoved") }; };
-      await h("click", { xy: [900, 500], fast: true, quiet: true });
+        return next(op, inp);
+      });
+      const movesOf = async (input: Record<string, unknown>, target?: string) => {
+        const from = m.cdpCalls.length;
+        const r = await h("click", { quiet: true, ...input }, target);
+        return { r, moves: m.ofType("mouseMoved", from) };
+      };
+      await movesOf({ xy: [900, 500], fast: true });
       activeTab = "TAB-B";
-      expect((await movesOf(() => h("click", { xy: [901, 500], quiet: true }))).moves.length).toBeGreaterThanOrEqual(4);
+      expect((await movesOf({ xy: [901, 500] })).moves.length).toBeGreaterThanOrEqual(4);
       activeTab = "TAB-A";
-      expect((await movesOf(() => h("click", { xy: [901, 500], quiet: true }))).moves).toHaveLength(1);
-      await h("click", { xy: [300, 300], fast: true, quiet: true }, "extension:42@7");
-      expect((await movesOf(() => h("click", { xy: [301, 300], quiet: true }, "extension:42"))).moves).toHaveLength(1);
+      expect((await movesOf({ xy: [901, 500] })).moves).toHaveLength(1);
+      await movesOf({ xy: [300, 300], fast: true }, "extension:42@7");
+      expect((await movesOf({ xy: [301, 300] }, "extension:42")).moves).toHaveLength(1);
       failMove = 2;
-      const cut = await movesOf(() => h("click", { xy: [100, 100], quiet: true }));
+      const cut = await movesOf({ xy: [100, 100] });
       expect(cut.r.ok).toBe(false);
-      expect((await movesOf(() => h("click", { xy: [Number(cut.moves[0]!.params["x"]), Number(cut.moves[0]!.params["y"])], quiet: true }))).moves.length).toBeGreaterThanOrEqual(4);
+      const at = cut.moves[0]!.params;
+      expect((await movesOf({ xy: [Number(at["x"]), Number(at["y"])] })).moves.length).toBeGreaterThanOrEqual(4);
     });
   });
 
-  test("S5: document scroll moves resting pointer off nested scroller to pageScrollPoint", async () => {
+  test("S5: document scroll reuses the resting pointer only when pageScrollPoint confirms it", async () => {
     await withNaturalOn(async () => {
-      const m = makeNaturalMock({ inView: false });
-      const h = createPageHelperHandler(m.invoke, undefined, undefined, { sleep: async () => {}, rng: createSeededRng(31), now: () => 0 });
-      await h("click", { xy: [80, 300], fast: true, quiet: true });
-      expect((await h("click", { ref: "e1", quiet: true })).ok).toBe(true);
-      const wheels = m.cdpCalls.filter((c) => c.params["type"] === "mouseWheel");
-      expect(wheels.length).toBeGreaterThanOrEqual(4);
-      for (const w of wheels) expect([w.params["x"], w.params["y"]]).toEqual([640, 400]);
+      for (const [rest, wheelAt] of [[[80, 300], [640, 400]], [[900, 500], [900, 500]]] as const) {
+        const m = makeNaturalMock({ inView: false });
+        const h = m.handler(31);
+        await h("click", { xy: rest, fast: true, quiet: true });
+        const from = m.cdpCalls.length;
+        expect((await h("click", { ref: "e1", quiet: true })).ok).toBe(true);
+        const wheels = m.ofType("mouseWheel", from);
+        expect(wheels.length).toBeGreaterThanOrEqual(4);
+        for (const w of wheels) expect([w.params["x"], w.params["y"]]).toEqual([...wheelAt]);
+        const firstWheel = m.cdpCalls.indexOf(wheels[0]!);
+        expect(m.ofType("mouseMoved", from).some((c) => m.cdpCalls.indexOf(c) < firstWheel)).toBe(rest[0] < 200);
+      }
     });
   });
 });
@@ -772,6 +681,9 @@ describe("page-helpers v10 — point detail/noScroll, hitCheck, pageScrollPoint"
       const sp = JSON.parse(bc.pageScrollPoint());
       expect(sp).not.toBeNull();
       expect(sp).not.toEqual({ x: 500, y: 400 });
+      // A given point is kept only when it is over the document, not the nested scroller.
+      expect(JSON.parse(bc.pageScrollPoint(500, 400))).toEqual(sp);
+      expect(JSON.parse(bc.pageScrollPoint(sp.x + 1, sp.y))).toEqual({ x: sp.x + 1, y: sp.y });
 
       // Default point() scrolls into view and returns legacy string for existing callers.
       const legacy = await bc.point("e1");

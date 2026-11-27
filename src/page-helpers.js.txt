@@ -800,7 +800,8 @@
   };
 
   // pageScrollPoint adapted from anomalyco/browse (MIT License).
-  function pageScrollPointRaw() {
+  /** With (px, py), that point wins when it is over the document scroller; otherwise search the usual grid. */
+  function pageScrollPointRaw(px, py) {
     if (typeof document.elementFromPoint !== 'function') return null;
     const root = document.scrollingElement || document.documentElement;
     const nested = (element) => {
@@ -815,16 +816,17 @@
     const width = innerWidth, height = innerHeight;
     const points = [[0.5, 0.5]];
     for (const fy of [0.3, 0.7, 0.15, 0.85]) for (const fx of [0.5, 0.25, 0.75, 0.1, 0.9]) points.push([fx, fy]);
-    for (const [fx, fy] of points) {
-      const x = Math.round(width * fx), y = Math.round(height * fy);
+    const cands = Number.isFinite(px) && Number.isFinite(py) ? [[px, py]] : [];
+    for (const [fx, fy] of points) cands.push([Math.round(width * fx), Math.round(height * fy)]);
+    for (const [x, y] of cands) {
       const element = deepHitIn(document, x, y);
       if (element && element.localName !== 'iframe' && !nested(element)) return { x, y };
     }
     return null;
   }
 
-  function pageScrollPoint() {
-    return JSON.stringify(pageScrollPointRaw());
+  function pageScrollPoint(px, py) {
+    return JSON.stringify(pageScrollPointRaw(px, py));
   }
 
   const clientBox = (cur, fd) => {
