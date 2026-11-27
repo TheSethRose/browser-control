@@ -101,7 +101,47 @@ export function createScriptRunner(dispatch: PageDispatch, evalPage: EvalFn) {
     const runAction = async (action: string, params: Json): Promise<string> => {
       const res = await dispatch(action, { ...params, quiet: params["quiet"] ?? true }, targetId);
       if (!res.ok) throw new Error(res.error.message);
+      const challenge = (res.data as Json | undefined)?.["challenge"] as
+        | { kind?: string; vendor?: string; message?: string }
+        | undefined;
+      if (challenge && typeof challenge.kind === "string" && typeof challenge.vendor === "string") {
+        const msg =
+          typeof challenge.message === "string" && challenge.message
+            ? challenge.message
+            : `${challenge.kind === "block" ? "BLOCKED" : "CHALLENGE"}: ${challenge.vendor} ${challenge.kind} challenge`;
+        throw new Error(msg);
+      }
       return valueOf(res);
+    };
+
+    let remainingMs = timeoutMs;
+    let timerStartedAt = Date.now();
+    let handoffDepth = 0;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let rejectTimeout!: (err: Error) => void;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      rejectTimeout = reject;
+    });
+
+    const armTimer = () => {
+      if (timer) clearTimeout(timer);
+      timerStartedAt = Date.now();
+      timer = setTimeout(
+        () => rejectTimeout(new Error(`SCRIPT_TIMEOUT: script exceeded ${timeoutMs}ms`)),
+        Math.max(1, remainingMs),
+      );
+    };
+    const pauseTimer = () => {
+      if (handoffDepth++ === 0 && timer) {
+        clearTimeout(timer);
+        timer = undefined;
+        remainingMs = Math.max(1, remainingMs - (Date.now() - timerStartedAt));
+      }
+    };
+    const resumeTimer = () => {
+      if (handoffDepth > 0 && --handoffDepth === 0) {
+        armTimer();
+      }
     };
 
     const page = {
@@ -120,6 +160,19 @@ export function createScriptRunner(dispatch: PageDispatch, evalPage: EvalFn) {
       query: (selector: string, opts: Json = {}) => step(`query(${selector})`, () => runAction("query", { selector, ...opts, quiet: false })),
       readUrls: (urls: string[], opts: Json = {}) => step(`readUrls(${urls.length})`, () => runAction("read-urls", { urls, ...opts, quiet: false })),
       value: (ref: string) => step(`value(${ref})`, () => runAction("value", { ref })),
+      handoff: (message?: string | Json, opts: Json = {}) =>
+        step("handoff", async () => {
+          const params: Json =
+            typeof message === "object" && message !== null && !Array.isArray(message)
+              ? { ...message }
+              : { ...(typeof message === "string" ? { message } : {}), ...opts };
+          pauseTimer();
+          try {
+            return await runAction("handoff", params);
+          } finally {
+            resumeTimer();
+          }
+        }),
       evaluate: (fnOrExpr: string | ((...a: unknown[]) => unknown), ...args: unknown[]) =>
         step("evaluate", async () => {
           const expr = typeof fnOrExpr === "function"
@@ -165,16 +218,11 @@ export function createScriptRunner(dispatch: PageDispatch, evalPage: EvalFn) {
     });
 
     const wrapped = `(async () => {\n${code}\n})()`;
-    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
+      armTimer();
       const script = new vm.Script(wrapped, { filename: "browser-control-script.js" });
       const runPromise = Promise.resolve(script.runInContext(sandbox, { timeout: Math.min(timeoutMs, 10_000) }));
-      const result = await Promise.race([
-        runPromise,
-        new Promise<never>((_, reject) => {
-          timer = setTimeout(() => reject(new Error(`SCRIPT_TIMEOUT: script exceeded ${timeoutMs}ms`)), timeoutMs);
-        }),
-      ]);
+      const result = await Promise.race([runPromise, timeoutPromise]);
       if (outPath) {
         const digest = await writeOutputFile(outPath, result);
         const logTail = logs.slice(-10).map((l) => `log: ${l}`);
@@ -196,9 +244,10 @@ export function createScriptRunner(dispatch: PageDispatch, evalPage: EvalFn) {
       const hint = /\b(document|window|localStorage)\b is not defined/.test(msg)
         ? "\nhint: scripts run outside the page; use page.evaluate(...) for DOM access"
         : "";
+      const prefix = /^(?:CHALLENGE|BLOCKED):/.test(msg) ? "" : "SCRIPT_ERROR: ";
       return failure(
         "EXECUTION_FAILED",
-        `SCRIPT_ERROR: ${msg}${hint}${history ? `\nsteps (${steps.filter((s) => s.ok).length}/${steps.length} ok): ${history}` : ""}${stateKeys.length ? `\nstate preserved keys: ${stateKeys.join(", ")}` : ""}`,
+        `${prefix}${msg}${hint}${history ? `\nsteps (${steps.filter((s) => s.ok).length}/${steps.length} ok): ${history}` : ""}${stateKeys.length ? `\nstate preserved keys: ${stateKeys.join(", ")}` : ""}`,
       );
     } finally {
       if (timer) clearTimeout(timer);
