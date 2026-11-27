@@ -1,0 +1,18 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Just a moment...</title></head>
+<body>
+<div id="challenge-running">Checking your browser before accessing this site.</div>
+<div class="cf-turnstile" style="width:300px;height:65px;border:1px solid #ccc">Verify you are human</div>
+<form id="wall-form" action="/challenge-wall" method="get"
+      onsubmit="event.preventDefault(); window.__submitted++;">
+  <label for="wall-field">Wall field</label><input id="wall-field" type="text">
+  <button id="wall-button" type="submit">Wall button</button>
+</form>
+<script>
+  // A real form with counters, so "nothing was pressed or typed" is measured, not inferred.
+  window.__submitted = 0;
+  window.__pressed = 0;
+  window.__typed = 0;
+  document.getElementById('wall-button').addEventListener('click', () => { window.__pressed++; }, true);
+  document.getElementById('wall-field').addEventListener('input', () => { window.__typed++; }, true);
+</script>
+</body></html>
