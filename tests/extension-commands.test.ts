@@ -2,9 +2,19 @@ import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { handleExtensionRoute } from "../daemon";
-import { redactSecrets, type ConnectedBrowserInfo, type ExtensionReportBackend } from "../src/backends/extension";
-import { backendOrder, setDaemonBackendsFile } from "../src/backends/router";
+import { createPageHelperHandler, dispatchExtensionRequest, handleExtensionRoute } from "../daemon";
+import {
+  createExtensionBackend,
+  EXTENSION_ORIGIN,
+  extProofMessage,
+  hmacHex,
+  PROTOCOL_VERSION,
+  redactSecrets,
+  type ConnectedBrowserInfo,
+  type ExtensionReportBackend,
+} from "../src/backends/extension";
+import { backendOrder, route, setDaemonBackendsFile } from "../src/backends/router";
+import { PAGE_HELPERS_VERSION } from "../src/page-helpers";
 
 const WRAPPER = resolve(import.meta.dir, "../.agents/skills/browser-control/scripts/browser-control-daemon");
 const TOKEN = "ab".repeat(32);
@@ -128,13 +138,18 @@ describe("daemon backends file", () => {
   });
 });
 
-function mockBackend(browsers: ConnectedBrowserInfo[], diag: unknown): ExtensionReportBackend & { requests: unknown[][] } {
+function mockBackend(
+  browsers: ConnectedBrowserInfo[],
+  diag: unknown,
+  port: number | null = 49222,
+): ExtensionReportBackend & { requests: unknown[][] } {
   const requests: unknown[][] = [];
   return {
     instanceId: "inst-1",
     requests,
+    getPort: () => port ?? undefined,
     async status() {
-      return { available: browsers.length > 0, listening: true, port: 49222, protocolVersion: 1, browsers, profileId: "secret-profile" };
+      return { available: browsers.length > 0, listening: port !== null, port, protocolVersion: 1, browsers, profileId: "secret-profile" };
     },
     getConnectedBrowsers: () => browsers,
     async request(op, params, timeoutMs, slug) {
@@ -185,10 +200,42 @@ describe("daemon /extension routes", () => {
 
   test("status when disabled is CDP-only and does not start the relay", async () => {
     let started = false;
-    const backend = { ...mockBackend([], {}), async status() { started = true; return {}; } };
+    const backend = { ...mockBackend([], {}, null), async status() { started = true; return {}; } };
     const out = await (await handleExtensionRoute("status", backend, ["cdp"], join(dir, "none.json"))).json();
     expect(out.data).toEqual({ enabled: false, backends: "cdp", paired: false, listening: false, port: null, browsers: 0 });
     expect(started).toBe(false);
+  });
+
+  test("S3: status when disabled still reports actual listening state and port if relay is bound", async () => {
+    const backend = createExtensionBackend({ portStart: 49326, portEnd: 49330, token: TOKEN });
+    try {
+      const before = await (await handleExtensionRoute("status", backend, ["cdp"], tokenFile)).json();
+      expect(before.data).toEqual({
+        enabled: false,
+        backends: "cdp",
+        paired: true,
+        listening: false,
+        port: null,
+        browsers: 0,
+      });
+      expect(backend.getPort()).toBeUndefined();
+
+      await backend.start?.();
+      const boundPort = backend.getPort();
+      expect(typeof boundPort).toBe("number");
+
+      const after = await (await handleExtensionRoute("status", backend, ["cdp"], tokenFile)).json();
+      expect(after.data).toEqual({
+        enabled: false,
+        backends: "cdp",
+        paired: true,
+        listening: true,
+        port: boundPort,
+        browsers: 0,
+      });
+    } finally {
+      await backend.dispose?.();
+    }
   });
 
   test("browsers lists slug, brand and version one per line", async () => {
@@ -241,5 +288,141 @@ describe("daemon /extension routes", () => {
       port: 1,
       list: [{ secret: "[redacted]" }],
     });
+  });
+
+  test("S2: after extension disable, explicit extension target ids cannot reach the connected extension", async () => {
+    const backendsFile = join(dir, "s2-backends");
+    await writeFile(backendsFile, "extension,cdp\n");
+    setDaemonBackendsFile(backendsFile);
+    const backend = createExtensionBackend({
+      portStart: 49320,
+      portEnd: 49325,
+      token: TOKEN,
+      registerGlobal: true,
+      waitConnectMs: 5_000,
+    });
+    let ws: WebSocket | undefined;
+    try {
+      await backend.start?.();
+      const port = backend.getPort()!;
+      const received: Array<{ op: string; params: Record<string, unknown> }> = [];
+      const extNonce = "2".repeat(32);
+      ws = new WebSocket(`ws://127.0.0.1:${port}/extension`, {
+        headers: { Origin: EXTENSION_ORIGIN },
+      } as unknown as string[]);
+      await new Promise<void>((resolveReady, rejectReady) => {
+        ws!.addEventListener("open", () => {
+          ws!.send(
+            JSON.stringify({
+              type: "hello",
+              profileId: "prof-s2",
+              browser: "Chrome",
+              version: "2.0.0",
+              helpersVersion: PAGE_HELPERS_VERSION,
+              protocolVersion: PROTOCOL_VERSION,
+              nonce: extNonce,
+            }),
+          );
+        });
+        ws!.addEventListener("message", (ev) => {
+          const msg = JSON.parse(String(ev.data)) as Record<string, unknown>;
+          if (msg["type"] === "auth.challenge") {
+            const proof = hmacHex(TOKEN, extProofMessage(port, String(msg["nonce"]), extNonce));
+            ws!.send(JSON.stringify({ type: "auth.response", proof }));
+          } else if (msg["type"] === "welcome") {
+            resolveReady();
+          } else if (msg["type"] === "req") {
+            received.push({ op: String(msg["op"]), params: (msg["params"] ?? {}) as Record<string, unknown> });
+            ws!.send(JSON.stringify({ type: "res", id: msg["id"], ok: true, result: { ok: true } }));
+          }
+        });
+        ws!.addEventListener("error", (err) => rejectReady(err));
+      });
+
+      // Disable the extension backend while the relay and browser stay connected.
+      await writeFile(backendsFile, "cdp\n");
+
+      const cdpCalled: string[] = [];
+      const ops = route(
+        {
+          read_events: async () => {
+            cdpCalled.push("read_events");
+            return { events: [] };
+          },
+          wait_for_event: async () => {
+            cdpCalled.push("wait_for_event");
+            return { found: false };
+          },
+          execute_cdp: async () => {
+            cdpCalled.push("execute_cdp");
+            return { result: {} };
+          },
+          get_browser_status: async () => ({ connected: true }),
+          clear_target: async () => ({}),
+          list_targets: async () => ({ targets: [] }),
+        },
+        [backend],
+      );
+      const invoke = async (op: string, input: Record<string, unknown> = {}) => {
+        try {
+          return { ok: true as const, data: await ops[op]!(input) };
+        } catch (error) {
+          return { ok: false as const, error: { code: "EXECUTION_FAILED" as const, message: (error as Error).message } };
+        }
+      };
+
+      const handlePage = createPageHelperHandler(invoke);
+      const handoff = await handlePage("handoff", { message: "Sign in", timeout: 2 }, "extension:7");
+      expect(handoff.ok).toBe(false);
+      if (!handoff.ok) {
+        expect(handoff.error.message).toBe("INPUT_INVALID: the extension backend is disabled; run: extension enable");
+      }
+
+      const extReq = (globalThis as Record<symbol, unknown>)[
+        Symbol.for("browser-control.extension-request")
+      ] as (op: string, params?: Record<string, unknown>) => Promise<unknown>;
+      await expect(extReq("resolve_bc_node", { targetId: "extension:7", ref: "e1", mode: "ref" })).rejects.toThrow(
+        "INPUT_INVALID: the extension backend is disabled; run: extension enable",
+      );
+
+      const dialog = await handlePage("dialog", { sub: "accept" }, "extension:7");
+      expect(dialog.ok).toBe(false);
+      if (!dialog.ok) {
+        expect(dialog.error.message).toBe("INPUT_INVALID: the extension backend is disabled; run: extension enable");
+      }
+
+      expect(received).toEqual([]);
+      expect(cdpCalled).toEqual([]);
+    } finally {
+      ws?.close();
+      setDaemonBackendsFile(undefined);
+      await backend.dispose?.();
+    }
+  });
+
+  test("S5: dispatchExtensionRequest matches only GET /extension/(status|browsers|diagnostics) and rejects bad methods/paths", async () => {
+    const backend = mockBackend([chrome], {});
+    const callExt = (method: string, path: string) => {
+      const url = new URL(`http://localhost${path}`);
+      return dispatchExtensionRequest(new Request(url, { method }), url, backend, ["extension", "cdp"], tokenFile);
+    };
+
+    const ok = await callExt("GET", "/extension/status?m=should-not-lookup");
+    expect(ok?.status).toBe(200);
+    expect((await ok!.json()).data).toMatchObject({ enabled: true, listening: true, port: 49222, browsers: 1 });
+
+    const badMethod = await callExt("POST", "/extension/status");
+    expect(badMethod?.status).toBe(405);
+    expect(badMethod?.headers.get("allow")).toBe("GET");
+
+    const badMethod2 = await callExt("DELETE", "/extension/browsers");
+    expect(badMethod2?.status).toBe(405);
+
+    for (const badPath of ["/extension", "/extension/", "/extension/status/extra", "/extension/pair"]) {
+      const res = await callExt("GET", badPath);
+      expect(res?.status).toBe(404);
+    }
+
+    expect(await callExt("GET", "/tabs")).toBeUndefined();
   });
 });

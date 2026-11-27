@@ -869,6 +869,8 @@ describe("handoff end refocuses user's previous tab and re-collapses Agents grou
 
 describe("extension backend targetRequest exposes resolve_bc_node", () => {
   test("resolve_bc_node is permitted via TARGET_REQUEST_OPS and routes through extension relay", async () => {
+    const savedBackends = process.env["BROWSER_CONTROL_BACKENDS"];
+    process.env["BROWSER_CONTROL_BACKENDS"] = "extension";
     const { createExtensionBackend, EXTENSION_ORIGIN, PROTOCOL_VERSION, extProofMessage, hmacHex } = await import(
       "../src/backends/extension"
     );
@@ -937,6 +939,8 @@ describe("extension backend targetRequest exposes resolve_bc_node", () => {
 
       ws.close();
     } finally {
+      if (savedBackends === undefined) delete process.env["BROWSER_CONTROL_BACKENDS"];
+      else process.env["BROWSER_CONTROL_BACKENDS"] = savedBackends;
       await backend.dispose?.();
     }
   });

@@ -89,7 +89,14 @@ export function route(
     }
 
     const prefix = prefixOf(input["targetId"]);
-    const named = prefix !== undefined && enabled().includes(prefix) ? byName.get(prefix) : undefined;
+    if (prefix !== undefined && byName.has(prefix) && !enabled().includes(prefix)) {
+      throw new Error(
+        prefix === EXTENSION
+          ? "INPUT_INVALID: the extension backend is disabled; run: extension enable"
+          : `INPUT_INVALID: the ${prefix} backend is disabled`,
+      );
+    }
+    const named = prefix !== undefined ? byName.get(prefix) : undefined;
     if (named) {
       if (!named.handles(op, input, active === named.name)) {
         throw new Error(`INPUT_INVALID: ${op} isn't available on ${named.name} tabs; use a DevTools tab for it`);

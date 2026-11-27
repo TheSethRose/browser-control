@@ -18,6 +18,7 @@ import type { Server, ServerWebSocket } from "bun";
 import { EventBuffer, eventMatches, type CdpEvent, type EventMatcher } from "../events";
 import { PAGE_HELPERS_VERSION, type HelperStep, type NormalizedHelperCall } from "../page-helpers";
 import { isBlockedCdpMethod, isBrowserLevelMethod } from "../session";
+import { backendOrder } from "./router";
 import { BackendUnavailable, prefixOf, type Backend, type BackendTarget, type OpInput } from "./types";
 
 export const NAME = "extension";
@@ -767,6 +768,7 @@ export function registerExtensionBcCall(fn: BcCallFn | undefined): void {
 
 const EXTENSION_REQUEST_SYMBOL = Symbol.for("browser-control.extension-request");
 const TARGET_REQUEST_OPS = new Set(["handoff_start", "handoff_clear", "resolve_bc_node", "list_frames"]);
+const EXTENSION_DISABLED_MSG = "INPUT_INVALID: the extension backend is disabled; run: extension enable";
 
 export type ExtensionRequestFn = (
   op: string,
@@ -1480,6 +1482,9 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
     params: Record<string, unknown> = {},
     timeoutMs: number = DEFAULT_REQ_TIMEOUT_MS,
   ): Promise<unknown> {
+    if (!backendOrder().includes(NAME)) {
+      throw new Error(EXTENSION_DISABLED_MSG);
+    }
     if (!TARGET_REQUEST_OPS.has(op)) {
       throw new Error(`INPUT_INVALID: extension op "${op}" is not allowed`);
     }
@@ -1996,7 +2001,7 @@ export function getRegisteredExtensionBackend(): ExtensionBackend | undefined {
 
 export type ExtensionReportBackend = Pick<
   ExtensionBackend,
-  "instanceId" | "status" | "getConnectedBrowsers" | "request" | "waitForConnection"
+  "instanceId" | "getPort" | "status" | "getConnectedBrowsers" | "request" | "waitForConnection"
 >;
 
 /** `paired` when the relay token file exists, is private, and is valid. */
@@ -2041,7 +2046,16 @@ export async function extensionStatusReport(
     paired: pairing === "paired",
     ...(pairing === "bad" ? { pairingProblem: "relay token file is not private or not valid; run: extension setup" } : {}),
   };
-  if (!enabled) return { ...base, listening: false, port: null, browsers: 0 };
+  if (!enabled) {
+    const port = backend?.getPort() ?? null;
+    const listening = port !== null;
+    return {
+      ...base,
+      listening,
+      port,
+      browsers: listening ? backend!.getConnectedBrowsers().length : 0,
+    };
+  }
   let s = (await backend.status()) as Record<string, unknown>;
   // A relay that just started needs a moment for the extension to find it.
   if (s["listening"] && backend.getConnectedBrowsers().length === 0 && waitMs > 0) {
