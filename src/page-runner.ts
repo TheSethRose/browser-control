@@ -16,7 +16,7 @@ import {
   isBackendUnavailable,
   isExtensionOnlyOrder,
 } from "./backends/router";
-import { extensionFrameTarget, extensionTabOf, getRegisteredExtensionBcCall, type BcCallFn } from "./backends/extension";
+import { extensionFrameTarget, extensionTabOf, getRegisteredExtensionBackend, getRegisteredExtensionBcCall, parseExtensionTargetId, type BcCallFn } from "./backends/extension";
 import {
   SHORT_PAGE_CHARS,
   buildChallengeProbeExpression,
@@ -51,6 +51,7 @@ import {
   isNaturalEnabled,
   pickClickPoint,
   planClickTiming,
+  planKeyHold,
   planPointerPath,
   planWheelScroll,
   type Box2D,
@@ -294,6 +295,8 @@ export function createPageHelperHandler(
     naturalDefault?: boolean;
     bcCall?: BcCallFn;
     extensionRequest?: ExtensionRequestFn;
+    /** Qualify a short extension tab id with its browser; defaults to the registered extension backend. */
+    extensionResolveKey?: (targetId: string) => string | undefined;
     challengeWaitMaxMs?: number;
   } = {},
 ) {
@@ -304,7 +307,11 @@ export function createPageHelperHandler(
   let typingSpeed: number | undefined;
   const typingSpeedFactor = (): number => (typingSpeed ??= 0.85 + rng() * 0.3);
   const now = options.now ?? (() => Date.now());
-  const isNatural = (input: Json): boolean => isNaturalEnabled(input, { defaultEnabled: options.naturalDefault });
+  /** `_natural` is the wrapper caller's resolved on/off switch, so status and dispatch agree. */
+  const isNatural = (input: Json): boolean =>
+    input["fast"] !== true && typeof input["_natural"] === "boolean"
+      ? (input["_natural"] as boolean)
+      : isNaturalEnabled(input, { defaultEnabled: options.naturalDefault });
   /** Per-tab pointer state keyed by resolved top-level target id (without frame suffix). */
   const motionByTab = new Map<string, { pointer?: Point2D; viewport?: Viewport }>();
   let implicitCdpTarget: string | undefined;
@@ -318,8 +325,39 @@ export function createPageHelperHandler(
     }
     return st;
   };
+  /** What the page still has down because its release never reached it: one record per browser, tab and kind. */
+  type HeldInput = { kind: "key" | "mouse"; label: string };
+  const heldByTab = new Map<string, HeldInput>();
+  /** Held state is keyed by browser (profile) and tab, never by a bare tab number two browsers can share. */
+  const heldKeyOf = (targetId?: string): string => {
+    const raw = targetId ?? implicitCdpTarget;
+    if (raw === undefined) return "";
+    const plain = raw.replace(/@(?:frame:)?\d+$/, "");
+    if (!parseExtensionTargetId(raw)) return plain;
+    // The backend binds a short tab id to its browser and qualifies both forms the same way.
+    const resolve = options.extensionResolveKey ?? ((id: string) => getRegisteredExtensionBackend()?.resolveTargetKey(id));
+    try {
+      return resolve(raw) ?? plain;
+    } catch {
+      return plain;
+    }
+  };
+  const heldLine = (held: HeldInput): string =>
+    `# HELD: ${held.label}. It was not sent again; the caller decides what to do next.`;
+  /** Attach the held-input line to the result of a release this command could not deliver. */
+  const withHeld = (res: InvokeResult, held?: HeldInput): InvokeResult =>
+    !held
+      ? res
+      : res.ok
+        ? success(`${valueOf(res)}\n${heldLine(held)}`)
+        : failure(res.error.code, `${messageOf(res)}\n${heldLine(held)}`);
+  const HELD_KINDS = ["key", "mouse"] as const;
+  /** A held key and a held mouse button on one tab are separate records. */
+  const heldSlot = (targetId: string | undefined, kind: HeldInput["kind"]): string => `${heldKeyOf(targetId)}#${kind}`;
+  /** Navigation starts a new document, so pointer and held-input state for the old one are dropped. */
   const resetMotion = (targetId?: string): void => {
     motionByTab.delete(tabKeyOf(targetId));
+    for (const kind of HELD_KINDS) heldByTab.delete(heldSlot(targetId, kind));
   };
   /** Cross-origin iframe targets from the last snap of each tab: f1 is index 0. */
   const frameTargets = new Map<string, string[]>();
@@ -1059,13 +1097,22 @@ export function createPageHelperHandler(
     if (!spec) {
       return failure("INPUT_VALIDATION_FAILED", `INPUT_INVALID: key must be ${Object.keys(KEYS).join(", ")}`);
     }
+    // Pin the tab once: a tab switch during the hold cannot move the release to another page.
+    const gestureTarget = targetId ?? implicitCdpTarget;
+    const held: HeldInput = { kind: "key", label: `key ${name} still down` };
     const base: Json = { key: spec.key, code: spec.code, windowsVirtualKeyCode: spec.windowsVirtualKeyCode };
     const down = spec.text !== undefined
-      ? await cdp("Input.dispatchKeyEvent", { type: "keyDown", ...base, text: spec.text }, targetId, INPUT_TIMEOUT_MS)
-      : await cdp("Input.dispatchKeyEvent", { type: "rawKeyDown", ...base }, targetId, INPUT_TIMEOUT_MS);
-    if (!down.ok) return down;
+      ? await cdp("Input.dispatchKeyEvent", { type: "keyDown", ...base, text: spec.text }, gestureTarget, INPUT_TIMEOUT_MS)
+      : await cdp("Input.dispatchKeyEvent", { type: "rawKeyDown", ...base }, gestureTarget, INPUT_TIMEOUT_MS);
+    if (!down.ok) {
+      // The press may have landed before the page opened its dialog, so still try the matching release.
+      if (refusedByDialog(down)) return down;
+      const cleanup = await sendRelease("Input.dispatchKeyEvent", { type: "keyUp", ...base }, gestureTarget, held, INPUT_TIMEOUT_MS);
+      return cleanup.ok ? down : withHeld(down, held);
+    }
     if (holdMs > 0) await pause(holdMs);
-    return cdp("Input.dispatchKeyEvent", { type: "keyUp", ...base }, targetId, INPUT_TIMEOUT_MS);
+    const up = await sendRelease("Input.dispatchKeyEvent", { type: "keyUp", ...base }, gestureTarget, held, INPUT_TIMEOUT_MS);
+    return up.ok ? up : withHeld(up, held);
   }
 
   async function dispatchText(
@@ -1102,8 +1149,21 @@ export function createPageHelperHandler(
     const plan = planTyping(text, { rng, speedFactor: typingSpeedFactor(), fieldKind: opts.fieldKind });
     // A key is recorded as down before its keyDown goes out, so one that reached the page but timed out is
     // still released. Events run on elapsed time, absorbing round trips; a stall past STALL_MS shifts the rest.
-    const held = heldFor(targetId);
-    await releaseKeys(targetId);
+    // Each keyUp goes out once: one that never reached the page is reported as held, never re-sent.
+    const down = new Map<string, CharKeySpec>();
+    const stuck: string[] = [];
+    let result: InvokeResult = success("ok");
+    let blocked = false;
+    const keyUp = async (spec: CharKeySpec): Promise<InvokeResult> => {
+      down.delete(spec.key);
+      // After one release times out, the rest would too: they are reported held without waiting on each.
+      if (blocked) return (stuck.push(spec.key), failure("EXECUTION_FAILED", "CDP_TIMEOUT"));
+      const up = await sendKey("keyUp", spec, targetId).catch((err: unknown) => failure("EXECUTION_FAILED", String(err)));
+      if (up.ok) return up;
+      if (messageOf(up).startsWith("CDP_TIMEOUT")) blocked = true;
+      else stuck.push(spec.key);
+      return up;
+    };
     let start = now();
     let plannedAt = 0;
     try {
@@ -1116,43 +1176,35 @@ export function createPageHelperHandler(
         const spec: CharKeySpec =
           step.kind === "insert" ? { key: step.text, code: "", windowsVirtualKeyCode: 0, text: step.text } : step.spec;
         if (step.kind !== "keyUp") {
-          held.set(spec.key, spec);
-          const down = await sendKey(spec.text !== undefined ? "keyDown" : "rawKeyDown", spec, targetId);
-          if (!down.ok) return down;
+          down.set(spec.key, spec);
+          const res = await sendKey(spec.text !== undefined ? "keyDown" : "rawKeyDown", spec, targetId);
+          if (!res.ok) {
+            if (refusedByDialog(res)) down.delete(spec.key);
+            result = res;
+            break;
+          }
         }
         if (step.kind !== "keyDown") {
-          const up = await sendKey("keyUp", spec, targetId);
-          if (!up.ok) return up;
-          held.delete(spec.key);
+          const res = await keyUp(spec);
+          if (!res.ok) {
+            result = res;
+            break;
+          }
         }
       }
-      return success("ok");
     } finally {
-      await releaseKeys(targetId);
+      for (const spec of [...down.values()].reverse()) await keyUp(spec);
     }
+    if (stuck.length === 0) return result;
+    const held: HeldInput = { kind: "key", label: `key${stuck.length > 1 ? "s" : ""} ${stuck.join(", ")} still down` };
+    heldByTab.set(heldSlot(targetId, "key"), held);
+    return withHeld(result, held);
   }
 
   function sendKey(type: string, spec: CharKeySpec, targetId?: string, timeoutMs = INPUT_TIMEOUT_MS): Promise<InvokeResult> {
     const { key, code, windowsVirtualKeyCode, modifiers, text } = spec;
     const extra = { ...(modifiers ? { modifiers } : {}), ...(type === "keyDown" && text !== undefined ? { text } : {}) };
     return cdp("Input.dispatchKeyEvent", { type, key, code, windowsVirtualKeyCode, ...extra }, targetId, timeoutMs);
-  }
-
-  /** Keys whose keyUp has not landed, per tab. Retried at the next dispatch and after a dialog closes. */
-  const heldKeys = new Map<string, Map<string, CharKeySpec>>();
-  function heldFor(targetId?: string): Map<string, CharKeySpec> {
-    let held = heldKeys.get(targetId ?? "");
-    if (!held) heldKeys.set(targetId ?? "", (held = new Map()));
-    return held;
-  }
-
-  async function releaseKeys(targetId?: string): Promise<void> {
-    const held = heldFor(targetId);
-    for (const [key, spec] of [...held].reverse()) {
-      // A dialog blocks input: stop and keep the rest for the retry instead of waiting on each.
-      if (!(await sendKey("keyUp", spec, targetId, 1_000).catch(() => undefined))?.ok) return;
-      held.delete(key);
-    }
   }
 
   /** Typo policy from the focused field's live type and flags (attach-free read); any doubt means none. */
@@ -1192,8 +1244,31 @@ export function createPageHelperHandler(
   const withChanges = async (line: string, before: string | undefined, quiet: boolean, targetId?: string): Promise<InvokeResult> =>
     success(quiet ? line : `${line}\n${await changes(before, targetId)}`);
 
+  /** An input command the extension refused because a dialog was already open never reached the page. */
+  const refusedByDialog = (res: InvokeResult): boolean => /^DIALOG_OPEN:/.test(messageOf(res));
   const inputFailed = (res: InvokeResult, what: string): InvokeResult =>
     messageOf(res).startsWith("CDP_TIMEOUT") ? success(`${what}: delivered_unverified (${DIALOG_HINT})`) : res;
+
+  /**
+   * Send a release to its pinned tab; it is never retried. A timeout may have reached the page, so it reads as
+   * delivered_unverified, not held; any other failure (a dialog refusal included) never reached it and is held.
+   */
+  async function sendRelease(
+    method: string,
+    params: Json,
+    target: string | undefined,
+    held: HeldInput,
+    timeoutMs = 2_000,
+  ): Promise<InvokeResult> {
+    const res = await cdp(method, params, target, timeoutMs).catch((err: unknown) => failure("EXECUTION_FAILED", String(err)));
+    const slot = heldSlot(target, held.kind);
+    if (res.ok) heldByTab.delete(slot);
+    else if (messageOf(res).startsWith("CDP_TIMEOUT")) {
+      heldByTab.delete(slot);
+      return inputFailed(res, `${held.label.replace(/ still down$/, "")} release`);
+    } else heldByTab.set(slot, held);
+    return res;
+  }
 
   /** Targets that can run helpers inside a child frame: OOPIF targets on CDP, frame ids on extension tabs. */
   async function frameTargetPool(targetId?: string): Promise<Array<{ targetId: string; url: string }>> {
@@ -1366,7 +1441,7 @@ export function createPageHelperHandler(
     }
     if (!Array.isArray(raw)) return 'do takes a JSON array of steps, e.g. [{"type":["Email","a@b.co"]},{"key":"Tab"},{"click":"Next"}]';
     for (const [i, entry] of raw.entries()) {
-      const keys = typeof entry === "object" && entry !== null ? Object.keys(entry as Json) : [];
+      const keys = typeof entry === "object" && entry !== null ? Object.keys(entry as Json).filter((k) => k !== "fast") : [];
       const verb = keys[0];
       const arg = verb ? (entry as Json)[verb] : undefined;
       if (keys.length !== 1 || !verb) return `step ${i + 1}: each step is one verb, e.g. {"click":"Save"}`;
@@ -1380,8 +1455,8 @@ export function createPageHelperHandler(
           input: {
             ref: arg[0],
             text: arg[1],
-            fast: arg[2] === "fast",
-            keys: arg[2] === "keys" || arg[2] === true,
+            ...(arg[2] === "fast" ? { fast: true } : {}),
+            ...(arg[2] === "keys" || arg[2] === true ? { keys: true } : {}),
           },
           label: `type ${js(arg[0])}`,
         });
@@ -1398,6 +1473,8 @@ export function createPageHelperHandler(
       } else {
         return `step ${i + 1}: use {"click":"<ref|label>"}, {"type":["<ref|label>","<text>"]}, {"select":["<ref|label>","<option>"]}, {"upload":["<ref|label>","<abs-path>"]}, {"drag":["<from>","<to>"]}, {"wait":"<text>"}, or {"key":"<name>"}`;
       }
+      const last = steps[steps.length - 1]!;
+      if ((entry as Json)["fast"] === true) last.input = { ...last.input, fast: true };
     }
     return steps;
   }
@@ -1458,7 +1535,9 @@ export function createPageHelperHandler(
   }
 
   /** Perform HTML5 drag-and-drop (via Input.setInterceptDrags) or plain mouse drag. */
-  async function runDrag(input: Json, targetId: string | undefined, quiet: boolean, healInBatch: boolean): Promise<InvokeResult> {
+  async function runDrag(input: Json, rawTargetId: string | undefined, quiet: boolean, healInBatch: boolean): Promise<InvokeResult> {
+    // Pin the tab once: press, moves, and release must all land on the tab the drag started on.
+    const targetId = rawTargetId ?? implicitCdpTarget;
     const fromLoc = await locate(input["from"], "click", targetId, healInBatch);
     if (!fromLoc.ok) return fromLoc.res;
     const toLoc = await locate(input["to"], "click", targetId, healInBatch);
@@ -1477,48 +1556,129 @@ export function createPageHelperHandler(
       sx: number; sy: number; dx: number; dy: number; draggable: boolean; listMeta: Json | null;
     };
 
+    const natural = isNatural(input);
+    const held: HeldInput = { kind: "mouse", label: "mouse left button still down" };
     let html5Dropped = false;
     let dragIntercepted: { data?: Json } | undefined;
     let mouseDown = false;
+    let dragErr: InvokeResult | undefined;
+    let releaseHeld: HeldInput | undefined;
+    const releaseParams: Json = { type: "mouseReleased", x: info.dx, y: info.dy, button: "left", buttons: 0, clickCount: 1 };
+    /** Release the button before an early return, so a blocked release is reported on this command's result. */
+    const bail = async (res: InvokeResult, what: string): Promise<InvokeResult> => {
+      const failed = inputFailed(res, what);
+      if (!mouseDown) return failed;
+      mouseDown = false;
+      const rel = await sendRelease("Input.dispatchMouseEvent", releaseParams, targetId, held);
+      return rel.ok ? failed : withHeld(failed, held);
+    };
     if (info.draggable) {
       await cdp("Input.setInterceptDrags", { enabled: true }, targetId, 4_000);
     }
     try {
-      await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: info.sx, y: info.sy }, targetId, INPUT_TIMEOUT_MS);
-      await cdp("Input.dispatchMouseEvent", { type: "mousePressed", x: info.sx, y: info.sy, button: "left", buttons: 1, clickCount: 1 }, targetId, INPUT_TIMEOUT_MS);
-      mouseDown = true;
-      const mx = Math.round((info.sx + info.dx) / 2);
-      const my = Math.round((info.sy + info.dy) / 2);
-      if (info.draggable) {
-        const waitDrag = invoke("wait_for_event", { method: "Input.dragIntercepted", timeoutMs: 1200, ...(targetId ? { targetId } : {}) });
-        await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: mx, y: my, button: "left", buttons: 1 }, targetId, INPUT_TIMEOUT_MS);
-        const ev = await waitDrag;
-        if (ev.ok && (ev.data as Json)["found"] === true) {
-          dragIntercepted = (((ev.data as Json)["event"] as Json)?.["params"] as { data?: Json }) ?? {};
-          const dragData = dragIntercepted.data ?? { items: [], dragOperationsMask: 1 };
-          await cdp("Input.dispatchDragEvent", { type: "dragEnter", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
-          await cdp("Input.dispatchDragEvent", { type: "dragOver", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
-          const dropRes = await cdp("Input.dispatchDragEvent", { type: "drop", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
-          html5Dropped = dropRes.ok;
+      if (!natural) {
+        const m0 = await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: info.sx, y: info.sy }, targetId, INPUT_TIMEOUT_MS);
+        if (!m0.ok) { dragErr = m0; return bail(m0, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
+        mouseDown = true;
+        const mp = await cdp("Input.dispatchMouseEvent", { type: "mousePressed", x: info.sx, y: info.sy, button: "left", buttons: 1, clickCount: 1 }, targetId, INPUT_TIMEOUT_MS);
+        if (!mp.ok) { mouseDown = !refusedByDialog(mp); dragErr = mp; return bail(mp, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
+        const mx = Math.round((info.sx + info.dx) / 2);
+        const my = Math.round((info.sy + info.dy) / 2);
+        if (info.draggable) {
+          const waitDrag = invoke("wait_for_event", { method: "Input.dragIntercepted", timeoutMs: 1200, ...(targetId ? { targetId } : {}) });
+          await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: mx, y: my, button: "left", buttons: 1 }, targetId, INPUT_TIMEOUT_MS);
+          const ev = await waitDrag;
+          if (ev.ok && (ev.data as Json)["found"] === true) {
+            dragIntercepted = (((ev.data as Json)["event"] as Json)?.["params"] as { data?: Json }) ?? {};
+            const dragData = dragIntercepted.data ?? { items: [], dragOperationsMask: 1 };
+            await cdp("Input.dispatchDragEvent", { type: "dragEnter", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
+            await cdp("Input.dispatchDragEvent", { type: "dragOver", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
+            const dropRes = await cdp("Input.dispatchDragEvent", { type: "drop", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
+            html5Dropped = dropRes.ok;
+          } else {
+            await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: info.dx, y: info.dy, button: "left", buttons: 1 }, targetId, INPUT_TIMEOUT_MS);
+          }
         } else {
+          await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: mx, y: my, button: "left", buttons: 1 }, targetId, INPUT_TIMEOUT_MS);
           await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: info.dx, y: info.dy, button: "left", buttons: 1 }, targetId, INPUT_TIMEOUT_MS);
         }
       } else {
-        await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: mx, y: my, button: "left", buttons: 1 }, targetId, INPUT_TIMEOUT_MS);
-        await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: info.dx, y: info.dy, button: "left", buttons: 1 }, targetId, INPUT_TIMEOUT_MS);
+        const toSrc = await movePointer({ x: info.sx, y: info.sy }, targetId);
+        if (!toSrc.ok) { dragErr = toSrc; return bail(toSrc, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
+        await pause(planClickTiming(1, rng).dwellMs);
+        mouseDown = true;
+        const mp = await cdp("Input.dispatchMouseEvent", { type: "mousePressed", x: info.sx, y: info.sy, button: "left", buttons: 1, clickCount: 1 }, targetId, INPUT_TIMEOUT_MS);
+        if (!mp.ok) { mouseDown = !refusedByDialog(mp); dragErr = mp; return bail(mp, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
+        await pause(Math.round(60 + rng() * 50));
+
+        const state = motionOf(targetId);
+        const dragPlan = planPointerPath({
+          from: { x: info.sx, y: info.sy },
+          to: { x: info.dx, y: info.dy },
+          viewport: state.viewport ?? DEFAULT_VIEWPORT,
+          maxSteps: 20,
+          overshootProb: 0,
+          rng,
+        });
+        const dispatchSteps = async (stepsSlice: typeof dragPlan.steps): Promise<InvokeResult> => {
+          const pace = createPacer();
+          for (const step of stepsSlice) {
+            await pace(step.delayMs);
+            const res = await cdp(
+              "Input.dispatchMouseEvent",
+              { type: "mouseMoved", x: step.x, y: step.y, button: "left", buttons: 1 },
+              targetId,
+              INPUT_TIMEOUT_MS,
+            );
+            if (!res.ok) return res;
+            state.pointer = { x: step.x, y: step.y };
+          }
+          return success("ok");
+        };
+
+        if (info.draggable) {
+          const waitDrag = invoke("wait_for_event", { method: "Input.dragIntercepted", timeoutMs: 1200, ...(targetId ? { targetId } : {}) });
+          let splitIdx = dragPlan.steps.findIndex((s) => Math.hypot(s.x - info.sx, s.y - info.sy) >= 10);
+          if (splitIdx < 0) splitIdx = Math.max(0, Math.floor(dragPlan.steps.length / 2) - 1);
+          const nudge = await dispatchSteps(dragPlan.steps.slice(0, splitIdx + 1));
+          if (!nudge.ok) { dragErr = nudge; return bail(nudge, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
+          const ev = await waitDrag;
+          if (ev.ok && (ev.data as Json)["found"] === true) {
+            dragIntercepted = (((ev.data as Json)["event"] as Json)?.["params"] as { data?: Json }) ?? {};
+            const dragData = dragIntercepted.data ?? { items: [], dragOperationsMask: 1 };
+            await cdp("Input.dispatchDragEvent", { type: "dragEnter", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
+            await cdp("Input.dispatchDragEvent", { type: "dragOver", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
+            const dropRes = await cdp("Input.dispatchDragEvent", { type: "drop", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
+            html5Dropped = dropRes.ok;
+            state.pointer = { x: info.dx, y: info.dy };
+          } else {
+            const rest = await dispatchSteps(dragPlan.steps.slice(splitIdx + 1));
+            if (!rest.ok) { dragErr = rest; return bail(rest, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
+          }
+        } else {
+          const moved = await dispatchSteps(dragPlan.steps);
+          if (!moved.ok) { dragErr = moved; return bail(moved, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
+        }
+        await pause(Math.round(40 + rng() * 50));
       }
     } finally {
       if (info.draggable && dragIntercepted && !html5Dropped) {
         await cdp("Input.dispatchDragEvent", { type: "dragCancel", x: info.dx, y: info.dy, data: dragIntercepted.data ?? { items: [], dragOperationsMask: 1 } }, targetId, 2_000).catch(() => {});
       }
       if (mouseDown) {
-        await cdp("Input.dispatchMouseEvent", { type: "mouseReleased", x: info.dx, y: info.dy, button: "left", buttons: 0, clickCount: 1 }, targetId, 2_000).catch(() => {});
+        const rel = await sendRelease("Input.dispatchMouseEvent", releaseParams, targetId, held);
+        if (rel.ok && !dragErr) motionOf(targetId).pointer = { x: info.dx, y: info.dy };
+        else if (!rel.ok) {
+          releaseHeld = held;
+          if (!dragErr) dragErr = rel;
+        }
       }
       if (info.draggable) {
         await cdp("Input.setInterceptDrags", { enabled: false }, targetId, 2_000).catch(() => {});
       }
     }
 
+    if (dragErr) return withHeld(inputFailed(dragErr, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}: release`), releaseHeld);
     const posRes = info.listMeta
       ? await evalHelper({ kind: "bc", method: "listPosition", args: [info.listMeta] }, targetId)
       : undefined;
@@ -1589,8 +1749,9 @@ export function createPageHelperHandler(
           return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: text is required");
         }
         const text = input["text"];
+        const natural = isNatural(input);
         const mode: "human" | "fast" | "keys" =
-          input["fast"] === true ? "fast" : input["keys"] === true ? "keys" : "human";
+          input["fast"] === true ? "fast" : input["keys"] === true ? "keys" : natural ? "human" : "fast";
         if (browseTab !== undefined) {
           if (input["focused"] === true) {
             return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: type --focused needs a DevTools tab");
@@ -1642,14 +1803,14 @@ export function createPageHelperHandler(
             const before = quiet ? undefined : await evalHelper({ kind: "bc", method: "baseline" }, targetId);
             let editorRef = cInfo.editorRef;
             if (!editorRef) {
-              const pt = await pointOf(loc, targetId, false);
+              const pt = await pointOf(loc, targetId, false, natural);
               if (!pt.ok) return pt.res;
-              await clickAt(pt.pt, targetId, 2);
+              await clickAt(pt.pt, targetId, 2, natural, loc.kind === "dom" ? loc.ref : undefined);
               await sleep(150);
               const ed = await evalHelper({ kind: "bc", method: "cellEditor" }, fieldTarget);
               editorRef = ed.ok && /^e\d+$/.test(valueOf(ed)) ? valueOf(ed) : null;
               if (!editorRef) {
-                await pressKey("Enter", targetId);
+                await pressKey("Enter", targetId, natural ? planKeyHold(rng) : 0);
                 await sleep(150);
                 const ed2 = await evalHelper({ kind: "bc", method: "cellEditor" }, fieldTarget);
                 editorRef = ed2.ok && /^e\d+$/.test(valueOf(ed2)) ? valueOf(ed2) : null;
@@ -1661,7 +1822,7 @@ export function createPageHelperHandler(
             const cellKind = mode === "human" ? await fieldKindOf(text, fieldTarget) : undefined;
             const sent = await dispatchText(text, mode, targetId, { fieldKind: cellKind });
             if (!sent.ok) return inputFailed(sent, `type ${name}`);
-            await pressKey("Enter", targetId);
+            await pressKey("Enter", targetId, natural ? planKeyHold(rng) : 0);
             await sleep(150);
             const afterRes = await evalHelper({ kind: "bc", method: "cellRead", args: [loc.ref, cInfo.before] }, fieldTarget);
             if (afterRes.ok) {
@@ -1680,9 +1841,9 @@ export function createPageHelperHandler(
           }
         }
 
-        const at = await pointOf(loc, targetId, !quiet);
+        const at = await pointOf(loc, targetId, !quiet, natural);
         if (!at.ok) return at.res;
-        const clicked = await clickAt(at.pt, targetId);
+        const clicked = await clickAt(at.pt, targetId, 1, natural, loc.kind === "dom" ? loc.ref : undefined);
         if (!clicked.ok) return inputFailed(clicked, `type ${name}`);
         let activeRef = loc.kind === "ax" ? "" : loc.ref;
         let retargetNote = "";
@@ -1843,7 +2004,8 @@ export function createPageHelperHandler(
         const isPic = !quiet && (await picture.isPicture(targetId));
         const beforeHash = isPic ? await picture.canvasHash(targetId) : "";
         const before = quiet || isPic ? undefined : await evalHelper({ kind: "bc", method: "baseline" }, targetId);
-        const res = await pressKey(keyName, targetId);
+        const natural = isNatural(input);
+        const res = await pressKey(keyName, targetId, natural ? planKeyHold(rng) : 0);
         if (!res.ok) return inputFailed(res, `key ${keyName}`);
         if (isPic) return success(`key ${keyName}: sent\n${await picture.pictureChanges(targetId, beforeHash)}`);
         return withChanges(`key ${keyName}: sent`, before?.ok ? valueOf(before) : undefined, quiet, targetId);
@@ -1986,6 +2148,7 @@ export function createPageHelperHandler(
     browseTab: number | undefined,
   ): Promise<InvokeResult> {
     if (browseTab !== undefined) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: hover needs a DevTools tab");
+    const natural = isNatural(input);
     if (Array.isArray(input["xy"])) {
       const [x, y] = (input["xy"] as unknown[]).map(Number);
       if (!Number.isFinite(x) || !Number.isFinite(y)) {
@@ -1997,20 +2160,29 @@ export function createPageHelperHandler(
       );
       if (!hit.ok) return hit;
       const [before, what] = valueOf(hit).split("\n");
-      const moved = await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: x!, y: y! }, targetId, INPUT_TIMEOUT_MS);
+      const moved = natural
+        ? await movePointer({ x: x!, y: y! }, targetId)
+        : await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: x!, y: y! }, targetId, INPUT_TIMEOUT_MS);
       if (!moved.ok) return inputFailed(moved, `hover ${x},${y}`);
+      if (natural) await pause(planClickTiming(1, rng).dwellMs);
       return withChanges(`hover ${x},${y}: delivered. ${what ?? ""}`.trimEnd(), before, quiet, targetId);
     }
     const found = await locate(input["ref"], "click", targetId);
     if (!found.ok) return found.res;
-    const at = await pointOf(found.loc, targetId, !quiet);
+    const at = await pointOf(found.loc, targetId, !quiet, natural);
     if (!at.ok) return at.res;
     if (at.pt.hidden) {
       const foc = await cdp("Emulation.setFocusEmulationEnabled", { enabled: true }, targetId);
       if (!foc.ok) return foc;
     }
-    const moved = await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: at.pt.x, y: at.pt.y }, targetId, INPUT_TIMEOUT_MS);
+    const moved = natural
+      ? await movePointer({ x: at.pt.x, y: at.pt.y }, targetId, {
+          viewport: at.pt.viewport,
+          targetSize: at.pt.box ? Math.min(at.pt.box.width, at.pt.box.height) : undefined,
+        })
+      : await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: at.pt.x, y: at.pt.y }, targetId, INPUT_TIMEOUT_MS);
     if (!moved.ok) return inputFailed(moved, `hover ${nameOf(found.loc)}`);
+    if (natural) await pause(planClickTiming(1, rng).dwellMs);
     return withChanges(`hover ${nameOf(found.loc)} at ${at.pt.x},${at.pt.y}: delivered`, at.pt.before, quiet, targetId);
   }
 
@@ -2039,9 +2211,12 @@ export function createPageHelperHandler(
       }
       return res;
     }
-    await releaseKeys(targetId);
-    if (accept) return success(typeof params["promptText"] === "string" ? `dialog accept: accepted with prompt text ${js(params["promptText"])}` : "dialog accept: accepted");
-    return success("dialog dismiss: dismissed");
+    // Nothing is re-sent automatically: the release a dialog blocked is reported as still held.
+    const held = HELD_KINDS.flatMap((kind) => heldByTab.get(heldSlot(targetId, kind)) ?? []);
+    const head = accept
+      ? typeof params["promptText"] === "string" ? `dialog accept: accepted with prompt text ${js(params["promptText"])}` : "dialog accept: accepted"
+      : "dialog dismiss: dismissed";
+    return success([head, ...held.map(heldLine)].join("\n"));
   }
 
   const mediaByTarget = new Map<string, Map<string, string>>();
@@ -2709,7 +2884,13 @@ export function createPageHelperHandler(
         let challengeReport: string | undefined;
         const challengeBackend = challengeBackendOf(targetId);
         for (const [i, step] of steps.entries()) {
-          const res = await act(step.action, { ...step.input, quiet: true }, targetId, true, browseTab, true);
+          const stepInput: Json = {
+            ...(input["fast"] === true ? { fast: true } : {}),
+            ...(input["_natural"] !== undefined ? { _natural: input["_natural"] } : {}),
+            ...step.input,
+            quiet: true,
+          };
+          const res = await act(step.action, stepInput, targetId, true, browseTab, true);
           if (!res.ok) {
             out.push(`${i + 1}. ${step.label}: FAILED ${messageOf(res)}`);
             stopped = `step ${i + 1} failed`;
@@ -3135,9 +3316,10 @@ export function createPageHelperHandler(
     invoke("evaluate", { expression, ...(tid ? { targetId: tid } : {}) }),
   );
 
-  return async function handlePageWithRemedies(action: string, input: Json, targetId?: string): Promise<InvokeResult> {
+  const handlePageWithRemedies = async (action: string, input: Json, targetId?: string): Promise<InvokeResult> => {
     const res = await handlePage(action, input, targetId);
     if (!res.ok) return failure(res.error.code, withRemedy(res.error.message));
     return res;
   };
+  return handlePageWithRemedies;
 }

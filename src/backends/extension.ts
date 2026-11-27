@@ -948,6 +948,8 @@ export interface ExtensionBackend extends Backend {
   getConnectedBrowsers(): ConnectedBrowserInfo[];
   getHandshakeRecords(): RelayHandshakeRecord[];
   request(op: string, params?: Record<string, unknown>, timeoutMs?: number, browserSlug?: string): Promise<unknown>;
+  /** Canonical `extension:<slug>:<tabId>` for a target id, so a short id and its browser-qualified form agree. */
+  resolveTargetKey(targetId: unknown): string | undefined;
   bcCall(input: BcCallInput): Promise<{ value: unknown }>;
   waitForConnection(timeoutMs?: number): Promise<void>;
 }
@@ -1904,6 +1906,15 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
 
     getConnectedBrowsers,
     getHandshakeRecords,
+
+    resolveTargetKey(targetId) {
+      try {
+        const resolved = resolveTarget(targetId);
+        return resolved ? eventKey(resolved.link, resolved.tabId) : undefined;
+      } catch {
+        return undefined;
+      }
+    },
 
     start,
     waitForConnection,

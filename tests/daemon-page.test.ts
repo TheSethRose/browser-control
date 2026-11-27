@@ -95,6 +95,7 @@ function makeFakeInvoker(options: {
         return ok(seq[Math.min(hashIdx++, seq.length - 1)]!);
       }
       if (expr.includes("__bc.typingField")) return ok(options.field ?? "");
+      if (expr.includes("__bc.hitCheck")) return ok('{"ok":true}');
       if (expr.includes("__bc.hit")) return ok("https://a.test/x\nhit: canvas#c");
       if (expr.includes("__bc.diff")) return ok('+ button "Extra" [e9]');
       if (expr.includes("__bc.point")) return ok(expr.includes("__bc.baseline()") ? `https://a.test/x ${point}` : point);
@@ -239,7 +240,7 @@ describe("daemon page helpers", () => {
       rng: () => 0.5, // deterministic, no typo triggered at 0.5 >= 0.045
     });
 
-    const human = await handle("type", { ref: "e2", text: "hello", quiet: true });
+    const human = await handle("type", { ref: "e2", text: "hello", quiet: true, _natural: true });
     expect(text(human)).toContain("delivered (read back matches)");
     const humanKeys = calls.filter((c) => c.op === "execute_cdp" && c.input["method"] === "Input.dispatchKeyEvent");
     expect(humanKeys).toHaveLength(10); // 5 chars * (keyDown + keyUp)
@@ -257,8 +258,8 @@ describe("daemon page helpers", () => {
     ]);
 
     const keysMock = makeFakeInvoker({ readback: "ab" });
-    const keysHandle = createPageHelperHandler(keysMock.invoke);
-    const keysRes = await keysHandle("type", { ref: "e2", text: "ab", keys: true, quiet: true });
+    const keysHandle = createPageHelperHandler(keysMock.invoke, undefined, undefined, { sleep: async () => {}, rng: () => 0.5 });
+    const keysRes = await keysHandle("type", { ref: "e2", text: "ab", keys: true, quiet: true, _natural: true });
     expect(text(keysRes)).toContain("delivered (read back matches)");
     const keyEvents = keysMock.calls.filter((c) => c.op === "execute_cdp" && c.input["method"] === "Input.dispatchKeyEvent");
     expect(keyEvents).toHaveLength(4);
@@ -271,24 +272,28 @@ describe("daemon page helpers", () => {
     const live = (type: string, flags = "") => `{"type":"${type}","flags":[${flags}]}`;
     for (const [field, typos] of [["", false], [live("number"), false], [live("text", '"payment"'), false], [live("text"), true]] as const) {
       const m = makeFakeInvoker({ field });
-      await createPageHelperHandler(m.invoke, undefined, undefined, { ...quick, rng: () => 0 })("type", { ref: "e2", text: "123e45 and more", quiet: true });
+      await createPageHelperHandler(m.invoke, undefined, undefined, { ...quick, rng: () => 0 })("type", { _natural: true, ref: "e2", text: "123e45 and more", quiet: true });
       expect(keys(m.calls).some((k) => k["key"] === "Backspace")).toBe(typos);
     }
 
     const emoji = makeFakeInvoker({ field: live("text") });
-    await createPageHelperHandler(emoji.invoke, undefined, undefined, quick)("type", { ref: "e2", text: "go 🚀", quiet: true });
+    await createPageHelperHandler(emoji.invoke, undefined, undefined, quick)("type", { _natural: true, ref: "e2", text: "go 🚀", quiet: true });
     expect(cdpMethods(emoji.calls)).not.toContain("Input.insertText");
     expect(keys(emoji.calls).filter((k) => k["key"] === "🚀").map((k) => [k["type"], k["text"]])).toEqual([["keyDown", "🚀"], ["keyUp", undefined]]);
 
-    // A keyDown that timed out behind a dialog is released once the dialog closes.
-    let blocked = true;
-    const timeout = { ok: false as const, error: { code: "EXECUTION_FAILED" as const, message: "CDP_TIMEOUT" } };
-    const stuck = makeFakeInvoker({ onCdp: (method) => (blocked && method === "Input.dispatchKeyEvent" ? timeout : undefined) });
-    const stuckHandle = createPageHelperHandler(stuck.invoke, undefined, undefined, quick);
-    expect(text(await stuckHandle("type", { ref: "e2", text: "hi", quiet: true }))).toContain("delivered_unverified");
-    blocked = false;
-    await stuckHandle("dialog", { sub: "accept" });
-    expect(keys(stuck.calls).at(-1)).toMatchObject({ type: "keyUp", key: "h" });
+    // A keyUp a dialog refused is reported as held and never re-sent, even after the dialog closes.
+    const refused = { ok: false as const, error: { code: "EXECUTION_FAILED" as const, message: "DIALOG_OPEN: alert" } };
+    let ups = 0;
+    const blocked = makeFakeInvoker({
+      field: live("text"),
+      onCdp: (method, params) => (method === "Input.dispatchKeyEvent" && params["type"] === "keyUp" && ups++ === 0 ? refused : undefined),
+    });
+    const blockedHandle = createPageHelperHandler(blocked.invoke, undefined, undefined, quick);
+    expect(text(await blockedHandle("type", { _natural: true, ref: "e2", text: "hi", quiet: true }))).toContain("# HELD: key h still down. It was not sent again");
+    const sentBefore = keys(blocked.calls).length;
+    expect(keys(blocked.calls).filter((k) => k["type"] === "keyUp" && k["key"] === "h")).toHaveLength(1);
+    expect(text(await blockedHandle("dialog", { sub: "accept" }))).toContain("# HELD: key h still down");
+    expect(keys(blocked.calls)).toHaveLength(sentBefore);
 
     // Events run against elapsed time, so 8 ms per CDP round trip doesn't slow the typing,
     // and after one 500 ms stall the later gaps keep their planned length.
@@ -304,7 +309,7 @@ describe("daemon page helpers", () => {
         },
       });
       const opts = { rng: createSeededRng(7), now: () => clock, sleep: async (ms: number) => void (clock += ms) };
-      await createPageHelperHandler(m.invoke, undefined, undefined, opts)("type", { ref: "e2", text: line, quiet: true });
+      await createPageHelperHandler(m.invoke, undefined, undefined, opts)("type", { _natural: true, ref: "e2", text: line, quiet: true });
       return at;
     };
     const steps = (at: number[]) => at.slice(1).map((t, i) => t - at[i]!);
@@ -312,8 +317,9 @@ describe("daemon page helpers", () => {
     const wpmOf = (at: number[]) => (line.length / 5) / ((at.at(-1)! - at[0]!) / 60000);
     const [ideal, slow] = [wpmOf(await dispatchTimes(0)), wpmOf(await dispatchTimes(8))];
     expect(Math.abs(slow - ideal) / ideal).toBeLessThan(0.01);
-    expect(slow).toBeGreaterThanOrEqual(75 * 0.85);
-    expect(slow).toBeLessThanOrEqual(95 * 1.15);
+    // One line is a single sample of the 75-95 wpm band at speed 0.85-1.15, so allow 5% noise.
+    expect(slow).toBeGreaterThanOrEqual(75 * 0.85 * 0.95);
+    expect(slow).toBeLessThanOrEqual(95 * 1.15 * 1.05);
   });
 
   test("select handles native <select> and custom ARIA comboboxes", async () => {
@@ -562,7 +568,7 @@ describe("picture pages and daemon script flags", () => {
       sleep: async () => {},
       rng: () => 0.5,
     });
-    const res = await handle("type", { focused: true, text: "hi", quiet: true });
+    const res = await handle("type", { focused: true, text: "hi", quiet: true, _natural: true });
     expect(text(res)).toStartWith("type --focused: sent");
     expect(cdpMethods(calls)).toEqual([
       "Input.dispatchKeyEvent",
