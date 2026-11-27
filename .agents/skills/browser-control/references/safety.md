@@ -1,6 +1,6 @@
 # Account Safety and Action Rules
 
-This skill drives the user's real, signed-in browser. Actions land on their real accounts, and sites with anti-abuse systems can lock an account that behaves like a bot. These rules apply to both DevTools and `browse:<n>` tabs.
+This skill drives the user's real, signed-in browser. Actions land on their real accounts, and sites with anti-abuse systems can lock an account that behaves like a bot. These rules apply to extension, DevTools, and `browse:<n>` tabs.
 
 ## Inspect and pace
 
@@ -11,9 +11,18 @@ This skill drives the user's real, signed-in browser. Actions land on their real
 
 - **Stop on warning signs:** HTTP 429, rate-limit messages, sign-out or re-auth prompts, repeated failures, a `# WALL:` line from `snap`, or a change you didn't make.
 - **CAPTCHA and account checkpoints:** capture the visible state and hand control back to the user:
-  - On a DevTools tab: bring the tab to the front (`Target.activateTarget`), say in one sentence what they need to do, and wait for them to say they're done. Don't read the page or act while they work. Then `snap` again, since the page has changed.
+  - Run `$BCD handoff '<one sentence: what the user needs to do>'`. On an extension tab it expands the `Agents · N` group, brings the tab forward, and shows a "Your turn" card with your message. Password managers work normally while it waits. The command returns when the user clicks **Continue** (or after `--timeout <s>`, default 10 minutes). Then `snap` again, since the page has changed. In `script`, use `await page.handoff('<message>')`.
+  - On a DevTools tab without `handoff`: bring the tab to the front (`Target.activateTarget`), say in one sentence what they need to do, and wait for them to say they're done. Don't read the page or act while they work. Then `snap` again, since the page has changed.
   - On a `browse:<n>` tab: run `browse handoff '<message>' <n>` and wait for their reply.
   - Never solve or bypass a challenge.
+
+## Bot challenges and block pages
+
+`nav`, `snap`, and `do` check the page for bot checks (Cloudflare, Akamai, DataDome, PerimeterX, Imperva, AWS WAF, reCAPTCHA, hCaptcha) and block pages. The output then has one line that says what to do:
+
+- `CHALLENGE: ... It should clear by itself` means a check that runs without a person. The daemon already waited briefly. Wait a little, then read the page again.
+- `CHALLENGE: ... A person has to answer it` means the user must solve it. Run `handoff` with the message the line suggests, and wait.
+- `BLOCKED: ...` means the site refused the visit. Stop and tell the user. Don't retry or reload. Repeated tries make the block worse for the user's IP address.
 
 ## Approvals and boundaries
 
