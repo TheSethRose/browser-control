@@ -17,20 +17,20 @@ import { createPageHelperHandler } from "../src/page-runner";
 
 type Call = { op: string; input: Record<string, unknown> };
 
+type MockOptions = {
+  chars?: number;
+  url?: string;
+  readback?: string;
+  locate?: Record<string, string>;
+  /** Runs inside the mocked `navigate`, so a test can advance its fake clock over a slow load. */
+  onNavigate?: () => void;
+};
+
 /**
  * Minimal page-helper invoker: serves the helper expressions the pacing hooks read and lets the
  * test set the document text length, the current URL, and the typed readback.
  */
-function makeMock(
-  options: {
-    chars?: number;
-    url?: string;
-    readback?: string;
-    locate?: Record<string, string>;
-    /** Runs inside the mocked `navigate`, so a test can advance its fake clock over a slow load. */
-    onNavigate?: () => void;
-  } = {},
-) {
+function makeMock(options: MockOptions = {}) {
   const calls: Call[] = [];
   let url = options.url ?? "https://a.test/1";
   let installed = false;
@@ -118,6 +118,21 @@ function makeClock() {
   };
 }
 
+type HandlerOptions = NonNullable<Parameters<typeof createPageHelperHandler>[3]>;
+
+/** A pacing handler over a mock, wired to a fake clock. `rng` 0.5 makes each planner hit its midpoint. */
+function pane(options: MockOptions = {}, extra: HandlerOptions = {}) {
+  const mock = makeMock(options);
+  const clock = makeClock();
+  const handle = createPageHelperHandler(mock.invoke, undefined, undefined, {
+    sleep: clock.sleep,
+    rng: () => 0.5,
+    now: clock.now,
+    ...extra,
+  });
+  return { mock, clock, handle };
+}
+
 let cfgDir: string;
 let prevNatural: string | undefined;
 let prevXdg: string | undefined;
@@ -139,42 +154,32 @@ afterEach(async () => {
 });
 
 describe("pacing planners — bounds and seeded determinism", () => {
-  test("planThinkPause stays in 160–420 ms and subtracts settling time", () => {
-    for (let seed = 1; seed <= 200; seed++) {
-      const rng = createSeededRng(seed);
-      const pause = planThinkPause(rng);
-      expect(pause).toBeGreaterThanOrEqual(160);
-      expect(pause).toBeLessThanOrEqual(420);
-      // A settle longer than the planned pause owes nothing.
-      expect(planThinkPause(createSeededRng(seed), 5_000)).toBe(0);
-      // Partial settling subtracts exactly the elapsed time.
-      expect(planThinkPause(createSeededRng(seed), 100)).toBe(pause - 100);
+  const PLANNERS = [
+    { plan: (rng: () => number) => planThinkPause(rng), lo: 160, hi: 420 },
+    { plan: (rng: () => number) => planNavDwell(4_000, rng), lo: 220, hi: 850 },
+    { plan: (rng: () => number) => planPaginationGap(rng), lo: 1_600, hi: 2_800 },
+  ];
+
+  test("every planner stays in bounds and repeats for a seed", () => {
+    for (const { plan, lo, hi } of PLANNERS) {
+      for (let seed = 1; seed <= 200; seed++) {
+        const value = plan(createSeededRng(seed));
+        expect(value).toBeGreaterThanOrEqual(lo);
+        expect(value).toBeLessThanOrEqual(hi);
+        expect(plan(createSeededRng(seed))).toBe(value);
+      }
     }
-    const a = [planThinkPause(createSeededRng(7)), planThinkPause(createSeededRng(7), 40)];
-    const b = [planThinkPause(createSeededRng(7)), planThinkPause(createSeededRng(7), 40)];
-    expect(a).toEqual(b);
+    expect(planPaginationGap(createSeededRng(11))).not.toBe(planPaginationGap(createSeededRng(12)));
   });
 
-  test("planNavDwell follows clamp(220 + 0.08·chars·(0.8–1.25), 220, 850)", () => {
+  test("think pause and nav dwell follow their formulas", () => {
     const rng = () => 0.5;
+    expect(planThinkPause(rng)).toBe(290); // triangular(0.5, 160, 420)
+    expect(planThinkPause(rng, 100)).toBe(190); // partial settling subtracts exactly
+    expect(planThinkPause(rng, 5_000)).toBe(0); // a slow settle owes nothing
     expect(planNavDwell(0, rng)).toBe(220);
     expect(planNavDwell(4_000, rng)).toBe(548); // 220 + 0.08 * 4000 * 1.025
     expect(planNavDwell(1_000_000, rng)).toBe(850);
-    for (let seed = 1; seed <= 100; seed++) {
-      const value = planNavDwell(seed * 137, createSeededRng(seed));
-      expect(value).toBeGreaterThanOrEqual(220);
-      expect(value).toBeLessThanOrEqual(850);
-    }
-  });
-
-  test("planPaginationGap stays in 1.6–2.8 s and is seeded", () => {
-    for (let seed = 1; seed <= 100; seed++) {
-      const gap = planPaginationGap(createSeededRng(seed));
-      expect(gap).toBeGreaterThanOrEqual(1600);
-      expect(gap).toBeLessThanOrEqual(2800);
-    }
-    expect(planPaginationGap(createSeededRng(11))).toBe(planPaginationGap(createSeededRng(11)));
-    expect(planPaginationGap(createSeededRng(11))).not.toBe(planPaginationGap(createSeededRng(12)));
   });
 
   test("planTextScrollStep jitters 0.72–0.92 of the height with reading pauses", () => {
@@ -202,29 +207,15 @@ describe("pacing planners — bounds and seeded determinism", () => {
 
 describe("do/fill think pauses", () => {
   test("pauses 160–420 ms between steps but not after the last one", async () => {
-    const mock = makeMock();
-    const clock = makeClock();
-    const handle = createPageHelperHandler(mock.invoke, undefined, undefined, {
-      sleep: clock.sleep,
-      rng: () => 0.5,
-      now: clock.now,
-    });
-
+    const { clock, handle } = pane();
     const res = await handle("do", { steps: [{ key: "Tab" }, { key: "Tab" }, { key: "Tab" }], quiet: true });
     expect(res.ok).toBe(true);
     // triangular(0.5, 160, 420) = 290 with this rng.
     expect(clock.thinkPauses()).toEqual([290, 290]);
   });
 
-  test("no pause after a wait step, and a fast step skips its pause", async () => {
-    const mock = makeMock();
-    const clock = makeClock();
-    const handle = createPageHelperHandler(mock.invoke, undefined, undefined, {
-      sleep: clock.sleep,
-      rng: () => 0.5,
-      now: clock.now,
-    });
-
+  test("skips the pause after a wait step and on a per-step fast", async () => {
+    const { clock, handle } = pane();
     const waited = await handle("do", { steps: [{ key: "Tab" }, { wait: "Ready" }, { key: "Tab" }], quiet: true });
     expect(waited.ok).toBe(true);
     expect(clock.thinkPauses()).toEqual([290]);
@@ -239,28 +230,14 @@ describe("do/fill think pauses", () => {
   });
 
   test("fill paces between fields", async () => {
-    const mock = makeMock({ readback: "v", locate: { Email: "e3", Name: "e4" } });
-    const clock = makeClock();
-    const handle = createPageHelperHandler(mock.invoke, undefined, undefined, {
-      sleep: clock.sleep,
-      rng: () => 0.5,
-      now: clock.now,
-    });
-
+    const { clock, handle } = pane({ readback: "v", locate: { Email: "e3", Name: "e4" } });
     const res = await handle("do", { fill: { Email: "v", Name: "v" }, quiet: true });
     expect(res.ok).toBe(true);
     expect(clock.thinkPauses()).toEqual([290]);
   });
 
   test("--fast and natural off add no pauses anywhere", async () => {
-    const mock = makeMock();
-    const clock = makeClock();
-    const handle = createPageHelperHandler(mock.invoke, undefined, undefined, {
-      sleep: clock.sleep,
-      rng: () => 0.5,
-      now: clock.now,
-    });
-
+    const { clock, handle } = pane();
     const fast = await handle("do", { steps: [{ key: "Tab" }, { key: "Tab" }], fast: true, quiet: true });
     expect(fast.ok).toBe(true);
     expect(clock.sleeps).toHaveLength(0);
@@ -270,155 +247,39 @@ describe("do/fill think pauses", () => {
     expect(off.ok).toBe(true);
     expect(clock.sleeps).toHaveLength(0);
   });
+
+  test("a malformed step is INPUT_INVALID, not a thrown TypeError", async () => {
+    const { handle } = pane();
+    const res = await handle("do", { steps: [null], quiet: true });
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("expected a failure");
+    expect(res.error.code).toBe("INPUT_VALIDATION_FAILED");
+    expect(res.error.message).toContain("INPUT_INVALID");
+  });
 });
 
 describe("post-nav dwell and pagination gap", () => {
-  test("nav adds no sleep, reads add none, and the next input waits the dwell", async () => {
-    const mock = makeMock({ chars: 4_000 });
-    const clock = makeClock();
-    const handle = createPageHelperHandler(mock.invoke, undefined, undefined, {
-      sleep: clock.sleep,
-      rng: () => 0.5,
-      now: clock.now,
-    });
-
+  test("nav and reads never sleep; the next input pays the dwell minus elapsed", async () => {
+    const { clock, handle } = pane({ chars: 4_000 });
     expect((await handle("nav", { url: "https://a.test/1" })).ok).toBe(true);
-    expect(clock.sleeps).toHaveLength(0);
-
     expect((await handle("text", {})).ok).toBe(true);
     expect((await handle("snap", {})).ok).toBe(true);
     expect(clock.sleeps).toHaveLength(0);
 
-    // dwell = 220 + 0.08 * 4000 * 1.025 = 548, nothing elapsed yet.
-    expect((await handle("key", { key: "Tab", quiet: true })).ok).toBe(true);
-    expect(clock.sleeps.at(0)).toBe(548);
-  });
-
-  test("dwell subtracts the time the agent already spent", async () => {
-    const mock = makeMock({ chars: 4_000 });
-    const clock = makeClock();
-    const handle = createPageHelperHandler(mock.invoke, undefined, undefined, {
-      sleep: clock.sleep,
-      rng: () => 0.5,
-      now: clock.now,
-    });
-
-    expect((await handle("nav", { url: "https://a.test/1" })).ok).toBe(true);
+    // dwell = 220 + 0.08 * 4000 * 1.025 = 548; 300 ms of it was reading.
     clock.advance(300);
     expect((await handle("key", { key: "Tab", quiet: true })).ok).toBe(true);
     expect(clock.sleeps.at(0)).toBe(548 - 300);
-  });
-
-  test("a second same-host nav within 4 s waits out the pagination gap", async () => {
-    const mock = makeMock({ chars: 4_000 });
-    const clock = makeClock();
-    const handle = createPageHelperHandler(mock.invoke, undefined, undefined, {
-      sleep: clock.sleep,
-      rng: () => 0.5,
-      now: clock.now,
-    });
-
-    expect((await handle("nav", { url: "https://a.test/1" })).ok).toBe(true);
-    expect(clock.sleeps).toHaveLength(0);
-
-    // gap 2200 ms measured from the first nav at t=0, so this nav at t=500 owes 1700.
-    clock.advance(500);
-    expect((await handle("nav", { url: "https://a.test/2" })).ok).toBe(true);
-    expect(clock.sleeps).toEqual([1_700]);
-
-    // The dwell of the new page still applies before the next input.
-    expect((await handle("key", { key: "Tab", quiet: true })).ok).toBe(true);
-    expect(clock.sleeps).toEqual([1_700, 548, 60]);
 
     // Consumed: later inputs pay only their own key hold.
-    const after = clock.sleeps.length;
-    expect((await handle("key", { key: "Tab", quiet: true })).ok).toBe(true);
-    expect(clock.sleeps.slice(after).every((ms) => ms <= 130)).toBe(true);
-  });
-
-  test("no gap for a different host, after 4 s, or with natural off", async () => {
-    const mock = makeMock({ chars: 4_000 });
-    const clock = makeClock();
-    const handle = createPageHelperHandler(mock.invoke, undefined, undefined, {
-      sleep: clock.sleep,
-      rng: () => 0.5,
-      now: clock.now,
-    });
-
-    expect((await handle("nav", { url: "https://a.test/1" })).ok).toBe(true);
-    clock.advance(300);
-    expect((await handle("nav", { url: "https://b.test/1" })).ok).toBe(true);
-    expect(clock.sleeps).toHaveLength(0);
-    expect((await handle("key", { key: "Tab", quiet: true })).ok).toBe(true);
-    expect(clock.sleeps.at(0)).toBe(548);
-
-    // Same host again, but more than 4 s later.
     clock.sleeps.length = 0;
-    clock.advance(4_500);
-    expect((await handle("nav", { url: "https://b.test/2" })).ok).toBe(true);
-    expect(clock.sleeps).toHaveLength(0);
-
-    // Natural off: nav records nothing at all.
-    process.env["BROWSER_CONTROL_NATURAL"] = "off";
-    clock.sleeps.length = 0;
-    expect((await handle("nav", { url: "https://b.test/3" })).ok).toBe(true);
-    expect((await handle("key", { key: "Tab", quiet: true })).ok).toBe(true);
-    expect(clock.sleeps).toHaveLength(0);
-  });
-
-  test("nav --fast skips the dwell", async () => {
-    const mock = makeMock({ chars: 4_000 });
-    const clock = makeClock();
-    const handle = createPageHelperHandler(mock.invoke, undefined, undefined, {
-      sleep: clock.sleep,
-      rng: () => 0.5,
-      now: clock.now,
-    });
-
-    expect((await handle("nav", { url: "https://a.test/1", fast: true })).ok).toBe(true);
     expect((await handle("key", { key: "Tab", quiet: true })).ok).toBe(true);
     expect(clock.sleeps.every((ms) => ms <= 130)).toBe(true);
   });
 
-  test("nav takes the length from the attach-free probe, never an evaluate on an extension tab", async () => {
-    const bcCalls: BcCallInput[] = [];
-    const mock = makeMock({ chars: 4_000 });
-    const clock = makeClock();
-    const bcCall: BcCallFn = async (input) => {
-      bcCalls.push(input);
-      const values = input.steps.map((step) => {
-        if (step.kind === "href") return "https://a.test/1";
-        if (step.kind === "title") return "Page";
-        if (step.kind !== "bc") return "";
-        if (step.method === "chars") return 4_000;
-        if (step.method === "text") return `# Page | https://a.test/1\n\n${"word ".repeat(600)}`;
-        if (step.method === "query") return "";
-        if (step.method === "settle") return "quiet";
-        return "";
-      });
-      const kept = values.filter((_, i) => !input.steps[i]!.discard);
-      return { value: input.join === undefined ? values.at(-1) : kept.join(input.join) };
-    };
-    const handle = createPageHelperHandler(mock.invoke, undefined, undefined, {
-      bcCall,
-      sleep: clock.sleep,
-      rng: () => 0.5,
-      now: clock.now,
-    });
-
-    expect((await handle("nav", { url: "https://a.test/1" }, "extension:42")).ok).toBe(true);
-    // The char count rides inside the existing bc_call nav probe, so nothing attaches the debugger.
-    expect(bcCalls.some((c) => c.steps.some((s) => s.kind === "bc" && s.method === "chars"))).toBe(true);
-    expect(mock.calls.filter((c) => c.op === "evaluate")).toHaveLength(0);
-
-    expect((await handle("key", { key: "Tab", quiet: true }, "extension:42")).ok).toBe(true);
-    expect(clock.sleeps.at(0)).toBe(548);
-  });
-
-  test("the pagination clock starts at nav dispatch, not after a slow load", async () => {
-    const clock = makeClock();
+  test("pagination runs from nav dispatch and only for same-host navs under 4 s", async () => {
     let slowLoad = true;
-    const mock = makeMock({
+    const { clock, handle } = pane({
       chars: 4_000,
       onNavigate: () => {
         if (!slowLoad) return;
@@ -426,18 +287,88 @@ describe("post-nav dwell and pagination gap", () => {
         clock.advance(1_000);
       },
     });
-    const handle = createPageHelperHandler(mock.invoke, undefined, undefined, {
-      sleep: clock.sleep,
-      rng: () => 0.5,
-      now: clock.now,
-    });
-
     // Nav 1 dispatches at t=0 and finishes at t=1000; nav 2 dispatches at t=1500.
     expect((await handle("nav", { url: "https://a.test/1" })).ok).toBe(true);
     clock.advance(500);
     expect((await handle("nav", { url: "https://a.test/2" })).ok).toBe(true);
-    // Gap 2200 ms from dispatch (t=0) leaves 700 ms, not 1700 as a post-load clock would.
+    // Gap 2200 ms from dispatch (t=0) leaves 700, not 1700 as a post-load clock would.
     expect(clock.sleeps).toEqual([700]);
+
+    // The dwell of the new page still applies before the next input.
+    expect((await handle("key", { key: "Tab", quiet: true })).ok).toBe(true);
+    expect(clock.sleeps).toEqual([700, 548, 60]);
+
+    // Different host, then the same host more than 4 s later: no gap.
+    clock.sleeps.length = 0;
+    clock.advance(300);
+    expect((await handle("nav", { url: "https://b.test/1" })).ok).toBe(true);
+    expect(clock.sleeps).toHaveLength(0);
+    clock.advance(4_500);
+    expect((await handle("nav", { url: "https://b.test/2" })).ok).toBe(true);
+    expect(clock.sleeps).toHaveLength(0);
+  });
+
+  test("nav --fast and a per-step fast skip the dwell, and natural off records nothing", async () => {
+    const { clock, handle } = pane({ chars: 4_000 });
+    expect((await handle("nav", { url: "https://a.test/1", fast: true })).ok).toBe(true);
+    expect((await handle("key", { key: "Tab", quiet: true })).ok).toBe(true);
+    expect(clock.sleeps.every((ms) => ms <= 130)).toBe(true);
+
+    clock.sleeps.length = 0;
+    expect((await handle("nav", { url: "https://a.test/1" })).ok).toBe(true);
+    // The fast step pays no dwell, and the `wait` after it is skipped by pacing, so nothing is owed.
+    expect((await handle("do", { steps: [{ key: "Tab", fast: true }, { wait: "Ready" }], quiet: true })).ok).toBe(true);
+    expect(clock.sleeps.filter((ms) => ms >= 220)).toEqual([]);
+
+    process.env["BROWSER_CONTROL_NATURAL"] = "off";
+    clock.sleeps.length = 0;
+    expect((await handle("nav", { url: "https://a.test/2" })).ok).toBe(true);
+    expect((await handle("key", { key: "Tab", quiet: true })).ok).toBe(true);
+    expect(clock.sleeps).toHaveLength(0);
+  });
+
+  test("the nav probe is attach-free and only asks for the body length when pacing is on", async () => {
+    const bcCalls: BcCallInput[] = [];
+    const calls: Call[] = [];
+    const { invoke } = makeMock({ chars: 4_000 });
+    const clock = makeClock();
+    const bcCall: BcCallFn = async (input) => {
+      bcCalls.push(input);
+      const values = input.steps.map((step) =>
+        step.kind === "href" ? "https://a.test/1" : step.kind === "bc" && step.method === "chars" ? 4_000 : "",
+      );
+      const kept = values.filter((_, i) => !input.steps[i]!.discard);
+      return { value: input.join === undefined ? values.at(-1) : kept.join(input.join) };
+    };
+    const handle = createPageHelperHandler(
+      async (op, input = {}) => {
+        calls.push({ op, input });
+        return invoke(op, input);
+      },
+      undefined,
+      undefined,
+      { bcCall, sleep: clock.sleep, rng: () => 0.5, now: clock.now },
+    );
+    /** Whether the bc probe steps added since `from` asked for the body length. */
+    const readChars = (from: number): boolean =>
+      bcCalls.slice(from).some((c) => c.steps.some((s) => s.kind === "bc" && s.method === "chars"));
+
+    const first = bcCalls.length;
+    expect((await handle("nav", { url: "https://a.test/1" }, "extension:42")).ok).toBe(true);
+    // The count rides inside the existing bc_call nav probe, so nothing attaches the debugger.
+    expect(readChars(first)).toBe(true);
+    expect(calls.filter((c) => c.op === "evaluate")).toHaveLength(0);
+    expect((await handle("key", { key: "Tab", quiet: true }, "extension:42")).ok).toBe(true);
+    expect(clock.sleeps.at(0)).toBe(548);
+
+    // --fast and natural off pay no dwell, so they never read the body text at all.
+    const fast = bcCalls.length;
+    expect((await handle("nav", { url: "https://a.test/2", fast: true }, "extension:42")).ok).toBe(true);
+    expect(readChars(fast)).toBe(false);
+    process.env["BROWSER_CONTROL_NATURAL"] = "off";
+    const off = bcCalls.length;
+    expect((await handle("nav", { url: "https://a.test/3" }, "extension:42")).ok).toBe(true);
+    expect(readChars(off)).toBe(false);
   });
 
   test("implicit targets on different tabs never share dwell state", async () => {
@@ -467,44 +398,11 @@ describe("post-nav dwell and pagination gap", () => {
   });
 
   test("hover pays the post-nav dwell before it moves the pointer", async () => {
-    const mock = makeMock({ chars: 4_000 });
-    const clock = makeClock();
-    const handle = createPageHelperHandler(mock.invoke, undefined, undefined, {
-      sleep: clock.sleep,
-      rng: () => 0.5,
-      now: clock.now,
-    });
-
+    const { clock, handle } = pane({ chars: 4_000 });
     expect((await handle("nav", { url: "https://a.test/1" })).ok).toBe(true);
     clock.sleeps.length = 0;
     expect((await handle("hover", { ref: "e5" })).ok).toBe(true);
     expect(clock.sleeps.at(0)).toBe(548);
-  });
-
-  test("a malformed step is INPUT_INVALID, not a thrown TypeError", async () => {
-    const mock = makeMock();
-    const handle = createPageHelperHandler(mock.invoke, undefined, undefined, { now: () => 0 });
-    const res = await handle("do", { steps: [null], quiet: true });
-    expect(res.ok).toBe(false);
-    if (res.ok) throw new Error("expected a failure");
-    expect(res.error.code).toBe("INPUT_VALIDATION_FAILED");
-    expect(res.error.message).toContain("INPUT_INVALID");
-  });
-
-  test("a fast step skips the nav dwell on that step", async () => {
-    const mock = makeMock({ chars: 4_000 });
-    const clock = makeClock();
-    const handle = createPageHelperHandler(mock.invoke, undefined, undefined, {
-      sleep: clock.sleep,
-      rng: () => 0.5,
-      now: clock.now,
-    });
-
-    expect((await handle("nav", { url: "https://a.test/1" })).ok).toBe(true);
-    clock.sleeps.length = 0;
-    // The fast step pays no dwell, and the `wait` after it is skipped by pacing, so nothing is owed.
-    expect((await handle("do", { steps: [{ key: "Tab", fast: true }, { wait: "Ready" }], quiet: true })).ok).toBe(true);
-    expect(clock.sleeps.filter((ms) => ms >= 220)).toEqual([]);
   });
 });
 
@@ -516,21 +414,13 @@ describe("text --scroll pace", () => {
     return { factors: parse(match[1]!), pauses: parse(match[2]!) };
   };
 
-  const lastScrollExpr = (mock: ReturnType<typeof makeMock>): string => {
-    const expr = String(
-      mock.calls.filter((c) => c.op === "evaluate").at(-1)?.input["expression"] ?? "",
-    );
-    return expr;
-  };
+  const lastScrollExpr = (mock: ReturnType<typeof makeMock>): string =>
+    String(mock.calls.filter((c) => c.op === "evaluate").at(-1)?.input["expression"] ?? "");
 
   test("natural on plans jittered steps; --fast sends no plan and keeps the plain reader", async () => {
-    const naturalMock = makeMock();
-    const natural = createPageHelperHandler(naturalMock.invoke, undefined, undefined, {
-      rng: createSeededRng(42),
-      now: () => 0,
-    });
-    expect((await natural("text", { scroll: true })).ok).toBe(true);
-    const plan = scrollPaceOf(lastScrollExpr(naturalMock));
+    const natural = pane({}, { rng: createSeededRng(42) });
+    expect((await natural.handle("text", { scroll: true })).ok).toBe(true);
+    const plan = scrollPaceOf(lastScrollExpr(natural.mock));
     expect(plan).toBeDefined();
     expect(plan!.factors).toHaveLength(64);
     expect(plan!.pauses).toHaveLength(64);
@@ -542,21 +432,9 @@ describe("text --scroll pace", () => {
       expect((pause >= 140 && pause <= 290) || (pause >= 320 && pause <= 600)).toBe(true);
     }
 
-    const fastMock = makeMock();
-    const fast = createPageHelperHandler(fastMock.invoke, undefined, undefined, {
-      rng: createSeededRng(42),
-      now: () => 0,
-    });
-    expect((await fast("text", { scroll: true, fast: true })).ok).toBe(true);
-    expect(scrollPaceOf(lastScrollExpr(fastMock))).toBeUndefined();
-  });
-
-  test("the in-page reader honors the provided plan and stays plain JavaScript", () => {
-    expect(PAGE_HELPERS_SOURCE).toContain("opts.scrollPace");
-    expect(PAGE_HELPERS_SOURCE).toContain("scrollPace.factors");
-    expect(() => new Function(PAGE_HELPERS_SOURCE)).not.toThrow();
-    // No debugger attach anywhere in the page helper.
-    expect(PAGE_HELPERS_SOURCE).not.toContain("Runtime.enable");
+    const fast = pane({}, { rng: createSeededRng(42) });
+    expect((await fast.handle("text", { scroll: true, fast: true })).ok).toBe(true);
+    expect(scrollPaceOf(lastScrollExpr(fast.mock))).toBeUndefined();
   });
 
   test("the plan cycles past its 64 steps and the 200 px floor is fast-path only", () => {
@@ -568,10 +446,14 @@ describe("text --scroll pace", () => {
     expect(source).toContain("Number.isFinite(factor) ? Math.round(height * factor) : Math.max(200");
   });
 
-  test("helpers v11 ships the attach-free chars reader and the extension copy matches", () => {
+  test("helpers v11 ship the attach-free chars reader, stay plain JavaScript, and match the extension copy", () => {
     expect(PAGE_HELPERS_VERSION).toBe(11);
     expect(PAGE_HELPERS_SOURCE).toContain("scrollRead, text, chars,");
+    expect(PAGE_HELPERS_SOURCE).toContain("opts.scrollPace");
+    expect(PAGE_HELPERS_SOURCE).toContain("scrollPace.factors");
     expect(() => new Function(PAGE_HELPERS_SOURCE)).not.toThrow();
+    // No debugger attach anywhere in the page helper.
+    expect(PAGE_HELPERS_SOURCE).not.toContain("Runtime.enable");
     const shipped = readFileSync(new URL("../extension/page-helpers.js", import.meta.url), "utf8");
     expect(shipped).toBe(PAGE_HELPERS_SOURCE);
   });
