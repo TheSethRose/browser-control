@@ -5,11 +5,12 @@
 export const CHUNK_MAX_DATA_BYTES = 512 * 1024;
 export const TRANSPORT_MAX_PAYLOAD_BYTES = 1024 * 1024;
 export const POST_AUTH_MAX_BYTES = 64 * 1024 * 1024;
+export const MAX_CONCURRENT_STREAMS = 16;
+export const STREAM_TIMEOUT_MS = 30_000;
+export const MAX_ABORTED_STREAMS = 64;
 
 // Leave comfortable headroom below 1 MiB for JSON envelope keys and quote/backslash escaping.
 const DEFAULT_MAX_FRAME_BYTES = 900 * 1024;
-const DEFAULT_MAX_CONCURRENT_STREAMS = 32;
-const DEFAULT_STREAM_TIMEOUT_MS = 60_000;
 
 const encoder = new TextEncoder();
 
@@ -37,7 +38,7 @@ function sliceUtf8Chunk(text, start, maxDataBytes) {
     const lastCode = text.charCodeAt(end - 1);
     if (lastCode >= 0xd800 && lastCode <= 0xdbff) end -= 1;
   }
-  let slice = text.slice(start, end);
+  const slice = text.slice(start, end);
   if (utf8ByteLength(slice) <= maxDataBytes) return slice;
 
   // Binary search the largest code-unit length whose UTF-8 size fits in maxDataBytes.
@@ -120,35 +121,70 @@ export function encodeMessage(obj, options = {}) {
 
 /**
  * Stateful reassembler for incoming `{ type: "chunk", id, seq, last, data }` streams.
- * Rejects out-of-order sequences, per-chunk > 512 KiB payloads, and > 64 MiB total streams
- * with a clean per-request error result without requiring the socket to close.
+ * Caps per-chunk bytes (512 KiB), per-stream bytes (64 MiB), aggregate unfinished bytes across
+ * all streams (64 MiB), concurrent open streams (16), remembered rejected IDs (64), and expires
+ * idle streams on a timer 30 s after their last chunk.
  */
 export function createFrameDecoder(options = {}) {
   const maxDataBytes = options.maxDataBytes ?? CHUNK_MAX_DATA_BYTES;
   const maxTotalBytes = options.maxTotalBytes ?? POST_AUTH_MAX_BYTES;
-  const maxConcurrent = options.maxConcurrent ?? DEFAULT_MAX_CONCURRENT_STREAMS;
-  const streamTimeoutMs = options.streamTimeoutMs ?? DEFAULT_STREAM_TIMEOUT_MS;
+  const maxBufferedBytes = options.maxBufferedBytes ?? maxTotalBytes;
+  const maxConcurrent = options.maxConcurrent ?? MAX_CONCURRENT_STREAMS;
+  const streamTimeoutMs = options.streamTimeoutMs ?? STREAM_TIMEOUT_MS;
+  const maxAbortedIds = options.maxAbortedIds ?? MAX_ABORTED_STREAMS;
   const now = options.now ?? (() => Date.now());
+  const onExpire = typeof options.onExpire === "function" ? options.onExpire : undefined;
 
-  const streams = new Map(); // id -> { nextSeq, totalBytes, parts, startedAt }
-  const aborted = new Map(); // id -> abortedAt
+  const streams = new Map(); // id -> { nextSeq, totalBytes, parts, lastActivityAt, timer, reqId }
+  const aborted = new Map(); // id -> abortedAt (insertion-ordered LRU capped at maxAbortedIds)
+  let totalBufferedBytes = 0;
 
-  function pruneExpired() {
-    const t = now();
-    for (const [id, entry] of streams) {
-      if (t - entry.startedAt > streamTimeoutMs) streams.delete(id);
+  function deleteStream(id) {
+    const entry = streams.get(id);
+    if (!entry) return undefined;
+    if (entry.timer !== undefined) clearTimeout(entry.timer);
+    totalBufferedBytes = Math.max(0, totalBufferedBytes - entry.totalBytes);
+    streams.delete(id);
+    return entry;
+  }
+
+  function rememberAborted(id) {
+    aborted.delete(id);
+    aborted.set(id, now());
+    while (aborted.size > maxAbortedIds) {
+      const oldest = aborted.keys().next().value;
+      if (oldest === undefined) break;
+      aborted.delete(oldest);
     }
+  }
+
+  function scheduleExpiry(id, entry) {
+    if (entry.timer !== undefined) clearTimeout(entry.timer);
+    entry.lastActivityAt = now();
+    const timer = setTimeout(() => {
+      if (streams.get(id) !== entry) return;
+      deleteStream(id);
+      if (onExpire) onExpire({ id, reqId: entry.reqId });
+    }, streamTimeoutMs);
+    if (timer && typeof timer === "object" && typeof timer.unref === "function") {
+      timer.unref();
+    }
+    entry.timer = timer;
+  }
+
+  function pruneExpiredAborted() {
+    const t = now();
     for (const [id, ts] of aborted) {
       if (t - ts > streamTimeoutMs) aborted.delete(id);
     }
   }
 
   function abortStream(id, isLast) {
-    streams.delete(id);
+    deleteStream(id);
     if (isLast) {
       aborted.delete(id);
     } else {
-      aborted.set(id, now());
+      rememberAborted(id);
     }
   }
 
@@ -158,7 +194,7 @@ export function createFrameDecoder(options = {}) {
         return { kind: "message", message: msg };
       }
 
-      pruneExpired();
+      pruneExpiredAborted();
 
       const rawId = msg.id;
       const validId =
@@ -224,7 +260,7 @@ export function createFrameDecoder(options = {}) {
             error: `EXECUTION_FAILED: too many concurrent chunked streams (limit ${maxConcurrent})`,
           };
         }
-        entry = { nextSeq: 0, totalBytes: 0, parts: [], startedAt: now() };
+        entry = { nextSeq: 0, totalBytes: 0, parts: [], lastActivityAt: now(), timer: undefined, reqId };
         streams.set(id, entry);
       }
 
@@ -248,15 +284,27 @@ export function createFrameDecoder(options = {}) {
         };
       }
 
+      if (totalBufferedBytes + chunkBytes > maxBufferedBytes) {
+        abortStream(id, last);
+        return {
+          kind: "error",
+          id,
+          reqId,
+          error: `EXECUTION_FAILED: chunked buffer limit exceeded (aggregate unfinished bytes > ${maxBufferedBytes} limit)`,
+        };
+      }
+
       entry.parts.push(data);
       entry.totalBytes += chunkBytes;
+      totalBufferedBytes += chunkBytes;
       entry.nextSeq += 1;
 
       if (!last) {
+        scheduleExpiry(id, entry);
         return { kind: "pending", id, seq, totalBytes: entry.totalBytes };
       }
 
-      streams.delete(id);
+      deleteStream(id);
       const joined = entry.parts.join("");
       try {
         const parsed = JSON.parse(joined);
@@ -276,17 +324,26 @@ export function createFrameDecoder(options = {}) {
 
     clear(id) {
       if (id === undefined) {
-        streams.clear();
+        for (const key of [...streams.keys()]) deleteStream(key);
+        totalBufferedBytes = 0;
         aborted.clear();
       } else {
         const key = String(id);
-        streams.delete(key);
+        deleteStream(key);
         aborted.delete(key);
       }
     },
 
     size() {
       return streams.size;
+    },
+
+    bufferedBytes() {
+      return totalBufferedBytes;
+    },
+
+    abortedSize() {
+      return aborted.size;
     },
   };
 }

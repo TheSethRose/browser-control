@@ -1,24 +1,27 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { randomBytes } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash, randomBytes } from "node:crypto";
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { InvokeResult, OperationHandler } from "@agent-software/core";
+import { applyNavBrowserScope, type NavBrowserScope } from "../daemon";
 import {
   CHUNK_MAX_DATA_BYTES,
   CLOSE_AUTH_REFUSED,
   CLOSE_BAD_HELLO,
   CLOSE_VERSION_MISMATCH,
-  EXTENSION_ID,
   EXTENSION_ORIGIN,
-  PAIR_CODE_MAX_FAILURES,
+  MAX_ABORTED_CHUNK_STREAMS,
+  MAX_CONCURRENT_CHUNK_STREAMS,
   PRE_AUTH_MAX_BYTES,
   PROTOCOL_VERSION,
   RELAY_VERSION,
   TRANSPORT_MAX_PAYLOAD_BYTES,
-  allocateBrowserSlug,
+  ChunkReassembler,
+  OutboundFrameQueue,
+  browserSlugFor,
   createExtensionBackend,
-  createPairingCode,
   ensureRelayToken,
   extProofMessage,
   hmacHex,
@@ -28,50 +31,16 @@ import {
   type ExtensionBackend,
 } from "../src/backends/extension";
 // @ts-expect-error plain JS MV3 module
-import * as extPairingRaw from "../extension/lib/pairing.js";
-// @ts-expect-error plain JS MV3 module
 import * as extFramesRaw from "../extension/lib/frames.js";
-
-type ExtPairingMod = {
-  normalizePairingCode(raw: string): string | null;
-  formatPairingCode(raw: string): string;
-  selectAuthCredentials(
-    stored: Record<string, unknown>,
-    fileCfg: Record<string, unknown> | null,
-    defaultPort?: number,
-  ): { port: number; mode: "browser" | "bootstrap" | "none"; token: string; tokenId?: string; pairingId?: string };
-  unwrapBootstrapToken(params: {
-    wrappedToken: Record<string, unknown>;
-    bootstrapToken: string;
-    port: number;
-    extNonce: string;
-    relayNonce: string;
-    profileId: string;
-  }): Promise<{ token: string; tokenId: string }>;
-  startCodePairing(): Promise<{ keyPair: CryptoKeyPair; ecdhPub: string; extNonce: string }>;
-  buildPairResponse(params: {
-    code: string;
-    port: number;
-    extNonce: string;
-    relayNonce: string;
-    extPubB64: string;
-    relayPubB64: string;
-    keyPair: CryptoKeyPair;
-    salt: string;
-    iterations: number;
-  }): Promise<{ extProof: string; expectedRelayProof: string; pairKey: Uint8Array }>;
-  verifyPairWelcome(params: {
-    welcome: Record<string, unknown>;
-    expectedRelayProof: string;
-    pairKey: Uint8Array;
-    port: number;
-    extNonce: string;
-    relayNonce: string;
-    profileId: string;
-  }): Promise<{ ok: true; token: string; tokenId: string; slug?: string } | { ok: false; error: string }>;
-};
+import { route } from "../src/backends/router";
+import { BackendUnavailable } from "../src/backends/types";
+import { PAGE_HELPERS_VERSION } from "../src/page-helpers";
+import { createPageHelperHandler } from "../src/page-runner";
 
 type ExtFramesMod = {
+  MAX_CONCURRENT_STREAMS: number;
+  STREAM_TIMEOUT_MS: number;
+  MAX_ABORTED_STREAMS: number;
   encodeMessage(
     obj: Record<string, unknown>,
     options?: { id?: string; maxDataBytes?: number; maxFrameBytes?: number; maxTotalBytes?: number },
@@ -81,6 +50,11 @@ type ExtFramesMod = {
   createFrameDecoder(options?: {
     maxDataBytes?: number;
     maxTotalBytes?: number;
+    maxBufferedBytes?: number;
+    maxConcurrent?: number;
+    streamTimeoutMs?: number;
+    maxAbortedIds?: number;
+    onExpire?: (info: { id: string; reqId?: number }) => void;
   }): {
     push(msg: Record<string, unknown>):
       | { kind: "message"; message: Record<string, unknown> }
@@ -89,23 +63,18 @@ type ExtFramesMod = {
       | { kind: "error"; id: string; reqId?: number; error: string };
     clear(id?: string): void;
     size(): number;
+    bufferedBytes(): number;
+    abortedSize(): number;
   };
 };
 
 const {
-  buildPairResponse,
-  formatPairingCode,
-  normalizePairingCode,
-  selectAuthCredentials,
-  startCodePairing,
-  unwrapBootstrapToken,
-  verifyPairWelcome,
-} = extPairingRaw as unknown as ExtPairingMod;
-const { createFrameDecoder, encodeMessage } = extFramesRaw as unknown as ExtFramesMod;
-import { route } from "../src/backends/router";
-import { BackendUnavailable } from "../src/backends/types";
-import { PAGE_HELPERS_VERSION } from "../src/page-helpers";
-import { createPageHelperHandler } from "../src/page-runner";
+  MAX_ABORTED_STREAMS: EXT_MAX_ABORTED_STREAMS,
+  MAX_CONCURRENT_STREAMS: EXT_MAX_CONCURRENT_STREAMS,
+  STREAM_TIMEOUT_MS: EXT_STREAM_TIMEOUT_MS,
+  createFrameDecoder,
+  encodeMessage,
+} = extFramesRaw as unknown as ExtFramesMod;
 
 const disposables: ExtensionBackend[] = [];
 const sockets: WebSocket[] = [];
@@ -211,8 +180,6 @@ type MockHandler = (op: string, params: Record<string, unknown>) => unknown | Pr
 type MockConnectOpts = {
   profileId?: string;
   browser?: string;
-  name?: string;
-  tokenId?: string;
   chunkedResponses?: boolean;
   maxChunkDataBytes?: number;
   manualRequests?: boolean;
@@ -231,6 +198,7 @@ async function connectMockExtension(
   relayNonce: string;
   daemonProofVerified: boolean;
   receivedReqs: Array<{ id: number; op: string; params: Record<string, unknown> }>;
+  receivedChunkFrames: number[];
 }> {
   const ws = openWs(`ws://127.0.0.1:${port}/extension`, EXTENSION_ORIGIN);
   await waitOpen(ws);
@@ -242,8 +210,6 @@ async function connectMockExtension(
       type: "hello",
       profileId: opts.profileId ?? "test-profile-1",
       browser: opts.browser ?? "Chrome",
-      ...(opts.name ? { name: opts.name } : {}),
-      ...(opts.tokenId ? { tokenId: opts.tokenId } : {}),
       version: "2.0.0",
       helpersVersion: PAGE_HELPERS_VERSION,
       protocolVersion: PROTOCOL_VERSION,
@@ -264,10 +230,14 @@ async function connectMockExtension(
   const welcome = await welcomePromise;
 
   const receivedReqs: Array<{ id: number; op: string; params: Record<string, unknown> }> = [];
+  const receivedChunkFrames: number[] = [];
   const decoder = createFrameDecoder();
   if (!opts.manualRequests) {
     ws.addEventListener("message", async (ev) => {
       const rawMsg = JSON.parse(String(ev.data)) as Record<string, unknown>;
+      if (rawMsg["type"] === "chunk" && typeof rawMsg["seq"] === "number") {
+        receivedChunkFrames.push(rawMsg["seq"]);
+      }
       const decoded = decoder.push(rawMsg);
       if (decoded.kind !== "message") return;
       const msg = decoded.message as Record<string, unknown>;
@@ -301,7 +271,16 @@ async function connectMockExtension(
     });
   }
 
-  return { ws, welcome, challenge, extNonce, relayNonce, daemonProofVerified, receivedReqs };
+  return {
+    ws,
+    welcome,
+    challenge,
+    extNonce,
+    relayNonce,
+    daemonProofVerified,
+    receivedReqs,
+    receivedChunkFrames,
+  };
 }
 
 function fakeCdp(log: string[]): Record<string, OperationHandler> {
@@ -506,7 +485,7 @@ describe("extension relay backend", () => {
         if (steps.length === 3 && steps[0]?.method === "settle") {
           return { values: [undefined, "http://127.0.0.1/app", ""] };
         }
-        return { values: ["# App | http://127.0.0.1/app\n- button \"Go\" [e1]"] };
+        return { values: ['# App | http://127.0.0.1/app\n- button "Go" [e1]'] };
       }
       if (op === "eval") {
         if (String(params["expression"]).includes("restricted")) {
@@ -614,10 +593,8 @@ describe("extension relay backend", () => {
     const pairing = JSON.parse(await readFile(setup.pairingFile, "utf8")) as {
       token: string;
       port: number;
-      pairingId: string;
     };
-    expect(setup.pairingId).toMatch(/^[0-9a-f]{32}$/);
-    expect(pairing).toEqual({ token, port: 49222, pairingId: setup.pairingId });
+    expect(pairing).toEqual({ token, port: 49222 });
   });
 
   test("page-runner nav/snap/click/type on extension tab uses bc_call and cdp, never evaluate(__bc)", async () => {
@@ -775,501 +752,59 @@ describe("relay token files", () => {
   });
 });
 
-function waitMessageOrClose(
-  ws: WebSocket,
-  timeoutMs = 3_000,
-): Promise<{ kind: "msg"; msg: Record<string, unknown> } | { kind: "closed"; closed: { code: number; reason: string } }> {
-  return new Promise((resolve, reject) => {
-    if (ws.readyState === WebSocket.CLOSED) {
-      resolve({ kind: "closed", closed: { code: 1006, reason: "" } });
-      return;
-    }
-    const timer = setTimeout(() => reject(new Error("timed out waiting for ws message or close")), timeoutMs);
-    const onMsg = (ev: MessageEvent) => {
-      clearTimeout(timer);
-      ws.removeEventListener("message", onMsg);
-      ws.removeEventListener("close", onClose);
-      resolve({ kind: "msg", msg: JSON.parse(String(ev.data)) as Record<string, unknown> });
-    };
-    const onClose = (ev: CloseEvent) => {
-      clearTimeout(timer);
-      ws.removeEventListener("message", onMsg);
-      ws.removeEventListener("close", onClose);
-      resolve({ kind: "closed", closed: { code: ev.code, reason: ev.reason } });
-    };
-    ws.addEventListener("message", onMsg);
-    ws.addEventListener("close", onClose);
-  });
-}
+describe("Phase 2 slice B: BrowserLinks and chunked frames", () => {
+  test("slug is deterministic and differs per profile", async () => {
+    const expectedA = `chrome-${createHash("sha256").update("profile-alpha", "utf8").digest("hex").slice(0, 6)}`;
+    const expectedB = `chrome-${createHash("sha256").update("profile-beta", "utf8").digest("hex").slice(0, 6)}`;
+    const expectedBrave = `brave-${createHash("sha256").update("profile-alpha", "utf8").digest("hex").slice(0, 6)}`;
 
-async function runCodePairingHandshake(
-  port: number,
-  code: string,
-  opts: { profileId?: string; browser?: string; name?: string } = {},
-): Promise<{
-  ws: WebSocket;
-  welcome?: Record<string, unknown>;
-  unwrapped?: { token: string; tokenId: string; slug?: string };
-  closed?: { code: number; reason: string };
-}> {
-  const profileId = opts.profileId ?? "pair-profile-1";
-  const browser = opts.browser ?? "Brave";
-  const ws = openWs(`ws://127.0.0.1:${port}/extension`, EXTENSION_ORIGIN);
-  await waitOpen(ws);
+    expect(browserSlugFor("Chrome", "profile-alpha")).toBe(expectedA);
+    expect(browserSlugFor("Google Chrome", "profile-alpha")).toBe(expectedA);
+    expect(browserSlugFor("Chrome", "profile-beta")).toBe(expectedB);
+    expect(browserSlugFor("Brave", "profile-alpha")).toBe(expectedBrave);
+    expect(expectedA).not.toBe(expectedB);
 
-  const started = await startCodePairing();
-  const challengeOrClose = waitMessageOrClose(ws);
-  ws.send(
-    JSON.stringify({
-      type: "pair.hello",
-      profileId,
-      browser,
-      ...(opts.name ? { name: opts.name } : {}),
-      version: "2.0.0",
-      helpersVersion: PAGE_HELPERS_VERSION,
-      protocolVersion: PROTOCOL_VERSION,
-      nonce: started.extNonce,
-      ecdhPub: started.ecdhPub,
-    }),
-  );
-
-  const first = await challengeOrClose;
-  if (first.kind === "closed") return { ws, closed: first.closed };
-  expect(first.msg["type"]).toBe("pair.challenge");
-
-  const relayNonce = String(first.msg["nonce"]);
-  const relayPubB64 = String(first.msg["ecdhPub"]);
-  const salt = String(first.msg["salt"]);
-  const iterations = Number(first.msg["iterations"]);
-
-  const built = await buildPairResponse({
-    code,
-    port,
-    extNonce: started.extNonce,
-    relayNonce,
-    extPubB64: started.ecdhPub,
-    relayPubB64,
-    keyPair: started.keyPair,
-    salt,
-    iterations,
-  });
-
-  const welcomeOrClose = waitMessageOrClose(ws);
-  ws.send(JSON.stringify({ type: "pair.response", proof: built.extProof }));
-
-  const second = await welcomeOrClose;
-  if (second.kind === "closed") return { ws, closed: second.closed };
-
-  const verified = await verifyPairWelcome({
-    welcome: second.msg,
-    expectedRelayProof: built.expectedRelayProof,
-    pairKey: built.pairKey,
-    port,
-    extNonce: started.extNonce,
-    relayNonce,
-    profileId,
-  });
-  expect(verified.ok).toBe(true);
-  if (!verified.ok) throw new Error(verified.error);
-
-  return {
-    ws,
-    welcome: second.msg,
-    unwrapped: { token: verified.token, tokenId: verified.tokenId, slug: verified.slug },
-  };
-}
-
-describe("Phase 2 slice B: hardened relay pairing, BrowserLinks, and chunked frames", () => {
-  test("per-browser token is minted, wrapped with AES-256-GCM/HKDF, persisted 0600, and reused on reconnect", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "bc-per-browser-"));
-    tempDirs.push(dir);
-    const tokenFile = join(dir, "extension-relay.json");
-    const browsersFile = join(dir, "extension-browsers.json");
-    const extDir = join(dir, "ext");
-
-    const setup = await setupExtensionPairing(extDir, { tokenFile, port: 49222 });
-    const pairingFile = JSON.parse(await readFile(setup.pairingFile, "utf8")) as {
-      token: string;
-      port: number;
-      pairingId: string;
-    };
-
-    const backend = createExtensionBackend({
-      ...allocPortWindow(),
-      tokenFile,
-      browsersFile,
-      hostname: "MacBook-Pro.local",
-      waitConnectMs: 500,
-    });
+    const token = randomBytes(32).toString("hex");
+    const backend = createExtensionBackend({ ...allocPortWindow(), token, waitConnectMs: 500 });
     disposables.push(backend);
     await backend.start!();
     const port = backend.getPort()!;
 
-    // First connection authenticates with bootstrap token from pairing.json
-    const firstCreds = selectAuthCredentials({}, pairingFile);
-    expect(firstCreds.mode).toBe("bootstrap");
-    expect(firstCreds.token).toBe(pairingFile.token);
-    expect(firstCreds.tokenId).toBeUndefined();
-
-    const first = await connectMockExtension(port, firstCreds.token, undefined, {
-      profileId: "prof-chrome-1",
+    const first = await connectMockExtension(port, token, undefined, {
+      profileId: "profile-alpha",
       browser: "Chrome",
     });
-    expect(first.welcome["slug"]).toBe("chrome-macbook-pro");
-    expect(first.welcome["wrappedToken"]).toBeDefined();
-
-    // Unwrap per-browser token via extension/lib/pairing.js (Web Crypto AES-256-GCM + HKDF-SHA256)
-    const unwrapped = await unwrapBootstrapToken({
-      wrappedToken: first.welcome["wrappedToken"] as Record<string, unknown>,
-      bootstrapToken: firstCreds.token,
-      port,
-      extNonce: first.extNonce,
-      relayNonce: first.relayNonce,
-      profileId: "prof-chrome-1",
-    });
-    expect(unwrapped.token).toMatch(/^[0-9a-f]{64}$/);
-    expect(unwrapped.token).not.toBe(pairingFile.token);
-    expect(unwrapped.tokenId).toMatch(/^[0-9a-f]{32}$/);
-
-    // Wrong profileId (AAD mismatch) must fail AES-GCM unwrap
-    await expect(
-      unwrapBootstrapToken({
-        wrappedToken: first.welcome["wrappedToken"] as Record<string, unknown>,
-        bootstrapToken: firstCreds.token,
-        port,
-        extNonce: first.extNonce,
-        relayNonce: first.relayNonce,
-        profileId: "wrong-profile-id",
-      }),
-    ).rejects.toThrow();
-
-    // Stored in extension-browsers.json with 0600 permissions
-    const browsersStat = await stat(browsersFile);
-    expect(browsersStat.mode & 0o777).toBe(0o600);
-    const browsersData = JSON.parse(await readFile(browsersFile, "utf8")) as {
-      browsers: Record<string, { slug: string; token: string; tokenId: string }>;
-    };
-    expect(browsersData.browsers["prof-chrome-1"]?.slug).toBe("chrome-macbook-pro");
-    expect(browsersData.browsers["prof-chrome-1"]?.token).toBe(unwrapped.token);
-    expect(browsersData.browsers["prof-chrome-1"]?.tokenId).toBe(unwrapped.tokenId);
-
-    // Reconnect using stored per-browser token + tokenId (selectAuthCredentials chooses browser token)
-    const stored = {
-      browserToken: unwrapped.token,
-      browserTokenId: unwrapped.tokenId,
-      pairingId: pairingFile.pairingId,
-    };
-    const nextCreds = selectAuthCredentials(stored, pairingFile);
-    expect(nextCreds.mode).toBe("browser");
-    expect(nextCreds.token).toBe(unwrapped.token);
-    expect(nextCreds.tokenId).toBe(unwrapped.tokenId);
-
+    expect(first.welcome["slug"]).toBe(expectedA);
     first.ws.close();
     await waitClose(first.ws);
 
-    const second = await connectMockExtension(port, nextCreds.token, undefined, {
-      profileId: "prof-chrome-1",
-      browser: "Chrome",
-      tokenId: nextCreds.tokenId,
-    });
-    expect(second.welcome["type"]).toBe("welcome");
-    expect(second.welcome["slug"]).toBe("chrome-macbook-pro");
-    expect(second.welcome["wrappedToken"]).toBeUndefined();
-
-    // Unknown tokenId is refused with 4006
-    const badWs = openWs(`ws://127.0.0.1:${port}/extension`);
-    await waitOpen(badWs);
-    const badClosed = waitClose(badWs);
-    badWs.send(
-      JSON.stringify({
-        type: "hello",
-        profileId: "prof-chrome-1",
-        browser: "Chrome",
-        version: "2.0.0",
-        helpersVersion: PAGE_HELPERS_VERSION,
-        protocolVersion: PROTOCOL_VERSION,
-        nonce: randomBytes(16).toString("hex"),
-        tokenId: "f".repeat(32),
-      }),
-    );
-    expect((await badClosed).code).toBe(CLOSE_AUTH_REFUSED);
-  });
-
-  test("newer pairing.json pairingId wins over stored per-browser token and rotates cleanly", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "bc-rotate-"));
-    tempDirs.push(dir);
-    const tokenFile = join(dir, "extension-relay.json");
-    const browsersFile = join(dir, "extension-browsers.json");
-    const extDir = join(dir, "ext");
-
-    const setup1 = await setupExtensionPairing(extDir, { tokenFile, port: 49222 });
-    const file1 = JSON.parse(await readFile(setup1.pairingFile, "utf8")) as {
-      token: string;
-      port: number;
-      pairingId: string;
-    };
-
-    const backend = createExtensionBackend({
-      ...allocPortWindow(),
-      tokenFile,
-      browsersFile,
-      hostname: "studio",
-      waitConnectMs: 500,
-    });
-    disposables.push(backend);
-    await backend.start!();
-    const port = backend.getPort()!;
-
-    // First bootstrap mints token T1
-    const c1 = await connectMockExtension(port, file1.token, undefined, {
-      profileId: "prof-rot",
+    const reconnected = await connectMockExtension(port, token, undefined, {
+      profileId: "profile-alpha",
       browser: "Chrome",
     });
-    const t1 = await unwrapBootstrapToken({
-      wrappedToken: c1.welcome["wrappedToken"] as Record<string, unknown>,
-      bootstrapToken: file1.token,
-      port,
-      extNonce: c1.extNonce,
-      relayNonce: c1.relayNonce,
-      profileId: "prof-rot",
-    });
-    const stored = {
-      browserToken: t1.token,
-      browserTokenId: t1.tokenId,
-      pairingId: file1.pairingId,
-    };
-    c1.ws.close();
-    await waitClose(c1.ws);
+    expect(reconnected.welcome["slug"]).toBe(expectedA);
 
-    // Re-run setup -> new pairingId beats stored per-browser token
-    const setup2 = await setupExtensionPairing(extDir, { tokenFile, port: 49222 });
-    expect(setup2.pairingId).not.toBe(setup1.pairingId);
-    const file2 = JSON.parse(await readFile(setup2.pairingFile, "utf8")) as {
-      token: string;
-      port: number;
-      pairingId: string;
-    };
-
-    const creds = selectAuthCredentials(stored, file2);
-    expect(creds.mode).toBe("bootstrap");
-    expect(creds.token).toBe(file2.token);
-    expect(creds.tokenId).toBeUndefined();
-    expect(creds.pairingId).toBe(file2.pairingId);
-
-    // Reconnecting with bootstrap mints a fresh per-browser token T2 and keeps stable slug
-    const c2 = await connectMockExtension(port, creds.token, undefined, {
-      profileId: "prof-rot",
+    const second = await connectMockExtension(port, token, undefined, {
+      profileId: "profile-beta",
       browser: "Chrome",
     });
-    const t2 = await unwrapBootstrapToken({
-      wrappedToken: c2.welcome["wrappedToken"] as Record<string, unknown>,
-      bootstrapToken: creds.token,
-      port,
-      extNonce: c2.extNonce,
-      relayNonce: c2.relayNonce,
-      profileId: "prof-rot",
-    });
-    expect(t2.token).not.toBe(t1.token);
-    expect(t2.tokenId).not.toBe(t1.tokenId);
-    expect(c2.welcome["slug"]).toBe("chrome-studio");
-
-    // Old T1 is no longer accepted
-    const oldWs = openWs(`ws://127.0.0.1:${port}/extension`);
-    await waitOpen(oldWs);
-    const oldClosed = waitClose(oldWs);
-    oldWs.send(
-      JSON.stringify({
-        type: "hello",
-        profileId: "prof-rot",
-        browser: "Chrome",
-        version: "2.0.0",
-        helpersVersion: PAGE_HELPERS_VERSION,
-        protocolVersion: PROTOCOL_VERSION,
-        nonce: randomBytes(16).toString("hex"),
-        tokenId: t1.tokenId,
-      }),
-    );
-    expect((await oldClosed).code).toBe(CLOSE_AUTH_REFUSED);
+    expect(second.welcome["slug"]).toBe(expectedB);
+    expect(second.welcome["slug"]).not.toBe(reconnected.welcome["slug"]);
   });
 
-  test("code pairing: Crockford normalization, ECDH+PBKDF2 success, token reuse, and single-use spend", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "bc-pair-code-"));
-    tempDirs.push(dir);
-    const tokenFile = join(dir, "extension-relay.json");
-    const codesFile = join(dir, "extension-pairing-codes.json");
-    const browsersFile = join(dir, "extension-browsers.json");
-
-    expect(normalizePairingCode("o i l - 2 3 4 5 6")).toBe("01123456");
-    expect(formatPairingCode("01123456")).toBe("0112-3456");
-    expect(normalizePairingCode("bad!")).toBeNull();
-
-    const backend = createExtensionBackend({
-      ...allocPortWindow(),
-      tokenFile,
-      browsersFile,
-      codesFile,
-      hostname: "mini",
-      waitConnectMs: 500,
-    });
-    disposables.push(backend);
-    await backend.start!();
-    const port = backend.getPort()!;
-
-    // Mint code via standalone helper (same path as `bun ./cli.ts extension-pair`)
-    const issued = await createPairingCode({ codesFile });
-    expect(issued.code).toMatch(/^[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}$/);
-    expect(issued.url).toBe(
-      `chrome-extension://${EXTENSION_ID}/onboarding.html#code=${encodeURIComponent(issued.code)}`,
-    );
-    expect(issued.expiresInSeconds).toBe(600);
-    // Stored hashed (plaintext code never appears on disk) and 0600
-    const rawCodesFile = await readFile(codesFile, "utf8");
-    expect((await stat(codesFile)).mode & 0o777).toBe(0o600);
-    expect(rawCodesFile).not.toContain(issued.code);
-    expect(rawCodesFile).not.toContain(normalizePairingCode(issued.code)!);
-
-    // Pair using lowercase + confusable formatting to verify Crockford normalization
-    const paired = await runCodePairingHandshake(port, issued.code.toLowerCase().replace("-", " "), {
-      profileId: "prof-brave-1",
-      browser: "Brave",
-    });
-    expect(paired.closed).toBeUndefined();
-    expect(paired.unwrapped?.slug).toBe("brave-mini");
-    expect(paired.unwrapped?.token).toMatch(/^[0-9a-f]{64}$/);
-    expect(backend.isConnected()).toBe(true);
-
-    // verifyPairWelcome rejects a forged relay proof before unwrapping
-    const forgedCheck = await verifyPairWelcome({
-      welcome: { ...(paired.welcome ?? {}), proof: "0".repeat(64) },
-      expectedRelayProof: "1".repeat(64),
-      pairKey: new Uint8Array(32),
-      port,
-      extNonce: "a".repeat(32),
-      relayNonce: "b".repeat(32),
-      profileId: "prof-brave-1",
-    });
-    expect(forgedCheck.ok).toBe(false);
-
-    // Reusing the same code a second time fails with 4006 (spent)
-    const reuse = await runCodePairingHandshake(port, issued.code, {
-      profileId: "prof-brave-2",
-      browser: "Brave",
-    });
-    expect(reuse.closed?.code).toBe(CLOSE_AUTH_REFUSED);
-    expect(reuse.closed?.reason).toMatch(/used/i);
-
-    // The newly paired browser can disconnect and reconnect with its per-browser token
-    paired.ws.close();
-    await waitClose(paired.ws);
-
-    const reconnected = await connectMockExtension(port, paired.unwrapped!.token, undefined, {
-      profileId: "prof-brave-1",
-      browser: "Brave",
-      tokenId: paired.unwrapped!.tokenId,
-    });
-    expect(reconnected.welcome["type"]).toBe("welcome");
-    expect(reconnected.welcome["slug"]).toBe("brave-mini");
-  });
-
-  test("code pairing: wrong code closes 4006, 5 failures burn the code, and expiry rejects", async () => {
-    let fakeNow = 1_700_000_000_000;
-    const token = randomBytes(32).toString("hex");
-    const backend = createExtensionBackend({
-      ...allocPortWindow(),
-      token,
-      waitConnectMs: 500,
-      now: () => fakeNow,
-      pairRateLimitMax: 20,
-    });
-    disposables.push(backend);
-    await backend.start!();
-    const port = backend.getPort()!;
-
-    const issued = await backend.createPairingCode({ ttlMs: 10 * 60 * 1000 });
-    const wrongCode = issued.code.startsWith("0") ? "1111-1111" : "0000-0000";
-
-    // 5 wrong attempts all close with 4006 and burn the code
-    for (let i = 0; i < PAIR_CODE_MAX_FAILURES; i++) {
-      const attempt = await runCodePairingHandshake(port, wrongCode, { profileId: `bad-${i}` });
-      expect(attempt.closed?.code).toBe(CLOSE_AUTH_REFUSED);
-    }
-
-    // Even the real code is now rejected with 4006 because it was burned
-    const afterBurn = await runCodePairingHandshake(port, issued.code, { profileId: "good-too-late" });
-    expect(afterBurn.closed?.code).toBe(CLOSE_AUTH_REFUSED);
-    expect(afterBurn.closed?.reason).toMatch(/burned/i);
-
-    // Expiry test: mint a new code, advance clock past 10 minutes -> rejected with 4006
-    const expiring = await backend.createPairingCode({ ttlMs: 10 * 60 * 1000 });
-    fakeNow += 10 * 60 * 1000 + 1;
-    const afterExpiry = await runCodePairingHandshake(port, expiring.code, { profileId: "expired-prof" });
-    expect(afterExpiry.closed?.code).toBe(CLOSE_AUTH_REFUSED);
-    expect(afterExpiry.closed?.reason).toMatch(/expired/i);
-  });
-
-  test("code pairing: rate-limits repeated failed attempts with 4006", async () => {
-    let fakeNow = 1_700_000_000_000;
-    const token = randomBytes(32).toString("hex");
-    const backend = createExtensionBackend({
-      ...allocPortWindow(),
-      token,
-      waitConnectMs: 500,
-      now: () => fakeNow,
-      pairRateLimitMax: 3,
-      pairRateLimitWindowMs: 60_000,
-    });
-    disposables.push(backend);
-    await backend.start!();
-    const port = backend.getPort()!;
-
-    const issued = await backend.createPairingCode();
-    const wrongCode = issued.code.startsWith("0") ? "1111-1111" : "0000-0000";
-
-    for (let i = 0; i < 3; i++) {
-      const res = await runCodePairingHandshake(port, wrongCode);
-      expect(res.closed?.code).toBe(CLOSE_AUTH_REFUSED);
-    }
-
-    // 4th attempt hits rate limit immediately even with the correct code
-    const limited = await runCodePairingHandshake(port, issued.code);
-    expect(limited.closed?.code).toBe(CLOSE_AUTH_REFUSED);
-    expect(limited.closed?.reason).toMatch(/rate limit/i);
-
-    // After window passes, the correct code works (only 3 failures recorded on it < 5)
-    fakeNow += 61_000;
-    const ok = await runCodePairingHandshake(port, issued.code);
-    expect(ok.closed).toBeUndefined();
-    expect(ok.unwrapped?.token).toMatch(/^[0-9a-f]{64}$/);
-  });
-
-  test("BrowserLinks: stable slugs with -2 collision, distinct target IDs for same tabId, and browser routing", async () => {
-    // Slug allocation unit check
-    const used = new Set<string>();
-    const s1 = allocateBrowserSlug("Chrome", used, { hostname: "MacBook.local" });
-    used.add(s1);
-    const s2 = allocateBrowserSlug("Chrome", used, { hostname: "MacBook.local" });
-    used.add(s2);
-    const s3 = allocateBrowserSlug("Brave", used, { hostname: "MacBook.local" });
-    expect([s1, s2, s3]).toEqual(["chrome-macbook", "chrome-macbook-2", "brave-macbook"]);
-
+  test("BrowserLinks: distinct target IDs for same tabId, unbound short id ambiguity, and event isolation", async () => {
+    const slug1 = browserSlugFor("Chrome", "p-chrome-1");
+    const slug2 = browserSlugFor("Chrome", "p-chrome-2");
     expect(parseExtensionTargetId("extension:42")).toEqual({ tabId: 42 });
-    expect(parseExtensionTargetId("extension:chrome-macbook:42")).toEqual({
-      slug: "chrome-macbook",
-      tabId: 42,
-    });
+    expect(parseExtensionTargetId(`extension:${slug1}:42`)).toEqual({ slug: slug1, tabId: 42 });
 
     const token = randomBytes(32).toString("hex");
-    const backend = createExtensionBackend({
-      ...allocPortWindow(),
-      token,
-      hostname: "MacBook.local",
-      waitConnectMs: 1_000,
-    });
+    const backend = createExtensionBackend({ ...allocPortWindow(), token, waitConnectMs: 1_000 });
     disposables.push(backend);
     await backend.start!();
     const port = backend.getPort()!;
 
-    // Connect first browser (Chrome) — with 1 browser connected, target IDs stay `extension:<tabId>`
+    // With 1 browser connected, target IDs stay `extension:<tabId>`
     const chrome1 = await connectMockExtension(
       port,
       token,
@@ -1281,11 +816,11 @@ describe("Phase 2 slice B: hardened relay pairing, BrowserLinks, and chunked fra
       },
       { profileId: "p-chrome-1", browser: "Chrome" },
     );
-    expect(chrome1.welcome["slug"]).toBe("chrome-macbook");
+    expect(chrome1.welcome["slug"]).toBe(slug1);
     const singleTargets = await backend.listTargets();
     expect(singleTargets.map((t) => t.targetId)).toEqual(["extension:42"]);
 
-    // Connect second browser (another Chrome profile -> -2 slug) with the EXACT SAME tabId 42
+    // Connect second browser with the EXACT SAME tabId 42
     const chrome2 = await connectMockExtension(
       port,
       token,
@@ -1297,61 +832,446 @@ describe("Phase 2 slice B: hardened relay pairing, BrowserLinks, and chunked fra
       },
       { profileId: "p-chrome-2", browser: "Chrome" },
     );
-    expect(chrome2.welcome["slug"]).toBe("chrome-macbook-2");
+    expect(chrome2.welcome["slug"]).toBe(slug2);
 
     // With 2 browsers connected, target IDs become `extension:<slug>:<tabId>` and never collide
     const multiTargets = await backend.listTargets();
-    expect(multiTargets.map((t) => t.targetId).sort()).toEqual([
-      "extension:chrome-macbook-2:42",
-      "extension:chrome-macbook:42",
-    ]);
+    expect(multiTargets.map((t) => t.targetId).sort()).toEqual(
+      [`extension:${slug1}:42`, `extension:${slug2}:42`].sort(),
+    );
 
     // Evaluating on each qualified target routes strictly to the matching browser
     const ev1 = (await backend.invoke("evaluate", {
       expression: "1",
-      targetId: "extension:chrome-macbook:42",
+      targetId: `extension:${slug1}:42`,
     })) as { value: string };
     const ev2 = (await backend.invoke("evaluate", {
       expression: "1",
-      targetId: "extension:chrome-macbook-2:42",
+      targetId: `extension:${slug2}:42`,
     })) as { value: string };
     expect(ev1.value).toBe("chrome1:42");
     expect(ev2.value).toBe("chrome2:42");
 
-    // Ambiguous unqualified `extension:42` is rejected when multiple browsers are connected
+    // Unbound short id is rejected as ambiguous when multiple browsers are connected
     await expect(
-      backend.invoke("evaluate", { expression: "1", targetId: "extension:42" }),
+      backend.invoke("evaluate", { expression: "1", targetId: "extension:99" }),
     ).rejects.toThrow(/ambiguous extension targetId/i);
-
-    // Input `browser` chooses which connected browser opens a new tab
-    const nav2 = (await backend.invoke("navigate", {
-      url: "https://two.new",
-      browser: "chrome-macbook-2",
-    })) as { targetId: string; browser: string };
-    expect(nav2.targetId).toBe("extension:chrome-macbook-2:202");
-    expect(nav2.browser).toBe("chrome-macbook-2");
-
-    const nav1 = (await backend.invoke("navigate", {
-      url: "https://one.new",
-      browser: "chrome-macbook",
-    })) as { targetId: string; browser: string };
-    expect(nav1.targetId).toBe("extension:chrome-macbook:101");
-    expect(nav1.browser).toBe("chrome-macbook");
 
     // Events on tab 42 from two browsers do not collide
     chrome1.ws.send(JSON.stringify({ type: "event", tabId: 42, method: "Page.loadEventFired", params: { from: 1 } }));
     chrome2.ws.send(JSON.stringify({ type: "event", tabId: 42, method: "Page.loadEventFired", params: { from: 2 } }));
     await new Promise((r) => setTimeout(r, 30));
     const evs1 = (await backend.invoke("read_events", {
-      targetId: "extension:chrome-macbook:42",
+      targetId: `extension:${slug1}:42`,
       method: "Page.loadEventFired",
     })) as { events: Array<{ params: { from: number } }> };
     const evs2 = (await backend.invoke("read_events", {
-      targetId: "extension:chrome-macbook-2:42",
+      targetId: `extension:${slug2}:42`,
       method: "Page.loadEventFired",
     })) as { events: Array<{ params: { from: number } }> };
     expect(evs1.events.map((e) => e.params.from)).toEqual([1]);
     expect(evs2.events.map((e) => e.params.from)).toEqual([2]);
+  });
+
+  test("S5: stale short id rejected after its profile leaves instead of routing to another profile", async () => {
+    const token = randomBytes(32).toString("hex");
+    const backend = createExtensionBackend({ ...allocPortWindow(), token, waitConnectMs: 1_000 });
+    disposables.push(backend);
+    await backend.start!();
+    const port = backend.getPort()!;
+
+    // Browser A is the sole connected browser and issues short target id `extension:42`
+    const browserA = await connectMockExtension(
+      port,
+      token,
+      (op) => {
+        if (op === "list_tabs") return { tabs: [{ tabId: 42, url: "https://a.test", title: "A" }] };
+        if (op === "eval") return { value: "from-A" };
+        return { ok: true };
+      },
+      { profileId: "profile-a", browser: "Chrome" },
+    );
+    const tabsA = await backend.listTargets();
+    expect(tabsA.map((t) => t.targetId)).toEqual(["extension:42"]);
+
+    // Browser A disconnects
+    browserA.ws.close();
+    await waitClose(browserA.ws);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(backend.isConnected()).toBe(false);
+
+    // Browser B connects as the ONLY browser and also happens to have tabId 42
+    const browserB = await connectMockExtension(
+      port,
+      token,
+      (op) => {
+        if (op === "list_tabs") return { tabs: [{ tabId: 42, url: "https://b.test", title: "B" }] };
+        if (op === "eval") return { value: "from-B" };
+        return { ok: true };
+      },
+      { profileId: "profile-b", browser: "Brave" },
+    );
+
+    // Reusing Browser A's stale `extension:42` must fail with NO_ACTIVE_TARGET, never hit Browser B
+    await expect(
+      backend.invoke("evaluate", { expression: "1", targetId: "extension:42" }),
+    ).rejects.toThrow("NO_ACTIVE_TARGET: tab extension:42 belonged to a browser that disconnected; list tabs again");
+    expect(browserB.receivedReqs.filter((r) => r.op === "eval")).toHaveLength(0);
+
+    // After listing tabs again, `extension:42` is freshly issued for Browser B and works
+    const tabsB = await backend.listTargets();
+    expect(tabsB.map((t) => t.targetId)).toEqual(["extension:42"]);
+    const resB = (await backend.invoke("evaluate", { expression: "1", targetId: "extension:42" })) as {
+      value: string;
+    };
+    expect(resB.value).toBe("from-B");
+  });
+
+  test("S4: browser-named nav ignores the active tab of another browser and rejects explicit cross-browser targetId", async () => {
+    const token = randomBytes(32).toString("hex");
+    const backend = createExtensionBackend({ ...allocPortWindow(), token, waitConnectMs: 1_000 });
+    disposables.push(backend);
+    await backend.start!();
+    const port = backend.getPort()!;
+
+    const slug1 = browserSlugFor("Chrome", "nav-prof-1");
+    const slug2 = browserSlugFor("Brave", "nav-prof-2");
+
+    const browser1 = await connectMockExtension(
+      port,
+      token,
+      (op, params) => {
+        if (op === "navigate") return { tabId: 10, loaded: true, url: String(params["url"]), title: "B1" };
+        if (op === "bc_call") return { values: [undefined, String(params["tabId"]), ""] };
+        return { ok: true };
+      },
+      { profileId: "nav-prof-1", browser: "Chrome" },
+    );
+    const browser2 = await connectMockExtension(
+      port,
+      token,
+      (op, params) => {
+        if (op === "navigate") return { tabId: 202, loaded: true, url: String(params["url"]), title: "B2" };
+        if (op === "bc_call") return { values: [undefined, "https://two.new", ""] };
+        return { ok: true };
+      },
+      { profileId: "nav-prof-2", browser: "Brave" },
+    );
+
+    // Wire route + daemon.ts AsyncLocalStorage nav-browser scoping + page-runner `handlePage("nav", ...)`
+    const ops = route(fakeCdp([]), [backend], () => ["extension", "cdp"]);
+    const requestBrowser = new AsyncLocalStorage<NavBrowserScope | undefined>();
+    const invoke = async (op: string, input: Record<string, unknown> = {}): Promise<InvokeResult> => {
+      try {
+        const effective = applyNavBrowserScope(op, input, requestBrowser.getStore());
+        const data = await ops[op]!(effective);
+        return { ok: true, data };
+      } catch (err) {
+        return { ok: false, error: { code: "EXECUTION_FAILED", message: (err as Error).message } };
+      }
+    };
+    const handlePage = createPageHelperHandler(invoke, undefined, undefined, {
+      bcCall: (input) => backend.bcCall(input),
+      sleep: async () => {},
+      rng: () => 0.5,
+    });
+
+    // Make Browser 1's tab 10 the active tab (so page-runner's resolveTargetBackend(undefined) returns it!)
+    await ops["select_target"]!({ targetId: `extension:${slug1}:10` });
+
+    // /nav?browser=<slug2> and /page/nav { url, browser: slug2 } have no explicit targetId:
+    // must ignore Browser 1's active targetId and open a new tab in Browser 2
+    const navRes = await requestBrowser.run({ browser: slug2 }, () =>
+      handlePage("nav", { url: "https://two.new", until: "load" }),
+    );
+    expect(navRes.ok).toBe(true);
+    if (navRes.ok) {
+      const firstLine = JSON.parse(String((navRes.data as Record<string, unknown>)["value"]).split("\n")[0]!) as {
+        targetId: string;
+        browser: string;
+      };
+      expect(firstLine.browser).toBe(slug2);
+      expect(firstLine.targetId).toBe(`extension:${slug2}:202`);
+    }
+    expect(browser1.receivedReqs.filter((r) => r.op === "navigate")).toHaveLength(0);
+    const b2Navs = browser2.receivedReqs.filter((r) => r.op === "navigate");
+    expect(b2Navs).toHaveLength(1);
+    expect(b2Navs[0]!.params["tabId"]).toBeUndefined();
+
+    // Explicit targetId belonging to Browser 1 while naming Browser 2 MUST fail with INPUT_INVALID
+    const mismatchRes = await requestBrowser.run(
+      { browser: slug2, explicitTargetId: `extension:${slug1}:10` },
+      () => handlePage("nav", { url: "https://mismatch.test", until: "load" }, `extension:${slug1}:10`),
+    );
+    expect(mismatchRes.ok).toBe(false);
+    if (!mismatchRes.ok) {
+      expect(mismatchRes.error.message).toMatch(/INPUT_INVALID:.*belongs to browser/i);
+    }
+    expect(browser1.receivedReqs.filter((r) => r.op === "navigate")).toHaveLength(0);
+    expect(browser2.receivedReqs.filter((r) => r.op === "navigate")).toHaveLength(1);
+  });
+
+  test("S6: a large outbound batch (>=250 chunks) completes with backpressure", async () => {
+    // 1. Deterministic backpressure proof: pause on -1, resume on drain(), deliver >=250 chunks in order
+    const sent: string[] = [];
+    let paused = false;
+    let backpressureHits = 0;
+    const mockSocket = {
+      send(frame: string): number {
+        if (paused) throw new Error("sent while paused under backpressure");
+        sent.push(frame);
+        if (sent.length % 5 === 0) {
+          paused = true;
+          backpressureHits += 1;
+          return -1;
+        }
+        return frame.length;
+      },
+    };
+    const queue = new OutboundFrameQueue(mockSocket);
+    const frames = Array.from({ length: 260 }, (_, i) => JSON.stringify({ type: "chunk", id: "b", seq: i }));
+    let settled = false;
+    const sendPromise = queue.enqueue(frames).then(() => {
+      settled = true;
+    });
+
+    expect(sent.length).toBe(5);
+    expect(queue.isPaused).toBe(true);
+    expect(settled).toBe(false);
+
+    while (queue.isPaused) {
+      paused = false;
+      queue.drain();
+    }
+    await sendPromise;
+    expect(settled).toBe(true);
+    expect(backpressureHits).toBe(52);
+    expect(sent).toEqual(frames);
+
+    // 2. Live WebSocket round-trip of >=250 outbound chunks (~26 MiB >> backpressureLimit)
+    //    exercising real Bun ServerWebSocket backpressure (-1) and `drain` resume
+    const token = randomBytes(32).toString("hex");
+    const backend = createExtensionBackend({
+      ...allocPortWindow(),
+      token,
+      maxChunkDataBytes: 100 * 1024,
+      backpressureLimit: 256 * 1024,
+      waitConnectMs: 1_000,
+    });
+    disposables.push(backend);
+    await backend.start!();
+    const port = backend.getPort()!;
+
+    const client = await connectMockExtension(port, token, (op, params) => {
+      if (op === "eval") {
+        return { value: String(params["expression"]).length };
+      }
+      return { ok: true };
+    });
+
+    await backend.invoke("select_target", { targetId: "extension:10" });
+    // 26 MiB split at 100 KiB/chunk = 267 outbound chunks (> 250) exceeding kernel + 256 KiB backpressure limit
+    const hugeExpr = `"${"Q".repeat(26 * 1024 * 1024)}"`;
+    const res = (await backend.invoke("evaluate", { expression: hugeExpr })) as { value: number };
+    expect(res.value).toBe(hugeExpr.length);
+    expect(client.receivedChunkFrames.length).toBeGreaterThanOrEqual(250);
+    // Verify strictly monotonic sequence numbers 0..N-1
+    for (let i = 0; i < client.receivedChunkFrames.length; i++) {
+      expect(client.receivedChunkFrames[i]).toBe(i);
+    }
+  });
+
+  test("S6: dropped send (ws.send returning 0) fails the request and never reports success", async () => {
+    // Partial send: first 2 chunks succeed, 3rd returns 0 (dropped) -> must reject cleanly
+    let calls = 0;
+    const queue = new OutboundFrameQueue({
+      send(frame: string): number {
+        calls += 1;
+        return calls === 3 ? 0 : frame.length;
+      },
+    });
+    const frames = Array.from({ length: 5 }, (_, i) => `frame-${i}`);
+    await expect(queue.enqueue(frames)).rejects.toThrow("EXECUTION_FAILED: WebSocket frame dropped (sent 2/5 frames)");
+    expect(calls).toBe(3);
+
+    // Subsequent queued message after a dropped one still runs cleanly when socket recovers
+    let okCalls = 0;
+    const queue2 = new OutboundFrameQueue({
+      send(frame: string): number {
+        okCalls += 1;
+        return okCalls === 1 ? 0 : frame.length;
+      },
+    });
+    await expect(queue2.enqueue(["bad"])).rejects.toThrow(/WebSocket frame dropped/);
+    await expect(queue2.enqueue(["good"])).resolves.toBeUndefined();
+  });
+
+  test("S7: aggregate unfinished-bytes cap, max 16 streams, and capped remembered rejected IDs", async () => {
+    // Verify default constants match across daemon and extension/lib/frames.js
+    expect(MAX_CONCURRENT_CHUNK_STREAMS).toBe(16);
+    expect(EXT_MAX_CONCURRENT_STREAMS).toBe(16);
+    expect(EXT_STREAM_TIMEOUT_MS).toBe(30_000);
+    expect(MAX_ABORTED_CHUNK_STREAMS).toBe(64);
+    expect(EXT_MAX_ABORTED_STREAMS).toBe(64);
+
+    // 1. frames.js decoder: 3 streams each under per-stream cap (1 MiB) exceed aggregate 1 MiB cap
+    const extDec = createFrameDecoder({
+      maxDataBytes: 512 * 1024,
+      maxTotalBytes: 1024 * 1024,
+      maxBufferedBytes: 1024 * 1024,
+      maxConcurrent: 16,
+      maxAbortedIds: 64,
+    });
+    const chunk400k = "A".repeat(400 * 1024);
+    expect(extDec.push({ type: "chunk", id: "s1", seq: 0, last: false, data: chunk400k }).kind).toBe("pending");
+    expect(extDec.push({ type: "chunk", id: "s2", seq: 0, last: false, data: chunk400k }).kind).toBe("pending");
+    expect(extDec.bufferedBytes()).toBe(800 * 1024);
+    const overAgg = extDec.push({ type: "chunk", id: "s3", seq: 0, last: false, data: chunk400k });
+    expect(overAgg.kind).toBe("error");
+    if (overAgg.kind === "error") expect(overAgg.error).toMatch(/aggregate unfinished bytes/i);
+    expect(extDec.size()).toBe(2);
+    expect(extDec.bufferedBytes()).toBe(800 * 1024);
+    extDec.clear();
+
+    // 2. Max 16 concurrent open streams + max 64 remembered rejected stream IDs in both decoders
+    const daemonDec = new ChunkReassembler({ maxBufferedBytes: 1024 * 1024, maxConcurrent: 16, maxAbortedIds: 64 });
+    for (let i = 0; i < 16; i++) {
+      expect(daemonDec.push({ type: "chunk", id: `open-${i}`, seq: 0, last: false, data: "{" }).kind).toBe("pending");
+      expect(extDec.push({ type: "chunk", id: `open-${i}`, seq: 0, last: false, data: "{" }).kind).toBe("pending");
+    }
+    const stream17Daemon = daemonDec.push({ type: "chunk", id: "open-16", seq: 0, last: false, data: "{" });
+    const stream17Ext = extDec.push({ type: "chunk", id: "open-16", seq: 0, last: false, data: "{" });
+    expect(stream17Daemon.kind).toBe("error");
+    expect(stream17Ext.kind).toBe("error");
+    if (stream17Daemon.kind === "error") expect(stream17Daemon.error).toMatch(/limit 16/);
+    if (stream17Ext.kind === "error") expect(stream17Ext.error).toMatch(/limit 16/);
+
+    // Trigger 80 distinct rejected non-last streams -> aborted map stays capped at 64
+    for (let i = 0; i < 80; i++) {
+      daemonDec.push({ type: "chunk", id: `bad-${i}`, seq: 1, last: false, data: "x" });
+      extDec.push({ type: "chunk", id: `bad-${i}`, seq: 1, last: false, data: "x" });
+    }
+    expect(daemonDec.abortedSize()).toBe(64);
+    expect(extDec.abortedSize()).toBe(64);
+    daemonDec.clear();
+    extDec.clear();
+
+    // 3. Live WebSocket test: two unfinished streams + 3rd stream pushes over aggregate unfinished-bytes cap
+    const token = randomBytes(32).toString("hex");
+    const backend = createExtensionBackend({
+      ...allocPortWindow(),
+      token,
+      maxPostAuthBytes: 1024 * 1024,
+      maxBufferedChunkBytes: 1024 * 1024,
+      waitConnectMs: 1_000,
+    });
+    disposables.push(backend);
+    await backend.start!();
+    const port = backend.getPort()!;
+
+    const client = await connectMockExtension(port, token, undefined, {
+      profileId: "p-agg-cap",
+      manualRequests: true,
+    });
+    const slug = String(client.welcome["slug"]);
+
+    const waitReqId = (expectedOp: string) =>
+      new Promise<number>((resolve) => {
+        const onMsg = (ev: MessageEvent) => {
+          const m = JSON.parse(String(ev.data)) as { type?: string; id?: number; op?: string };
+          if (m.type === "req" && m.op === expectedOp && typeof m.id === "number") {
+            client.ws.removeEventListener("message", onMsg);
+            resolve(m.id);
+          }
+        };
+        client.ws.addEventListener("message", onMsg);
+      });
+
+    const pId1 = waitReqId("agg_1");
+    const req1 = backend.request("agg_1", {}, 3_000, slug);
+    const id1 = await pId1;
+
+    const pId2 = waitReqId("agg_2");
+    const req2 = backend.request("agg_2", {}, 3_000, slug);
+    const id2 = await pId2;
+
+    const pId3 = waitReqId("agg_3");
+    const req3 = backend.request("agg_3", {}, 3_000, slug);
+    const id3 = await pId3;
+
+    // Streams 1 and 2 buffer 400 KiB each (800 KiB total < 1 MiB)
+    client.ws.send(JSON.stringify({ type: "chunk", id: String(id1), seq: 0, last: false, data: `{"type":"res","id":${id1},"ok":true,"result":{"v":"${"a".repeat(400 * 1024)}` }));
+    client.ws.send(JSON.stringify({ type: "chunk", id: String(id2), seq: 0, last: false, data: `{"type":"res","id":${id2},"ok":true,"result":{"v":"${"b".repeat(400 * 1024)}` }));
+    // Stream 3 tries to buffer 400 KiB -> total 1.2 MiB > 1 MiB aggregate cap -> fails req3 cleanly!
+    client.ws.send(JSON.stringify({ type: "chunk", id: String(id3), seq: 0, last: false, data: `{"type":"res","id":${id3},"ok":true,"result":{"v":"${"c".repeat(400 * 1024)}` }));
+    await expect(req3).rejects.toThrow(/aggregate unfinished bytes/i);
+
+    // Streams 1 and 2 still finish cleanly on the same open socket
+    client.ws.send(JSON.stringify({ type: "chunk", id: String(id1), seq: 1, last: true, data: '"}}' }));
+    client.ws.send(JSON.stringify({ type: "chunk", id: String(id2), seq: 1, last: true, data: '"}}' }));
+    expect(((await req1) as { v: string }).v.length).toBe(400 * 1024);
+    expect(((await req2) as { v: string }).v.length).toBe(400 * 1024);
+  });
+
+  test("S7: abandoned stream expires on timer without new traffic, and activity resets the timer", async () => {
+    // 1. frames.js decoder: abandoned stream expires on timer with ZERO new push() calls
+    const expiredExt: string[] = [];
+    const extDec = createFrameDecoder({
+      streamTimeoutMs: 60,
+      onExpire: ({ id }) => expiredExt.push(id),
+    });
+    expect(extDec.push({ type: "chunk", id: "abandoned", seq: 0, last: false, data: "hello" }).kind).toBe("pending");
+    expect(extDec.size()).toBe(1);
+    expect(extDec.bufferedBytes()).toBe(5);
+
+    // Wait past timeout without pushing any new frame
+    await new Promise((r) => setTimeout(r, 120));
+    expect(expiredExt).toEqual(["abandoned"]);
+    expect(extDec.size()).toBe(0);
+    expect(extDec.bufferedBytes()).toBe(0);
+
+    // Activity resets the timer: chunks spaced < timeoutMs complete cleanly even when total > timeoutMs
+    expect(extDec.push({ type: "chunk", id: "active", seq: 0, last: false, data: '{"a":' }).kind).toBe("pending");
+    await new Promise((r) => setTimeout(r, 40));
+    expect(extDec.push({ type: "chunk", id: "active", seq: 1, last: false, data: "1" }).kind).toBe("pending");
+    await new Promise((r) => setTimeout(r, 40));
+    const finished = extDec.push({ type: "chunk", id: "active", seq: 2, last: true, data: "}" });
+    expect(finished).toMatchObject({ kind: "message", message: { a: 1 } });
+    expect(extDec.size()).toBe(0);
+    expect(extDec.bufferedBytes()).toBe(0);
+
+    // 2. Live WebSocket test: abandoned incoming chunk stream fails its pending request on timer with zero new traffic
+    const token = randomBytes(32).toString("hex");
+    const backend = createExtensionBackend({
+      ...allocPortWindow(),
+      token,
+      chunkStreamTimeoutMs: 70,
+      waitConnectMs: 1_000,
+    });
+    disposables.push(backend);
+    await backend.start!();
+    const port = backend.getPort()!;
+
+    const client = await connectMockExtension(port, token, undefined, {
+      profileId: "p-expire",
+      manualRequests: true,
+    });
+    const reqIdP = new Promise<number>((resolve) => {
+      const onMsg = (ev: MessageEvent) => {
+        const m = JSON.parse(String(ev.data)) as { type?: string; id?: number; op?: string };
+        if (m.type === "req" && m.op === "stall" && typeof m.id === "number") {
+          client.ws.removeEventListener("message", onMsg);
+          resolve(m.id);
+        }
+      };
+      client.ws.addEventListener("message", onMsg);
+    });
+
+    // Request timeout is 5s, but chunk stream timeout is 70ms -> must fail via stream expiry without new traffic
+    const reqP = backend.request("stall", {}, 5_000, String(client.welcome["slug"]));
+    const reqId = await reqIdP;
+    client.ws.send(JSON.stringify({ type: "chunk", id: String(reqId), seq: 0, last: false, data: '{"type":"res",' }));
+    await expect(reqP).rejects.toThrow(/chunked stream .* expired/i);
   });
 
   test("chunked post-auth frames reassemble payloads > 1 MiB, and reject out-of-order or oversized streams per-request", async () => {
@@ -1397,9 +1317,6 @@ describe("Phase 2 slice B: hardened relay pairing, BrowserLinks, and chunked fra
           if (params["expression"] === "echo_large") {
             return { value: largePayload };
           }
-          if (params["expression"] === "len") {
-            return { value: String(params["expression"]).length };
-          }
           return { value: String(params["expression"]).length };
         }
         return { ok: true };
@@ -1423,7 +1340,6 @@ describe("Phase 2 slice B: hardened relay pairing, BrowserLinks, and chunked fra
       profileId: "p-chunk-err",
       manualRequests: true,
     });
-    // Hijack a single request manually to send out-of-order chunks
     const outOfOrderReqId = new Promise<number>((resolve) => {
       const onMsg = (ev: MessageEvent) => {
         const m = JSON.parse(String(ev.data)) as { type?: string; id?: number; op?: string };
@@ -1501,26 +1417,5 @@ describe("Phase 2 slice B: hardened relay pairing, BrowserLinks, and chunked fra
     const result = await closed;
     expect([1006, 1009]).toContain(result.code);
     expect(backend.isConnected()).toBe(false);
-  });
-
-  test("cli.ts extension-pair prints Crockford code and onboarding URL under XDG_CONFIG_HOME", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "bc-cli-pair-"));
-    tempDirs.push(dir);
-    const proc = Bun.spawn(["bun", "./cli.ts", "extension-pair"], {
-      cwd: join(import.meta.dir, ".."),
-      env: { ...process.env, XDG_CONFIG_HOME: dir },
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const out = await new Response(proc.stdout).text();
-    expect(await proc.exited).toBe(0);
-    const parsed = JSON.parse(out) as { code: string; url: string; expiresInSeconds: number; codesFile: string };
-    expect(parsed.code).toMatch(/^[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}$/);
-    expect(parsed.url).toBe(
-      `chrome-extension://${EXTENSION_ID}/onboarding.html#code=${encodeURIComponent(parsed.code)}`,
-    );
-    expect(parsed.expiresInSeconds).toBe(600);
-    expect(parsed.codesFile).toBe(join(dir, "browser-control", "extension-pairing-codes.json"));
-    expect((await stat(parsed.codesFile)).mode & 0o777).toBe(0o600);
   });
 });
