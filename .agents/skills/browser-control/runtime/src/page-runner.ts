@@ -349,6 +349,16 @@ export function createPageHelperHandler(
   const HELD_KINDS = ["key", "mouse"] as const;
   /** A held key and a held mouse button on one tab are separate records. */
   const heldSlot = (targetId: string | undefined, kind: HeldInput["kind"]): string => `${heldKeyOf(targetId)}#${kind}`;
+  /**
+   * A press the extension refused because a dialog was open may never have gone out, so it records the input as
+   * possibly down and the command stops there: nothing more is sent into the open dialog. A later dialog accept or
+   * dismiss reports the record and the caller decides.
+   */
+  const refusedPress = (res: InvokeResult, targetId: string | undefined, held: HeldInput): InvokeResult => {
+    const uncertain: HeldInput = { kind: held.kind, label: held.label.replace(/ still down$/, " may still be down") };
+    heldByTab.set(heldSlot(targetId, held.kind), uncertain);
+    return withHeld(res, uncertain);
+  };
   /** Navigation starts a new document, so pointer and held-input state for the old one are dropped. */
   const resetMotion = (targetId?: string): void => {
     motionByTab.delete(tabKeyOf(targetId));
@@ -725,6 +735,7 @@ export function createPageHelperHandler(
         if (!chk.ok) return chk.res ?? notActionable(opts.domRef, chk.blocked);
       }
     }
+    const HELD_MOUSE: HeldInput = { kind: "mouse", label: "mouse left button still down" };
     for (let c = 1; c <= clickCount; c++) {
       const m2 = await cdp(
         "Input.dispatchMouseEvent",
@@ -732,15 +743,20 @@ export function createPageHelperHandler(
         targetId,
         INPUT_TIMEOUT_MS,
       );
-      if (!m2.ok) return m2;
+      // A dialog refusal means the press may never have gone out: report it and send nothing into the dialog.
+      if (!m2.ok) return refusedByDialog(m2) ? refusedPress(m2, targetId, HELD_MOUSE) : m2;
       if (timing) await pause(timing.holdsMs[c - 1]!);
-      const m3 = await cdp(
+      const rel = await sendRelease(
         "Input.dispatchMouseEvent",
         { type: "mouseReleased", ...at, button: "left", buttons: 0, clickCount: c },
         targetId,
+        HELD_MOUSE,
         INPUT_TIMEOUT_MS,
       );
-      if (!m3.ok) return m3;
+      // A release nobody can vouch for is reported, never re-sent, and the caller must stop reading the page.
+      if (rel.held) return withHeld(rel.res, rel.held);
+      if (rel.note) return success(rel.note);
+      if (!rel.res.ok) return rel.res;
       if (timing && c < clickCount) await pause(timing.gapsMs[c - 1]!);
     }
     return success("ok");
@@ -1074,15 +1090,23 @@ export function createPageHelperHandler(
     });
   }
 
+  /** Why a page read could not happen because a dialog blocks the page, or undefined when it answered. */
+  const dialogBlockedBy = (res: InvokeResult): string | undefined =>
+    refusedByDialog(res)
+      ? "a dialog opened; accept or dismiss it before reading the page"
+      : messageOf(res).startsWith("CDP_TIMEOUT")
+        ? DIALOG_HINT
+        : undefined;
+
   /** Arm isolated-world event probe and read back trusted event counts after input. */
-  async function readProbe(targetId?: string): Promise<Record<string, number> | undefined> {
+  async function readProbe(targetId?: string): Promise<{ counts?: Record<string, number>; blocked?: string }> {
     const res = await evalHelper({ kind: "bc", method: "readInputProbe" }, targetId, 2_000);
-    if (!res.ok) return undefined;
+    if (!res.ok) return { blocked: dialogBlockedBy(res) };
     try {
       const parsed = JSON.parse(valueOf(res)) as Record<string, number>;
-      return typeof parsed === "object" && parsed !== null && "mousedown" in parsed ? parsed : undefined;
+      return { counts: typeof parsed === "object" && parsed !== null && "mousedown" in parsed ? parsed : undefined };
     } catch {
-      return undefined;
+      return {};
     }
   }
 
@@ -1099,14 +1123,15 @@ export function createPageHelperHandler(
       ? await cdp("Input.dispatchKeyEvent", { type: "keyDown", ...base, text: spec.text }, gestureTarget, INPUT_TIMEOUT_MS)
       : await cdp("Input.dispatchKeyEvent", { type: "rawKeyDown", ...base }, gestureTarget, INPUT_TIMEOUT_MS);
     if (!down.ok) {
-      // The press may have landed before the page opened its dialog, so still try the matching release.
-      if (refusedByDialog(down)) return down;
-      const cleanup = await sendRelease("Input.dispatchKeyEvent", { type: "keyUp", ...base }, gestureTarget, held, INPUT_TIMEOUT_MS);
-      return cleanup.ok ? down : withHeld(down, held);
+      // A dialog refusal may mean the press never went out: send nothing more into the open dialog.
+      if (refusedByDialog(down)) return refusedPress(down, gestureTarget, held);
+      const out = await sendRelease("Input.dispatchKeyEvent", { type: "keyUp", ...base }, gestureTarget, held, INPUT_TIMEOUT_MS, true);
+      return out.held ? withHeld(down, out.held) : down;
     }
     if (holdMs > 0) await pause(holdMs);
     const up = await sendRelease("Input.dispatchKeyEvent", { type: "keyUp", ...base }, gestureTarget, held, INPUT_TIMEOUT_MS);
-    return up.ok ? up : withHeld(up, held);
+    if (up.held) return withHeld(up.res, up.held);
+    return up.note ? success(up.note) : up.res;
   }
 
   async function dispatchText(
@@ -1181,7 +1206,8 @@ export function createPageHelperHandler(
       steps: [{ kind: "bc", method: "settle" }, { kind: "bc", method: "diff", args: [{ from: before ?? "" }] }],
     };
     let res = await evalHelper(call, targetId, 8_000);
-    if (!res.ok && messageOf(res).startsWith("CDP_TIMEOUT")) return `# ${DIALOG_HINT}`;
+    // A dialog makes every read wait out its timeout, so report it instead of retrying on a blocked page.
+    if (!res.ok && dialogBlockedBy(res)) return `# ${dialogBlockedBy(res)}`;
     if (!res.ok) {
       await waitParsed(targetId);
       res = await evalHelper(call, targetId, 8_000);
@@ -1192,14 +1218,22 @@ export function createPageHelperHandler(
   const withChanges = async (line: string, before: string | undefined, quiet: boolean, targetId?: string): Promise<InvokeResult> =>
     success(quiet ? line : `${line}\n${await changes(before, targetId)}`);
 
-  /** An input command the extension refused because a dialog was already open never reached the page. */
+  /**
+   * An input command the extension refused because a dialog blocked it. It is ambiguous: the dialog may have been
+   * open already (nothing was sent) or the event itself opened it (it was delivered), so the event may have landed.
+   */
   const refusedByDialog = (res: InvokeResult): boolean => /^DIALOG_OPEN:/.test(messageOf(res));
+  /** Word a failed input as delivered_unverified, keeping any held-input lines it already carries. */
   const inputFailed = (res: InvokeResult, what: string): InvokeResult =>
-    messageOf(res).startsWith("CDP_TIMEOUT") ? success(`${what}: delivered_unverified (${DIALOG_HINT})`) : res;
+    messageOf(res).startsWith("CDP_TIMEOUT")
+      ? success([`${what}: delivered_unverified (${DIALOG_HINT})`, ...messageOf(res).split("\n").filter((l) => l.startsWith("# HELD:"))].join("\n"))
+      : res;
 
+  type ReleaseOutcome = { res: InvokeResult; held?: HeldInput; note?: string };
   /**
    * Send a release to its pinned tab; it is never retried. A timeout may have reached the page, so it reads as
-   * delivered_unverified, not held; any other failure (a dialog refusal included) never reached it and is held.
+   * delivered_unverified, not held. A dialog refusal is ambiguous too, so it reads as unverified — unless the press
+   * it releases was itself refused, which leaves the input possibly still down.
    */
   async function sendRelease(
     method: string,
@@ -1207,15 +1241,28 @@ export function createPageHelperHandler(
     target: string | undefined,
     held: HeldInput,
     timeoutMs = 2_000,
-  ): Promise<InvokeResult> {
+    pressRefused = false,
+  ): Promise<ReleaseOutcome> {
     const res = await cdp(method, params, target, timeoutMs).catch((err: unknown) => failure("EXECUTION_FAILED", String(err)));
     const slot = heldSlot(target, held.kind);
-    if (res.ok) heldByTab.delete(slot);
-    else if (messageOf(res).startsWith("CDP_TIMEOUT")) {
+    if (res.ok) {
       heldByTab.delete(slot);
-      return inputFailed(res, `${held.label.replace(/ still down$/, "")} release`);
-    } else heldByTab.set(slot, held);
-    return res;
+      return { res };
+    }
+    const what = `${held.label.replace(/ still down$/, "")} release`;
+    if (messageOf(res).startsWith("CDP_TIMEOUT")) {
+      heldByTab.delete(slot);
+      return { res, note: `${what}: delivered_unverified (${DIALOG_HINT})` };
+    }
+    if (refusedByDialog(res) && !pressRefused) {
+      heldByTab.delete(slot);
+      return { res, note: `${what}: delivery unverified (a dialog opened)` };
+    }
+    const uncertain: HeldInput = refusedByDialog(res)
+      ? { kind: held.kind, label: what.replace(/ release$/, " may still be down") }
+      : held;
+    heldByTab.set(slot, uncertain);
+    return { res, held: uncertain };
   }
 
   /** Targets that can run helpers inside a child frame: OOPIF targets on CDP, frame ids on extension tabs. */
@@ -1511,14 +1558,17 @@ export function createPageHelperHandler(
     let mouseDown = false;
     let dragErr: InvokeResult | undefined;
     let releaseHeld: HeldInput | undefined;
+    let releaseNote: string | undefined;
     const releaseParams: Json = { type: "mouseReleased", x: info.dx, y: info.dy, button: "left", buttons: 0, clickCount: 1 };
     /** Release the button before an early return, so a blocked release is reported on this command's result. */
     const bail = async (res: InvokeResult, what: string): Promise<InvokeResult> => {
       const failed = inputFailed(res, what);
       if (!mouseDown) return failed;
       mouseDown = false;
-      const rel = await sendRelease("Input.dispatchMouseEvent", releaseParams, targetId, held);
-      return rel.ok ? failed : withHeld(failed, held);
+      // A dialog refusal means the button may never have gone down: send nothing into the open dialog.
+      if (refusedByDialog(res)) return refusedPress(res, targetId, held);
+      const out = await sendRelease("Input.dispatchMouseEvent", releaseParams, targetId, held, 2_000, true);
+      return out.held ? withHeld(failed, out.held) : failed;
     };
     if (info.draggable) {
       await cdp("Input.setInterceptDrags", { enabled: true }, targetId, 4_000);
@@ -1529,7 +1579,12 @@ export function createPageHelperHandler(
         if (!m0.ok) { dragErr = m0; return bail(m0, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
         mouseDown = true;
         const mp = await cdp("Input.dispatchMouseEvent", { type: "mousePressed", x: info.sx, y: info.sy, button: "left", buttons: 1, clickCount: 1 }, targetId, INPUT_TIMEOUT_MS);
-        if (!mp.ok) { mouseDown = !refusedByDialog(mp); dragErr = mp; return bail(mp, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
+        if (!mp.ok) {
+          dragErr = mp;
+          // A dialog refusal may mean the press never went out: report it and send nothing into the dialog.
+          if (refusedByDialog(mp)) { mouseDown = false; return refusedPress(mp, targetId, held); }
+          return bail(mp, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`);
+        }
         const mx = Math.round((info.sx + info.dx) / 2);
         const my = Math.round((info.sy + info.dy) / 2);
         if (info.draggable) {
@@ -1556,7 +1611,12 @@ export function createPageHelperHandler(
         await pause(planClickTiming(1, rng).dwellMs);
         mouseDown = true;
         const mp = await cdp("Input.dispatchMouseEvent", { type: "mousePressed", x: info.sx, y: info.sy, button: "left", buttons: 1, clickCount: 1 }, targetId, INPUT_TIMEOUT_MS);
-        if (!mp.ok) { mouseDown = !refusedByDialog(mp); dragErr = mp; return bail(mp, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
+        if (!mp.ok) {
+          dragErr = mp;
+          // A dialog refusal may mean the press never went out: report it and send nothing into the dialog.
+          if (refusedByDialog(mp)) { mouseDown = false; return refusedPress(mp, targetId, held); }
+          return bail(mp, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`);
+        }
         await pause(Math.round(60 + rng() * 50));
 
         const state = motionOf(targetId);
@@ -1614,12 +1674,12 @@ export function createPageHelperHandler(
         await cdp("Input.dispatchDragEvent", { type: "dragCancel", x: info.dx, y: info.dy, data: dragIntercepted.data ?? { items: [], dragOperationsMask: 1 } }, targetId, 2_000).catch(() => {});
       }
       if (mouseDown) {
-        const rel = await sendRelease("Input.dispatchMouseEvent", releaseParams, targetId, held);
-        if (rel.ok && !dragErr) motionOf(targetId).pointer = { x: info.dx, y: info.dy };
-        else if (!rel.ok) {
-          releaseHeld = held;
-          if (!dragErr) dragErr = rel;
-        }
+        const out = await sendRelease("Input.dispatchMouseEvent", releaseParams, targetId, held);
+        if (out.held) {
+          releaseHeld = out.held;
+          if (!dragErr) dragErr = out.res;
+        } else if (out.note) releaseNote = out.note;
+        else if (!dragErr) motionOf(targetId).pointer = { x: info.dx, y: info.dy };
       }
       if (info.draggable) {
         await cdp("Input.setInterceptDrags", { enabled: false }, targetId, 2_000).catch(() => {});
@@ -1627,6 +1687,7 @@ export function createPageHelperHandler(
     }
 
     if (dragErr) return withHeld(inputFailed(dragErr, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}: release`), releaseHeld);
+    if (releaseNote) return success(`drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}: ${releaseNote}`);
     const posRes = info.listMeta
       ? await evalHelper({ kind: "bc", method: "listPosition", args: [info.listMeta] }, targetId)
       : undefined;
@@ -1667,6 +1728,8 @@ export function createPageHelperHandler(
           const beforeHash = isCanvas ? await picture.canvasHash(targetId) : "";
           const clicked = await clickCoords(x!, y!, targetId, 1, { natural });
           if (!clicked.ok) return inputFailed(clicked, `click ${x},${y}`);
+          // A release the dialog refused is reported here; the page is never read behind an open dialog.
+          if (valueOf(clicked).startsWith("mouse left button release:")) return success(`click ${x},${y}: ${valueOf(clicked)}`);
           if (isCanvas) return success(`click ${x},${y}: delivered. ${what}\n${await picture.pictureChanges(targetId, beforeHash)}`);
           return withChanges(`click ${x},${y}: delivered. ${what}`, before, quiet, targetId);
         }
@@ -1684,9 +1747,15 @@ export function createPageHelperHandler(
         if (found.loc.kind === "dom") await evalHelper({ kind: "bc", method: "armInputProbe" }, targetId, 2_000).catch(() => {});
         const clicked = await clickAt(at.pt, targetId, 1, useNatural, found.loc.kind === "dom" ? found.loc.ref : undefined);
         if (!clicked.ok) return inputFailed(clicked, `click ${nameOf(found.loc)}`);
+        // A release the dialog refused is reported here; the page is never read behind an open dialog.
+        if (valueOf(clicked).startsWith("mouse left button release:")) {
+          return success(`click ${nameOf(found.loc)} at ${at.pt.x},${at.pt.y}: ${valueOf(clicked)}`);
+        }
         const probe = found.loc.kind === "dom" ? await readProbe(targetId) : undefined;
         const healPrefix = found.healedFrom ? `↻ ${found.healedFrom}->${nameOf(found.loc)} ` : "";
-        const delivery = probe && probe["mousedown"] === 0 && probe["mouseup"] === 0
+        // The click opened a dialog (or stopped the page): report it now, never wait out every later read.
+        if (probe?.blocked) return success(`${healPrefix}click ${nameOf(found.loc)} at ${at.pt.x},${at.pt.y}: delivered, then ${probe.blocked}`);
+        const delivery = probe?.counts && probe.counts["mousedown"] === 0 && probe.counts["mouseup"] === 0
           ? "delivered_unverified (no mouse events reached page)"
           : "delivered";
         return withChanges(`${healPrefix}click ${nameOf(found.loc)} at ${at.pt.x},${at.pt.y}: ${delivery}`, at.pt.before, quiet, targetId);
@@ -1953,6 +2022,8 @@ export function createPageHelperHandler(
         const natural = isNatural(input);
         const res = await pressKey(keyName, targetId, natural ? planKeyHold(rng) : 0);
         if (!res.ok) return inputFailed(res, `key ${keyName}`);
+        // A release nobody can vouch for replaces "sent"; the press reached the page.
+        if (valueOf(res).startsWith(`key ${keyName} release:`)) return success(valueOf(res));
         if (isPic) return success(`key ${keyName}: sent\n${await picture.pictureChanges(targetId, beforeHash)}`);
         return withChanges(`key ${keyName}: sent`, before?.ok ? valueOf(before) : undefined, quiet, targetId);
       }
