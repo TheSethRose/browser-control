@@ -94,13 +94,13 @@ describe("browser-control standalone delivery", () => {
   test("named standalone CLI runs the shared implementation", async () => {
     const cliPath = join(browserControlDir, "cli.ts");
 
-    const listProc = Bun.spawn(["bun", cliPath, "--list"], { stdout: "pipe", stderr: "pipe" });
+    const listProc = Bun.spawn(["bun", cliPath, "--list"], { env: { ...process.env }, stdout: "pipe", stderr: "pipe" });
     const listOut = await new Response(listProc.stdout).text();
     expect(await listProc.exited).toBe(0);
     const listed = JSON.parse(listOut) as Array<{ operation: string }>;
     expect(listed.map((operation) => operation.operation).sort()).toEqual(EXPECTED_OPERATIONS);
 
-    const callProc = Bun.spawn(["bun", cliPath, "list_browsers"], { stdout: "pipe", stderr: "pipe" });
+    const callProc = Bun.spawn(["bun", cliPath, "list_browsers"], { env: { ...process.env }, stdout: "pipe", stderr: "pipe" });
     const callOut = await new Response(callProc.stdout).text();
     expect(await callProc.exited).toBe(0);
     const result = JSON.parse(callOut) as { ok: boolean; data: { browsers: unknown } };

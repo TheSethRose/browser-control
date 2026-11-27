@@ -46,6 +46,18 @@ import {
   type RecordedGet,
 } from "./flows";
 import { drawMarksOnImage, type MarkBox } from "./marks";
+import {
+  DEFAULT_VIEWPORT,
+  isNaturalEnabled,
+  pickClickPoint,
+  planClickTiming,
+  planKeyHold,
+  planPointerPath,
+  planWheelScroll,
+  type Box2D,
+  type Point2D,
+  type Viewport,
+} from "./natural";
 import { appendNote, approveNote, getNote, listNotes, noteHeaderForUrl, removeNote, setNote } from "./notes";
 import { recognizeText, type Recognizer } from "./ocr";
 import {
@@ -243,7 +255,28 @@ function checkBrowseFieldGuard(labelOrLine: string, ref: string): InvokeResult |
   return null;
 }
 
-type Point = { x: number; y: number; hidden: boolean; before?: string };
+type Point = { x: number; y: number; hidden: boolean; before?: string; box?: Box2D; viewport?: Viewport };
+type ScrollerDetail = {
+  kind: "element" | "document";
+  box: Box2D;
+  scrollTop: number;
+  scrollLeft: number;
+  scrollHeight: number;
+  clientHeight: number;
+  point?: Point2D | null;
+};
+type PointDetail = {
+  x: number;
+  y: number;
+  hidden: boolean;
+  inView: boolean;
+  box: Box2D;
+  rect: Box2D;
+  viewport: Viewport;
+  stickyTop: number;
+  stickyBottom: number;
+  scroller?: ScrollerDetail;
+};
 type Step = { action: string; input: Json; label: string };
 
 export function createPageHelperHandler(
@@ -256,6 +289,8 @@ export function createPageHelperHandler(
     sessionId?: string;
     sleep?: (ms: number) => Promise<void>;
     rng?: () => number;
+    now?: () => number;
+    naturalDefault?: boolean;
     bcCall?: BcCallFn;
     extensionRequest?: ExtensionRequestFn;
     challengeWaitMaxMs?: number;
@@ -264,6 +299,23 @@ export function createPageHelperHandler(
   const daemonSessionId = options.sessionId ?? randomUUID().slice(0, 12);
   const pause = options.sleep ?? sleep;
   const rng = options.rng ?? Math.random;
+  const now = options.now ?? (() => Date.now());
+  const isNatural = (input: Json): boolean => isNaturalEnabled(input, { defaultEnabled: options.naturalDefault });
+  /** Per-tab pointer state keyed by tab id without frame suffix. */
+  const motionByTab = new Map<string, { pointer?: Point2D; viewport?: Viewport }>();
+  const tabKeyOf = (targetId?: string): string => (targetId ?? "").replace(/@frame:\d+$/, "");
+  const motionOf = (targetId?: string): { pointer?: Point2D; viewport?: Viewport } => {
+    const key = tabKeyOf(targetId);
+    let st = motionByTab.get(key);
+    if (!st) {
+      st = {};
+      motionByTab.set(key, st);
+    }
+    return st;
+  };
+  const resetMotion = (targetId?: string): void => {
+    motionByTab.delete(tabKeyOf(targetId));
+  };
   /** Cross-origin iframe targets from the last snap of each tab: f1 is index 0. */
   const frameTargets = new Map<string, string[]>();
   /** Last isolated-world executionContextId seen per target, used by upload/styles. */
@@ -521,9 +573,103 @@ export function createPageHelperHandler(
     return { ok: true, objectId };
   }
 
-  async function clickCoords(x: number, y: number, targetId?: string, clickCount = 1): Promise<InvokeResult> {
-    const m1 = await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x, y }, targetId, INPUT_TIMEOUT_MS);
-    if (!m1.ok) return m1;
+  async function movePointer(
+    to: Point2D,
+    targetId: string | undefined,
+    opts: {
+      viewport?: Viewport;
+      targetSize?: number;
+      maxSteps?: number;
+      overshootProb?: number;
+      button?: string;
+      buttons?: number;
+    } = {},
+  ): Promise<InvokeResult> {
+    const state = motionOf(targetId);
+    const viewport = opts.viewport ?? state.viewport ?? DEFAULT_VIEWPORT;
+    if (opts.viewport) state.viewport = opts.viewport;
+    const plan = planPointerPath({
+      from: state.pointer,
+      to,
+      viewport,
+      targetSize: opts.targetSize,
+      maxSteps: opts.maxSteps,
+      overshootProb: opts.overshootProb,
+      rng,
+    });
+    let prevSendMs = 0;
+    for (const step of plan.steps) {
+      if (step.delayMs > 0) {
+        const rem = Math.max(0, step.delayMs - prevSendMs);
+        if (rem > 0) await pause(rem);
+      }
+      const t0 = now();
+      const res = await cdp(
+        "Input.dispatchMouseEvent",
+        {
+          type: "mouseMoved",
+          x: step.x,
+          y: step.y,
+          ...(opts.button !== undefined ? { button: opts.button } : {}),
+          ...(opts.buttons !== undefined ? { buttons: opts.buttons } : {}),
+        },
+        targetId,
+        INPUT_TIMEOUT_MS,
+      );
+      prevSendMs = Math.max(0, now() - t0);
+      if (!res.ok) return res;
+      state.pointer = { x: step.x, y: step.y };
+    }
+    return success("ok");
+  }
+
+  async function clickCoords(
+    x: number,
+    y: number,
+    targetId?: string,
+    clickCount = 1,
+    opts: { natural?: boolean; box?: Box2D; viewport?: Viewport; domRef?: string } = {},
+  ): Promise<InvokeResult> {
+    if (!opts.natural) {
+      const m1 = await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x, y }, targetId, INPUT_TIMEOUT_MS);
+      if (!m1.ok) return m1;
+      for (let c = 1; c <= clickCount; c++) {
+        const m2 = await cdp(
+          "Input.dispatchMouseEvent",
+          { type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: c },
+          targetId,
+          INPUT_TIMEOUT_MS,
+        );
+        if (!m2.ok) return m2;
+        const m3 = await cdp(
+          "Input.dispatchMouseEvent",
+          { type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: c },
+          targetId,
+          INPUT_TIMEOUT_MS,
+        );
+        if (!m3.ok) return m3;
+      }
+      return success("ok");
+    }
+    const targetSize = opts.box ? Math.min(opts.box.width, opts.box.height) : undefined;
+    const moved = await movePointer({ x, y }, targetId, { viewport: opts.viewport, targetSize });
+    if (!moved.ok) return moved;
+    const timing = planClickTiming(clickCount, rng);
+    await pause(timing.dwellMs);
+    if (opts.domRef) {
+      const hc = await evalHelper({ kind: "bc", method: "hitCheck", args: [opts.domRef, x, y] }, targetId, 2_000);
+      if (hc.ok) {
+        const raw = valueOf(hc);
+        if (raw.startsWith("{")) {
+          try {
+            const parsed = JSON.parse(raw) as { ok?: boolean; reason?: string };
+            if (parsed.ok === false) {
+              return failure("EXECUTION_FAILED", `NOT_ACTIONABLE: ${opts.domRef} ${parsed.reason ?? "covered after hover"}`);
+            }
+          } catch { /* ignore */ }
+        }
+      }
+    }
     for (let c = 1; c <= clickCount; c++) {
       const m2 = await cdp(
         "Input.dispatchMouseEvent",
@@ -532,6 +678,7 @@ export function createPageHelperHandler(
         INPUT_TIMEOUT_MS,
       );
       if (!m2.ok) return m2;
+      await pause(timing.holdsMs[c - 1]!);
       const m3 = await cdp(
         "Input.dispatchMouseEvent",
         { type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: c },
@@ -539,6 +686,7 @@ export function createPageHelperHandler(
         INPUT_TIMEOUT_MS,
       );
       if (!m3.ok) return m3;
+      if (c < clickCount) await pause(timing.gapsMs[c - 1]!);
     }
     return success("ok");
   }
@@ -589,11 +737,154 @@ export function createPageHelperHandler(
     return frameTargets.get(targetId ?? "")?.[frame - 1];
   }
 
+  function parsePointDetail(raw: string): PointDetail | undefined {
+    if (!raw.startsWith("{")) return undefined;
+    try {
+      const parsed = JSON.parse(raw) as Partial<PointDetail>;
+      if (typeof parsed.x === "number" && typeof parsed.y === "number" && parsed.box && parsed.viewport) {
+        return {
+          x: parsed.x,
+          y: parsed.y,
+          hidden: parsed.hidden === true,
+          inView: parsed.inView !== false,
+          box: parsed.box,
+          rect: parsed.rect ?? parsed.box,
+          viewport: parsed.viewport,
+          stickyTop: typeof parsed.stickyTop === "number" ? parsed.stickyTop : 0,
+          stickyBottom: typeof parsed.stickyBottom === "number" ? parsed.stickyBottom : 0,
+          scroller: parsed.scroller,
+        };
+      }
+    } catch { /* fall back to legacy format */ }
+    return undefined;
+  }
+
+  async function sampleHitCheckedPoint(
+    ref: string,
+    detail: PointDetail,
+    where: string | undefined,
+  ): Promise<Point2D> {
+    if (detail.box.width < 2 || detail.box.height < 2) return { x: detail.x, y: detail.y };
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const cand = pickClickPoint(detail.box, rng);
+      const hc = await evalHelper({ kind: "bc", method: "hitCheck", args: [ref, cand.x, cand.y] }, where, 2_000);
+      if (!hc.ok) break;
+      const raw = valueOf(hc);
+      if (raw.startsWith("{")) {
+        try {
+          const parsed = JSON.parse(raw) as { ok?: boolean };
+          if (parsed.ok) return cand;
+          continue;
+        } catch {
+          return cand;
+        }
+      }
+      return cand;
+    }
+    return { x: detail.x, y: detail.y };
+  }
+
+  async function wheelScrollIntoView(
+    ref: string,
+    initial: PointDetail,
+    targetId: string | undefined,
+  ): Promise<{ ok: true; detail: PointDetail } | { ok: false; res: InvokeResult }> {
+    let cur = initial;
+    if (cur.hidden) {
+      const foc = await cdp("Emulation.setFocusEmulationEnabled", { enabled: true }, targetId);
+      if (!foc.ok) return { ok: false, res: foc };
+    }
+    const vw = cur.viewport.width || DEFAULT_VIEWPORT.width;
+    const vh = cur.viewport.height || DEFAULT_VIEWPORT.height;
+    motionOf(targetId).viewport = { width: vw, height: vh };
+
+    const scroller = cur.scroller;
+    const goalY = scroller?.kind === "element"
+      ? scroller.box.top + scroller.box.height * (0.32 + rng() * 0.22)
+      : vh * (0.32 + rng() * 0.22);
+    const neededDeltaY = Math.round(cur.rect.top + cur.rect.height / 2 - goalY);
+
+    if (Math.abs(neededDeltaY) >= 4) {
+      let anchor: Point2D;
+      if (scroller?.kind === "element") {
+        const cl = Math.max(0, scroller.box.left);
+        const ct = Math.max(0, scroller.box.top);
+        const cr = Math.min(vw, scroller.box.left + scroller.box.width);
+        const cb = Math.min(vh, scroller.box.top + scroller.box.height);
+        anchor = cr - cl >= 4 && cb - ct >= 4
+          ? pickClickPoint({ left: cl, top: ct, width: cr - cl, height: cb - ct }, rng)
+          : { x: Math.round(vw * 0.5), y: Math.round(vh * 0.5) };
+      } else if (scroller?.point) {
+        anchor = scroller.point;
+      } else {
+        anchor = {
+          x: Math.round(vw * (0.35 + rng() * 0.3)),
+          y: Math.round(vh * (0.35 + rng() * 0.3)),
+        };
+      }
+
+      const ptr = motionOf(targetId).pointer;
+      const nearAnchor = ptr !== undefined && Math.hypot(ptr.x - anchor.x, ptr.y - anchor.y) < 25;
+      if (!nearAnchor) {
+        const moved = await movePointer(anchor, targetId, { viewport: { width: vw, height: vh }, overshootProb: 0 });
+        if (!moved.ok) return { ok: false, res: moved };
+      }
+
+      const plan = planWheelScroll(neededDeltaY, rng);
+      for (let fi = 0; fi < plan.flicks.length; fi++) {
+        const flick = plan.flicks[fi]!;
+        const prevTop = cur.rect.top;
+        let prevSendMs = 0;
+        for (const ev of flick.events) {
+          if (ev.delayMs > 0) {
+            const rem = Math.max(0, ev.delayMs - prevSendMs);
+            if (rem > 0) await pause(rem);
+          }
+          const t0 = now();
+          const wres = await cdp(
+            "Input.dispatchMouseEvent",
+            { type: "mouseWheel", x: anchor.x, y: anchor.y, deltaX: 0, deltaY: ev.deltaY },
+            targetId,
+            INPUT_TIMEOUT_MS,
+          );
+          prevSendMs = Math.max(0, now() - t0);
+          if (!wres.ok) return { ok: false, res: wres };
+        }
+        const probe = await evalHelper(
+          { kind: "bc", method: "point", args: [ref, { noScroll: true, detail: true }] },
+          targetId,
+        );
+        if (!probe.ok) break;
+        const next = parsePointDetail(valueOf(probe));
+        if (!next) break;
+        cur = next;
+        if (next.inView) return { ok: true, detail: next };
+        if (Math.abs(next.rect.top - prevTop) < 2) break;
+        if (fi < plan.flicks.length - 1 && flick.pauseAfterMs > 0) {
+          await pause(flick.pauseAfterMs);
+        }
+      }
+    }
+
+    // Fallback to instant scrollIntoView when wheel scrolling stagnates or target is still off-screen.
+    const settled = await evalHelper(
+      { kind: "bc", method: "point", args: [ref, { detail: true }] },
+      targetId,
+    );
+    if (!settled.ok) return { ok: false, res: settled };
+    const detail = parsePointDetail(valueOf(settled));
+    if (!detail) {
+      return { ok: false, res: failure("EXECUTION_FAILED", `unexpected point output: ${valueOf(settled)}`) };
+    }
+    return { ok: true, detail };
+  }
+
   /** Where to click, in the top page's viewport coordinates. `baseline` also records the controls for the later diff. */
   async function pointOf(
     loc: Exclude<Locator, { kind: "label" }>,
     targetId: string | undefined,
     baseline: boolean,
+    natural = false,
   ): Promise<{ ok: true; pt: Point } | { ok: false; res: InvokeResult }> {
     const bad = (res: InvokeResult) => ({ ok: false as const, res });
     if (loc.kind === "ax") {
@@ -605,13 +896,25 @@ export function createPageHelperHandler(
       if (!q || q.length < 8) {
         return bad(failure("EXECUTION_FAILED", `NOT_ACTIONABLE: a${loc.node} has no visible box. Run snap --ax again.`));
       }
+      const xs = [q[0]!, q[2]!, q[4]!, q[6]!];
+      const ys = [q[1]!, q[3]!, q[5]!, q[7]!];
+      const box: Box2D = {
+        left: Math.min(...xs),
+        top: Math.min(...ys),
+        width: Math.max(...xs) - Math.min(...xs),
+        height: Math.max(...ys) - Math.min(...ys),
+      };
+      const picked = natural && box.width >= 2 && box.height >= 2
+        ? pickClickPoint(box, rng)
+        : { x: Math.round((q[0]! + q[2]! + q[4]! + q[6]!) / 4), y: Math.round((q[1]! + q[3]! + q[5]! + q[7]!) / 4) };
       return {
         ok: true,
         pt: {
-          x: Math.round((q[0]! + q[2]! + q[4]! + q[6]!) / 4),
-          y: Math.round((q[1]! + q[3]! + q[5]! + q[7]!) / 4),
+          x: picked.x,
+          y: picked.y,
           hidden: false,
           before: before?.ok ? valueOf(before) : undefined,
+          ...(natural ? { box } : {}),
         },
       };
     }
@@ -620,20 +923,90 @@ export function createPageHelperHandler(
       return bad(failure("EXECUTION_FAILED", `STALE_REF: iframe f${loc.frame} is not known for this tab. Run snap again.`));
     }
     const before = baseline && loc.kind === "frame" ? await evalHelper({ kind: "bc", method: "baseline" }, targetId) : undefined;
+    if (!natural) {
+      const call: HelperCall = baseline && loc.kind === "dom"
+        ? { steps: [{ kind: "bc", method: "baseline" }, { kind: "bc", method: "point", args: [loc.ref] }], join: " " }
+        : { kind: "bc", method: "point", args: [loc.ref] };
+      const res = await evalHelper(call, where);
+      if (!res.ok) return bad(res);
+      const parts = valueOf(res).split(" ");
+      const href = baseline && loc.kind === "dom" ? parts.shift() : before?.ok ? valueOf(before) : undefined;
+      let x = Number(parts[0]);
+      let y = Number(parts[1]);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) {
+        return bad(failure("EXECUTION_FAILED", `unexpected point output: ${valueOf(res)}`));
+      }
+      if (loc.kind === "frame") {
+        // Offset the iframe element that hosts the frame the point came from, not whatever sits in slot f<n> now.
+        const slot = (await crossFrames(targetId)).find((f) => f.target === where)?.i;
+        if (slot === undefined) {
+          return bad(failure("EXECUTION_FAILED", `STALE_REF: iframe f${loc.frame} is gone. Run snap again.`));
+        }
+        const off = await evalHelper({ kind: "bc", method: "frameOffset", args: [slot] }, targetId);
+        if (!off.ok) return bad(off);
+        const [ox, oy] = valueOf(off).split(" ").map(Number);
+        x = Math.round(x + (ox ?? 0));
+        y = Math.round(y + (oy ?? 0));
+      }
+      return { ok: true, pt: { x, y, hidden: parts[2] === "hidden", before: href } };
+    }
+
+    // Natural mode: inspect visibility without scrolling on main-frame DOM refs so off-screen targets wheel-scroll.
+    const pointOpts = loc.kind === "dom" ? { noScroll: true, detail: true } : { detail: true };
     const call: HelperCall = baseline && loc.kind === "dom"
-      ? { steps: [{ kind: "bc", method: "baseline" }, { kind: "bc", method: "point", args: [loc.ref] }], join: " " }
-      : { kind: "bc", method: "point", args: [loc.ref] };
+      ? { steps: [{ kind: "bc", method: "baseline" }, { kind: "bc", method: "point", args: [loc.ref, pointOpts] }], join: "\n" }
+      : { kind: "bc", method: "point", args: [loc.ref, pointOpts] };
     const res = await evalHelper(call, where);
     if (!res.ok) return bad(res);
-    const parts = valueOf(res).split(" ");
-    const href = baseline && loc.kind === "dom" ? parts.shift() : before?.ok ? valueOf(before) : undefined;
-    let x = Number(parts[0]);
-    let y = Number(parts[1]);
-    if (!Number.isFinite(x) || !Number.isFinite(y)) {
-      return bad(failure("EXECUTION_FAILED", `unexpected point output: ${valueOf(res)}`));
+    const raw = valueOf(res);
+    let href: string | undefined = before?.ok ? valueOf(before) : undefined;
+    let ptRaw = raw;
+    if (baseline && loc.kind === "dom") {
+      const nl = raw.indexOf("\n");
+      if (nl >= 0) {
+        href = raw.slice(0, nl);
+        ptRaw = raw.slice(nl + 1);
+      } else {
+        const sp = raw.indexOf(" ");
+        if (sp >= 0) {
+          href = raw.slice(0, sp);
+          ptRaw = raw.slice(sp + 1);
+        }
+      }
     }
+    let detail = parsePointDetail(ptRaw);
+    if (!detail) {
+      // Fallback for mocks returning legacy "x y visible" format.
+      const parts = ptRaw.split(" ");
+      let x = Number(parts[0]);
+      let y = Number(parts[1]);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) {
+        return bad(failure("EXECUTION_FAILED", `unexpected point output: ${raw}`));
+      }
+      if (loc.kind === "frame") {
+        const slot = (await crossFrames(targetId)).find((f) => f.target === where)?.i;
+        if (slot === undefined) {
+          return bad(failure("EXECUTION_FAILED", `STALE_REF: iframe f${loc.frame} is gone. Run snap again.`));
+        }
+        const off = await evalHelper({ kind: "bc", method: "frameOffset", args: [slot] }, targetId);
+        if (!off.ok) return bad(off);
+        const [ox, oy] = valueOf(off).split(" ").map(Number);
+        x = Math.round(x + (ox ?? 0));
+        y = Math.round(y + (oy ?? 0));
+      }
+      return { ok: true, pt: { x, y, hidden: parts[2] === "hidden", before: href } };
+    }
+
+    if (loc.kind === "dom" && !detail.inView) {
+      const scrolled = await wheelScrollIntoView(loc.ref, detail, targetId);
+      if (!scrolled.ok) return bad(scrolled.res);
+      detail = scrolled.detail;
+    }
+
+    motionOf(targetId).viewport = detail.viewport;
+    let picked = await sampleHitCheckedPoint(loc.ref, detail, where);
+    let box = detail.box;
     if (loc.kind === "frame") {
-      // Offset the iframe element that hosts the frame the point came from, not whatever sits in slot f<n> now.
       const slot = (await crossFrames(targetId)).find((f) => f.target === where)?.i;
       if (slot === undefined) {
         return bad(failure("EXECUTION_FAILED", `STALE_REF: iframe f${loc.frame} is gone. Run snap again.`));
@@ -641,18 +1014,41 @@ export function createPageHelperHandler(
       const off = await evalHelper({ kind: "bc", method: "frameOffset", args: [slot] }, targetId);
       if (!off.ok) return bad(off);
       const [ox, oy] = valueOf(off).split(" ").map(Number);
-      x = Math.round(x + (ox ?? 0));
-      y = Math.round(y + (oy ?? 0));
+      const dx = ox ?? 0;
+      const dy = oy ?? 0;
+      picked = { x: Math.round((picked.x + dx) * 10) / 10, y: Math.round((picked.y + dy) * 10) / 10 };
+      box = { left: box.left + dx, top: box.top + dy, width: box.width, height: box.height };
     }
-    return { ok: true, pt: { x, y, hidden: parts[2] === "hidden", before: href } };
+    return {
+      ok: true,
+      pt: {
+        x: picked.x,
+        y: picked.y,
+        hidden: detail.hidden,
+        before: href,
+        box,
+        viewport: detail.viewport,
+      },
+    };
   }
 
-  async function clickAt(pt: Point, targetId?: string, clickCount = 1): Promise<InvokeResult> {
+  async function clickAt(
+    pt: Point,
+    targetId?: string,
+    clickCount = 1,
+    natural = false,
+    domRef?: string,
+  ): Promise<InvokeResult> {
     if (pt.hidden) {
       const foc = await cdp("Emulation.setFocusEmulationEnabled", { enabled: true }, targetId);
       if (!foc.ok) return foc;
     }
-    return clickCoords(pt.x, pt.y, targetId, clickCount);
+    return clickCoords(pt.x, pt.y, targetId, clickCount, {
+      natural,
+      box: pt.box,
+      viewport: pt.viewport,
+      domRef,
+    });
   }
 
   /** Arm isolated-world event probe and read back trusted event counts after input. */
@@ -952,8 +1348,8 @@ export function createPageHelperHandler(
           input: {
             ref: arg[0],
             text: arg[1],
-            fast: arg[2] === "fast",
-            keys: arg[2] === "keys" || arg[2] === true,
+            ...(arg[2] === "fast" ? { fast: true } : {}),
+            ...(arg[2] === "keys" || arg[2] === true ? { keys: true } : {}),
           },
           label: `type ${js(arg[0])}`,
         });
@@ -1049,42 +1445,112 @@ export function createPageHelperHandler(
       sx: number; sy: number; dx: number; dy: number; draggable: boolean; listMeta: Json | null;
     };
 
+    const natural = isNatural(input);
     let html5Dropped = false;
     let dragIntercepted: { data?: Json } | undefined;
     let mouseDown = false;
+    let dragErr: InvokeResult | undefined;
     if (info.draggable) {
       await cdp("Input.setInterceptDrags", { enabled: true }, targetId, 4_000);
     }
     try {
-      await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: info.sx, y: info.sy }, targetId, INPUT_TIMEOUT_MS);
-      await cdp("Input.dispatchMouseEvent", { type: "mousePressed", x: info.sx, y: info.sy, button: "left", buttons: 1, clickCount: 1 }, targetId, INPUT_TIMEOUT_MS);
-      mouseDown = true;
-      const mx = Math.round((info.sx + info.dx) / 2);
-      const my = Math.round((info.sy + info.dy) / 2);
-      if (info.draggable) {
-        const waitDrag = invoke("wait_for_event", { method: "Input.dragIntercepted", timeoutMs: 1200, ...(targetId ? { targetId } : {}) });
-        await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: mx, y: my, button: "left", buttons: 1 }, targetId, INPUT_TIMEOUT_MS);
-        const ev = await waitDrag;
-        if (ev.ok && (ev.data as Json)["found"] === true) {
-          dragIntercepted = (((ev.data as Json)["event"] as Json)?.["params"] as { data?: Json }) ?? {};
-          const dragData = dragIntercepted.data ?? { items: [], dragOperationsMask: 1 };
-          await cdp("Input.dispatchDragEvent", { type: "dragEnter", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
-          await cdp("Input.dispatchDragEvent", { type: "dragOver", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
-          const dropRes = await cdp("Input.dispatchDragEvent", { type: "drop", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
-          html5Dropped = dropRes.ok;
+      if (!natural) {
+        const m0 = await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: info.sx, y: info.sy }, targetId, INPUT_TIMEOUT_MS);
+        if (!m0.ok) { dragErr = m0; return inputFailed(m0, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
+        const mp = await cdp("Input.dispatchMouseEvent", { type: "mousePressed", x: info.sx, y: info.sy, button: "left", buttons: 1, clickCount: 1 }, targetId, INPUT_TIMEOUT_MS);
+        if (!mp.ok) { dragErr = mp; return inputFailed(mp, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
+        mouseDown = true;
+        const mx = Math.round((info.sx + info.dx) / 2);
+        const my = Math.round((info.sy + info.dy) / 2);
+        if (info.draggable) {
+          const waitDrag = invoke("wait_for_event", { method: "Input.dragIntercepted", timeoutMs: 1200, ...(targetId ? { targetId } : {}) });
+          await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: mx, y: my, button: "left", buttons: 1 }, targetId, INPUT_TIMEOUT_MS);
+          const ev = await waitDrag;
+          if (ev.ok && (ev.data as Json)["found"] === true) {
+            dragIntercepted = (((ev.data as Json)["event"] as Json)?.["params"] as { data?: Json }) ?? {};
+            const dragData = dragIntercepted.data ?? { items: [], dragOperationsMask: 1 };
+            await cdp("Input.dispatchDragEvent", { type: "dragEnter", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
+            await cdp("Input.dispatchDragEvent", { type: "dragOver", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
+            const dropRes = await cdp("Input.dispatchDragEvent", { type: "drop", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
+            html5Dropped = dropRes.ok;
+          } else {
+            await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: info.dx, y: info.dy, button: "left", buttons: 1 }, targetId, INPUT_TIMEOUT_MS);
+          }
         } else {
+          await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: mx, y: my, button: "left", buttons: 1 }, targetId, INPUT_TIMEOUT_MS);
           await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: info.dx, y: info.dy, button: "left", buttons: 1 }, targetId, INPUT_TIMEOUT_MS);
         }
       } else {
-        await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: mx, y: my, button: "left", buttons: 1 }, targetId, INPUT_TIMEOUT_MS);
-        await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: info.dx, y: info.dy, button: "left", buttons: 1 }, targetId, INPUT_TIMEOUT_MS);
+        const toSrc = await movePointer({ x: info.sx, y: info.sy }, targetId);
+        if (!toSrc.ok) { dragErr = toSrc; return inputFailed(toSrc, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
+        await pause(planClickTiming(1, rng).dwellMs);
+        const mp = await cdp("Input.dispatchMouseEvent", { type: "mousePressed", x: info.sx, y: info.sy, button: "left", buttons: 1, clickCount: 1 }, targetId, INPUT_TIMEOUT_MS);
+        if (!mp.ok) { dragErr = mp; return inputFailed(mp, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
+        mouseDown = true;
+        await pause(Math.round(60 + rng() * 50));
+
+        const state = motionOf(targetId);
+        const dragPlan = planPointerPath({
+          from: { x: info.sx, y: info.sy },
+          to: { x: info.dx, y: info.dy },
+          viewport: state.viewport ?? DEFAULT_VIEWPORT,
+          maxSteps: 20,
+          overshootProb: 0,
+          rng,
+        });
+        const dispatchSteps = async (stepsSlice: typeof dragPlan.steps): Promise<InvokeResult> => {
+          let prevSendMs = 0;
+          for (const step of stepsSlice) {
+            if (step.delayMs > 0) {
+              const rem = Math.max(0, step.delayMs - prevSendMs);
+              if (rem > 0) await pause(rem);
+            }
+            const t0 = now();
+            const res = await cdp(
+              "Input.dispatchMouseEvent",
+              { type: "mouseMoved", x: step.x, y: step.y, button: "left", buttons: 1 },
+              targetId,
+              INPUT_TIMEOUT_MS,
+            );
+            prevSendMs = Math.max(0, now() - t0);
+            if (!res.ok) return res;
+            state.pointer = { x: step.x, y: step.y };
+          }
+          return success("ok");
+        };
+
+        if (info.draggable) {
+          const waitDrag = invoke("wait_for_event", { method: "Input.dragIntercepted", timeoutMs: 1200, ...(targetId ? { targetId } : {}) });
+          let splitIdx = dragPlan.steps.findIndex((s) => Math.hypot(s.x - info.sx, s.y - info.sy) >= 10);
+          if (splitIdx < 0) splitIdx = Math.max(0, Math.floor(dragPlan.steps.length / 2) - 1);
+          const nudge = await dispatchSteps(dragPlan.steps.slice(0, splitIdx + 1));
+          if (!nudge.ok) { dragErr = nudge; return inputFailed(nudge, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
+          const ev = await waitDrag;
+          if (ev.ok && (ev.data as Json)["found"] === true) {
+            dragIntercepted = (((ev.data as Json)["event"] as Json)?.["params"] as { data?: Json }) ?? {};
+            const dragData = dragIntercepted.data ?? { items: [], dragOperationsMask: 1 };
+            await cdp("Input.dispatchDragEvent", { type: "dragEnter", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
+            await cdp("Input.dispatchDragEvent", { type: "dragOver", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
+            const dropRes = await cdp("Input.dispatchDragEvent", { type: "drop", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
+            html5Dropped = dropRes.ok;
+            state.pointer = { x: info.dx, y: info.dy };
+          } else {
+            const rest = await dispatchSteps(dragPlan.steps.slice(splitIdx + 1));
+            if (!rest.ok) { dragErr = rest; return inputFailed(rest, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
+          }
+        } else {
+          const moved = await dispatchSteps(dragPlan.steps);
+          if (!moved.ok) { dragErr = moved; return inputFailed(moved, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
+        }
+        await pause(Math.round(40 + rng() * 50));
       }
     } finally {
       if (info.draggable && dragIntercepted && !html5Dropped) {
         await cdp("Input.dispatchDragEvent", { type: "dragCancel", x: info.dx, y: info.dy, data: dragIntercepted.data ?? { items: [], dragOperationsMask: 1 } }, targetId, 2_000).catch(() => {});
       }
       if (mouseDown) {
-        await cdp("Input.dispatchMouseEvent", { type: "mouseReleased", x: info.dx, y: info.dy, button: "left", buttons: 0, clickCount: 1 }, targetId, 2_000).catch(() => {});
+        const rel = await cdp("Input.dispatchMouseEvent", { type: "mouseReleased", x: info.dx, y: info.dy, button: "left", buttons: 0, clickCount: 1 }, targetId, 2_000).catch(() => undefined);
+        if (rel?.ok && !dragErr) motionOf(targetId).pointer = { x: info.dx, y: info.dy };
       }
       if (info.draggable) {
         await cdp("Input.setInterceptDrags", { enabled: false }, targetId, 2_000).catch(() => {});
@@ -1114,6 +1580,7 @@ export function createPageHelperHandler(
   ): Promise<InvokeResult> {
     switch (action) {
       case "click": {
+        const natural = isNatural(input);
         if (Array.isArray(input["xy"])) {
           const [x, y] = (input["xy"] as unknown[]).map(Number);
           if (!Number.isFinite(x) || !Number.isFinite(y)) {
@@ -1128,7 +1595,7 @@ export function createPageHelperHandler(
           const [before, what] = valueOf(hit).split("\n");
           const isCanvas = !quiet && /^hit: canvas/.test(what ?? "");
           const beforeHash = isCanvas ? await picture.canvasHash(targetId) : "";
-          const clicked = await clickCoords(x!, y!, targetId);
+          const clicked = await clickCoords(x!, y!, targetId, 1, { natural });
           if (!clicked.ok) return inputFailed(clicked, `click ${x},${y}`);
           if (isCanvas) return success(`click ${x},${y}: delivered. ${what}\n${await picture.pictureChanges(targetId, beforeHash)}`);
           return withChanges(`click ${x},${y}: delivered. ${what}`, before, quiet, targetId);
@@ -1141,10 +1608,10 @@ export function createPageHelperHandler(
         }
         const found = await locate(input["ref"], "click", targetId, healInBatch);
         if (!found.ok) return found.res;
-        const at = await pointOf(found.loc, targetId, !quiet);
+        const at = await pointOf(found.loc, targetId, !quiet, natural);
         if (!at.ok) return at.res;
         if (found.loc.kind === "dom") await evalHelper({ kind: "bc", method: "armInputProbe" }, targetId, 2_000).catch(() => {});
-        const clicked = await clickAt(at.pt, targetId);
+        const clicked = await clickAt(at.pt, targetId, 1, natural, found.loc.kind === "dom" ? found.loc.ref : undefined);
         if (!clicked.ok) return inputFailed(clicked, `click ${nameOf(found.loc)}`);
         const probe = found.loc.kind === "dom" ? await readProbe(targetId) : undefined;
         const healPrefix = found.healedFrom ? `↻ ${found.healedFrom}->${nameOf(found.loc)} ` : "";
@@ -1159,8 +1626,9 @@ export function createPageHelperHandler(
           return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: text is required");
         }
         const text = input["text"];
+        const natural = isNatural(input);
         const mode: "human" | "fast" | "keys" =
-          input["fast"] === true ? "fast" : input["keys"] === true ? "keys" : "human";
+          input["fast"] === true ? "fast" : input["keys"] === true ? "keys" : natural ? "human" : "fast";
         if (browseTab !== undefined) {
           if (input["focused"] === true) {
             return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: type --focused needs a DevTools tab");
@@ -1212,14 +1680,14 @@ export function createPageHelperHandler(
             const before = quiet ? undefined : await evalHelper({ kind: "bc", method: "baseline" }, targetId);
             let editorRef = cInfo.editorRef;
             if (!editorRef) {
-              const pt = await pointOf(loc, targetId, false);
+              const pt = await pointOf(loc, targetId, false, natural);
               if (!pt.ok) return pt.res;
-              await clickAt(pt.pt, targetId, 2);
+              await clickAt(pt.pt, targetId, 2, natural, loc.kind === "dom" ? loc.ref : undefined);
               await sleep(150);
               const ed = await evalHelper({ kind: "bc", method: "cellEditor" }, fieldTarget);
               editorRef = ed.ok && /^e\d+$/.test(valueOf(ed)) ? valueOf(ed) : null;
               if (!editorRef) {
-                await pressKey("Enter", targetId);
+                await pressKey("Enter", targetId, natural ? planKeyHold(rng) : 0);
                 await sleep(150);
                 const ed2 = await evalHelper({ kind: "bc", method: "cellEditor" }, fieldTarget);
                 editorRef = ed2.ok && /^e\d+$/.test(valueOf(ed2)) ? valueOf(ed2) : null;
@@ -1230,7 +1698,7 @@ export function createPageHelperHandler(
             }
             const sent = await dispatchText(text, mode, targetId);
             if (!sent.ok) return inputFailed(sent, `type ${name}`);
-            await pressKey("Enter", targetId);
+            await pressKey("Enter", targetId, natural ? planKeyHold(rng) : 0);
             await sleep(150);
             const afterRes = await evalHelper({ kind: "bc", method: "cellRead", args: [loc.ref, cInfo.before] }, fieldTarget);
             if (afterRes.ok) {
@@ -1249,9 +1717,9 @@ export function createPageHelperHandler(
           }
         }
 
-        const at = await pointOf(loc, targetId, !quiet);
+        const at = await pointOf(loc, targetId, !quiet, natural);
         if (!at.ok) return at.res;
-        const clicked = await clickAt(at.pt, targetId);
+        const clicked = await clickAt(at.pt, targetId, 1, natural, loc.kind === "dom" ? loc.ref : undefined);
         if (!clicked.ok) return inputFailed(clicked, `type ${name}`);
         let activeRef = loc.kind === "ax" ? "" : loc.ref;
         let retargetNote = "";
@@ -1317,9 +1785,10 @@ export function createPageHelperHandler(
             targetId,
           );
         }
-        const at = await pointOf(loc, targetId, false);
+        const natural = isNatural(input);
+        const at = await pointOf(loc, targetId, false, natural);
         if (!at.ok) return at.res;
-        const opened = await clickAt(at.pt, targetId);
+        const opened = await clickAt(at.pt, targetId, 1, natural, loc.kind === "dom" ? loc.ref : undefined);
         if (!opened.ok) return inputFailed(opened, `select ${nameOf(loc)}`);
         await evalHelper({ kind: "bc", method: "settle", args: [300, 80] }, fieldTarget, 4_000);
         const optRef = await evalHelper({ kind: "bc", method: "locateOption", args: [option] }, fieldTarget);
@@ -1328,9 +1797,9 @@ export function createPageHelperHandler(
           loc.kind === "frame"
             ? { kind: "frame", frame: loc.frame, ref: valueOf(optRef), ...(loc.target ? { target: loc.target } : {}) }
             : { kind: "dom", ref: valueOf(optRef) };
-        const optAt = await pointOf(optLoc, targetId, false);
+        const optAt = await pointOf(optLoc, targetId, false, natural);
         if (!optAt.ok) return optAt.res;
-        const picked = await clickAt(optAt.pt, targetId);
+        const picked = await clickAt(optAt.pt, targetId, 1, natural, optLoc.kind === "dom" ? optLoc.ref : undefined);
         if (!picked.ok) return inputFailed(picked, `select ${nameOf(loc)} "${option}"`);
         return withChanges(
           `select ${nameOf(loc)} -> "${option}": delivered`,
@@ -1410,7 +1879,8 @@ export function createPageHelperHandler(
         const isPic = !quiet && (await picture.isPicture(targetId));
         const beforeHash = isPic ? await picture.canvasHash(targetId) : "";
         const before = quiet || isPic ? undefined : await evalHelper({ kind: "bc", method: "baseline" }, targetId);
-        const res = await pressKey(keyName, targetId);
+        const natural = isNatural(input);
+        const res = await pressKey(keyName, targetId, natural ? planKeyHold(rng) : 0);
         if (!res.ok) return inputFailed(res, `key ${keyName}`);
         if (isPic) return success(`key ${keyName}: sent\n${await picture.pictureChanges(targetId, beforeHash)}`);
         return withChanges(`key ${keyName}: sent`, before?.ok ? valueOf(before) : undefined, quiet, targetId);
@@ -1553,6 +2023,7 @@ export function createPageHelperHandler(
     browseTab: number | undefined,
   ): Promise<InvokeResult> {
     if (browseTab !== undefined) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: hover needs a DevTools tab");
+    const natural = isNatural(input);
     if (Array.isArray(input["xy"])) {
       const [x, y] = (input["xy"] as unknown[]).map(Number);
       if (!Number.isFinite(x) || !Number.isFinite(y)) {
@@ -1564,19 +2035,26 @@ export function createPageHelperHandler(
       );
       if (!hit.ok) return hit;
       const [before, what] = valueOf(hit).split("\n");
-      const moved = await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: x!, y: y! }, targetId, INPUT_TIMEOUT_MS);
+      const moved = natural
+        ? await movePointer({ x: x!, y: y! }, targetId)
+        : await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: x!, y: y! }, targetId, INPUT_TIMEOUT_MS);
       if (!moved.ok) return inputFailed(moved, `hover ${x},${y}`);
       return withChanges(`hover ${x},${y}: delivered. ${what ?? ""}`.trimEnd(), before, quiet, targetId);
     }
     const found = await locate(input["ref"], "click", targetId);
     if (!found.ok) return found.res;
-    const at = await pointOf(found.loc, targetId, !quiet);
+    const at = await pointOf(found.loc, targetId, !quiet, natural);
     if (!at.ok) return at.res;
     if (at.pt.hidden) {
       const foc = await cdp("Emulation.setFocusEmulationEnabled", { enabled: true }, targetId);
       if (!foc.ok) return foc;
     }
-    const moved = await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: at.pt.x, y: at.pt.y }, targetId, INPUT_TIMEOUT_MS);
+    const moved = natural
+      ? await movePointer({ x: at.pt.x, y: at.pt.y }, targetId, {
+          viewport: at.pt.viewport,
+          targetSize: at.pt.box ? Math.min(at.pt.box.width, at.pt.box.height) : undefined,
+        })
+      : await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: at.pt.x, y: at.pt.y }, targetId, INPUT_TIMEOUT_MS);
     if (!moved.ok) return inputFailed(moved, `hover ${nameOf(found.loc)}`);
     return withChanges(`hover ${nameOf(found.loc)} at ${at.pt.x},${at.pt.y}: delivered`, at.pt.before, quiet, targetId);
   }
@@ -2274,7 +2752,12 @@ export function createPageHelperHandler(
         let challengeReport: string | undefined;
         const challengeBackend = challengeBackendOf(targetId);
         for (const [i, step] of steps.entries()) {
-          const res = await act(step.action, { ...step.input, quiet: true }, targetId, true, browseTab, true);
+          const stepInput: Json = {
+            ...(input["fast"] === true ? { fast: true } : {}),
+            ...step.input,
+            quiet: true,
+          };
+          const res = await act(step.action, stepInput, targetId, true, browseTab, true);
           if (!res.ok) {
             out.push(`${i + 1}. ${step.label}: FAILED ${messageOf(res)}`);
             stopped = `step ${i + 1} failed`;
@@ -2321,6 +2804,7 @@ export function createPageHelperHandler(
           }
           const markerRows = rest.join("\n");
           const navigated = Boolean(url && prevUrl && stripHash(url) !== stripHash(prevUrl));
+          if (navigated) resetMotion(targetId);
           const challengeWall = wall === "captcha" || wall === "rate-limit" || /^# [1-9]\d* row/.test(markerRows);
           if (browseTab === undefined && (navigated || challengeWall)) {
             const challenge = await checkChallenge(targetId, { wallHint: wall, knownUrl: url });
@@ -2551,6 +3035,7 @@ export function createPageHelperHandler(
         if (!nav.ok) return nav;
         const data = nav.data as Json;
         const tab = typeof data["targetId"] === "string" ? (data["targetId"] as string) : targetId;
+        resetMotion(tab);
         // Only the tab id this nav returned may be cleaned up, never the caller's targetId.
         const newTab =
           data["created"] === true && typeof data["targetId"] === "string" && extensionTabOf(data["targetId"]) !== undefined

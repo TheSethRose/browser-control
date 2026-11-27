@@ -98,8 +98,14 @@ export function createScriptRunner(dispatch: PageDispatch, evalPage: EvalFn) {
       }
     };
 
+    const scriptFast = input["fast"] === true;
     const runAction = async (action: string, params: Json): Promise<string> => {
-      const res = await dispatch(action, { ...params, quiet: params["quiet"] ?? true }, targetId);
+      const merged: Json = {
+        ...(scriptFast && params["fast"] === undefined ? { fast: true } : {}),
+        ...params,
+        quiet: params["quiet"] ?? true,
+      };
+      const res = await dispatch(action, merged, targetId);
       if (!res.ok) throw new Error(res.error.message);
       const challenge = (res.data as Json | undefined)?.["challenge"] as
         | { kind?: string; vendor?: string; message?: string }
@@ -147,12 +153,17 @@ export function createScriptRunner(dispatch: PageDispatch, evalPage: EvalFn) {
     const page = {
       goto: (url: string, opts: Json = {}) => step(`goto(${url})`, () => runAction("nav", { url, ...opts })),
       click: (ref: string, opts: Json = {}) => step(`click(${ref})`, () => runAction("click", { ref, ...opts })),
+      hover: (ref: string | Json, opts: Json = {}) =>
+        step(
+          `hover(${typeof ref === "string" ? ref : "xy"})`,
+          () => runAction("hover", typeof ref === "string" ? { ref, ...opts } : { ...ref, ...opts }),
+        ),
       type: (ref: string, text: string, opts: Json = {}) => step(`type(${ref})`, () => runAction("type", { ref, text, ...opts })),
       fill: (ref: string, text: string, opts: Json = {}) => step(`fill(${ref})`, () => runAction("type", { ref, text, ...opts })),
       select: (ref: string, option: string, opts: Json = {}) => step(`select(${ref})`, () => runAction("select", { ref, option, ...opts })),
       drag: (from: string, to: string, opts: Json = {}) => step(`drag(${from},${to})`, () => runAction("drag", { from, to, ...opts })),
-      key: (key: string) => step(`key(${key})`, () => runAction("key", { key })),
-      press: (key: string) => step(`press(${key})`, () => runAction("key", { key })),
+      key: (key: string, opts: Json = {}) => step(`key(${key})`, () => runAction("key", { key, ...opts })),
+      press: (key: string, opts: Json = {}) => step(`press(${key})`, () => runAction("key", { key, ...opts })),
       wait: (opts: string | Json) => step("wait", () => runAction("wait", typeof opts === "string" ? { text: opts } : opts)),
       snap: (opts: Json = {}) => step("snap", () => runAction("snap", { ...opts, quiet: false })),
       text: (opts: Json = {}) => step("text", () => runAction("text", { ...opts, quiet: false })),

@@ -79,9 +79,13 @@ function readOneLine(file: string): string {
 
 export type RelayTokenRead = { token: string } | { state: "missing" | "bad" };
 
-export function defaultTokenFilePath(): string {
+export function configFilePath(name: string): string {
   const config = process.env["XDG_CONFIG_HOME"] || join(homedir(), ".config");
-  return join(config, "browser-control", "extension-relay.json");
+  return join(config, "browser-control", name);
+}
+
+export function defaultTokenFilePath(): string {
+  return configFilePath("extension-relay.json");
 }
 
 /** Read and validate a private (0600, owned by us) relay token file holding a 64-hex token. */
@@ -111,10 +115,7 @@ export function backendOrder(): string[] {
   const daemonBackendsFile = shared[DAEMON_BACKENDS_FILE] as string | undefined;
   let raw = daemonBackendsFile ? readOneLine(daemonBackendsFile) : "";
   if (!raw) raw = process.env["BROWSER_CONTROL_BACKENDS"]?.trim() ?? "";
-  if (!raw) {
-    const config = process.env["XDG_CONFIG_HOME"] || join(homedir(), ".config");
-    raw = readOneLine(join(config, "browser-control", "backends"));
-  }
+  if (!raw) raw = readOneLine(configFilePath("backends"));
   if (!raw) raw = "token" in readPrivateTokenSync() ? EXTENSION : CDP;
   const names = raw
     .split(/[\s,]+/)

@@ -254,6 +254,7 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
                 snap: url.searchParams.get("snap") === "1",
                 newWindow: url.searchParams.get("new_window") === "1",
                 keepOpen: url.searchParams.get("keep_open") === "1",
+                ...(url.searchParams.get("fast") === "1" ? { fast: true } : {}),
               },
               targetId,
             ),

@@ -14,6 +14,7 @@
 #   start [browser]                   switch browser by name (chrome, beta, brave, ardia); opens it
 #                                     if needed. Never pass a port.
 #   default [browser]                 show or set the default browser
+#   natural [on|off|status]           show or set global natural browsing (default on; --fast opts out per call)
 #   ops | status | check-update [--force]
 #
 # Chrome extension (no remote-debugging prompt):
@@ -75,6 +76,14 @@ fail() { printf '%s\n' '{"ok":false,"error":{"code":"'"$1"'","message":'"$(json_
 write_backends() {
   local f="$dir/backends" t="$dir/backends.$$"
   if mkdir -p "$dir" && chmod 700 "$dir" && [[ ! -d "$f" ]] && printf '%s\n' "$1" >"$t" && mv -f "$t" "$f"; then return 0; fi
+  rm -f "$t" 2>/dev/null || true
+  fail EXECUTION_FAILED "could not write $f"
+}
+# Write the global natural-browsing setting atomically.
+write_natural() {
+  local d="${XDG_CONFIG_HOME:-$HOME/.config}/browser-control"
+  local f="$d/natural" t="$d/natural.$$"
+  if mkdir -p "$d" && chmod 700 "$d" && [[ ! -d "$f" ]] && printf '%s\n' "$1" >"$t" && mv -f "$t" "$f"; then return 0; fi
   rm -f "$t" 2>/dev/null || true
   fail EXECUTION_FAILED "could not write $f"
 }
@@ -325,11 +334,12 @@ case "$cmd" in
     run POST "eval$(query "$(arg 1)")" "$(body "$(arg 0)")"
     ;;
   nav)
-    [[ -n "$(arg 0)" ]] || fail INPUT_INVALID "usage: browser-control-daemon nav <url> [targetId] [--snap] [--until load] [--new-window] [--keep-open]"
+    [[ -n "$(arg 0)" ]] || fail INPUT_INVALID "usage: browser-control-daemon nav <url> [targetId] [--snap] [--until load] [--new-window] [--keep-open] [--fast]"
     extra=""; [[ -z "$snap" ]] || extra="snap=1"
     [[ "$until" != "load" ]] || extra="${extra:+$extra&}until=load"
     [[ -z "$new_window" ]] || extra="${extra:+$extra&}new_window=1"
     [[ -z "$keep_open" ]] || extra="${extra:+$extra&}keep_open=1"
+    [[ "$fast" != true ]] || extra="${extra:+$extra&}fast=1"
     run POST "nav$(query "$(arg 1)" "$extra")" "$(arg 0)"
     ;;
   tabs | ops) run GET "$cmd" ;;
@@ -351,6 +361,7 @@ case "$cmd" in
     [[ -z "$limit" ]] || input+=',"limit":'"$((limit))"
     [[ -z "$timeout" ]] || input+=',"timeoutMs":'"$((timeout))"
     [[ -z "$out_path" ]] || input+=',"out":'"$(json_str "$(abs_path "$out_path")")"
+    [[ "$fast" != true ]] || input+=',"fast":true'
     run POST "page/text$(query "$(arg 0)")" "$input}"
     ;;
   form)
@@ -385,19 +396,27 @@ case "$cmd" in
   click)
     if [[ -n "$xy" ]]; then
       [[ "$xy" =~ ^[0-9.]+,[0-9.]+$ ]] || fail INPUT_INVALID "--xy takes x,y in CSS pixels, e.g. --xy 120,240"
-      run POST "page/click$(query "$(arg 0)")" '{"xy":['"$xy"']}'
+      input='{"xy":['"$xy"']'
+      [[ "$fast" != true ]] || input+=',"fast":true'
+      run POST "page/click$(query "$(arg 0)")" "$input}"
     else
       [[ -n "$(arg 0)" ]] || fail INPUT_INVALID "usage: browser-control-daemon click <ref|label> [targetId]"
-      run POST "page/click$(query "$(arg 1)")" '{"ref":'"$(json_str "$(arg 0)")"'}'
+      input='{"ref":'"$(json_str "$(arg 0)")"
+      [[ "$fast" != true ]] || input+=',"fast":true'
+      run POST "page/click$(query "$(arg 1)")" "$input}"
     fi
     ;;
   hover)
     if [[ -n "$xy" ]]; then
       [[ "$xy" =~ ^(0|[1-9][0-9]*)(\.[0-9]+)?,(0|[1-9][0-9]*)(\.[0-9]+)?$ ]] || fail INPUT_INVALID "--xy takes x,y in CSS pixels, e.g. --xy 120,240"
-      run POST "page/hover$(query "$(arg 0)")" '{"xy":['"$xy"']}'
+      input='{"xy":['"$xy"']'
+      [[ "$fast" != true ]] || input+=',"fast":true'
+      run POST "page/hover$(query "$(arg 0)")" "$input}"
     else
       [[ -n "$(arg 0)" ]] || fail INPUT_INVALID "usage: browser-control-daemon hover <ref|label> [targetId] | hover --xy x,y [targetId]"
-      run POST "page/hover$(query "$(arg 1)")" '{"ref":'"$(json_str "$(arg 0)")"'}'
+      input='{"ref":'"$(json_str "$(arg 0)")"
+      [[ "$fast" != true ]] || input+=',"fast":true'
+      run POST "page/hover$(query "$(arg 1)")" "$input}"
     fi
     ;;
   dialog)
@@ -466,9 +485,10 @@ case "$cmd" in
     run POST "page/upload$(query "$(arg 2)")" '{"ref":'"$(json_str "$(arg 0)")"',"path":'"$(json_str "$fpath")"'}'
     ;;
   drag)
-    [[ ${#args[@]} -ge 2 ]] || fail INPUT_INVALID "usage: browser-control-daemon drag <from> <to> [--side before|after] [targetId]"
+    [[ ${#args[@]} -ge 2 ]] || fail INPUT_INVALID "usage: browser-control-daemon drag <from> <to> [--side before|after] [--fast] [targetId]"
     input='{"from":'"$(json_str "$(arg 0)")"',"to":'"$(json_str "$(arg 1)")"
     [[ -z "$side" ]] || input+=',"side":'"$(json_str "$side")"
+    [[ "$fast" != true ]] || input+=',"fast":true'
     run POST "page/drag$(query "$(arg 2)")" "$input}"
     ;;
   wait)
@@ -484,8 +504,10 @@ case "$cmd" in
     run POST "page/wait$(query "$(arg 0)")" "$input}"
     ;;
   key)
-    [[ -n "$(arg 0)" ]] || fail INPUT_INVALID "usage: browser-control-daemon key <name> [targetId]"
-    run POST "page/key$(query "$(arg 1)")" '{"key":'"$(json_str "$(arg 0)")"'}'
+    [[ -n "$(arg 0)" ]] || fail INPUT_INVALID "usage: browser-control-daemon key [--fast] <name> [targetId]"
+    input='{"key":'"$(json_str "$(arg 0)")"
+    [[ "$fast" != true ]] || input+=',"fast":true'
+    run POST "page/key$(query "$(arg 1)")" "$input}"
     ;;
   value)
     [[ -n "$(arg 0)" ]] || fail INPUT_INVALID "usage: browser-control-daemon value <ref|label> [targetId]"
@@ -496,8 +518,10 @@ case "$cmd" in
     run POST "page/do$(query "$(arg 1)")" '{"fill":'"$(body "$(arg 0)")"',"fast":'"$fast"'}'
     ;;
   do)
-    [[ -n "$(arg 0)" ]] || fail INPUT_INVALID "usage: browser-control-daemon do '<json array of steps>' [targetId]"
-    run POST "page/do$(query "$(arg 1)")" '{"steps":'"$(body "$(arg 0)")"'}'
+    [[ -n "$(arg 0)" ]] || fail INPUT_INVALID "usage: browser-control-daemon do [--fast] '<json array of steps>' [targetId]"
+    input='{"steps":'"$(body "$(arg 0)")"
+    [[ "$fast" != true ]] || input+=',"fast":true'
+    run POST "page/do$(query "$(arg 1)")" "$input}"
     ;;
   shot)
     input='{"marks":'"$marks"',"full":'"$full"',"png":'"$png"
@@ -548,11 +572,12 @@ case "$cmd" in
     run POST "page/flow$(query "")" "$input}"
     ;;
   script)
-    [[ ${#args[@]} -ge 1 ]] || fail INPUT_INVALID "usage: browser-control-daemon script '<js>' [--timeout <ms>] [--out <path>] [targetId]"
+    [[ ${#args[@]} -ge 1 ]] || fail INPUT_INVALID "usage: browser-control-daemon script [--fast] '<js>' [--timeout <ms>] [--out <path>] [targetId]"
     code="$(body "$(arg 0)")"
     input='{"code":'"$(json_str "$code")"
     [[ -z "$timeout" ]] || input+=',"timeoutMs":'"$((timeout))"
     [[ -z "$out_path" ]] || input+=',"out":'"$(json_str "$(abs_path "$out_path")")"
+    [[ "$fast" != true ]] || input+=',"fast":true'
     run POST "page/script$(query "$(arg 1)")" "$input}"
     ;;
   verdict | health) run POST "page/$cmd$(query "$(arg 0)")" '{}' ;;
@@ -564,6 +589,25 @@ case "$cmd" in
     file="${XDG_CONFIG_HOME:-$HOME/.config}/browser-control/default-browser"
     if [[ -n "$(arg 0)" ]]; then mkdir -p "$(dirname "$file")"; printf '%s\n' "$(arg 0)" >"$file"; fi
     cat "$file" 2>/dev/null || echo "(none: the first browser with remote debugging on is used)"
+    ;;
+  natural)
+    sub="$(arg 0)"
+    file="${XDG_CONFIG_HOME:-$HOME/.config}/browser-control/natural"
+    case "$sub" in
+      on | off)
+        write_natural "$sub"
+        printf '%s\n' '{"ok":true,"data":{"natural":'"$(json_str "$sub")"',"file":'"$(json_str "$file")"'}}'
+        ;;
+      "" | status)
+        env_raw="$(printf '%s' "${BROWSER_CONTROL_NATURAL:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+        file_raw="$(tr -d '[:space:]' <"$file" 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
+        val="on"; src="default"
+        case "$file_raw" in 0|false|off|no) val="off"; src="file" ;; 1|true|on|yes) val="on"; src="file" ;; esac
+        case "$env_raw" in 0|false|off|no) val="off"; src="env" ;; 1|true|on|yes) val="on"; src="env" ;; esac
+        printf '%s\n' '{"ok":true,"data":{"natural":'"$(json_str "$val")"',"source":'"$(json_str "$src")"',"file":'"$(json_str "$file")"'}}'
+        ;;
+      *) fail INPUT_INVALID "usage: browser-control-daemon natural [on|off|status]" ;;
+    esac
     ;;
   check-update)
     check_update "$(arg 0)"
