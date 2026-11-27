@@ -1,5 +1,5 @@
 (() => {
-  const VERSION = 8;
+  const VERSION = 9;
   if (globalThis.__bc && globalThis.__bc.v === VERSION) return;
 
   const INTERACTIVE = [
