@@ -26,7 +26,6 @@ import {
   extensionBrowsersReport,
   extensionDiagnosticsReport,
   extensionStatusReport,
-  extensionTabOf,
   getRegisteredExtensionBackend,
 } from "./src/backends/extension";
 import { backendOrder, setDaemonBackendsFile } from "./src/backends/router";
@@ -263,7 +262,7 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
           (typeof parsed.value["targetId"] === "string" && parsed.value["targetId"].trim() !== ""
             ? parsed.value["targetId"].trim()
             : undefined);
-        if (explicitTargetId && extensionTabOf(explicitTargetId) !== undefined && !backendOrder().includes("extension")) {
+        if (explicitTargetId?.toLowerCase().startsWith("extension:") && !backendOrder().includes("extension")) {
           return json(
             failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: the extension backend is disabled; run: extension enable"),
           );

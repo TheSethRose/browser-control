@@ -35,11 +35,14 @@ const TAB_OPS = new Set([
   "wait_for_event",
 ]);
 
-let daemonBackendsFile: string | undefined;
+// The bundled daemon and the capability it loads each hold a copy of this module, so the path
+// lives on a process-wide key that both copies read.
+const DAEMON_BACKENDS_FILE = Symbol.for("browser-control.daemonBackendsFile");
+const shared = globalThis as unknown as Record<symbol, string | undefined>;
 
 /** The daemon calls this once at startup with `<daemonDir>/backends`. */
 export function setDaemonBackendsFile(file: string | undefined): void {
-  daemonBackendsFile = file;
+  shared[DAEMON_BACKENDS_FILE] = file;
 }
 
 function readOneLine(file: string): string {
@@ -51,6 +54,7 @@ function readOneLine(file: string): string {
 }
 
 export function backendOrder(): string[] {
+  const daemonBackendsFile = shared[DAEMON_BACKENDS_FILE];
   let raw = daemonBackendsFile ? readOneLine(daemonBackendsFile) : "";
   if (!raw) raw = process.env["BROWSER_CONTROL_BACKENDS"]?.trim() ?? "";
   if (!raw) {

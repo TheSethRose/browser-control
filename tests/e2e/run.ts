@@ -336,6 +336,14 @@ async function main(): Promise<number> {
     record("handoff-done", /handoff: done/.test(done), done);
     await checkEval("handoff-done-cleared", "String(!!document.querySelector('[data-bc-handoff-host]'))", /false/);
     await checkEval("handoff-tab-usable", "document.title", /E2E Fixture/);
+
+    // The backends file the wrapper writes steers the shipped daemon and outranks the env var.
+    const tid = /extension:[A-Za-z0-9:@-]*[A-Za-z0-9]/.exec(await bc(["tabs"]))?.[0] ?? "";
+    record("tab-id", tid !== "", tid);
+    await check("disable", ["extension", "disable"], /"backends":"cdp"/);
+    await check("disabled-refuses", ["eval", "document.title", tid], /extension backend is disabled/);
+    await check("enable", ["extension", "enable"], /"backends":"extension,cdp"/);
+    await check("enabled-works", ["eval", "document.title", tid], /E2E Fixture/);
     return results.some((r) => !r.ok) ? 1 : 0;
   } catch (error) {
     record("runner", false, String(error instanceof Error ? error.stack : error));
