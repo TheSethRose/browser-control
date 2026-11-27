@@ -1099,55 +1099,73 @@ export function createPageHelperHandler(
     const plan = planTyping(text, {
       rng,
       speedFactor: typingSpeedFactor(),
-      fieldKind: opts.fieldKind ?? "prose",
+      fieldKind: opts.fieldKind ?? "none",
     });
-    const held = new Map<string, CharKeySpec>();
+    // A key is recorded as down before its keyDown goes out, so one that reached the page but
+    // timed out is still released. Events run against elapsed time, so round trips don't add up.
+    const held = heldFor(targetId);
+    await releaseKeys(targetId);
+    const start = now();
+    let plannedAt = 0;
     try {
       for (const step of plan.events) {
-        if (step.delayMs > 0) await pause(step.delayMs);
-        if (step.kind === "insert") {
-          const ins = await cdp("Input.insertText", { text: step.text }, targetId, INPUT_TIMEOUT_MS);
-          if (!ins.ok) return ins;
-          continue;
-        }
-        const base: Json = {
-          key: step.spec.key,
-          code: step.spec.code,
-          windowsVirtualKeyCode: step.spec.windowsVirtualKeyCode,
-          ...(step.spec.modifiers ? { modifiers: step.spec.modifiers } : {}),
-        };
-        if (step.kind === "keyDown") {
-          const down = step.spec.text !== undefined
-            ? await cdp("Input.dispatchKeyEvent", { type: "keyDown", ...base, text: step.spec.text }, targetId, INPUT_TIMEOUT_MS)
-            : await cdp("Input.dispatchKeyEvent", { type: "rawKeyDown", ...base }, targetId, INPUT_TIMEOUT_MS);
+        plannedAt += step.delayMs;
+        const wait = start + plannedAt - now();
+        if (wait > 0) await pause(wait);
+        // Emoji and other unmapped characters go as key text: keyDown with text, then keyUp.
+        const spec: CharKeySpec =
+          step.kind === "insert" ? { key: step.text, code: "", windowsVirtualKeyCode: 0, text: step.text } : step.spec;
+        if (step.kind !== "keyUp") {
+          held.set(spec.key, spec);
+          const down = await sendKey(spec.text !== undefined ? "keyDown" : "rawKeyDown", spec, targetId);
           if (!down.ok) return down;
-          held.set(step.spec.key, step.spec);
-        } else {
-          const up = await cdp("Input.dispatchKeyEvent", { type: "keyUp", ...base }, targetId, INPUT_TIMEOUT_MS);
+        }
+        if (step.kind !== "keyDown") {
+          const up = await sendKey("keyUp", spec, targetId);
           if (!up.ok) return up;
-          held.delete(step.spec.key);
+          held.delete(spec.key);
         }
       }
       return success("ok");
     } finally {
-      // Never leave a key down, including when a dispatch fails part-way through.
-      for (const spec of [...held.values()].reverse()) {
-        await cdp(
-          "Input.dispatchKeyEvent",
-          { type: "keyUp", key: spec.key, code: spec.code, windowsVirtualKeyCode: spec.windowsVirtualKeyCode },
-          targetId,
-          INPUT_TIMEOUT_MS,
-        ).catch(() => {});
-      }
+      await releaseKeys(targetId);
     }
   }
 
-  /** Field kind for typo policy: `none` for a focused field we can't inspect and for secure fields. */
-  async function fieldKindOf(text: string, hint: string, ref?: string, targetId?: string): Promise<FieldKind> {
-    if (!ref) return "none";
-    const probe = await evalHelper({ kind: "bc", method: "value", args: [ref] }, targetId, 2_000);
-    if (probe.ok && valueOf(probe) === "__secure__") return "none";
-    return classifyFieldKind(text, hint);
+  function sendKey(type: string, spec: CharKeySpec, targetId?: string, timeoutMs = INPUT_TIMEOUT_MS): Promise<InvokeResult> {
+    const { key, code, windowsVirtualKeyCode, modifiers, text } = spec;
+    const extra = { ...(modifiers ? { modifiers } : {}), ...(type === "keyDown" && text !== undefined ? { text } : {}) };
+    return cdp("Input.dispatchKeyEvent", { type, key, code, windowsVirtualKeyCode, ...extra }, targetId, timeoutMs);
+  }
+
+  /** Keys whose keyUp has not landed, per tab. Retried at the next dispatch and after a dialog closes. */
+  const heldKeys = new Map<string, Map<string, CharKeySpec>>();
+  function heldFor(targetId?: string): Map<string, CharKeySpec> {
+    let held = heldKeys.get(targetId ?? "");
+    if (!held) heldKeys.set(targetId ?? "", (held = new Map()));
+    return held;
+  }
+
+  async function releaseKeys(targetId?: string): Promise<void> {
+    const held = heldFor(targetId);
+    for (const [key, spec] of [...held].reverse()) {
+      // A dialog blocks input: stop and keep the rest for the retry instead of waiting on each.
+      if (!(await sendKey("keyUp", spec, targetId, 1_000).catch(() => undefined))?.ok) return;
+      held.delete(key);
+    }
+  }
+
+  /** Typo policy from the focused field's live type and flags (attach-free read); any doubt means none. */
+  async function fieldKindOf(text: string, targetId?: string): Promise<FieldKind> {
+    const probe = await evalHelper({ kind: "bc", method: "typingField" }, targetId, 2_000);
+    let f: { type?: unknown; flags?: unknown; hint?: unknown } = {};
+    try {
+      f = (probe.ok && JSON.parse(valueOf(probe))) || {};
+    } catch {}
+    if (typeof f.type !== "string" || !Array.isArray(f.flags)) return "none";
+    if (/^(number|password)$/.test(f.type) || f.flags.some((x) => /^(secure|trap|payment|cc)$/.test(String(x)))) return "none";
+    if (/^(email|tel|url|date|time|datetime-local|month|week)$/.test(f.type)) return "structured";
+    return classifyFieldKind(text, String(f.hint ?? ""));
   }
 
   async function waitParsed(targetId?: string): Promise<void> {
@@ -1640,7 +1658,7 @@ export function createPageHelperHandler(
             if (editorRef) {
               await evalHelper({ kind: "bc", method: "focusForType", args: [editorRef] }, fieldTarget);
             }
-            const cellKind = mode === "human" ? await fieldKindOf(text, String(input["ref"] ?? ""), editorRef ?? undefined, fieldTarget) : undefined;
+            const cellKind = mode === "human" ? await fieldKindOf(text, fieldTarget) : undefined;
             const sent = await dispatchText(text, mode, targetId, { fieldKind: cellKind });
             if (!sent.ok) return inputFailed(sent, `type ${name}`);
             await pressKey("Enter", targetId);
@@ -1680,9 +1698,7 @@ export function createPageHelperHandler(
             return failure("EXECUTION_FAILED", `type ${name}: not_delivered (the click did not focus it; try snap again)`);
           }
         }
-        const typeKind = mode === "human"
-          ? await fieldKindOf(text, String(input["ref"] ?? ""), loc.kind === "ax" ? undefined : activeRef, fieldTarget)
-          : undefined;
+        const typeKind = mode === "human" ? await fieldKindOf(text, fieldTarget) : undefined;
         const sent = await dispatchText(text, mode, targetId, { fieldKind: typeKind });
         if (!sent.ok) return inputFailed(sent, `type ${name}`);
         if (loc.kind === "ax") {
@@ -2023,6 +2039,7 @@ export function createPageHelperHandler(
       }
       return res;
     }
+    await releaseKeys(targetId);
     if (accept) return success(typeof params["promptText"] === "string" ? `dialog accept: accepted with prompt text ${js(params["promptText"])}` : "dialog accept: accepted");
     return success("dialog dismiss: dismissed");
   }

@@ -1,12 +1,7 @@
 /**
- * Human-like keyboard typing planner and CDP key metadata.
- *
- * Pure: takes the text plus an injected `rng` and returns key events with millisecond delays, so
- * tests are deterministic and replaying a plan through a text editor reproduces the text exactly.
- *
- * Timing model: log-normal within-word gaps, wider word boundaries, occasional thinking pauses,
- * 20-40% key rollover on fast pairs, real Shift around capitals and shifted symbols, and
- * self-corrected typos (adjacent key, transposition, doubled, dropped).
+ * Human-like keyboard typing planner and CDP key metadata. Pure (inject `rng`): log-normal gaps,
+ * word pauses, rollover on fast pairs, real Shift, and self-corrected typos (adjacent key,
+ * transposition, doubled, dropped). Replaying a plan through an editor yields the text exactly.
  */
 
 export interface CharKeySpec {
@@ -74,6 +69,8 @@ export const QWERTY_NEIGHBORS: Record<string, string> = {
   x: "zsdc",
   y: "tghu",
   z: "asx",
+  // Digits stay digits, so a typo in a structured field is still a character it accepts.
+  ...Object.fromEntries([..."1234567890"].map((d, i, row) => [d, (row[i - 1] ?? "") + (row[i + 1] ?? "")])),
 };
 
 const PUNCTUATION: Record<string, { code: string; vk: number; shift?: boolean }> = {
@@ -150,20 +147,17 @@ const BACKSPACE_SPEC: CharKeySpec = { key: "Backspace", code: "Backspace", windo
 const PROSE_TYPO_RATE = 0.032;
 const STRUCTURED_TYPO_RATE = 0.008;
 
-/** Fast pairs: keyDown-to-keyDown under this are candidates for rollover. */
+/** Share of fast pairs (keyDown to keyDown under FAST_PAIR_MS) where the next key goes down first. */
 const FAST_PAIR_MS = 130;
-/** Share of fast pairs where the next key goes down before the previous key comes up. */
 const ROLLOVER_CHANCE = 0.3;
 
 const INTRA_MEDIAN = 74;
 const INTRA_SIGMA = 0.3;
 const INTRA_MIN = 42;
-/** Word boundary (after the space) — log-normal around this median. */
 const WORD_MEDIAN = 172;
 const WORD_SIGMA = 0.26;
 const WORD_MIN = 120;
 const WORD_MAX = 262;
-/** Thinking pause every few words. */
 const WORD_PAUSE_CHANCE = 0.24;
 const WORD_PAUSE_MIN = 350;
 const WORD_PAUSE_MAX = 900;
@@ -178,28 +172,20 @@ const STRUCTURED_HINT =
 export function classifyFieldKind(text: string, hint = ""): FieldKind {
   const t = text.trim();
   if (t === "") return "prose";
-  if (/^[^\s@]+@[^\s@]+\.[A-Za-z]{2,}$/.test(t)) return "structured";
-  if (/^(?:https?:\/\/|www\.)\S+$/i.test(t)) return "structured";
-  if (/^\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4}$/.test(t)) return "structured";
-  if (/^[+-]?\d+(?:[.,]\d+)?$/.test(t)) return "structured";
-  if (/^\+?[\d(][\d\s().-]{5,}$/.test(t)) return "structured";
-  if (STRUCTURED_HINT.test(hint)) return "structured";
-  return "prose";
+  const shapes = [
+    /^[^\s@]+@[^\s@]+\.[A-Za-z]{2,}$/,
+    /^(?:https?:\/\/|www\.)\S+$/i,
+    /^\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4}$/,
+    /^[+-]?\d+(?:[.,]\d+)?$/,
+    /^\+?[\d(][\d\s().-]{5,}$/,
+  ];
+  return shapes.some((re) => re.test(t)) || STRUCTURED_HINT.test(hint) ? "structured" : "prose";
 }
 
-function clamp(n: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, n));
-}
-
-function gauss(rng: () => number): number {
-  const u = Math.max(1e-9, rng());
-  const v = rng();
-  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
-}
-
-function logNormal(rng: () => number, median: number, sigma: number): number {
-  return median * Math.exp(sigma * gauss(rng));
-}
+const clamp = (n: number, min: number, max: number): number => Math.min(max, Math.max(min, n));
+const gauss = (rng: () => number): number =>
+  Math.sqrt(-2 * Math.log(Math.max(1e-9, rng()))) * Math.cos(2 * Math.PI * rng());
+const logNormal = (rng: () => number, median: number, sigma: number): number => median * Math.exp(sigma * gauss(rng));
 
 interface Unit {
   ch: string;
@@ -210,23 +196,12 @@ interface Unit {
 export type TypoKind = "adjacent" | "transpose" | "double" | "drop";
 
 function pickTypoKind(rng: () => number, ch: string, next: string | undefined): TypoKind {
-  const options: TypoKind[] = [];
-  if (QWERTY_NEIGHBORS[ch.toLowerCase()]) options.push("adjacent");
-  if (next !== undefined && next !== ch && !/\s/.test(next)) options.push("transpose");
-  options.push("double");
-  options.push("drop");
+  const adjacent = QWERTY_NEIGHBORS[ch.toLowerCase()] !== undefined;
+  const transpose = next !== undefined && next !== ch && !/\s/.test(next);
   const roll = rng();
-  if (roll < 0.45) return options.includes("adjacent") ? "adjacent" : options[0]!;
-  if (roll < 0.62) return options.includes("transpose") ? "transpose" : "double";
-  if (roll < 0.82) return "double";
-  return "drop";
-}
-
-/** A typo is only worth planting where the surrounding characters are plain text. */
-function typoable(ch: string, prev: string | undefined): boolean {
-  if (/\s/.test(ch)) return false;
-  if (prev !== undefined && /\s/.test(prev)) return false;
-  return true;
+  if (roll < 0.45) return adjacent ? "adjacent" : transpose ? "transpose" : "double";
+  if (roll < 0.62) return transpose ? "transpose" : "double";
+  return roll < 0.82 ? "double" : "drop";
 }
 
 function planUnits(
@@ -237,24 +212,20 @@ function planUnits(
 ): { units: Unit[]; typos: number; typoKinds: TypoKind[] } {
   const units: Unit[] = [];
   const typoKinds: TypoKind[] = [];
-  const pushChar = (ch: string, spec = keySpecForChar(ch)) => {
-    units.push({ ch, spec });
-  };
+  const pushChar = (ch: string) => units.push({ ch, spec: keySpecForChar(ch) });
   const backspaces = (n: number) => {
     for (let k = 0; k < n; k++) units.push({ ch: "", spec: BACKSPACE_SPEC, back: true });
   };
+  // A typo span stays inside printable ASCII, where one Backspace deletes one typed character.
+  const asciiRun = new Array<number>(chars.length + 1).fill(0);
+  for (let k = chars.length - 1; k >= 0; k--) asciiRun[k] = /^[ -~]$/.test(chars[k]!) ? asciiRun[k + 1]! + 1 : 0;
   let typos = 0;
   let i = 0;
   while (i < chars.length) {
     const ch = chars[i]!;
-    const prev = i > 0 ? chars[i - 1] : undefined;
-    const room = chars.length - i - 2;
-    const wantTypo =
-      typoRate > 0 &&
-      typos < maxTypos &&
-      typoable(ch, prev) &&
-      room >= 0 &&
-      rng() < typoRate;
+    const room = asciiRun[i]! - 2;
+    const plain = !/\s/.test(ch) && !/\s/.test(chars[i - 1] ?? "");
+    const wantTypo = typoRate > 0 && typos < maxTypos && plain && room >= 0 && rng() < typoRate;
     if (!wantTypo) {
       pushChar(ch);
       i++;
@@ -275,11 +246,9 @@ function planUnits(
       backspaces(notice + 1);
       for (let k = 0; k <= notice; k++) pushChar(chars[i + k]!);
       i += notice + 1;
-    } else if (kind === "transpose" && chars[i + 1] !== undefined && !/\s/.test(chars[i + 1]!)) {
-      const a = ch;
-      const b = chars[i + 1]!;
-      pushChar(b);
-      pushChar(a);
+    } else if (kind === "transpose") {
+      pushChar(chars[i + 1]!);
+      pushChar(ch);
       for (let k = 2; k <= notice + 1; k++) pushChar(chars[i + k]!);
       backspaces(notice + 2);
       for (let k = 0; k <= notice + 1; k++) pushChar(chars[i + k]!);
@@ -369,6 +338,37 @@ export function planTyping(text: string, opts: HumanTypingOptions = {}): TypingP
     ups[j] = starts[j + 1]! + 5 + rng() * 16;
   }
 
+  // Shift runs: Shift goes down after every earlier key is up, spans consecutive capitals or shifted
+  // symbols, and comes up before the next key goes down. Too short a gap delays the later keys.
+  const isShifted = (u: Unit) => (u.spec?.modifiers ?? 0) === SHIFT;
+  const delayFrom = (from: number, by: number) => {
+    for (let k = from; k < units.length; k++) {
+      starts[k] = starts[k]! + by;
+      ups[k] = ups[k]! + by;
+    }
+  };
+  const shiftRuns: Array<[number, number]> = [];
+  let prevUp = -Infinity;
+  let scanned = 0;
+  for (let j = 0; j < units.length; ) {
+    if (!isShifted(units[j]!)) {
+      j++;
+      continue;
+    }
+    let last = j;
+    while (last + 1 < units.length && isShifted(units[last + 1]!)) last++;
+    for (; scanned < j; scanned++) prevUp = Math.max(prevUp, ups[scanned]!);
+    let down = starts[j]! - (30 + rng() * 58);
+    if (down < prevUp + 4) {
+      delayFrom(j, prevUp + 4 - down);
+      down = prevUp + 4;
+    }
+    const up = ups[last]! + 20 + rng() * 48;
+    if (last + 1 < units.length && starts[last + 1]! < up + 4) delayFrom(last + 1, up + 4 - starts[last + 1]!);
+    shiftRuns.push([down, up]);
+    j = last + 1;
+  }
+
   const out: Array<{ at: number; prio: number; ev: HumanKeystroke }> = [];
   for (let j = 0; j < units.length; j++) {
     const u = units[j]!;
@@ -387,29 +387,9 @@ export function planTyping(text: string, opts: HumanTypingOptions = {}): TypingP
     out.push({ at: ups[j]!, prio: 1, ev: { kind: "keyUp", ch: u.ch, spec: rest, delayMs: 0 } });
   }
 
-  // Shift runs: Shift goes down before the first capital/shifted symbol, stays down across
-  // consecutive ones, and comes up shortly after the last key.
-  const isShifted = (u: Unit) => (u.spec?.modifiers ?? 0) === SHIFT;
-  for (let j = 0; j < units.length; ) {
-    if (!isShifted(units[j]!)) {
-      j++;
-      continue;
-    }
-    let last = j;
-    while (last + 1 < units.length && isShifted(units[last + 1]!)) last++;
-    const lead = 30 + rng() * 58;
-    const lag = 20 + rng() * 48;
-    out.push({
-      at: Math.max(0, starts[j]! - lead),
-      prio: 2,
-      ev: { kind: "keyDown", ch: "", spec: { ...SHIFT_DOWN_SPEC }, delayMs: 0 },
-    });
-    out.push({
-      at: ups[last]! + lag,
-      prio: 0,
-      ev: { kind: "keyUp", ch: "", spec: { ...SHIFT_UP_SPEC }, delayMs: 0 },
-    });
-    j = last + 1;
+  for (const [down, up] of shiftRuns) {
+    out.push({ at: down, prio: 2, ev: { kind: "keyDown", ch: "", spec: { ...SHIFT_DOWN_SPEC }, delayMs: 0 } });
+    out.push({ at: up, prio: 0, ev: { kind: "keyUp", ch: "", spec: { ...SHIFT_UP_SPEC }, delayMs: 0 } });
   }
 
   out.sort((a, b) => a.at - b.at || a.prio - b.prio);

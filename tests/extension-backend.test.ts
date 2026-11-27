@@ -1953,7 +1953,7 @@ describe("relay handshake tracking, fix lines, and timeout", () => {
 
   test("S13: a reserved mismatch from before a successful connect never displaces a newer rejection", async () => {
     const token = randomBytes(32).toString("hex");
-    const backend = createExtensionBackend({ ...allocPortWindow(), token, helpersVersion: 10, waitConnectMs: 80, listTargetsWaitMs: 80 });
+    const backend = createExtensionBackend({ ...allocPortWindow(), token, helpersVersion: PAGE_HELPERS_VERSION, waitConnectMs: 80, listTargetsWaitMs: 80 });
     disposables.push(backend);
     await backend.start!();
     const port = backend.getPort()!;

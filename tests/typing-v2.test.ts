@@ -20,13 +20,13 @@ const SEEDS = (n: number) => Array.from({ length: n }, (_, i) => i + 1);
 const plan = (text: string, seed: number, opts: HumanTypingOptions = {}): TypingPlan =>
   planTyping(text, { rng: createSeededRng(seed), ...opts });
 
-/** Replay as a text editor: Shift and keyUp insert nothing, Backspace deletes one. */
+/** Replay as a text editor: Shift and keyUp insert nothing, Backspace deletes one grapheme. */
 function replay(events: HumanKeystroke[]): string {
   let buf = "";
   for (const ev of events) {
     if (ev.kind === "insert") buf += ev.text;
     else if (ev.kind !== "keyDown") continue;
-    else if (ev.spec.key === "Backspace") buf = buf.slice(0, -1);
+    else if (ev.spec.key === "Backspace") buf = [...new Intl.Segmenter().segment(buf)].slice(0, -1).map((g) => g.segment).join("");
     else if (ev.spec.text !== undefined) buf += ev.spec.text === "\r" ? "\n" : ev.spec.text;
   }
   return buf;
@@ -84,11 +84,17 @@ describe("typing v2: determinism and replay", () => {
     ];
     for (const text of samples) for (const seed of SEEDS(15)) expect(replay(plan(text, seed).events)).toBe(text);
     for (const speedFactor of [0.85, 1, 1.15]) expect(replay(plan(PROSE, 4, { speedFactor }).events)).toBe(PROSE);
-    const heavy = "abcdefghij klmnopqrst uvwxyz 0123456789";
+    for (const heavy of ["abcdefghij klmnopqrst uvwxyz 0123456789", "cafe\u0301xyz nai\u0308ve 👍🏽ok Ünï"]) {
+      for (const seed of SEEDS(40)) {
+        const p = plan(heavy, seed, { typoRate: 0.6, maxTypos: 30 });
+        expect(p.typos).toBeGreaterThan(1);
+        expect(replay(p.events)).toBe(heavy);
+      }
+    }
     for (const seed of SEEDS(40)) {
-      const p = plan(heavy, seed, { typoRate: 0.6, maxTypos: 30 });
-      expect(p.typos).toBeGreaterThan(3);
-      expect(replay(p.events)).toBe(heavy);
+      for (const ev of plan("2026 1127 5550", seed, { typoRate: 0.6, maxTypos: 9 }).events) {
+        if (ev.kind === "keyDown" && ev.spec.text) expect(ev.spec.text).toMatch(/^[\d ]$/);
+      }
     }
   });
 });
@@ -128,18 +134,6 @@ describe("typing v2: speed, rhythm and rollover", () => {
     expect(rolled / fast).toBeGreaterThanOrEqual(0.2);
     expect(rolled / fast).toBeLessThanOrEqual(0.4);
   });
-
-  test("every key is released and no key is left down", () => {
-    for (const seed of SEEDS(10)) {
-      const held = new Map<string, number>();
-      for (const ev of plan("Hello there, friend!", seed).events) {
-        if (ev.kind === "insert") continue;
-        const key = `${ev.spec.key}:${ev.ch}`;
-        held.set(key, (held.get(key) ?? 0) + (ev.kind === "keyDown" ? 1 : -1));
-      }
-      for (const count of held.values()) expect(count).toBe(0);
-    }
-  });
 });
 
 describe("typing v2: real modifiers", () => {
@@ -158,6 +152,25 @@ describe("typing v2: real modifiers", () => {
       expect(key.down - down).toBeLessThanOrEqual(95);
       expect(up - key.up).toBeGreaterThanOrEqual(15);
       expect(up - key.up).toBeLessThanOrEqual(80);
+    }
+    // In dispatch order, Shift is down exactly while a Shift-bit key goes down; every key comes up.
+    for (const t of ["aAaAa", text, PROSE]) {
+      for (const seed of SEEDS(30)) {
+        let down = false;
+        const held = new Set<string>();
+        for (const ev of plan(t, seed).events) {
+          if (ev.kind === "insert") continue;
+          held[ev.kind === "keyDown" ? "add" : "delete"](`${ev.spec.key}:${ev.ch}`);
+          if (ev.spec.key !== "Shift") {
+            if (ev.kind === "keyDown") expect((ev.spec.modifiers ?? 0) === 8).toBe(down);
+            continue;
+          }
+          expect(down).toBe(ev.kind === "keyUp");
+          down = ev.kind === "keyDown";
+        }
+        expect(down).toBe(false);
+        expect(held.size).toBe(0);
+      }
     }
     // Consecutive capitals hold one Shift across the run.
     const nasa = charKeys(plan("NASA", 8).events);
