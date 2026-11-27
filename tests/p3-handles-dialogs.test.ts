@@ -1790,6 +1790,53 @@ describe("background.js resolveBcNode & runBcSilent review fixes (S1, S3, S6, S7
     });
   });
 
+  // A commit while the frame lookup is in flight: the lookup returns the replaced document.
+  for (const mode of ["rejects", "hangs"] as const) {
+    test(`R2-N1: a commit during the frame lookup reruns on the new document (old document ${mode})`, async () => {
+      let env!: ReturnType<typeof makeBackgroundChrome>;
+      let doc = "doc-1";
+      env = makeBackgroundChrome({
+        frames: () => {
+          const snap = [{ frameId: 0, parentFrameId: -1, documentId: doc }];
+          if (doc === "doc-1") {
+            doc = "doc-2";
+            env.emitCommitted(7, 0, { documentId: "doc-2" });
+            env.emitUpdated(7, { status: "loading", url: "https://app.test/next" });
+          }
+          return snap;
+        },
+        executeScript: async (details) => {
+          const d = details as { args?: unknown[]; target: { documentIds?: string[] } };
+          if (d.target.documentIds?.[0] === "doc-1") {
+            if (mode === "rejects") throw new Error("No document with id doc-1 in tab 7.");
+            return new Promise(() => {});
+          }
+          if (Array.isArray(d.args) && typeof d.args[0] === "number") return [{ result: true }];
+          if (Array.isArray(d.args) && Array.isArray(d.args[0])) return [{ result: { ok: true, values: ["new"] } }];
+          return [{ result: 1 }];
+        },
+      });
+      await withBackgroundModule(`r2-n1-lookup-${mode}`, env.fullChrome, async (bg) => {
+        const t0 = Date.now();
+        expect(await bg.runBcSilent(7, [{ kind: "href" }], { timeoutMs: 3_000, livenessProbeTimeoutMs: 50 })).toEqual(["new"]);
+        expect(Date.now() - t0).toBeLessThan(1_000);
+        expect(env.cdpCalls.length).toBe(0);
+      });
+    });
+  }
+
+  test("R2-N5: a ref nested deep in the args still blocks a rerun on the new page", async () => {
+    let env!: ReturnType<typeof makeBackgroundChrome>;
+    env = makeBackgroundChrome({
+      executeScript: lostOnFirstRun(() => setTimeout(() => env.emitCommitted(7), 10), "done"),
+    });
+    await withBackgroundModule("r2-n5-deep-ref", env.fullChrome, async (bg) => {
+      const step = { kind: "bc", method: "snapshot", args: [{ x: { list: ["e9"] } }] };
+      await expect(bg.runBcSilent(7, [step], { timeoutMs: 10_000 })).rejects.toThrow(/refs from the old page are gone/);
+      expect(mainRuns(env).length).toBe(1);
+    });
+  });
+
   test("F1: non-shared tab refusal uses exact Share this tab wording across background.js and debugger-hub.js", async () => {
     const env = makeBackgroundChrome({});
     const expected =

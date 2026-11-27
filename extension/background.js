@@ -584,12 +584,22 @@ function bcStepReplaySafe(st) {
 }
 
 // Element refs (e12, f1:e3) name nodes of one document; a call carrying one never reruns on another.
+// The walk is bounded; args too large to scan count as carrying a ref.
 function bcStepHasRef(st) {
-  const hasRef = (v, depth) =>
-    typeof v === "string"
-      ? BC_DOC_REF.test(v)
-      : depth < 2 && v && typeof v === "object" && Object.values(v).some((x) => hasRef(x, depth + 1));
-  return st?.kind === "bc" && Array.isArray(st.args) && st.args.some((a) => hasRef(a, 0));
+  if (st?.kind !== "bc" || !Array.isArray(st.args)) return false;
+  const stack = [...st.args];
+  const seen = new Set();
+  for (let budget = 10_000; stack.length; budget--) {
+    if (budget <= 0) return true;
+    const v = stack.pop();
+    if (typeof v === "string") {
+      if (BC_DOC_REF.test(v)) return true;
+    } else if (v && typeof v === "object" && !seen.has(v)) {
+      seen.add(v);
+      for (const x of Object.values(v)) stack.push(x);
+    }
+  }
+  return false;
 }
 
 function assertTabAllowed(tabId) {
@@ -669,7 +679,6 @@ export async function runBcSilent(tabId, steps, opts = {}) {
   let unsubscribe;
   let timer;
   let probeTimer;
-  let livenessTimer;
   let settled = false;
   let cancelled = false;
   let timedOut = false;
@@ -732,8 +741,7 @@ export async function runBcSilent(tabId, steps, opts = {}) {
   const liveness = (n, target, waitMs) =>
     new Promise((resolve) => {
       let done = false;
-      clearTimeout(livenessTimer);
-      livenessTimer = setTimeout(() => {
+      const livenessTimer = setTimeout(() => {
         if (done) return;
         done = true;
         if (n === attempt) stalledAttempt = n;
@@ -786,21 +794,33 @@ export async function runBcSilent(tabId, steps, opts = {}) {
     for (;;) {
       assertTabAllowed(tabId);
       const n = ++attempt;
-      const doc = await bcFrameDoc(tabId, targetFrame);
-      assertTabAllowed(tabId);
-      const target = doc.documentId ? { tabId, documentIds: [doc.documentId] } : scriptTarget(tabId, opts.frameId);
-      lastTarget = target;
+      if (Date.now() >= deadline) throw new Error("__BC_TIMEOUT__");
       const token = { stale: false, ran: false };
-      const navigated = new Promise((_, reject) => {
-        cur = { doc, changed: (kind) => reject(Object.assign(new Error("__BC_NAVIGATED__"), { kind })) };
-      });
-      navigated.catch(() => {});
-      scheduleProbe(n, target);
-      const stepsPromise = runBcSteps(tabId, steps, target, () => cancelled || token.stale, () => {
-        token.ran = true;
-      });
-      stepsPromise.catch(() => {});
       try {
+        // Record commits that land during the frame lookup; the lookup may return the replaced document.
+        let early = null;
+        cur = { doc: { chain: new Set([0, targetFrame]) }, changed: (kind) => (early ??= kind) };
+        const doc = await bcFrameDoc(tabId, targetFrame);
+        assertTabAllowed(tabId);
+        if (early === "replaced") throw bcNavigated("replaced");
+        if (early && doc.documentId) {
+          const f = await Promise.resolve(chrome.webNavigation.getFrame({ tabId, frameId: targetFrame })).catch(() => ({}));
+          if (f?.documentId !== doc.documentId) throw bcNavigated(f ? "committed" : "frame-gone");
+        }
+        const target = doc.documentId ? { tabId, documentIds: [doc.documentId] } : scriptTarget(tabId, opts.frameId);
+        lastTarget = target;
+        const navigated = new Promise((_, reject) => {
+          cur = { doc, changed: (kind) => reject(bcNavigated(kind)) };
+        });
+        navigated.catch(() => {});
+        scheduleProbe(n, target);
+        const stepsPromise = runBcSteps(tabId, steps, target, () => cancelled || token.stale, () => {
+          token.ran = true;
+        }).catch((err) => {
+          // Chrome rejects a documentId whose document is already gone.
+          throw /No document with id/i.test(String(err?.message || "")) ? bcNavigated("committed") : err;
+        });
+        stepsPromise.catch(() => {});
         return await Promise.race([stepsPromise, navigated, dialogPromise, earlyProbePromise, timeoutPromise]);
       } catch (err) {
         if (String(err?.message || "") !== "__BC_NAVIGATED__" || cancelled) throw err;
@@ -831,7 +851,10 @@ export async function runBcSilent(tabId, steps, opts = {}) {
       // Suspect a dialog only when the current document is stalled right now.
       let stalled = stalledAttempt === attempt && attempt > 0;
       if (!stalled && answeredAttempt !== attempt && tabAllowed(tabId)) {
-        stalled = !(await liveness(attempt, lastTarget, livenessTimeoutMs));
+        // Check the frame's current document; the attempt's target may be a replaced or bfcached one.
+        const now = await bcFrameDoc(tabId, targetFrame);
+        const target = now.documentId ? { tabId, documentIds: [now.documentId] } : lastTarget;
+        stalled = !(await liveness(attempt, target, livenessTimeoutMs));
       }
       if (stalled) {
         const dialogErr = tabAllowed(tabId) ? await probeOpenDialog(tabId, { allowUnconfirmed: true, waitMs: 1_000 }) : null;
@@ -848,12 +871,15 @@ export async function runBcSilent(tabId, steps, opts = {}) {
     cur = null;
     clearTimeout(timer);
     clearTimeout(probeTimer);
-    clearTimeout(livenessTimer);
     unsubscribe?.();
     chrome.webNavigation?.onCommitted?.removeListener(onCommitted);
     chrome.webNavigation?.onTabReplaced?.removeListener(onTabReplaced);
     chrome.tabs?.onUpdated?.removeListener(onUpdated);
   }
+}
+
+function bcNavigated(kind) {
+  return Object.assign(new Error("__BC_NAVIGATED__"), { kind });
 }
 
 // The target frame's current document and its ancestor chain (target included).
