@@ -810,7 +810,7 @@ Set the \`cycles\` parameter to \`"ref"\` to resolve cyclical schemas with defs.
   };
 
   const parentOf = (el) => {
-    const p = el?.parentElement || el?.getRootNode?.()?.host || null;
+    const p = el?.assignedSlot || el?.parentElement || el?.getRootNode?.()?.host || null;
     return p === el ? null : p;
   };
   const deepHitIn = (doc, x, y) => {
@@ -1050,7 +1050,7 @@ Set the \`cycles\` parameter to \`"ref"\` to resolve cyclical schemas with defs.
       if (wantDetail) {
         hitGeom = visibleGeometry(el, b, fd, vw, vh);
         if (hitGeom.box.width <= 0 || hitGeom.box.height <= 0) return 'covered by nothing (off screen)';
-        return hitReason(el, hitGeom.box.left + hitGeom.box.width / 2, hitGeom.box.top + hitGeom.box.height / 2, fd);
+        return hitReason(el, Math.round(hitGeom.box.left + hitGeom.box.width / 2), Math.round(hitGeom.box.top + hitGeom.box.height / 2), fd);
       }
       return hitReason(el, b.left + b.width / 2 + fd.x, b.top + b.height / 2 + fd.y, fd);
     };
