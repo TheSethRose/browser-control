@@ -1013,6 +1013,36 @@ describe("page-runner natural motion integration", () => {
     });
   });
 
+  test("E12: a tab switch mid-type keeps every key event on the tab typing started on", async () => {
+    await withNaturalOn(async () => {
+      let active = "T1";
+      let switched = false;
+      const seen: Array<{ method: string; targetId?: string }> = [];
+      const base = makeNaturalMock({ inView: true });
+      const inv: Invoke = async (op, inp = {}) => {
+        if (op === "get_browser_status") return { ok: true, data: { connected: true, activeTargetId: active } };
+        // An unpinned call resolves to whichever tab is active now, as the real backend does.
+        if (op === "execute_cdp") seen.push({ method: String(inp["method"]), targetId: (inp["targetId"] as string | undefined) ?? active });
+        return base.invoke(op, inp);
+      };
+      const h: ReturnType<typeof createPageHelperHandler> = createPageHelperHandler(inv, undefined, undefined, {
+        rng: createSeededRng(3),
+        sleep: async () => {
+          if (switched) return;
+          switched = true;
+          active = "T2";
+          await h("key", { key: "Tab", quiet: true, fast: true });
+        },
+        bcCall: async () => ({ value: "https://a.test/\nhit: button#ok" }),
+      });
+      expect((await h("type", { ref: "e1", text: "hi", quiet: true, _natural: true })).ok).toBe(true);
+      expect(switched).toBe(true);
+      const keyed = seen.filter((e) => e.method === "Input.dispatchKeyEvent");
+      expect(keyed.filter((e) => e.targetId === "T2")).toHaveLength(2); // the nested key command only
+      expect([...new Set(keyed.filter((e) => e.targetId !== "T2").map((e) => e.targetId))]).toEqual(["T1"]);
+    });
+  });
+
   test("do accepts step fast metadata and script --fast wins over a step fast:false", async () => {
     await withNaturalOn(async () => {
       const m = makeNaturalMock({ inView: true });
@@ -1056,8 +1086,8 @@ describe("page-runner natural motion integration", () => {
 });
 
 describe("page-helpers v10 — point detail/noScroll, hitCheck, pageScrollPoint", () => {
-  test("VERSION is 10 and new helpers work in isolated DOM", async () => {
-    expect(PAGE_HELPERS_VERSION).toBe(10);
+  test("VERSION is 11 and new helpers work in isolated DOM", async () => {
+    expect(PAGE_HELPERS_VERSION).toBe(11);
 
     const btn: any = {
       nodeType: 1,
@@ -1138,7 +1168,7 @@ describe("page-helpers v10 — point detail/noScroll, hitCheck, pageScrollPoint"
 
       new Function(PAGE_HELPERS_SOURCE)();
       const bc = (globalThis as any).__bc;
-      expect(bc.v).toBe(10);
+      expect(bc.v).toBe(11);
       bc.snapshot();
 
       // noScroll reports inView: false without calling scrollIntoView.

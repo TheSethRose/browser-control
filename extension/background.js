@@ -29,7 +29,7 @@ const VERSION_PROBE_TIMEOUT_MS = 800;
 const DEBUGGER_IDLE_MS = 30_000;
 const KEEPALIVE_MS = 20_000;
 const PAGE_HELPERS_FILE = "page-helpers.js";
-const PAGE_HELPERS_VERSION = 10;
+const PAGE_HELPERS_VERSION = 11;
 const OVERLAY_FILE = "content-overlay.js";
 const HANDOFF_NOTIF_PREFIX = "bc-handoff-";
 const HANDOFF_ICON_DATA_URL =
@@ -764,7 +764,7 @@ export async function runBcSilent(tabId, steps, opts = {}) {
 
   const scheduleProbe = (n, target) => {
     clearTimeout(probeTimer);
-    if (probeDelayMs >= deadline - Date.now()) return;
+    if (opts.noAttach || probeDelayMs >= deadline - Date.now()) return;
     probeTimer = setTimeout(async () => {
       try {
         if (n !== attempt || settled || cancelled || !tabAllowed(tabId)) return;
@@ -857,7 +857,7 @@ export async function runBcSilent(tabId, steps, opts = {}) {
         stalled = !(await liveness(attempt, target, livenessTimeoutMs));
       }
       if (stalled) {
-        const dialogErr = tabAllowed(tabId) ? await probeOpenDialog(tabId, { allowUnconfirmed: true, waitMs: 1_000 }) : null;
+        const dialogErr = tabAllowed(tabId) && !opts.noAttach ? await probeOpenDialog(tabId, { allowUnconfirmed: true, waitMs: 1_000 }) : null;
         throw dialogErr || new Error(`EXECUTION_FAILED: tab ${tabId} got no answer in ${timeoutMs} ms (a JavaScript dialog may be blocking the page)`);
       }
       throw new Error(`EXECUTION_FAILED: tab ${tabId} got no answer in ${timeoutMs} ms (no dialog detected; the page may be busy or still loading)`);
@@ -1367,7 +1367,8 @@ async function handleRequest(msg) {
     }
 
     case "bc_call": {
-      const values = await runBcSilent(tabId, params.steps || [], { frameId: params.frameId, timeoutMs: params.timeoutMs });
+      const opts = { frameId: params.frameId, timeoutMs: params.timeoutMs, noAttach: params.noAttach === true };
+      const values = await runBcSilent(tabId, params.steps || [], opts);
       return { values };
     }
 

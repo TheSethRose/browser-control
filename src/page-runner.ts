@@ -75,7 +75,7 @@ import {
   type Locator,
 } from "./page-helpers";
 import { createPictureTracker, imageWidth, resizeImage } from "./picture";
-import { buildHumanKeystrokes } from "./typing";
+import { classifyFieldKind, planTyping, type CharKeySpec, type FieldKind } from "./typing";
 import { didYouMean, withRemedy, wrapUntrusted } from "./safety";
 import { formatCaptchaReport, type CaptchaStatus } from "./captcha";
 import { createScriptRunner, writeOutputFile } from "./script";
@@ -86,6 +86,8 @@ export type Invoker = (operation: string, input?: Json) => Promise<InvokeResult>
 const NEED_INSTALL = "__BC_NEED_INSTALL__";
 /** Input events never return while a JavaScript dialog is open, so don't wait the full CDP timeout. */
 const INPUT_TIMEOUT_MS = 10_000;
+/** Natural typing: a dispatch this far behind its schedule is a stall, not round-trip latency. */
+const STALL_MS = 60;
 /**
  * Chrome acks a mouse move or wheel event only once the page has handled it, which for these events waits on the
  * next painted frame. A page that is not painting (headless CI, a throttled renderer) acks about once a second, so a
@@ -346,6 +348,9 @@ export function createPageHelperHandler(
   const daemonSessionId = options.sessionId ?? randomUUID().slice(0, 12);
   const pause = options.sleep ?? sleep;
   const rng = options.rng ?? Math.random;
+  /** Natural typing speed for this daemon session, drawn once (0.85-1.15) on the first use. */
+  let typingSpeed: number | undefined;
+  const typingSpeedFactor = (): number => (typingSpeed ??= 0.85 + rng() * 0.3);
   const now = options.now ?? (() => Date.now());
   /** `_natural` is the wrapper caller's resolved on/off switch, so status and dispatch agree. */
   const isNatural = (input: Json): boolean =>
@@ -420,7 +425,7 @@ export function createPageHelperHandler(
   /** Active human handoff id per extension tab id (at most one active handoff per tab). */
   const activeHandoffs = new Map<number, string>();
 
-  async function runBcCall(call: ReturnType<typeof normalizeHelperCall>, targetId: string, timeoutMs?: number): Promise<InvokeResult> {
+  async function runBcCall(call: ReturnType<typeof normalizeHelperCall>, targetId: string, timeoutMs?: number, noAttach = false): Promise<InvokeResult> {
     const order = backendOrder();
     const fn = options.bcCall ?? (order.includes("extension") ? getRegisteredExtensionBcCall() : undefined);
     if (!fn) {
@@ -435,6 +440,7 @@ export function createPageHelperHandler(
         steps: call.steps,
         join: call.join,
         ...(timeoutMs ? { timeoutMs } : {}),
+        ...(noAttach ? { noAttach } : {}),
       });
       return { ok: true, data };
     } catch (error) {
@@ -445,10 +451,10 @@ export function createPageHelperHandler(
     }
   }
 
-  async function evalHelper(call: HelperCall, targetId?: string, timeoutMs?: number): Promise<InvokeResult> {
+  async function evalHelper(call: HelperCall, targetId?: string, timeoutMs?: number, noAttach = false): Promise<InvokeResult> {
     const normalized = normalizeHelperCall(call);
     if (extensionTabOf(targetId) !== undefined) {
-      return runBcCall(normalized, targetId!, timeoutMs);
+      return runBcCall(normalized, targetId!, timeoutMs, noAttach);
     }
     const callExpr = renderSteps(normalized);
     const extra = { isolated: true, ...(targetId ? { targetId } : {}), ...(timeoutMs ? { timeoutMs } : {}) };
@@ -1219,7 +1225,7 @@ export function createPageHelperHandler(
     text: string,
     mode: "human" | "fast" | "keys",
     targetId?: string,
-    opts: { focused?: boolean } = {},
+    opts: { focused?: boolean; fieldKind?: FieldKind } = {},
   ): Promise<InvokeResult> {
     if (text === "") {
       return pressKey("Backspace", targetId);
@@ -1251,37 +1257,86 @@ export function createPageHelperHandler(
       }
       return success("ok");
     }
-    // Default: human/natural typing with realistic hold times, variable cadence, and occasional self-corrected typos.
-    const plan = buildHumanKeystrokes(text, { rng });
-    for (const step of plan) {
-      if (step.kind === "backspace") {
-        const bs = await pressKey("Backspace", targetId, step.holdMs);
-        if (!bs.ok) return bs;
-      } else if (step.kind === "insert") {
-        const ins = await cdp("Input.insertText", { text: step.text }, targetId, INPUT_TIMEOUT_MS);
-        if (!ins.ok) return ins;
-      } else {
-        const base: Json = {
-          key: step.spec.key,
-          code: step.spec.code,
-          windowsVirtualKeyCode: step.spec.windowsVirtualKeyCode,
-          ...(step.spec.modifiers ? { modifiers: step.spec.modifiers } : {}),
-        };
-        const down: Json = step.spec.text !== undefined
-          ? { type: "keyDown", ...base, text: step.spec.text }
-          : { type: "rawKeyDown", ...base };
-        const sent = await sendKeyStroke(
-          down,
-          { type: "keyUp", ...base },
-          targetId,
-          { kind: "key", label: `key ${step.spec.key} still down` },
-          step.holdMs,
-        );
-        if (!sent.ok) return sent;
+    // Default: natural typing — human cadence, rollover, real Shift, and self-corrected typos.
+    const plan = planTyping(text, { rng, speedFactor: typingSpeedFactor(), fieldKind: opts.fieldKind });
+    // A key is recorded as down before its keyDown goes out, so one that reached the page but timed out is
+    // still released. Events run on elapsed time, absorbing round trips; a stall past STALL_MS shifts the rest.
+    // Each keyUp goes out once: one that never reached the page is reported as held, never re-sent.
+    const down = new Map<string, CharKeySpec>();
+    /** Keys whose keyDown a dialog refused: they may never have gone out, so they read as possibly down. */
+    const refusedDown = new Set<string>();
+    const stuck: string[] = [];
+    let result: InvokeResult = success("ok");
+    let blocked = false;
+    let mayBeDown = false;
+    const keyUp = async (spec: CharKeySpec, pressRefused = false): Promise<InvokeResult> => {
+      down.delete(spec.key);
+      if (pressRefused) mayBeDown = true;
+      // After a timeout or a dialog refusal nothing more goes out: the rest are reported held, never sent.
+      if (blocked) return (stuck.push(spec.key), failure("EXECUTION_FAILED", "CDP_TIMEOUT"));
+      const up = await sendKey("keyUp", spec, targetId).catch((err: unknown) => failure("EXECUTION_FAILED", String(err)));
+      if (!up.ok) {
+        if (messageOf(up).startsWith("CDP_TIMEOUT")) blocked = true;
+        // A dialog refusal may have landed: unverified, never "still down".
+        else if (refusedByDialog(up)) {
+          blocked = true;
+          return releaseUnverified(`key ${spec.key} release: delivery unverified (a dialog opened)`);
+        } else stuck.push(spec.key);
       }
-      if (step.pauseAfterMs > 0) await pause(step.pauseAfterMs);
+      return up;
+    };
+    let start = now();
+    let plannedAt = 0;
+    try {
+      for (const step of plan.events) {
+        plannedAt += step.delayMs;
+        const wait = start + plannedAt - now();
+        if (wait > 0) await pause(wait);
+        // Measure lateness after waking: a sleep that oversleeps past STALL_MS would otherwise leave the next
+        // step no hold at all, so the rest of the schedule shifts by the overshoot.
+        const late = now() - (start + plannedAt);
+        if (late > STALL_MS) start += late;
+        // Emoji and other unmapped characters go as key text: keyDown with text, then keyUp.
+        const spec: CharKeySpec =
+          step.kind === "insert" ? { key: step.text, code: "", windowsVirtualKeyCode: 0, text: step.text } : step.spec;
+        if (step.kind !== "keyUp") {
+          down.set(spec.key, spec);
+          result = await sendKey(spec.text !== undefined ? "keyDown" : "rawKeyDown", spec, targetId);
+          // The press may never have gone out: send nothing more into the open dialog.
+          if (refusedByDialog(result)) (refusedDown.add(spec.key), (blocked = true));
+        }
+        if (result.ok && step.kind !== "keyDown") result = await keyUp(spec);
+        if (!result.ok) break;
+      }
+    } finally {
+      for (const spec of [...down.values()].reverse()) await keyUp(spec, refusedDown.has(spec.key));
     }
-    return success("ok");
+    if (stuck.length === 0) return result;
+    const held: HeldInput = {
+      kind: "key",
+      label: `key${stuck.length > 1 ? "s" : ""} ${stuck.join(", ")} ${mayBeDown ? "may still be down" : "still down"}`,
+    };
+    heldByTab.set(heldSlot(targetId, "key"), held);
+    return withHeld(result, held);
+  }
+
+  function sendKey(type: string, spec: CharKeySpec, targetId?: string, timeoutMs = INPUT_TIMEOUT_MS): Promise<InvokeResult> {
+    const { key, code, windowsVirtualKeyCode, modifiers, text } = spec;
+    const extra = { ...(modifiers ? { modifiers } : {}), ...(type === "keyDown" && text !== undefined ? { text } : {}) };
+    return cdp("Input.dispatchKeyEvent", { type, key, code, windowsVirtualKeyCode, ...extra }, targetId, timeoutMs);
+  }
+
+  /** Typo policy from the focused field's live type and flags (attach-free read); any doubt means none. */
+  async function fieldKindOf(text: string, targetId?: string): Promise<FieldKind> {
+    const probe = await evalHelper({ kind: "bc", method: "typingField" }, targetId, 2_000, true);
+    let f: { type?: unknown; flags?: unknown; hint?: unknown } = {};
+    try {
+      f = (probe.ok && JSON.parse(valueOf(probe))) || {};
+    } catch {}
+    if (typeof f.type !== "string" || !Array.isArray(f.flags)) return "none";
+    if (/^(number|password)$/.test(f.type) || f.flags.some((x) => /^(secure|trap|payment|cc)$/.test(String(x)))) return "none";
+    if (/^(email|tel|url|date|time|datetime-local|month|week)$/.test(f.type)) return "structured";
+    return classifyFieldKind(text, String(f.hint ?? ""));
   }
 
   async function waitParsed(targetId?: string): Promise<void> {
@@ -1871,6 +1926,8 @@ export function createPageHelperHandler(
         if (typeof input["text"] !== "string") {
           return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: text is required");
         }
+        // Pin the tab once: a tab switch mid-typing cannot move a later key or its release to another page.
+        targetId = targetId ?? implicitCdpTarget;
         const text = input["text"];
         const natural = isNatural(input);
         const mode: "human" | "fast" | "keys" =
@@ -1945,7 +2002,8 @@ export function createPageHelperHandler(
             if (editorRef) {
               await evalHelper({ kind: "bc", method: "focusForType", args: [editorRef] }, fieldTarget);
             }
-            const sent = await dispatchText(text, mode, targetId);
+            const cellKind = mode === "human" ? await fieldKindOf(text, fieldTarget) : undefined;
+            const sent = await dispatchText(text, mode, targetId, { fieldKind: cellKind });
             if (!sent.ok) return inputFailed(sent, `type ${name}`);
             const committed = await pressKey("Enter", targetId, natural ? planKeyHold(rng) : 0);
             if (!committed.ok) return inputFailed(committed, `type ${name}`);
@@ -1985,7 +2043,8 @@ export function createPageHelperHandler(
             return failure("EXECUTION_FAILED", `type ${name}: not_delivered (the click did not focus it; try snap again)`);
           }
         }
-        const sent = await dispatchText(text, mode, targetId);
+        const typeKind = mode === "human" ? await fieldKindOf(text, fieldTarget) : undefined;
+        const sent = await dispatchText(text, mode, targetId, { fieldKind: typeKind });
         if (!sent.ok) return inputFailed(sent, `type ${name}`);
         if (loc.kind === "ax") {
           return withChanges(`${healPrefix}type ${name}: delivered_unverified (accessibility ref, not read back)`, at.pt.before, quiet, targetId);

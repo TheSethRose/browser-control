@@ -1553,6 +1553,15 @@ describe("background.js resolveBcNode & runBcSilent review fixes (S1, S3, S6, S7
       expect(envSlow.calls.some((c) => c.api === "debugger.attach")).toBe(false);
       expect(envSlow.cdpCalls.length).toBe(0);
     });
+
+    // 3. noAttach: a stalled read fails plainly at its timeout and never attaches the debugger.
+    const envStall = makeBackgroundChrome({ executeScript: () => new Promise(() => {}) });
+    await withBackgroundModule("s6-s9-no-attach", envStall.fullChrome, async (bg) => {
+      await expect(
+        bg.runBcSilent(7, [{ kind: "href" }], { timeoutMs: 120, dialogProbeDelayMs: 20, livenessProbeTimeoutMs: 20, noAttach: true }),
+      ).rejects.toThrow(/EXECUTION_FAILED: tab 7 got no answer/);
+      expect(envStall.calls.some((c) => c.api === "debugger.attach")).toBe(false);
+    });
   });
 
   // Chrome never settles an executeScript whose document a browser-side navigation replaces mid-call
