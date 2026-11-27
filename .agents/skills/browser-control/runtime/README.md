@@ -111,8 +111,9 @@ For longer tasks, follow the skill's reference files for tabs, frames, input, di
 network, scrolling, downloads, cookies and artifacts. Each one is a set of steps built from
 `call`. None of them adds an operation.
 
-Each new connection makes the user click Allow. Chrome asks the person at the keyboard to
-approve every new remote debugging connection. The daemon already holds an approved one. So
+With remote debugging (cdp), each new connection makes the user click Allow. Chrome asks
+the person at the keyboard to approve every new remote debugging connection. The extension
+has no Allow prompt. The daemon already holds an approved one. So
 don't restart it, stop it or disconnect it. Never pass a port. If a command waits and
 then reports a timeout, the user hasn't clicked Allow yet. Ask them to, then run the same
 command again.

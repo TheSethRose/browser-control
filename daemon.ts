@@ -139,7 +139,7 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
     if (operation === "disconnect_browser") {
       return failure(
         "EXECUTION_FAILED",
-        "DISCONNECT_REFUSED: the daemon keeps browser connections so the user is not asked to click Allow again. Disconnecting fixes nothing. Only if the user asked: browser-control-daemon stop --force",
+        "DISCONNECT_REFUSED: the daemon keeps browser connections so remote debugging (cdp) does not ask the user to click Allow again. Disconnecting fixes nothing. Only if the user asked: browser-control-daemon stop --force",
       );
     }
     const effectiveInput = applyNavBrowserScope(operation, input, requestBrowser.getStore());
