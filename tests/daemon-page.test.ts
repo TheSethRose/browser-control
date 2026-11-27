@@ -92,6 +92,7 @@ function makeFakeInvoker(options: {
         const seq = options.canvasHashes ?? ["h1", "h2"];
         return ok(seq[Math.min(hashIdx++, seq.length - 1)]!);
       }
+      if (expr.includes("__bc.hitCheck")) return ok('{"ok":true}');
       if (expr.includes("__bc.hit")) return ok("https://a.test/x\nhit: canvas#c");
       if (expr.includes("__bc.diff")) return ok('+ button "Extra" [e9]');
       if (expr.includes("__bc.point")) return ok(expr.includes("__bc.baseline()") ? `https://a.test/x ${point}` : point);
@@ -234,7 +235,7 @@ describe("daemon page helpers", () => {
       rng: () => 0.5, // deterministic, no typo triggered at 0.5 >= 0.045
     });
 
-    const human = await handle("type", { ref: "e2", text: "hello", quiet: true });
+    const human = await handle("type", { ref: "e2", text: "hello", quiet: true, _natural: true });
     expect(text(human)).toContain("delivered (read back matches)");
     const humanKeys = calls.filter((c) => c.op === "execute_cdp" && c.input["method"] === "Input.dispatchKeyEvent");
     expect(humanKeys).toHaveLength(10); // 5 chars * (keyDown + keyUp)
@@ -252,8 +253,8 @@ describe("daemon page helpers", () => {
     ]);
 
     const keysMock = makeFakeInvoker({ readback: "ab" });
-    const keysHandle = createPageHelperHandler(keysMock.invoke);
-    const keysRes = await keysHandle("type", { ref: "e2", text: "ab", keys: true, quiet: true });
+    const keysHandle = createPageHelperHandler(keysMock.invoke, undefined, undefined, { sleep: async () => {}, rng: () => 0.5 });
+    const keysRes = await keysHandle("type", { ref: "e2", text: "ab", keys: true, quiet: true, _natural: true });
     expect(text(keysRes)).toContain("delivered (read back matches)");
     const keyEvents = keysMock.calls.filter((c) => c.op === "execute_cdp" && c.input["method"] === "Input.dispatchKeyEvent");
     expect(keyEvents).toHaveLength(4);
@@ -540,7 +541,7 @@ describe("picture pages and daemon script flags", () => {
       sleep: async () => {},
       rng: () => 0.5,
     });
-    const res = await handle("type", { focused: true, text: "hi", quiet: true });
+    const res = await handle("type", { focused: true, text: "hi", quiet: true, _natural: true });
     expect(text(res)).toStartWith("type --focused: sent");
     expect(cdpMethods(calls)).toEqual([
       "Input.dispatchKeyEvent",

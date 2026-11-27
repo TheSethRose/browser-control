@@ -259,6 +259,13 @@ async function main(): Promise<number> {
     const out = await evalJs(expr);
     record(name, expect.test(out), out);
   };
+  // A page call refused with DIALOG_OPEN means the extension has seen the dialog, so `dialog` can handle it.
+  // A fixed sleep raced that detection on a loaded machine.
+  const waitForDialog = async (ms = 10_000) => {
+    for (const end = Date.now() + ms; Date.now() < end; await sleep(100)) {
+      if (/DIALOG_OPEN/.test(await evalJs("1"))) return;
+    }
+  };
 
   let cleaned: Promise<void> | undefined;
   const cleanup = () =>
@@ -400,11 +407,11 @@ async function main(): Promise<number> {
 
     // confirm: accept, then dismiss.
     await evalJs("setTimeout(()=>document.getElementById('cf').click(),50);1");
-    await sleep(500);
+    await waitForDialog();
     await check("confirm-accept", ["dialog", "accept"], /^dialog accept: accepted/m);
     await checkEval("confirm-accept-check", "document.getElementById('log').textContent", /confirm true/);
     await evalJs("setTimeout(()=>document.getElementById('cf').click(),50);1");
-    await sleep(500);
+    await waitForDialog();
     await check("confirm-dismiss", ["dialog", "dismiss"], /^dialog dismiss: dismissed/m);
     await checkEval("confirm-dismiss-check", "document.getElementById('log').textContent", /confirm false/);
 
