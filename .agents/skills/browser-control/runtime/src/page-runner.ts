@@ -594,7 +594,12 @@ export function createPageHelperHandler(
       return bad(failure("EXECUTION_FAILED", `unexpected point output: ${valueOf(res)}`));
     }
     if (loc.kind === "frame") {
-      const off = await evalHelper({ kind: "bc", method: "frameOffset", args: [loc.frame] }, targetId);
+      // Offset the iframe element that hosts the frame the point came from, not whatever sits in slot f<n> now.
+      const slot = (await crossFrames(targetId)).find((f) => f.target === where)?.i;
+      if (slot === undefined) {
+        return bad(failure("EXECUTION_FAILED", `STALE_REF: iframe f${loc.frame} is gone. Run snap again.`));
+      }
+      const off = await evalHelper({ kind: "bc", method: "frameOffset", args: [slot] }, targetId);
       if (!off.ok) return bad(off);
       const [ox, oy] = valueOf(off).split(" ").map(Number);
       x = Math.round(x + (ox ?? 0));
@@ -847,7 +852,7 @@ export function createPageHelperHandler(
         5_000,
       );
       const text = inner.ok ? valueOf(inner) : "";
-      const lines = text.split("\n").filter((l) => l.startsWith("- "));
+      const lines = text.split("\n").filter((l) => /^[-+~] /.test(l));
       const diff = /^# snap diff .*$/m.exec(text)?.[0];
       out.push(`# iframe ${label}: ${lines.length} control(s)${diff ? ` changed; ${diff.slice(2)}` : ""}`);
       out.push(...lines.map((l) => l.replace(/\[e(\d+)\]/, `[f${f.i}:e$1]`)));

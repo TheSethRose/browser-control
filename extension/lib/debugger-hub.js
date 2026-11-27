@@ -800,9 +800,10 @@ export function createDebuggerHub({
    * CDP sessionId of the out-of-process iframe whose document is `frameUrl`. Turns on flattened
    * Target.setAutoAttach once per attachment, then matches child targets by URL (exact, then
    * origin + path, then origin). When several children tie (same-URL siblings), `choose(sessionIds)`
-   * picks the right one. Returns undefined when no child target matches (same-process frame).
+   * picks the right one; a tie it cannot settle throws instead of guessing. Returns undefined when
+   * no child target matches (same-process frame).
    */
-  async function frameSession(tabId, frameUrl, timeoutMs = 1_500, choose) {
+  async function frameSession(tabId, frameUrl, timeoutMs = 1_500, choose, label = frameUrl) {
     const entry = await ensureAttached(tabId);
     if (!entry.autoAttached) {
       await chromeApi.debugger.sendCommand({ tabId }, "Target.setAutoAttach", {
@@ -837,9 +838,10 @@ export function createDebuggerHub({
     const deadline = Date.now() + timeoutMs;
     for (;;) {
       const ids = pick();
-      if (ids.length > 1 && typeof choose === "function") {
-        const chosen = await choose(ids).catch(() => undefined);
-        if (chosen) return chosen;
+      if (ids.length > 1) {
+        const chosen = typeof choose === "function" ? await choose(ids).catch(() => undefined) : undefined;
+        if (chosen && ids.includes(chosen)) return chosen;
+        throw new Error(`EXECUTION_FAILED: could not identify iframe session for frame ${label}: ${ids.length} frames share its URL. Run snap again.`);
       }
       if (ids.length || Date.now() >= deadline) return ids[0];
       await new Promise((r) => setTimeout(r, 50));
@@ -855,7 +857,7 @@ export function createDebuggerHub({
     const frame = await Promise.resolve(getFrame(tabId, frameId)).catch(() => null);
     if (!frame) throw new Error(`STALE_REF: frame ${frameId} is gone. Run snap again.`);
     if (!frame.url) return undefined;
-    return frameSession(tabId, frame.url, undefined, choose ? (ids) => choose(ids, frameId) : undefined);
+    return frameSession(tabId, frame.url, undefined, choose ? (ids) => choose(ids, frameId) : undefined, frameId);
   }
 
   return {

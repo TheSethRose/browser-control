@@ -170,7 +170,7 @@ type BcInput = { targetId?: string; steps: readonly Step[] };
 /** Minimal handler with caller-supplied helper, CDP and extension stubs; records where helpers ran. */
 function stubHandler(opts: {
   bc: (method: string | undefined, input: BcInput) => { value: string };
-  cdp?: (method: string, targetId?: string) => unknown;
+  cdp?: (method: string, targetId?: string, params?: Record<string, unknown>) => unknown;
   targets?: unknown[];
   listFrames?: () => unknown[];
 }) {
@@ -192,7 +192,8 @@ function stubHandler(opts: {
       }
     }
     if (op === "execute_cdp") {
-      return { ok: true, data: { result: opts.cdp?.(String(input["method"]), input["targetId"] as string | undefined) ?? {} } };
+      const params = (input["params"] ?? {}) as Record<string, unknown>;
+      return { ok: true, data: { result: opts.cdp?.(String(input["method"]), input["targetId"] as string | undefined, params) ?? {} } };
     }
     return { ok: true, data: { result: {} } };
   };
@@ -261,6 +262,52 @@ describe("p3 frames review fixes", () => {
     ran.length = 0;
     expect((await handle("hover", { ref: "f1:e1" }, TOP)).ok).toBe(true);
     expect(ran.find((r) => r.method === "point")?.targetId).toBe(FRAME);
+  });
+
+  test("S2: a saved frame ref after a reorder uses its own iframe's page offset", async () => {
+    let order = [{ i: 1, src: CROSS_SRC, title: "" }];
+    let frames = [{ frameId: 7, url: CROSS_SRC }];
+    const moves: Array<Record<string, unknown>> = [];
+    const offsets: Record<string, string> = { [CROSS_SRC]: "100 0", "http://ads.test/x": "300 0" };
+    const { handle } = stubHandler({
+      listFrames: () => frames,
+      cdp: (method, _t, params) => {
+        if (method === "Input.dispatchMouseEvent" && params?.["type"] === "mouseMoved") moves.push(params);
+        return {};
+      },
+      bc: (method, input) => {
+        if (method === "frames") return { value: input.targetId === TOP ? JSON.stringify(order) : "[]" };
+        if (method === "frameOffset") return { value: offsets[order[Number(input.steps.at(-1)?.args?.[0]) - 1]!.src]! };
+        return pointOrMiss(method, input, { [FRAME]: "e1" });
+      },
+    });
+    expect((await handle("hover", { ref: "Cross input" }, TOP)).ok).toBe(true);
+    order = [{ i: 1, src: "http://ads.test/x", title: "" }, { i: 2, src: CROSS_SRC, title: "" }];
+    frames = [{ frameId: 9, url: "http://ads.test/x" }, { frameId: 7, url: CROSS_SRC }];
+    expect((await handle("hover", { ref: "Cross input" }, TOP)).ok).toBe(true);
+    moves.length = 0;
+    expect((await handle("hover", { ref: "f1:e1" }, TOP)).ok).toBe(true);
+    expect(moves[0]).toMatchObject({ x: 101, y: 2 });
+  });
+
+  test("S6: a diff-mode snap keeps child-frame added, updated and removed rows with frame refs", async () => {
+    const { handle } = stubHandler({
+      listFrames: () => [{ frameId: 7, url: CROSS_SRC }],
+      bc: (method, input) => {
+        const inFrame = input.targetId === FRAME;
+        if (method === "frames") return { value: inFrame ? "[]" : JSON.stringify([{ i: 1, src: CROSS_SRC, title: "" }]) };
+        if (method !== "snapshot") return { value: "" };
+        if (!inFrame) return { value: `# page | http://127.0.0.1:49260/\n# 1 cross-origin iframe(s): listed below\n- button "Top" [e1]` };
+        return {
+          value: `# frame\n# snap diff (4 refs unchanged and still valid; pass --full for all)\n+ button "New" [e3]\n~ textbox "Cross input" [e1]\n- button "Go" [e2]`,
+        };
+      },
+    });
+    const out = String((await handle("snap", {}, TOP) as { data: { value: string } }).data.value);
+    expect(out).toContain("3 control(s) changed; snap diff");
+    expect(out).toContain('+ button "New" [f1:e3]');
+    expect(out).toContain('~ textbox "Cross input" [f1:e1]');
+    expect(out).toContain('- button "Go" [f1:e2]');
   });
 
   test("S6: snap --full forwards full to child frames so a repeat snap lists their controls", async () => {
@@ -339,6 +386,18 @@ describe("debugger hub frame session review fixes", () => {
     };
     expect(await hub.frameSession(5, CROSS_SRC, 500, choose)).toBe("S-SECOND");
     expect(asked[0]).toEqual(["S-FIRST", "S-SECOND"]);
+  });
+
+  test("S4: a same-URL tie the probe cannot settle throws instead of taking the first session", async () => {
+    const hub = hubWith([
+      { sessionId: "S-FIRST", url: CROSS_SRC },
+      { sessionId: "S-SECOND", url: CROSS_SRC },
+    ]);
+    await expect(hub.frameSession(5, CROSS_SRC, 500, async () => undefined)).rejects.toThrow(/could not identify iframe session/);
+    await expect(hub.frameSession(5, CROSS_SRC, 500)).rejects.toThrow(/could not identify iframe session/);
+    await expect(
+      hub.sessionForFrame(5, 7, async () => ({ url: CROSS_SRC }), async () => { throw new Error("probe failed"); }),
+    ).rejects.toThrow(/^EXECUTION_FAILED: could not identify iframe session for frame 7/);
   });
 
   test("S5: an explicit frameId that no longer exists throws STALE_REF instead of using the top session", async () => {
