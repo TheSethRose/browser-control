@@ -1159,9 +1159,7 @@ export function createPageHelperHandler(
       // After one release times out, the rest would too: they are reported held without waiting on each.
       if (blocked) return (stuck.push(spec.key), failure("EXECUTION_FAILED", "CDP_TIMEOUT"));
       const up = await sendKey("keyUp", spec, targetId).catch((err: unknown) => failure("EXECUTION_FAILED", String(err)));
-      if (up.ok) return up;
-      if (messageOf(up).startsWith("CDP_TIMEOUT")) blocked = true;
-      else stuck.push(spec.key);
+      if (!up.ok) messageOf(up).startsWith("CDP_TIMEOUT") ? (blocked = true) : stuck.push(spec.key);
       return up;
     };
     let start = now();
@@ -1177,20 +1175,11 @@ export function createPageHelperHandler(
           step.kind === "insert" ? { key: step.text, code: "", windowsVirtualKeyCode: 0, text: step.text } : step.spec;
         if (step.kind !== "keyUp") {
           down.set(spec.key, spec);
-          const res = await sendKey(spec.text !== undefined ? "keyDown" : "rawKeyDown", spec, targetId);
-          if (!res.ok) {
-            if (refusedByDialog(res)) down.delete(spec.key);
-            result = res;
-            break;
-          }
+          result = await sendKey(spec.text !== undefined ? "keyDown" : "rawKeyDown", spec, targetId);
+          if (refusedByDialog(result)) down.delete(spec.key);
         }
-        if (step.kind !== "keyDown") {
-          const res = await keyUp(spec);
-          if (!res.ok) {
-            result = res;
-            break;
-          }
-        }
+        if (result.ok && step.kind !== "keyDown") result = await keyUp(spec);
+        if (!result.ok) break;
       }
     } finally {
       for (const spec of [...down.values()].reverse()) await keyUp(spec);

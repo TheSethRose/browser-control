@@ -284,16 +284,12 @@ describe("daemon page helpers", () => {
     // A keyUp a dialog refused is reported as held and never re-sent, even after the dialog closes.
     const refused = { ok: false as const, error: { code: "EXECUTION_FAILED" as const, message: "DIALOG_OPEN: alert" } };
     let ups = 0;
-    const blocked = makeFakeInvoker({
-      field: live("text"),
-      onCdp: (method, params) => (method === "Input.dispatchKeyEvent" && params["type"] === "keyUp" && ups++ === 0 ? refused : undefined),
-    });
+    const blocked = makeFakeInvoker({ onCdp: (m, p) => (m === "Input.dispatchKeyEvent" && p["type"] === "keyUp" && ups++ === 0 ? refused : undefined) });
     const blockedHandle = createPageHelperHandler(blocked.invoke, undefined, undefined, quick);
     expect(text(await blockedHandle("type", { _natural: true, ref: "e2", text: "hi", quiet: true }))).toContain("# HELD: key h still down. It was not sent again");
-    const sentBefore = keys(blocked.calls).length;
-    expect(keys(blocked.calls).filter((k) => k["type"] === "keyUp" && k["key"] === "h")).toHaveLength(1);
+    const sent = keys(blocked.calls);
     expect(text(await blockedHandle("dialog", { sub: "accept" }))).toContain("# HELD: key h still down");
-    expect(keys(blocked.calls)).toHaveLength(sentBefore);
+    expect([sent.filter((k) => k["type"] === "keyUp" && k["key"] === "h").length, keys(blocked.calls).length]).toEqual([1, sent.length]);
 
     // Events run against elapsed time, so 8 ms per CDP round trip doesn't slow the typing,
     // and after one 500 ms stall the later gaps keep their planned length.
