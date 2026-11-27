@@ -261,6 +261,7 @@ const windowGroups = createWindowGroups({
   getSettings: () => settings,
   isAgentTab: (tabId) => agentTabs.has(tabId),
   isTabInHandoff: (tabId) => handoffTabs.has(tabId),
+  stateReady: () => tabSetsReady,
   onUserClaimTab: async (tabId) => {
     if (agentTabs.delete(tabId)) {
       await saveTabSets().catch(() => {});

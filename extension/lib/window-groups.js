@@ -121,6 +121,8 @@ export function createWindowGroups({
   onUserClaimTab = () => {},
   onAdoptPopup = async () => {},
   onPopupAdoptedEvent = () => {},
+  // Resolves once agent-tab ownership is restored after a worker start; events wait for it.
+  stateReady = () => Promise.resolve(),
 } = {}) {
   const knownGroupIds = new Set();
   const groupedAgentTabs = new Set();
@@ -373,6 +375,7 @@ export function createWindowGroups({
   }
 
   async function handleTabUpdated(tabId, changeInfo, tab) {
+    await Promise.resolve(stateReady()).catch(() => {});
     if (!isAgentTab(tabId)) return;
 
     if (changeInfo?.pinned === true) {
@@ -423,6 +426,7 @@ export function createWindowGroups({
     const sourceTabId = details?.sourceTabId;
     const tabId = details?.tabId;
     if (typeof sourceTabId !== "number" || typeof tabId !== "number") return false;
+    await Promise.resolve(stateReady()).catch(() => {});
     if (!isAgentTab(sourceTabId)) return false;
     if (isTabInHandoff(sourceTabId)) return false;
 

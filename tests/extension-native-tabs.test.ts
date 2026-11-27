@@ -518,6 +518,35 @@ describe("window-groups", () => {
     expect(claimed).toEqual([2]);
   });
 
+  test("a drag that wakes the worker waits for restored ownership before deciding", async () => {
+    const fake = makeFakeChrome({
+      windows: [{ id: 1, type: "normal", state: "normal", focused: true }],
+      tabs: [{ id: 2, windowId: 1, url: "https://agent.test", active: false, index: 0, groupId: 7 }],
+    });
+    const agentTabs = new Set<number>();
+    let finishRestore!: () => void;
+    const restored = new Promise<void>((r) => {
+      finishRestore = () => {
+        agentTabs.add(2);
+        r();
+      };
+    });
+    const claimed: number[] = [];
+    const wg = createWindowGroups({
+      chrome: fake.chrome,
+      getSettings: () => ({ tabGroupMode: "shared", autoCollapse: true }),
+      isAgentTab: (id: number) => agentTabs.has(id),
+      stateReady: () => restored,
+      onUserClaimTab: (id: number) => {
+        claimed.push(id);
+      },
+    });
+    const pending = wg.handleTabUpdated(2, { groupId: -1 }, fake.tabMap.get(2)!);
+    setTimeout(finishRestore, 10);
+    await pending;
+    expect(claimed).toEqual([2]);
+  });
+
   test("skips popup adoption while opener tab is in handoff", async () => {
     const fake = makeFakeChrome({
       windows: [{ id: 1, type: "normal", state: "normal", focused: true }],
