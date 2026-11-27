@@ -1,0 +1,9 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Frame</title></head>
+<body><script>
+  // Both iframes load this same URL; window.name ("a" / "b") gives each a distinct input.
+  const label = "Frame " + String(window.name || "x").toUpperCase() + " input";
+  const input = document.createElement("input");
+  input.setAttribute("aria-label", label);
+  input.id = "fi";
+  document.body.appendChild(input);
+</script></body></html>
