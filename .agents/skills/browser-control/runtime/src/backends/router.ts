@@ -49,6 +49,8 @@ export function backendOrder(): string[] {
   return [...new Set(names)];
 }
 
+const EXTENSION = "extension";
+
 export function route(
   cdpOps: Record<string, OperationHandler>,
   backends: Backend[],
@@ -60,6 +62,15 @@ export function route(
   const enabledBackends = () => enabled().flatMap((n) => (n === CDP ? [] : [byName.get(n)!]));
 
   async function runOp(op: string, input: OpInput): Promise<unknown> {
+    // `nav --browser <slug>` names an extension browser, whatever the backend order or target.
+    if (op === "navigate" && typeof input["browser"] === "string") {
+      const ext = enabled().includes(EXTENSION) ? byName.get(EXTENSION) : undefined;
+      if (!ext) throw new Error("INPUT_INVALID: --browser needs the extension backend enabled");
+      const result = await ext.invoke(op, input);
+      active = ext.name;
+      return result;
+    }
+
     const prefix = prefixOf(input["targetId"]);
     const named = prefix !== undefined && enabled().includes(prefix) ? byName.get(prefix) : undefined;
     if (named) {
@@ -69,16 +80,6 @@ export function route(
       const result = await named.invoke(op, input);
       active = named.name;
       return result;
-    }
-
-    // `nav --browser <slug>` names an extension browser, whatever the backend order.
-    if (op === "navigate" && typeof input["browser"] === "string") {
-      const owner = enabledBackends().find((b) => b.handles(op, input, active === b.name));
-      if (owner) {
-        const result = await owner.invoke(op, input);
-        active = owner.name;
-        return result;
-      }
     }
 
     const skipped: string[] = [];

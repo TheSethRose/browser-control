@@ -191,6 +191,32 @@ describe("router with extension first", () => {
     expect(log).toEqual([]);
   });
 
+  test("a browser-named navigate skips browse and fails when the extension is disabled", async () => {
+    const log: string[] = [];
+    const { run, calls } = fakeBrowse({ navigate: { out: JSON.stringify({ tab: 7 }) } });
+    const extCalls: string[] = [];
+    const ext = {
+      name: "extension",
+      handles: () => false,
+      invoke: async (op: string) => {
+        extCalls.push(op);
+        return { targetId: "extension:5" };
+      },
+      listTargets: async () => [],
+      clearActive: () => {},
+      status: async () => ({}),
+    };
+    const ops = route(fakeCdp(log), [createBrowseBackend(run), ext as never], () => ["cdp", "browse", "extension"]);
+    await ops["navigate"]!({ url: "https://x", browser: "chrome-abc123", targetId: "browse:7" });
+    expect(extCalls).toEqual(["navigate"]);
+    expect(calls.length).toBe(0);
+    const noExt = route(fakeCdp(log), [createBrowseBackend(run), ext as never], () => ["cdp", "browse"]);
+    await expect(noExt["navigate"]!({ url: "https://x", browser: "chrome-abc123" })).rejects.toThrow(
+      /needs the extension backend/,
+    );
+    expect(log).toEqual([]);
+  });
+
   test("a navigate that names an offline browser fails instead of using the CDP tab", async () => {
     const log: string[] = [];
     const ext = {
