@@ -34,7 +34,7 @@ If `$BCD extension status` shows no connected browser, set it up once (details i
 
 1. Run `$BCD extension setup`. It pairs automatically and prints the path of the `extension/` folder.
 2. Ask the user for three clicks: open `chrome://extensions`, turn on **Developer mode**, click **Load unpacked** and pick that folder.
-3. Setup waits up to 60 s for the extension, then lists tabs. If the user prefers DevTools, skip this and use remote debugging (below).
+3. Setup returns right away. After the user loads the extension, run `$BCD extension browsers` to confirm it connected. If the user prefers DevTools, skip this and use remote debugging (below).
 
 Extension tabs open in the background, can sit in a collapsed `Agents · N` tab group, and never steal focus. Reads show no yellow debugging banner. Clicks, typing, and DevTools commands attach the debugger, which detaches after 30 s idle.
 

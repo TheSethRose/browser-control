@@ -10,7 +10,7 @@ A backend is the path a command takes to the browser. There are three:
 - `cdp` is direct DevTools, the v1 way. It is the fallback. It reaches pages the extension can't run on, such as `chrome://` tabs, the Chrome Web Store, other extensions' pages, and the built-in PDF viewer.
 - `browse` is the optional [opencode browse](https://github.com/anomalyco/browse) adapter (section 7).
 
-The order lives in `~/.config/browser-control/backends` (or `BROWSER_CONTROL_BACKENDS`). `extension setup` and `extension enable` write `extension,cdp`. `extension disable` writes `cdp`. The daemon reads the order on every call, so a change needs no restart.
+`extension setup` and `extension enable` write `extension,cdp` to `<daemon dir>/backends` (default `$TMPDIR/browser-control-daemon/backends`). `extension disable` writes `cdp` there. The daemon reads that file first, then `BROWSER_CONTROL_BACKENDS`, then `~/.config/browser-control/backends`, and falls back to `cdp`. It reads the order on every call, so a change needs no restart.
 
 Routing rules:
 
@@ -25,7 +25,7 @@ The user does this once per browser profile. It takes three clicks and no typing
 
 1. Run `$BCD extension setup` (optionally `$BCD extension setup <extensionDir>`). It creates the shared secret in `~/.config/browser-control/extension-relay.json` (mode `0600`), writes `extension/pairing.json` beside the extension, sets the backend order to `extension,cdp`, and prints the exact path of the `extension/` folder.
 2. Tell the user the three clicks: open `chrome://extensions`, turn on **Developer mode**, click **Load unpacked** and choose the printed folder.
-3. `extension setup` waits up to 60 s for the extension to connect, then runs `tabs` to confirm.
+3. `extension setup` returns right away. After the user loads the extension, run `$BCD extension browsers` (or `tabs`) to confirm it connected.
 
 Pairing is automatic. The extension reads `pairing.json` and proves it holds the same secret. The secret never crosses the wire in plain text. Never print, copy, or commit `pairing.json` or `extension-relay.json`.
 

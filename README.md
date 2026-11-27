@@ -35,8 +35,8 @@ make three clicks:
 2. Turn on **Developer mode**.
 3. Click **Load unpacked** and choose the printed folder.
 
-Setup waits up to 60 seconds for the extension to connect, then lists your tabs. Pairing needs
-no typing. `extension setup` writes a shared secret to
+Setup returns right away. After you load the extension, `extension browsers` shows it connected.
+Pairing needs no typing. `extension setup` writes a shared secret to
 `~/.config/browser-control/extension-relay.json` and `extension/pairing.json` (both `0600`).
 Neither file belongs in a commit.
 
@@ -226,7 +226,7 @@ These environment variables are optional. None of them holds a credential.
 | Variable | What it sets |
 | --- | --- |
 | `BROWSER_CONTROL_BROWSER` | The browser to use when a connect names none (`beta`, `chrome`, …). It overrides the one-line file `~/.config/browser-control/default-browser`. |
-| `BROWSER_CONTROL_BACKENDS` | The backend order, for example `extension,cdp` or `browse,cdp`. It overrides the one-line file `~/.config/browser-control/backends`. `extension setup` writes `extension,cdp` to that file. With no file and no variable, the order is `cdp` (DevTools only). See [Backends](#backends). |
+| `BROWSER_CONTROL_BACKENDS` | The backend order, for example `extension,cdp` or `browse,cdp`. The daemon reads the order from `<daemon dir>/backends` first (written by `extension setup`, `enable` and `disable`), then this variable, then the one-line file `~/.config/browser-control/backends`. With none of them, the order is `cdp` (DevTools only). See [Backends](#backends). |
 | `BROWSER_CDP_CALL_TIMEOUT_MS` | How long a CDP call waits for a reply when it sets no timeout. Default 120000. |
 | `BROWSER_CONTROL_MAX_OUTPUT` | Daemon only. The most characters `eval`, `nav` and `tabs` print. Default 50000. |
 | `BROWSER_CDP_WS_URL` | The browser's WebSocket address, when finding it automatically fails. |
