@@ -1673,6 +1673,9 @@
     const deadline = performance.now() + timeoutMs;
     let stagnant = 0;
     let reason = 'scrolled to the end of the list';
+    // Provided by the daemon when natural browsing is on: per-step height factor and pause.
+    const scrollPace = opts.scrollPace && typeof opts.scrollPace === 'object' ? opts.scrollPace : null;
+    let scrollIdx = 0;
 
     try {
       scroller.scrollTop = 0;
@@ -1691,9 +1694,13 @@
         if (seen.size >= limit) { reason = `reached limit of ${limit} rows`; break; }
         if (performance.now() >= deadline) { reason = `timed out after ${timeoutMs}ms`; break; }
         const prevTop = scroller.scrollTop;
-        const step = Math.max(200, Math.round((scroller === document.scrollingElement ? innerHeight : scroller.clientHeight) * 0.9));
+        const height = scroller === document.scrollingElement ? innerHeight : scroller.clientHeight;
+        const factor = scrollPace && Number.isFinite(scrollPace.factors?.[scrollIdx]) ? scrollPace.factors[scrollIdx] : null;
+        const pauseMs = scrollPace && Number.isFinite(scrollPace.pauses?.[scrollIdx]) ? scrollPace.pauses[scrollIdx] : null;
+        scrollIdx++;
+        const step = Math.max(200, Math.round(height * (factor === null ? 0.9 : factor)));
         scroller.scrollTop = prevTop + step;
-        await new Promise((r) => setTimeout(r, 120));
+        await new Promise((r) => setTimeout(r, pauseMs === null ? 120 : pauseMs));
         if (scroller.scrollTop === prevTop && seen.size === beforeCount) {
           stagnant++;
           if (stagnant >= 2) break;
