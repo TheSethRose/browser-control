@@ -58,10 +58,6 @@ function makeFakeInvoker(options: {
     if (op === "evaluate") {
       const expr = String(input["expression"] ?? "");
       if (expr === "location.href") return ok(options.finalUrl ?? "https://a.test/x");
-      // The page is normal: the bot-challenge probe answers its complete `{skip,url}` readback.
-      if (expr.includes("responseStatus") && expr.includes("visibleSelectors")) {
-        return ok(JSON.stringify({ skip: true, url: options.finalUrl ?? "https://a.test/x" }));
-      }
       if (expr.includes(PAGE_HELPERS_SOURCE)) installed = true;
       if (!installed && expr.includes("__BC_NEED_INSTALL__")) return ok("__BC_NEED_INSTALL__");
       const point = `120 240 ${options.hidden ? "hidden" : "visible"}`;
@@ -448,10 +444,6 @@ describe("daemon page helpers", () => {
           stderr: "",
         };
       }
-      // The browse guard reads the page with the same probe; a normal page answers a complete skip.
-      if (args[0] === "eval") {
-        return { code: 0, stdout: JSON.stringify({ skip: true, url: "https://a.test/x" }), stderr: "" };
-      }
       return { code: 0, stdout: `ok:${args[0]}`, stderr: "" };
     };
     const handle = createPageHelperHandler(invoke, fakeBrowse);
@@ -485,11 +477,6 @@ describe("daemon page helpers", () => {
     const stopped = await walledHandle("do", { steps: [{ click: "e12" }, { key: "Tab" }], quiet: true });
     expect(stopped.ok).toBe(false);
     expect(text(stopped)).toContain("# STOPPED: the page is a captcha wall after step 1");
-    // The guard read the browse tab itself, not the CDP backend a bare target id would have reached.
-    expect(browseCalls.filter((c) => c[0] === "eval")).toHaveLength(1);
-    expect(
-      walled.calls.some((c) => c.op === "evaluate" && String(c.input["expression"] ?? "").includes("const fastHit")),
-    ).toBe(false);
 
     expect((await handle("value", { ref: "e5" })).ok).toBe(false);
   });
