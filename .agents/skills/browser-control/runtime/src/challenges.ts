@@ -20,6 +20,8 @@
  * `ChallengeProbe` lives in the caller.
  */
 
+import { scrubPromptTokens, wrapUntrusted } from "./safety";
+
 export type ChallengeVendor =
   | "cloudflare"
   | "akamai"
@@ -113,10 +115,35 @@ export const fastVendorSelectors = [
   "awswaf-captcha",
 ] as const;
 
-const DENIAL_TITLE_RE = /^(?:access denied|403 forbidden|forbidden|blocked|request blocked|you have been blocked)$/i;
+const DENIAL_TITLE_RE =
+  /^(?:(?:403|451)\s+)?(?:access denied|forbidden|blocked|request blocked|you have been blocked)$/i;
 const SUSPICIOUS_TITLE_RE =
-  /^(?:access denied|403 forbidden|forbidden|blocked|request blocked|you have been blocked|just a moment\b|attention required! \| cloudflare|checking your browser|un instant|einen moment|pardon our interruption|security check|one more step|please wait\b)|\b(?:captcha|security check|bot (?:check|detection)|verify (?:that )?you are (?:a )?human|are you a robot)\b/i;
+  /^(?:(?:(?:403|451)\s+)?(?:access denied|forbidden|blocked|request blocked|you have been blocked)|just a moment\b|attention required! \| cloudflare|checking your browser|un instant|einen moment|pardon our interruption|security check|one more step|please wait\b)|\b(?:captcha|security check|human verification|verify (?:that )?you(?:'re| are) (?:a )?human|are you a robot)\b/i;
 const SUSPICIOUS_URL_RE = /^https?:\/\/www\.google\.[^/]+\/sorry\//i;
+const CONTROL_OR_LINEBREAK = /[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g;
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+
+/** Strip line breaks, control chars, lone surrogates, and prompt tokens so page text stays on one bounded line. */
+export function sanitizeChallengeText(value: string, maxLen = 160): string {
+  return scrubPromptTokens(value)
+    .replace(LONE_SURROGATE, "")
+    .replace(CONTROL_OR_LINEBREAK, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxLen);
+}
+
+function safeOrigin(url: string): string {
+  try {
+    const parsed = new URL(url);
+    if ((parsed.protocol === "http:" || parsed.protocol === "https:") && parsed.origin && parsed.origin !== "null") {
+      return sanitizeChallengeText(parsed.origin, 120);
+    }
+  } catch {
+    /* fall through */
+  }
+  return "this page";
+}
 
 export const isDenialTitle = (title: string): boolean => DENIAL_TITLE_RE.test(title.trim());
 export const isSuspiciousTitle = (title: string): boolean => SUSPICIOUS_TITLE_RE.test(title.trim());
@@ -151,9 +178,9 @@ export function classifyChallenge(probe: ChallengeProbe): ChallengeDetection | u
   const title = probe.title.trim().toLowerCase();
   const text = probe.text.toLowerCase();
   const host = hostOf(probe.url);
-  const reason = (value: string) => value.slice(0, 160);
+  const reason = (value: string) => sanitizeChallengeText(value, 160);
   const refused = probe.status === 403 || probe.status === 451;
-  const denialTitle = /^(?:access denied|403 forbidden|forbidden|blocked|request blocked|you have been blocked)$/.test(title);
+  const denialTitle = isDenialTitle(title);
 
   // An HTTP refusal with an explicit denial title is a block at any length, even if it offers a CAPTCHA form.
   if (refused && denialTitle) {
@@ -262,7 +289,7 @@ export function classifyChallenge(probe: ChallengeProbe): ChallengeDetection | u
     const wallText =
       /verify you are (?:a )?human|are you a robot|not a robot|unusual traffic|security check|(?:solve|complete) the captcha|captcha to continue/.test(
         text,
-      ) || /captcha|security check|verify/.test(title);
+      ) || /\b(?:captcha|security check|human verification|verify (?:that )?you(?:'re| are) (?:a )?human|are you a robot)\b/.test(title);
     if (hcaptcha !== undefined && wallText) {
       return { vendor: "hcaptcha", kind: "interactive", reason: reason(`iframe ${hcaptcha}`) };
     }
@@ -288,11 +315,11 @@ export function classifyChallenge(probe: ChallengeProbe): ChallengeDetection | u
       };
     }
     if (
-      /verify (?:that )?you are (?:a )?human|confirm you are (?:a )?human|are you a robot\?|pardon our interruption|please verify you are a human|bot (?:check|detection)/.test(
+      /verify (?:that )?you are (?:a )?human|confirm you are (?:a )?human|are you a robot\?|pardon our interruption|please verify you are a human/.test(
         `${title}\n${text}`,
       )
     ) {
-      const phrase = /verify[^.\n]*human|confirm[^.\n]*human|are you a robot|pardon our interruption|bot (?:check|detection)/.exec(
+      const phrase = /verify[^.\n]*human|confirm[^.\n]*human|are you a robot|pardon our interruption/.exec(
         `${title}\n${text}`,
       )?.[0];
       return { vendor: "generic", kind: "interactive", reason: reason(`text: ${phrase ?? "verification"}`) };
@@ -309,14 +336,15 @@ export function classifyChallenge(probe: ChallengeProbe): ChallengeDetection | u
 export function describeChallenge(detection: ChallengeDetection, url: string): string {
   const where = (() => {
     try {
-      return new URL(url).origin;
+      return sanitizeChallengeText(new URL(url).origin, 120);
     } catch {
-      return url;
+      return sanitizeChallengeText(url, 120);
     }
   })();
-  const label = `${detection.vendor} ${detection.kind} challenge on ${where} (${detection.reason})`;
+  const safeReason = sanitizeChallengeText(detection.reason, 160) || "security check";
+  const label = `${detection.vendor} ${detection.kind} challenge on ${where} (${safeReason})`;
   if (detection.kind === "block") {
-    return `BLOCKED: ${detection.vendor} refused the visit on ${where} (${detection.reason}). Do not retry or reload in a loop: it makes the block worse for the user's IP. Stop and tell the user.`;
+    return `BLOCKED: ${detection.vendor} refused the visit on ${where} (${safeReason}). Do not retry or reload in a loop: it makes the block worse for the user's IP. Stop and tell the user.`;
   }
   if (detection.kind === "interactive") {
     return `CHALLENGE: ${label}. A person has to answer it: call handoff("Solve the security check on ${where}, then continue"). Do not retry or reload in a loop.`;
@@ -324,27 +352,61 @@ export function describeChallenge(detection: ChallengeDetection, url: string): s
   return `CHALLENGE: ${label}. It should clear by itself: wait briefly, then re-read the page.`;
 }
 
+const REMEDY_EXTENSION_INTERACTIVE = 'remedy: run handoff "Solve the security check, then continue"';
+const REMEDY_EXTENSION_WAIT_TIMEOUT = 'remedy: run handoff "Complete the security check, then continue"';
+const REMEDY_CDP_MANUAL = "remedy: ask the user to complete the security check in the browser, then continue";
+
+export type FormatChallengeOptions = {
+  /** Target backend: `extension` supports `handoff`; `cdp` does not. Defaults to `"cdp"`. */
+  backend?: "extension" | "cdp";
+  /**
+   * Wrap page-derived reason text in `wrapUntrusted` markers. Enable on error paths that the
+   * daemon serializes directly outside its untrusted-content wrapper.
+   */
+  untrustedBoundary?: boolean;
+};
+
 /**
- * Format a `CHALLENGE:` / `BLOCKED:` output block with an actionable `remedy:` line when
- * human handoff is needed.
+ * Format a `CHALLENGE:` / `BLOCKED:` output block with a fixed actionable `remedy:` line when
+ * human action is needed.
  */
-export function formatChallengeOutput(detection: ChallengeDetection, url: string): string {
-  const where = (() => {
-    try {
-      return new URL(url).origin;
-    } catch {
-      return url;
-    }
-  })();
+export function formatChallengeOutput(
+  detection: ChallengeDetection,
+  url: string,
+  opts: FormatChallengeOptions = {},
+): string {
+  const where = safeOrigin(url);
+  const safeReason = sanitizeChallengeText(detection.reason, 160) || "security check";
+  const isExtension = opts.backend === "extension";
   if (detection.kind === "block") {
-    return `BLOCKED: ${detection.vendor} refused the visit on ${where} (${detection.reason}). Do not retry or reload in a loop: it makes the block worse for the user's IP. Stop and tell the user.`;
+    if (opts.untrustedBoundary) {
+      return [
+        `BLOCKED: ${detection.vendor} refused the visit on ${where}. Do not retry or reload in a loop: it makes the block worse for the user's IP. Stop and tell the user.`,
+        wrapUntrusted(`reason: ${safeReason}`),
+      ].join("\n");
+    }
+    return `BLOCKED: ${detection.vendor} refused the visit on ${where} (${safeReason}). Do not retry or reload in a loop: it makes the block worse for the user's IP. Stop and tell the user.`;
   }
   if (detection.kind === "interactive") {
-    const handoffMessage = `Solve the security check on ${where}, then continue`;
-    return `CHALLENGE: ${detection.vendor} interactive challenge on ${where} (${detection.reason}). A person has to answer it; do not retry or reload in a loop.\nremedy: run handoff ${JSON.stringify(handoffMessage)}`;
+    const remedy = isExtension ? REMEDY_EXTENSION_INTERACTIVE : REMEDY_CDP_MANUAL;
+    if (opts.untrustedBoundary) {
+      return [
+        `CHALLENGE: ${detection.vendor} interactive challenge on ${where}. A person has to answer it; do not retry or reload in a loop.`,
+        wrapUntrusted(`reason: ${safeReason}`),
+        remedy,
+      ].join("\n");
+    }
+    return `CHALLENGE: ${detection.vendor} interactive challenge on ${where} (${safeReason}). A person has to answer it; do not retry or reload in a loop.\n${remedy}`;
   }
-  const handoffMessage = `Complete the security check on ${where}, then continue`;
-  return `CHALLENGE: ${detection.vendor} non-interactive challenge on ${where} (${detection.reason}). It did not clear automatically; re-read the page or hand off to the user.\nremedy: run handoff ${JSON.stringify(handoffMessage)}`;
+  const remedy = isExtension ? REMEDY_EXTENSION_WAIT_TIMEOUT : REMEDY_CDP_MANUAL;
+  if (opts.untrustedBoundary) {
+    return [
+      `CHALLENGE: ${detection.vendor} non-interactive challenge on ${where}. It did not clear automatically; re-read the page or hand off to the user.`,
+      wrapUntrusted(`reason: ${safeReason}`),
+      remedy,
+    ].join("\n");
+  }
+  return `CHALLENGE: ${detection.vendor} non-interactive challenge on ${where} (${safeReason}). It did not clear automatically; re-read the page or hand off to the user.\n${remedy}`;
 }
 
 /** True when a `snap` output looks like it might be a bot challenge or block page. */

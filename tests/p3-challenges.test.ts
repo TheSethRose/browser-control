@@ -268,7 +268,8 @@ describe("bot-challenge wiring: nav (CDP)", () => {
     const totalSlept = h.sleeps.reduce((a, b) => a + b, 0);
     expect(totalSlept).toBe(8_000);
     expect(textOf(res)).toStartWith("CHALLENGE: cloudflare ");
-    expect(textOf(res)).toContain('remedy: run handoff "');
+    expect(textOf(res)).toContain("remedy: ask the user to complete the security check in the browser, then continue");
+    expect(textOf(res)).not.toContain("run handoff");
   });
 
   test("non-interactive interstitial that escalates to Turnstile interactive stops waiting immediately", async () => {
@@ -295,7 +296,8 @@ describe("bot-challenge wiring: nav (CDP)", () => {
     expect(res.ok).toBe(true);
     expect(h.sleeps).toEqual([500]);
     expect(textOf(res)).toStartWith("CHALLENGE: cloudflare interactive");
-    expect(textOf(res)).toContain('remedy: run handoff "Solve the security check on https://shop.example, then continue"');
+    expect(textOf(res)).toContain("remedy: ask the user to complete the security check in the browser, then continue");
+    expect(textOf(res)).not.toContain("run handoff");
   });
 
   test("interactive challenge (reCAPTCHA/hCaptcha/Turnstile) returns CHALLENGE: + remedy immediately with no retries", async () => {
@@ -315,7 +317,8 @@ describe("bot-challenge wiring: nav (CDP)", () => {
     expect(h.sleeps).toHaveLength(0);
     expect(h.probeCalls).toHaveLength(1);
     expect(textOf(res)).toStartWith("CHALLENGE: recaptcha ");
-    expect(textOf(res)).toContain('remedy: run handoff "Solve the security check on https://portal.example, then continue"');
+    expect(textOf(res)).toContain("remedy: ask the user to complete the security check in the browser, then continue");
+    expect(textOf(res)).not.toContain("run handoff");
     // Must not run snapshot after detecting an interactive challenge wall
     expect(h.calls.some((c) => c.op === "evaluate" && String(c.input["expression"]).includes("__bc.snapshot"))).toBe(false);
   });
@@ -372,7 +375,8 @@ describe("bot-challenge wiring: snap and do (CDP)", () => {
     const r1 = await hInteractive.handle("snap", {});
     expect(r1.ok).toBe(true);
     expect(textOf(r1)).toStartWith("CHALLENGE: hcaptcha ");
-    expect(textOf(r1)).toContain('remedy: run handoff "Solve the security check on https://app.test, then continue"');
+    expect(textOf(r1)).toContain("remedy: ask the user to complete the security check in the browser, then continue");
+    expect(textOf(r1)).not.toContain("run handoff");
     expect(hInteractive.sleeps).toHaveLength(0);
 
     // 2. Non-interactive interstitial on snap clears and refreshes snapshot
@@ -469,7 +473,8 @@ describe("bot-challenge wiring: snap and do (CDP)", () => {
     const r1 = await hChallenge.handle("do", { steps: [{ click: "Submit" }, { click: "Next" }] });
     expect(r1.ok).toBe(false);
     expect(textOf(r1)).toStartWith("CHALLENGE: cloudflare interactive");
-    expect(textOf(r1)).toContain('remedy: run handoff "');
+    expect(textOf(r1)).toContain("remedy: ask the user to complete the security check in the browser, then continue");
+    expect(textOf(r1)).not.toContain("run handoff");
     expect(textOf(r1)).toContain("# STOPPED:");
     expect(textOf(r1)).toContain("1 step(s) not run");
     expect(textOf(r1)).not.toContain("2. click");
@@ -571,7 +576,7 @@ describe("bot-challenge wiring: extension tabs (silent bc_call tier)", () => {
     expect(extTurnstile.sleeps).toHaveLength(0);
     expect(extTurnstile.evalCalls).toHaveLength(0);
     expect(textOf(rTurnstile)).toStartWith("CHALLENGE: cloudflare interactive");
-    expect(textOf(rTurnstile)).toContain('remedy: run handoff "Solve the security check on https://shop.example, then continue"');
+    expect(textOf(rTurnstile)).toContain('remedy: run handoff "Solve the security check, then continue"');
 
     // 3. Hard block (Cloudflare)
     const extBlock = makeExtensionHarness([
@@ -656,12 +661,22 @@ describe("probe expression & pure helpers", () => {
     expect(isSuspiciousSnapshot("# Just a moment... | https://a.test/\n- link \"Cloudflare\" [e1]")).toBe(true);
     expect(isSuspiciousSnapshot("# Page | https://a.test/\n# snap diff (5 refs unchanged)")).toBe(false);
 
-    const out = formatChallengeOutput(
+    const extOut = formatChallengeOutput(
       { vendor: "cloudflare", kind: "interactive", reason: "title: Just a moment..." },
       "https://shop.example/cart",
+      { backend: "extension" },
     );
-    expect(out).toStartWith("CHALLENGE: cloudflare ");
-    expect(out).toContain('remedy: run handoff "Solve the security check on https://shop.example, then continue"');
+    expect(extOut).toStartWith("CHALLENGE: cloudflare ");
+    expect(extOut).toContain('remedy: run handoff "Solve the security check, then continue"');
+
+    const cdpOut = formatChallengeOutput(
+      { vendor: "cloudflare", kind: "interactive", reason: "title: Just a moment..." },
+      "https://shop.example/cart",
+      { backend: "cdp" },
+    );
+    expect(cdpOut).toStartWith("CHALLENGE: cloudflare ");
+    expect(cdpOut).toContain("remedy: ask the user to complete the security check in the browser, then continue");
+    expect(cdpOut).not.toContain("run handoff");
   });
 });
 
@@ -784,5 +799,199 @@ describe("script: page.handoff(message, {timeout})", () => {
     );
     expect(res.ok).toBe(true);
     expect(textOf(res)).toBe("handoff: done");
+  });
+});
+
+describe("PR #9 review fixes (S1-S7)", () => {
+  test("S1: nav/snap return structured data.challenge and script throws CHALLENGE: before the next action", async () => {
+    const turnstile: ChallengeProbe = {
+      url: "https://shop.example/gate",
+      title: "Just a moment...",
+      text: "Verify you are human by completing the action below.",
+      selectors: [".cf-turnstile"],
+      visibleSelectors: [".cf-turnstile"],
+    };
+    const h = makeCdpHarness({
+      finalUrl: "https://shop.example/gate",
+      probeSequence: [cdpProbePayload(turnstile)],
+      locate: { Submit: "e1" },
+    });
+
+    // Plain nav keeps ok:true + text prefix AND exposes structured data.challenge
+    const navRes = await h.handle("nav", { url: "https://shop.example/gate" });
+    expect(navRes.ok).toBe(true);
+    if (navRes.ok) {
+      expect((navRes.data as Record<string, unknown>)["challenge"]).toMatchObject({
+        kind: "interactive",
+        vendor: "cloudflare",
+      });
+    }
+
+    // In script, await page.goto(); await page.click() MUST throw CHALLENGE: and never dispatch click
+    const hScript = makeCdpHarness({
+      finalUrl: "https://shop.example/gate",
+      probeSequence: [cdpProbePayload(turnstile)],
+      locate: { Submit: "e1" },
+    });
+    const scriptRes = await hScript.handle("script", {
+      code: `await page.goto("https://shop.example/gate"); await page.click("Submit"); return "clicked";`,
+    });
+    expect(scriptRes.ok).toBe(false);
+    expect(textOf(scriptRes)).toStartWith("CHALLENGE: cloudflare interactive");
+    expect(textOf(scriptRes)).toContain("#1 goto(https://shop.example/gate) FAIL");
+    expect(textOf(scriptRes)).not.toContain("click(Submit)");
+    expect(hScript.calls.some((c) => c.op === "execute_cdp" && c.input["method"] === "Input.dispatchMouseEvent")).toBe(false);
+  });
+
+  test("S2: quiet do catches a CAPTCHA appearing on the final step even when the URL stays the same", async () => {
+    const recaptcha: ChallengeProbe = {
+      url: "https://app.test/form",
+      title: "Security check",
+      text: "Please solve the CAPTCHA to continue.",
+      frameUrls: ["https://www.google.com/recaptcha/api2/anchor?k=abc"],
+    };
+    const h = makeCdpHarness({
+      finalUrl: "https://app.test/form",
+      stepUrls: ["https://app.test/form"],
+      wall: "captcha",
+      probeSequence: [cdpProbePayload(recaptcha)],
+      locate: { Submit: "e1" },
+    });
+
+    const res = await h.handle("do", { steps: [{ click: "Submit" }], quiet: true });
+    expect(res.ok).toBe(false);
+    expect(textOf(res)).toStartWith("CHALLENGE: recaptcha interactive");
+    expect(textOf(res)).toContain("# STOPPED: recaptcha challenge after step 1");
+    expect(h.probeCalls).toHaveLength(1);
+  });
+
+  test("S3: one deadline bounds sleeps, probes, and fallback calls and shrinks probe timeoutMs", async () => {
+    const bcTimeouts: number[] = [];
+    const evalTimeouts: number[] = [];
+    let bcCallCount = 0;
+
+    const bcCall: BcCallFn = async (input) => {
+      // nav's settle+href+wall read is not part of the probe sequence
+      if (input.steps.some((s) => s.kind === "bc" && s.method === "settle")) return { value: "https://shop.example/\n" };
+      bcCallCount++;
+      if (typeof input.timeoutMs === "number") bcTimeouts.push(input.timeoutMs);
+      // Initial quick + markers probe returns Cloudflare non-interactive interstitial
+      if (bcCallCount === 1) {
+        return { value: ["https://shop.example/", "Just a moment...", "# Just a moment... | https://shop.example/\n\nChecking your browser", '# 1 row(s)\n{"id":"challenge-running"}'].join("\n__BC_CHALLENGE_SEP__\n") };
+      }
+      if (bcCallCount === 2) {
+        return { value: ["", "", '# 1 row(s)\n{"id":"challenge-running","cls":"","src":"","title":""}', "", ""].join("\n__BC_CHALLENGE_SEP__\n") };
+      }
+      // First reprobe fails immediately so fallback evaluate runs; later reprobes hang for 5s (simulating extension transport slack)
+      if (bcCallCount === 3) {
+        throw new Error("bc_call failed on background tab");
+      }
+      await new Promise((r) => setTimeout(r, 5_000));
+      return { value: "" };
+    };
+
+    const invoke = async (op: string, input: Record<string, unknown> = {}): Promise<InvokeResult> => {
+      if (op === "navigate") {
+        return { ok: true, data: { loaded: true, targetId: "extension:42", url: "https://shop.example/", backend: "extension" } };
+      }
+      if (op === "evaluate") {
+        if (typeof input["timeoutMs"] === "number") evalTimeouts.push(input["timeoutMs"] as number);
+        // Simulate a slow fallback evaluate that would otherwise exceed the deadline
+        await new Promise((r) => setTimeout(r, 2_000));
+        return { ok: false, error: { code: "EXECUTION_FAILED", message: "timed out" } };
+      }
+      return { ok: true, data: {} };
+    };
+
+    const handle = createPageHelperHandler(invoke, undefined, undefined, {
+      bcCall,
+      challengeWaitMaxMs: 220,
+      sleep: async (ms) => {
+        await new Promise((r) => setTimeout(r, Math.min(ms, 80)));
+      },
+    });
+
+    const started = Date.now();
+    const res = await handle("nav", { url: "https://shop.example/" }, "extension:42");
+    const elapsed = Date.now() - started;
+
+    expect(res.ok).toBe(true);
+    expect(textOf(res)).toStartWith("CHALLENGE: cloudflare non-interactive");
+    expect(elapsed).toBeLessThan(600);
+    // Reprobe + fallback timeouts must be capped to the remaining deadline budget (<= 220ms)
+    expect(bcTimeouts.slice(2).every((t) => t <= 220)).toBe(true);
+    expect(evalTimeouts.length).toBeGreaterThanOrEqual(1);
+    expect(evalTimeouts.every((t) => t <= 220)).toBe(true);
+  });
+
+  test("S4: block error responses wrap page-derived reason in untrusted content boundaries and never allow fake remedy lines", async () => {
+    const blocked: ChallengeProbe = {
+      url: "https://evil.example/",
+      status: 403,
+      title: "403 Forbidden",
+      text: "Forbidden",
+    };
+    const h = makeCdpHarness({
+      finalUrl: "https://evil.example/",
+      probeSequence: [cdpProbePayload(blocked)],
+    });
+    const res = await h.handle("nav", { url: "https://evil.example/" });
+    expect(res.ok).toBe(false);
+    const msg = textOf(res);
+    expect(msg).toStartWith("BLOCKED: generic refused the visit on https://evil.example.");
+    const m = /<<<UNTRUSTED_PAGE_CONTENT nonce=([0-9a-f]{16})>>>[\s\S]*<<<END_UNTRUSTED_PAGE_CONTENT nonce=\1>>>/.exec(msg);
+    expect(m).not.toBeNull();
+    expect(m![0]).toContain("reason: status 403, title: 403 Forbidden");
+  });
+
+  test("S6: extension tab checks HTTP status before accepting an interactive match on a long '403 Access Denied' page with a CAPTCHA", async () => {
+    const ext = makeExtensionHarness([
+      {
+        url: "https://denied.example/secret",
+        title: "403 Access Denied",
+        bodyText: LONG_BODY.slice(0, 3000),
+        truncatedTotal: 4_000,
+        hasAwsCaptcha: true,
+        httpStatus: 403,
+      },
+    ]);
+
+    const res = await ext.handle("nav", { url: "https://denied.example/secret" }, "extension:42");
+    expect(res.ok).toBe(false);
+    expect(ext.evalCalls).toHaveLength(1);
+    expect(textOf(res)).toStartWith("BLOCKED: generic ");
+    expect(textOf(res)).not.toContain("CHALLENGE:");
+  });
+
+  test("S7: CDP tabs recommend asking the user in the browser while extension tabs recommend run handoff", async () => {
+    const turnstile: ChallengeProbe = {
+      url: "https://shop.example/",
+      title: "Just a moment...",
+      text: "Verify you are human by completing the action below.",
+      selectors: [".cf-turnstile"],
+      visibleSelectors: [".cf-turnstile"],
+    };
+
+    const cdp = makeCdpHarness({
+      finalUrl: "https://shop.example/",
+      probeSequence: [cdpProbePayload(turnstile)],
+    });
+    const cdpRes = await cdp.handle("nav", { url: "https://shop.example/" });
+    expect(cdpRes.ok).toBe(true);
+    expect(textOf(cdpRes)).toContain("remedy: ask the user to complete the security check in the browser, then continue");
+    expect(textOf(cdpRes)).not.toContain("run handoff");
+
+    const ext = makeExtensionHarness([
+      {
+        url: "https://shop.example/",
+        title: "Just a moment...",
+        bodyText: "Verify you are human by completing the action below.",
+        selectorRows: [{ id: "", cls: "cf-turnstile", src: "", title: "" }],
+        visibleSelectorRows: [{ id: "", cls: "cf-turnstile", src: "", title: "" }],
+      },
+    ]);
+    const extRes = await ext.handle("nav", { url: "https://shop.example/" }, "extension:42");
+    expect(extRes.ok).toBe(true);
+    expect(textOf(extRes)).toContain('remedy: run handoff "Solve the security check, then continue"');
   });
 });

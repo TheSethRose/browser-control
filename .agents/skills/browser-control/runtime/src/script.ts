@@ -101,6 +101,16 @@ export function createScriptRunner(dispatch: PageDispatch, evalPage: EvalFn) {
     const runAction = async (action: string, params: Json): Promise<string> => {
       const res = await dispatch(action, { ...params, quiet: params["quiet"] ?? true }, targetId);
       if (!res.ok) throw new Error(res.error.message);
+      const challenge = (res.data as Json | undefined)?.["challenge"] as
+        | { kind?: string; vendor?: string; message?: string }
+        | undefined;
+      if (challenge && typeof challenge.kind === "string" && typeof challenge.vendor === "string") {
+        const msg =
+          typeof challenge.message === "string" && challenge.message
+            ? challenge.message
+            : `${challenge.kind === "block" ? "BLOCKED" : "CHALLENGE"}: ${challenge.vendor} ${challenge.kind} challenge`;
+        throw new Error(msg);
+      }
       return valueOf(res);
     };
 
@@ -234,9 +244,10 @@ export function createScriptRunner(dispatch: PageDispatch, evalPage: EvalFn) {
       const hint = /\b(document|window|localStorage)\b is not defined/.test(msg)
         ? "\nhint: scripts run outside the page; use page.evaluate(...) for DOM access"
         : "";
+      const prefix = /^(?:CHALLENGE|BLOCKED):/.test(msg) ? "" : "SCRIPT_ERROR: ";
       return failure(
         "EXECUTION_FAILED",
-        `SCRIPT_ERROR: ${msg}${hint}${history ? `\nsteps (${steps.filter((s) => s.ok).length}/${steps.length} ok): ${history}` : ""}${stateKeys.length ? `\nstate preserved keys: ${stateKeys.join(", ")}` : ""}`,
+        `${prefix}${msg}${hint}${history ? `\nsteps (${steps.filter((s) => s.ok).length}/${steps.length} ok): ${history}` : ""}${stateKeys.length ? `\nstate preserved keys: ${stateKeys.join(", ")}` : ""}`,
       );
     } finally {
       if (timer) clearTimeout(timer);

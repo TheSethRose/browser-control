@@ -245,6 +245,7 @@ export function createPageHelperHandler(
     rng?: () => number;
     bcCall?: BcCallFn;
     extensionRequest?: ExtensionRequestFn;
+    challengeWaitMaxMs?: number;
   } = {},
 ) {
   const daemonSessionId = options.sessionId ?? randomUUID().slice(0, 12);
@@ -1668,13 +1669,58 @@ export function createPageHelperHandler(
     }
   }
 
-  async function readChallengeProbeCdp(targetId: string | undefined): Promise<ProbeReadResult> {
-    const res = await invoke("evaluate", {
-      expression: CHALLENGE_PROBE_EXPR,
-      isolated: true,
-      ...(targetId ? { targetId } : {}),
-      timeoutMs: 4_000,
-    });
+  const challengeBackendOf = (tid: string | undefined): "extension" | "cdp" =>
+    extensionTabOf(tid) !== undefined ? "extension" : "cdp";
+
+  function challengeDataOf(
+    detection: ChallengeDetection,
+    status: "interactive" | "non-interactive-timeout",
+    targetUrl: string,
+    backend: "extension" | "cdp",
+  ) {
+    return {
+      kind: detection.kind,
+      vendor: detection.vendor,
+      status,
+      url: targetUrl,
+      message: formatChallengeOutput(detection, targetUrl, { backend, untrustedBoundary: true }),
+    };
+  }
+
+  async function raceDeadline<T>(promise: Promise<T>, deadline: number | undefined, onTimeout: T): Promise<T> {
+    if (deadline === undefined) return promise;
+    const rem = deadline - Date.now();
+    if (rem <= 0) return onTimeout;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        promise.catch(() => onTimeout),
+        new Promise<T>((resolve) => {
+          timer = setTimeout(() => resolve(onTimeout), rem);
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  async function readChallengeProbeCdp(
+    targetId: string | undefined,
+    timeoutMs = 4_000,
+    deadline?: number,
+  ): Promise<ProbeReadResult> {
+    const budget = deadline !== undefined ? Math.min(timeoutMs, deadline - Date.now()) : timeoutMs;
+    if (budget <= 0) return { kind: "error" };
+    const res = await raceDeadline(
+      invoke("evaluate", {
+        expression: CHALLENGE_PROBE_EXPR,
+        isolated: true,
+        ...(targetId ? { targetId } : {}),
+        timeoutMs: Math.max(1, Math.floor(budget)),
+      }),
+      deadline,
+      failure("EXECUTION_FAILED", "CHALLENGE_PROBE_TIMEOUT"),
+    );
     if (!res.ok) return { kind: "error" };
     const raw = valueOf(res);
     if (!raw || !raw.startsWith("{")) return { kind: "skip" };
@@ -1697,25 +1743,34 @@ export function createPageHelperHandler(
    */
   async function readChallengeProbe(
     targetId: string | undefined,
-    opts: { wallHint?: string; reprobe?: boolean } = {},
+    opts: { wallHint?: string; reprobe?: boolean; deadline?: number } = {},
   ): Promise<ProbeReadResult> {
+    const remaining = (cap: number): number =>
+      opts.deadline !== undefined ? Math.min(cap, opts.deadline - Date.now()) : cap;
+
     if (extensionTabOf(targetId) !== undefined) {
-      const stepTimeout = opts.reprobe ? 1_500 : 4_000;
-      const quick = await evalHelper(
-        {
-          steps: [
-            { kind: "href" },
-            { kind: "title" },
-            { kind: "bc", method: "text", args: [{ all: true, max: 3000 }] },
-            { kind: "bc", method: "query", args: [{ selector: FAST_VENDOR_CSS, fields: { id: "@id" }, limit: 1, all: true }] },
-          ],
-          join: CHALLENGE_PROBE_SEP,
-        },
-        targetId,
-        stepTimeout,
+      const baseTimeout = opts.reprobe ? 1_500 : 4_000;
+      const quickBudget = remaining(baseTimeout);
+      if (quickBudget <= 0) return { kind: "error" };
+      const quick = await raceDeadline(
+        evalHelper(
+          {
+            steps: [
+              { kind: "href" },
+              { kind: "title" },
+              { kind: "bc", method: "text", args: [{ all: true, max: 3000 }] },
+              { kind: "bc", method: "query", args: [{ selector: FAST_VENDOR_CSS, fields: { id: "@id" }, limit: 1, all: true }] },
+            ],
+            join: CHALLENGE_PROBE_SEP,
+          },
+          targetId,
+          Math.max(1, Math.floor(quickBudget)),
+        ),
+        opts.deadline,
+        failure("EXECUTION_FAILED", "CHALLENGE_PROBE_TIMEOUT"),
       );
       if (!quick.ok) {
-        return opts.reprobe ? readChallengeProbeCdp(targetId) : { kind: "error" };
+        return opts.reprobe ? readChallengeProbeCdp(targetId, baseTimeout, opts.deadline) : { kind: "error" };
       }
       const rawQuick = valueOf(quick);
       if (!rawQuick.includes(CHALLENGE_PROBE_SEP)) return { kind: "skip" };
@@ -1731,27 +1786,33 @@ export function createPageHelperHandler(
         isSuspiciousUrl(url);
       if (!suspicious) return { kind: "skip", url };
 
-      const markers = await evalHelper(
-        {
-          steps: [
-            { kind: "bc", method: "query", args: [{ selector: "iframe[src]", fields: { src: "@src" }, limit: 20, all: true }] },
-            { kind: "bc", method: "query", args: [{ selector: "script[src]", fields: { src: "@src" }, limit: 50, all: true }] },
-            {
-              kind: "bc",
-              method: "query",
-              args: [{ selector: PROBE_SELECTORS_CSS, fields: { id: "@id", cls: "@class", src: "@src", title: "@title" }, limit: 20, all: true }],
-            },
-            {
-              kind: "bc",
-              method: "query",
-              args: [{ selector: PROBE_SELECTORS_CSS, fields: { id: "@id", cls: "@class", src: "@src", title: "@title" }, limit: 20, all: false }],
-            },
-            { kind: "bc", method: "query", args: [{ selector: "awswaf-captcha", fields: { id: "@id" }, limit: 1, all: true }] },
-          ],
-          join: CHALLENGE_PROBE_SEP,
-        },
-        targetId,
-        stepTimeout,
+      const markersBudget = remaining(baseTimeout);
+      if (markersBudget <= 0) return { kind: "error" };
+      const markers = await raceDeadline(
+        evalHelper(
+          {
+            steps: [
+              { kind: "bc", method: "query", args: [{ selector: "iframe[src]", fields: { src: "@src" }, limit: 20, all: true }] },
+              { kind: "bc", method: "query", args: [{ selector: "script[src]", fields: { src: "@src" }, limit: 50, all: true }] },
+              {
+                kind: "bc",
+                method: "query",
+                args: [{ selector: PROBE_SELECTORS_CSS, fields: { id: "@id", cls: "@class", src: "@src", title: "@title" }, limit: 20, all: true }],
+              },
+              {
+                kind: "bc",
+                method: "query",
+                args: [{ selector: PROBE_SELECTORS_CSS, fields: { id: "@id", cls: "@class", src: "@src", title: "@title" }, limit: 20, all: false }],
+              },
+              { kind: "bc", method: "query", args: [{ selector: "awswaf-captcha", fields: { id: "@id" }, limit: 1, all: true }] },
+            ],
+            join: CHALLENGE_PROBE_SEP,
+          },
+          targetId,
+          Math.max(1, Math.floor(markersBudget)),
+        ),
+        opts.deadline,
+        failure("EXECUTION_FAILED", "CHALLENGE_PROBE_TIMEOUT"),
       );
       const [rawFrames = "", rawScripts = "", rawSel = "", rawVis = "", rawAws = ""] = markers.ok
         ? valueOf(markers).split(CHALLENGE_PROBE_SEP)
@@ -1771,26 +1832,35 @@ export function createPageHelperHandler(
         selectors,
         visibleSelectors,
       };
-      // Only read HTTP navigation status if a long denial-titled page or short AWS WAF SDK page still needs status.
+      // Check HTTP navigation status before accepting a non-block match on a denial-titled page
+      // (e.g. a long "403 Access Denied" page with a CAPTCHA) or a short AWS WAF SDK page.
+      const preliminary = classifyChallenge(probe);
       const needsStatus =
-        classifyChallenge(probe) === undefined &&
+        preliminary?.kind !== "block" &&
         (isDenialTitle(title) || (textLength < SHORT_PAGE_CHARS && scriptSrcs.some((s) => /\.awswaf\.com\//.test(s))));
       if (needsStatus) {
-        const statusRes = await invoke("evaluate", {
-          expression: '(() => { const n = performance.getEntriesByType && performance.getEntriesByType("navigation")[0]; return n && typeof n.responseStatus === "number" ? n.responseStatus : 0; })()',
-          isolated: true,
-          ...(targetId ? { targetId } : {}),
-          timeoutMs: 2_000,
-        });
-        const statusNum = statusRes.ok ? Number((statusRes.data as Json)["value"]) : 0;
-        if (Number.isInteger(statusNum) && statusNum > 0) {
-          return { kind: "probe", probe: { ...probe, status: statusNum } };
+        const statusBudget = remaining(2_000);
+        if (statusBudget > 0) {
+          const statusRes = await raceDeadline(
+            invoke("evaluate", {
+              expression: '(() => { const n = performance.getEntriesByType && performance.getEntriesByType("navigation")[0]; return n && typeof n.responseStatus === "number" ? n.responseStatus : 0; })()',
+              isolated: true,
+              ...(targetId ? { targetId } : {}),
+              timeoutMs: Math.max(1, Math.floor(statusBudget)),
+            }),
+            opts.deadline,
+            failure("EXECUTION_FAILED", "CHALLENGE_PROBE_TIMEOUT"),
+          );
+          const statusNum = statusRes.ok ? Number((statusRes.data as Json)["value"]) : 0;
+          if (Number.isInteger(statusNum) && statusNum > 0) {
+            return { kind: "probe", probe: { ...probe, status: statusNum } };
+          }
         }
       }
       return { kind: "probe", probe };
     }
 
-    return readChallengeProbeCdp(targetId);
+    return readChallengeProbeCdp(targetId, opts.reprobe ? 1_500 : 4_000, opts.deadline);
   }
 
   /**
@@ -1815,13 +1885,18 @@ export function createPageHelperHandler(
       return { status: "interactive", detection, url: lastProbe.url || opts.knownUrl || "", waited: false };
     }
 
+    const waitMaxMs = options.challengeWaitMaxMs ?? CHALLENGE_WAIT_MAX_MS;
     const started = Date.now();
+    const deadline = started + waitMaxMs;
     let waitedMs = 0;
-    while (waitedMs < CHALLENGE_WAIT_MAX_MS && Date.now() - started < CHALLENGE_WAIT_MAX_MS) {
-      const step = Math.min(CHALLENGE_POLL_MS, CHALLENGE_WAIT_MAX_MS - waitedMs);
+    const remainingBudget = () => Math.max(0, Math.min(deadline - Date.now(), waitMaxMs - waitedMs));
+    while (remainingBudget() > 0) {
+      const step = Math.min(CHALLENGE_POLL_MS, remainingBudget());
+      if (step <= 0) break;
       await pause(step);
       waitedMs += step;
-      const next = await readChallengeProbe(targetId, { reprobe: true });
+      if (deadline - Date.now() <= 0) break;
+      const next = await readChallengeProbe(targetId, { reprobe: true, deadline });
       if (next.kind === "error") continue;
       if (next.kind === "skip") {
         return { status: "clear", waited: true, url: next.url || opts.knownUrl };
@@ -1880,15 +1955,25 @@ export function createPageHelperHandler(
         if (!res.ok) return res;
         let out = valueOf(res);
         let challengePrefix = "";
+        let challengeMeta: ReturnType<typeof challengeDataOf> | undefined;
         if (!find && !within && input["_skipChallengeCheck"] !== true && isSuspiciousSnapshot(out)) {
           const wallHint = out.includes("# WALL: captcha") ? "captcha" : out.includes("# WALL: rate-limit") ? "rate-limit" : undefined;
           const snapUrl = /^# .* \| (https?:\/\/[^\s]+)/.exec(out)?.[1];
+          const challengeBackend = challengeBackendOf(targetId);
           const challenge = await checkChallenge(targetId, { wallHint, knownUrl: snapUrl });
           if (challenge.status === "block") {
-            return failure("EXECUTION_FAILED", formatChallengeOutput(challenge.detection, challenge.url || snapUrl || ""));
+            return failure(
+              "EXECUTION_FAILED",
+              formatChallengeOutput(challenge.detection, challenge.url || snapUrl || "", {
+                backend: challengeBackend,
+                untrustedBoundary: true,
+              }),
+            );
           }
           if (challenge.status === "interactive" || challenge.status === "non-interactive-timeout") {
-            challengePrefix = formatChallengeOutput(challenge.detection, challenge.url || snapUrl || "");
+            const targetUrl = challenge.url || snapUrl || "";
+            challengePrefix = formatChallengeOutput(challenge.detection, targetUrl, { backend: challengeBackend });
+            challengeMeta = challengeDataOf(challenge.detection, challenge.status, targetUrl, challengeBackend);
           } else if (challenge.waited) {
             const refreshed = await evalHelper({ kind: "bc", method: "snapshot", args: [opts] }, targetId);
             if (refreshed.ok) out = valueOf(refreshed);
@@ -1909,7 +1994,7 @@ export function createPageHelperHandler(
           if (ax.ok && valueOf(ax).includes("\n- ")) out += `\n# No controls found in the DOM.\n${valueOf(ax)}`;
         }
         if (challengePrefix) out = `${challengePrefix}\n${out}`;
-        return maybeSaveOut(success(out), input);
+        return maybeSaveOut(challengeMeta ? { ok: true, data: { value: out, challenge: challengeMeta } } : success(out), input);
       }
 
       case "form": {
@@ -1974,6 +2059,7 @@ export function createPageHelperHandler(
         const out: string[] = [];
         let stopped: string | undefined;
         let challengeReport: string | undefined;
+        const challengeBackend = challengeBackendOf(targetId);
         for (const [i, step] of steps.entries()) {
           const res = await act(step.action, { ...step.input, quiet: true }, targetId, true, browseTab, true);
           if (!res.ok) {
@@ -1992,7 +2078,8 @@ export function createPageHelperHandler(
             stopped = `step ${i + 1} was not read back as typed`;
             break;
           }
-          if (i === steps.length - 1) continue;
+          const isLastStep = i === steps.length - 1;
+          if (isLastStep && browseTab !== undefined) continue;
           const state = await evalHelper(
             {
               steps: [
@@ -2022,12 +2109,18 @@ export function createPageHelperHandler(
           if (browseTab === undefined && (navigated || challengeWall)) {
             const challenge = await checkChallenge(targetId, { wallHint: wall, knownUrl: url });
             if (challenge.status === "block") {
-              challengeReport = formatChallengeOutput(challenge.detection, challenge.url || url);
+              challengeReport = formatChallengeOutput(challenge.detection, challenge.url || url, {
+                backend: challengeBackend,
+                untrustedBoundary: true,
+              });
               stopped = `blocked by ${challenge.detection.vendor} after step ${i + 1}`;
               break;
             }
             if (challenge.status === "interactive" || challenge.status === "non-interactive-timeout") {
-              challengeReport = formatChallengeOutput(challenge.detection, challenge.url || url);
+              challengeReport = formatChallengeOutput(challenge.detection, challenge.url || url, {
+                backend: challengeBackend,
+                untrustedBoundary: true,
+              });
               stopped = `${challenge.detection.vendor} challenge after step ${i + 1}`;
               break;
             }
@@ -2042,47 +2135,12 @@ export function createPageHelperHandler(
             }
           }
           if (url) prevUrl = url;
-          if (wall) stopped = `the page is a ${wall} wall after step ${i + 1}`;
-          else if (url && startUrl && hostOf(url) !== hostOf(startUrl)) {
-            stopped = `step ${i + 1} left ${hostOf(startUrl)} for ${hostOf(url)}`;
-          }
-          if (stopped) break;
-        }
-        let postDiff: string | undefined;
-        if (!stopped && browseTab === undefined) {
-          if (!quiet) {
-            postDiff = await changes(startUrl, targetId);
-            const urlDelta = /^# url: (\S+) -> (\S+)/m.exec(postDiff);
-            const lastNavigated = Boolean(urlDelta && stripHash(urlDelta[1]!) !== stripHash(urlDelta[2]!));
-            const lastWall = postDiff.includes("# WALL: captcha") ? "captcha" : postDiff.includes("# WALL: rate-limit") ? "rate-limit" : undefined;
-            if (lastNavigated || lastWall) {
-              const challenge = await checkChallenge(targetId, { wallHint: lastWall, knownUrl: urlDelta?.[2] || prevUrl });
-              if (challenge.status === "block") {
-                challengeReport = formatChallengeOutput(challenge.detection, challenge.url || urlDelta?.[2] || prevUrl);
-                stopped = `blocked by ${challenge.detection.vendor} after step ${steps.length}`;
-              } else if (challenge.status === "interactive" || challenge.status === "non-interactive-timeout") {
-                challengeReport = formatChallengeOutput(challenge.detection, challenge.url || urlDelta?.[2] || prevUrl);
-                stopped = `${challenge.detection.vendor} challenge after step ${steps.length}`;
-              } else if (challenge.waited) {
-                postDiff = await changes(startUrl, targetId);
-              }
+          if (!isLastStep) {
+            if (wall) stopped = `the page is a ${wall} wall after step ${i + 1}`;
+            else if (url && startUrl && hostOf(url) !== hostOf(startUrl)) {
+              stopped = `step ${i + 1} left ${hostOf(startUrl)} for ${hostOf(url)}`;
             }
-          } else {
-            const lastAction = steps[steps.length - 1]?.action;
-            if (lastAction === "click" || lastAction === "key") {
-              const curHref = await readProperty("href", targetId, { timeoutMs: 2_000 });
-              const finalUrl = curHref.ok ? valueOf(curHref) : "";
-              if (finalUrl && prevUrl && stripHash(finalUrl) !== stripHash(prevUrl)) {
-                const challenge = await checkChallenge(targetId, { knownUrl: finalUrl });
-                if (challenge.status === "block") {
-                  challengeReport = formatChallengeOutput(challenge.detection, challenge.url || finalUrl);
-                  stopped = `blocked by ${challenge.detection.vendor} after step ${steps.length}`;
-                } else if (challenge.status === "interactive" || challenge.status === "non-interactive-timeout") {
-                  challengeReport = formatChallengeOutput(challenge.detection, challenge.url || finalUrl);
-                  stopped = `${challenge.detection.vendor} challenge after step ${steps.length}`;
-                }
-              }
-            }
+            if (stopped) break;
           }
         }
         if (stopped) out.push(`# STOPPED: ${stopped}. ${steps.length - out.length} step(s) not run.`);
@@ -2093,8 +2151,6 @@ export function createPageHelperHandler(
               cacheBrowseSnapshot(browseTab, valueOf(delta));
               out.push(valueOf(delta));
             }
-          } else if (postDiff !== undefined && !challengeReport) {
-            out.push(postDiff);
           } else if (!challengeReport) {
             out.push(await changes(startUrl, targetId));
           }
@@ -2293,9 +2349,16 @@ export function createPageHelperHandler(
           if (state.ok) {
             [final = "", wall = ""] = valueOf(state).split("\n");
           }
+          const challengeBackend = challengeBackendOf(tab);
           const challenge = await checkChallenge(tab, { wallHint: wall, knownUrl: final || url });
           if (challenge.status === "block") {
-            return failure("EXECUTION_FAILED", formatChallengeOutput(challenge.detection, challenge.url || final || url));
+            return failure(
+              "EXECUTION_FAILED",
+              formatChallengeOutput(challenge.detection, challenge.url || final || url, {
+                backend: challengeBackend,
+                untrustedBoundary: true,
+              }),
+            );
           }
           if (challenge.status === "interactive" || challenge.status === "non-interactive-timeout") {
             const targetUrl = challenge.url || final || url;
@@ -2303,7 +2366,13 @@ export function createPageHelperHandler(
             if (final && hostOf(final) && hostOf(url) && hostOf(final) !== hostOf(url)) {
               lines.push(`# REDIRECTED: ${hostOf(url)} -> ${hostOf(final)}`);
             }
-            return success(`${formatChallengeOutput(challenge.detection, targetUrl)}\n${lines.join("\n")}`);
+            return {
+              ok: true,
+              data: {
+                value: `${formatChallengeOutput(challenge.detection, targetUrl, { backend: challengeBackend })}\n${lines.join("\n")}`,
+                challenge: challengeDataOf(challenge.detection, challenge.status, targetUrl, challengeBackend),
+              },
+            };
           }
           if (challenge.waited) {
             const afterWait = await evalHelper(
