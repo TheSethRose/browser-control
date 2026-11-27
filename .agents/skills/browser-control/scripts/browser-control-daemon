@@ -52,7 +52,7 @@
 #           [--reduced-motion] [--offline] [--ua <str>] [--reset]
 #   handoff <message> [--timeout <s>]            overlay for the user, wait, then continue
 #   type [--fast] [--keys] <ref|label> <text> | type --focused [--fast] <text>
-#   select <ref|label> <option>       native <select> or ARIA combobox
+#   select [--fast] <ref|label> <option> native <select> or ARIA combobox
 #   upload <ref|label> <path>         <input type="file"> (never opens OS picker)
 #   drag <from> <to> [--side before|after]        HTML5 drag-and-drop or mouse drag
 #   wait [--text <t>] [--selector <css>] [--url <u>] [--timeout <ms>]
@@ -506,8 +506,10 @@ case "$cmd" in
     run POST "page/type$(query "$(arg 2)")" '{"ref":'"$(json_str "$(arg 0)")"',"text":'"$(json_str "$(arg 1)")"',"fast":'"$fast"',"keys":'"$keys"'}'
     ;;
   select)
-    [[ ${#args[@]} -ge 2 ]] || fail INPUT_INVALID "usage: browser-control-daemon select <ref|label> <option> [targetId]"
-    run POST "page/select$(query "$(arg 2)")" '{"ref":'"$(json_str "$(arg 0)")"',"option":'"$(json_str "$(arg 1)")"'}'
+    [[ ${#args[@]} -ge 2 ]] || fail INPUT_INVALID "usage: browser-control-daemon select [--fast] <ref|label> <option> [targetId]"
+    input='{"ref":'"$(json_str "$(arg 0)")"',"option":'"$(json_str "$(arg 1)")"
+    [[ "$fast" != true ]] || input+=',"fast":true'
+    run POST "page/select$(query "$(arg 2)")" "$input}"
     ;;
   upload)
     [[ ${#args[@]} -ge 2 ]] || fail INPUT_INVALID "usage: browser-control-daemon upload <ref|label> <path> [targetId]"

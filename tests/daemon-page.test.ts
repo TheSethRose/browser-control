@@ -92,6 +92,7 @@ function makeFakeInvoker(options: {
         const seq = options.canvasHashes ?? ["h1", "h2"];
         return ok(seq[Math.min(hashIdx++, seq.length - 1)]!);
       }
+      if (expr.includes("__bc.hitCheck")) return ok('{"ok":true}');
       if (expr.includes("__bc.hit")) return ok("https://a.test/x\nhit: canvas#c");
       if (expr.includes("__bc.diff")) return ok('+ button "Extra" [e9]');
       if (expr.includes("__bc.point")) return ok(expr.includes("__bc.baseline()") ? `https://a.test/x ${point}` : point);

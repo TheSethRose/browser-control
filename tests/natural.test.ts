@@ -368,11 +368,18 @@ describe("page-runner natural motion integration", () => {
   const val = (value: string): InvokeResult => ({ ok: true, data: { value } });
 
   /** Main-frame page with one 200x40 button (e1) in a 1280x800 viewport; off-screen targets scroll by wheel delta. */
-  function makeNaturalMock(opts: { inView?: boolean; scrollDeltaPerWheel?: number } = {}) {
+  function makeNaturalMock(opts: {
+    inView?: boolean;
+    scrollDeltaPerWheel?: number;
+    draggable?: boolean;
+    failAtMouseMoveIndex?: number;
+    failMessage?: string;
+  } = {}) {
     const cdpCalls: CdpCall[] = [];
     const evalExprs: string[] = [];
     const sleeps: number[] = [];
     let currentTop = opts.inView === false ? 1200 : 200;
+    let mouseMoveCount = 0;
     const makeDetail = (forceInView: boolean) => {
       const inView = forceInView || (currentTop >= 16 && currentTop + 40 <= 784);
       const top = forceInView ? 380 : currentTop;
@@ -395,18 +402,30 @@ describe("page-runner natural motion integration", () => {
         // Points left of x=200 sit over a nested scroller; anything else is over the document.
         const sp = /__bc\.pageScrollPoint\((\d+), (\d+)\)/.exec(expr);
         if (sp) return val(JSON.stringify(Number(sp[1]) >= 200 ? { x: Number(sp[1]), y: Number(sp[2]) } : { x: 640, y: 400 }));
+        if (expr.includes("__bc.dragInfo")) {
+          return val(JSON.stringify({
+            sx: 120, sy: 200, dx: 520, dy: 460, draggable: opts.draggable === true, listMeta: null,
+          }));
+        }
         if (expr.includes("__bc.point")) {
           const noScroll = expr.includes('"noScroll":true');
           if (!noScroll && !expr.includes('"detail":true')) return val(base ? "https://a.test/ 350 220 visible" : "350 220 visible");
           return val(base ? `https://a.test/\n${makeDetail(!noScroll)}` : makeDetail(!noScroll));
         }
         if (expr.includes("__bc.readInputProbe")) return val('{"mousedown":1,"mouseup":1}');
+        if (expr.includes("__bc.setTypedValue")) return val("__not_typed__");
+        if (expr.includes("__bc.cellInfo")) return val("__not_cell__");
+        if (expr.includes("__bc.focusForType")) return val("focused");
+        if (expr.includes("__bc.value")) return val("hello");
         if (expr.includes("__bc.hit(")) return val("https://a.test/\nhit: button#ok");
         return val("ok");
       }
       if (op === "execute_cdp") {
         const params = (input["params"] ?? {}) as Record<string, unknown>;
         cdpCalls.push({ method: String(input["method"]), params, targetId: input["targetId"] as string | undefined });
+        if (params["type"] === "mouseMoved" && opts.failAtMouseMoveIndex !== undefined && ++mouseMoveCount === opts.failAtMouseMoveIndex) {
+          return { ok: false, error: { code: "EXECUTION_FAILED", message: opts.failMessage ?? "DIALOG_OPEN: alert open" } };
+        }
         if (params["type"] === "mouseWheel") currentTop -= opts.scrollDeltaPerWheel ?? Number(params["deltaY"] ?? 0);
         return { ok: true, data: { result: {} } };
       }
@@ -593,8 +612,9 @@ describe("page-runner natural motion integration", () => {
         now: () => 0,
       });
 
-      // Establish a resting pointer inside the viewport far from scroller.point (640, 400).
-      expect((await handler("hover", { xy: [180, 260], quiet: true })).ok).toBe(true);
+      // Establish a resting pointer inside the viewport over the document scroller (x >= 200), far from
+      // scroller.point (640, 400); pageScrollPoint confirms it, so the wheel reuses it without moving.
+      expect((await handler("hover", { xy: [240, 260], quiet: true })).ok).toBe(true);
       const beforeClick = mock.cdpCalls.length;
 
       const res = await handler("click", { ref: "e1", quiet: true });
@@ -605,7 +625,7 @@ describe("page-runner natural motion integration", () => {
         .filter((c) => c.method === "Input.dispatchMouseEvent");
       const firstWheelIdx = clickMouse.findIndex((c) => c.params["type"] === "mouseWheel");
       expect(firstWheelIdx).toBe(0);
-      expect(clickMouse[0]!.params["x"]).toBe(180);
+      expect(clickMouse[0]!.params["x"]).toBe(240);
       expect(clickMouse[0]!.params["y"]).toBe(260);
       // Zero mouseMoved events between the last pointer position and the first mouseWheel.
       expect(clickMouse.slice(0, firstWheelIdx).filter((c) => c.params["type"] === "mouseMoved")).toHaveLength(0);
@@ -1003,11 +1023,12 @@ describe("wrapper --fast forwarding and natural subcommand", () => {
     return made[0]!;
   }
 
-  test("forwards --fast on click, hover, drag, key, do, nav, text, script", async () => {
+  test("forwards --fast on click, hover, select, drag, key, do, nav, text, script", async () => {
     expect(JSON.parse((await call("click", "--fast", "e1")).body)).toEqual({ ref: "e1", fast: true });
     expect(JSON.parse((await call("click", "--fast", "--xy", "10,20")).body)).toEqual({ xy: [10, 20], fast: true });
     expect(JSON.parse((await call("hover", "--fast", "e1")).body)).toEqual({ ref: "e1", fast: true });
     expect(JSON.parse((await call("hover", "--fast", "--xy", "10,20")).body)).toEqual({ xy: [10, 20], fast: true });
+    expect(JSON.parse((await call("select", "--fast", "e8", "US")).body)).toEqual({ ref: "e8", option: "US", fast: true });
     expect(JSON.parse((await call("drag", "--fast", "e1", "e2")).body)).toEqual({ from: "e1", to: "e2", fast: true });
     expect(JSON.parse((await call("key", "--fast", "Enter")).body)).toEqual({ key: "Enter", fast: true });
     expect(JSON.parse((await call("do", "--fast", '[{"key":"Tab"}]')).body)).toEqual({ steps: [{ key: "Tab" }], fast: true });
