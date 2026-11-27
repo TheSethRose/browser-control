@@ -34,6 +34,8 @@ export interface Backend {
   status(): Promise<Record<string, unknown>>;
   /** Forget the selected tab. */
   clearActive(): void;
+  /** Whether a tab is selected (optional; assumed true when missing). */
+  hasActive?(): boolean;
   /** Optional startup hook (called when this backend is enabled in backendOrder). */
   start?(): Promise<void> | void;
   dispose?(): Promise<void> | void;

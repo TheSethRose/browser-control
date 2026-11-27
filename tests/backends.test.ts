@@ -612,6 +612,16 @@ describe("router with extension only (no implicit cdp fallback)", () => {
     expect(log).toEqual([]);
   });
 
+  test("S9: after a targeted extension call with no selected tab, untargeted ops still say no tab is selected", async () => {
+    const log: string[] = [];
+    const ext = fakeExtension({ hasActive: () => false });
+    const ops = route(fakeCdp(log), [ext], () => ["extension"]);
+    await ops["evaluate"]!({ expression: "1", targetId: "extension:5" });
+    ext.handles = () => false;
+    await expect(ops["evaluate"]!({ expression: "1" })).rejects.toThrow(/^EXTENSION_ONLY: no extension tab is selected/);
+    expect(log).toEqual([]);
+  });
+
   test("S5: untargeted handoff with no extension tab returns EXTENSION_ONLY in extension-only mode", async () => {
     const log: string[] = [];
     let available = true;

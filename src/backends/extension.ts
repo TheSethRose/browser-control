@@ -1538,6 +1538,9 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
     request,
     bcCall,
 
+    hasActive() {
+      return activeTab !== undefined;
+    },
     handles(op, input, isActive) {
       if (!OPS.has(op)) return false;
       if (op === "navigate" && (typeof input["url"] !== "string" || input["url"] === "")) return false;

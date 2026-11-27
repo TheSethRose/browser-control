@@ -172,6 +172,8 @@ export function route(
     }
   }
 
+  const extensionTabSelected = () => active === EXTENSION && (byName.get(EXTENSION)?.hasActive?.() ?? true);
+
   async function runOp(op: string, input: OpInput): Promise<unknown> {
     const orderNow = enabled();
     const extensionOnly = isExtensionOnlyOrder(orderNow);
@@ -198,7 +200,7 @@ export function route(
     if (named) {
       if (!named.handles(op, input, active === named.name)) {
         if (named.name === EXTENSION && extensionOnly) {
-          throw new Error(extensionOnlyMessage(unhandledExtensionReason(op, input, active === EXTENSION)));
+          throw new Error(extensionOnlyMessage(unhandledExtensionReason(op, input, extensionTabSelected())));
         }
         throw new Error(`INPUT_INVALID: ${op} isn't available on ${named.name} tabs; use a DevTools tab for it`);
       }
@@ -275,7 +277,7 @@ export function route(
       }
     }
     if (extensionOnly) {
-      throw new Error(extensionOnlyMessage(skipped[0] ?? unhandledExtensionReason(op, input, active === EXTENSION)));
+      throw new Error(extensionOnlyMessage(skipped[0] ?? unhandledExtensionReason(op, input, extensionTabSelected())));
     }
     const detail = skipped.length > 0 ? ` (${skipped.map((e) => e.message).join("; ")})` : "";
     throw new Error(`BACKEND_UNAVAILABLE: no enabled backend can run ${op}${detail}`);
