@@ -111,11 +111,22 @@ export function readPrivateTokenSync(tokenFile: string = defaultTokenFilePath())
   return { state: "bad" };
 }
 
-export function backendOrder(): string[] {
+/** Which of the precedence rules supplied the backend order, and its raw value ("" for the default). */
+export type BackendOrderSource = "daemon file" | "env" | "global file" | "default";
+
+export function backendOrderSource(): { source: BackendOrderSource; value: string } {
   const daemonBackendsFile = shared[DAEMON_BACKENDS_FILE] as string | undefined;
-  let raw = daemonBackendsFile ? readOneLine(daemonBackendsFile) : "";
-  if (!raw) raw = process.env["BROWSER_CONTROL_BACKENDS"]?.trim() ?? "";
-  if (!raw) raw = readOneLine(configFilePath("backends"));
+  const daemonRaw = daemonBackendsFile ? readOneLine(daemonBackendsFile) : "";
+  if (daemonRaw) return { source: "daemon file", value: daemonRaw };
+  const envRaw = process.env["BROWSER_CONTROL_BACKENDS"]?.trim() ?? "";
+  if (envRaw) return { source: "env", value: envRaw };
+  const globalRaw = readOneLine(configFilePath("backends"));
+  if (globalRaw) return { source: "global file", value: globalRaw };
+  return { source: "default", value: "" };
+}
+
+export function backendOrder(source: { value: string } = backendOrderSource()): string[] {
+  let raw = source.value;
   if (!raw) raw = "token" in readPrivateTokenSync() ? EXTENSION : CDP;
   const names = raw
     .split(/[\s,]+/)

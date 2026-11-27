@@ -29,7 +29,7 @@ import {
   extensionStatusReport,
   getRegisteredExtensionBackend,
 } from "./src/backends/extension";
-import { backendOrder, setDaemonBackendsFile, withAutoConnect } from "./src/backends/router";
+import { backendOrder, backendOrderSource, setDaemonBackendsFile, withAutoConnect } from "./src/backends/router";
 import { prefixOf } from "./src/backends/types";
 import { disposeOcr } from "./src/ocr";
 import { createPageHelperHandler, formatAxTree, matchTab } from "./src/page-runner";
@@ -212,7 +212,16 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
 
   async function respond(request: Request, url: URL, route: string, operation: string): Promise<Response> {
     if (url.pathname === "/extension" || url.pathname.startsWith("/extension/")) {
-      const extReply = await dispatchExtensionRequest(request, url, getRegisteredExtensionBackend(), backendOrder());
+      // One read of the order config, so status's order and its source always agree.
+      const orderSource = backendOrderSource();
+      const extReply = await dispatchExtensionRequest(
+        request,
+        url,
+        getRegisteredExtensionBackend(),
+        backendOrder(orderSource),
+        undefined,
+        orderSource,
+      );
       if (extReply) return extReply;
     }
 
@@ -363,6 +372,7 @@ export async function dispatchExtensionRequest(
   backend: Parameters<typeof extensionStatusReport>[0],
   order: string[],
   tokenFile?: string,
+  orderSource: ReturnType<typeof backendOrderSource> = backendOrderSource(),
 ): Promise<Response | undefined> {
   if (url.pathname !== "/extension" && !url.pathname.startsWith("/extension/")) return undefined;
   const matched = EXTENSION_ROUTE_RE.exec(url.pathname);
@@ -378,7 +388,7 @@ export async function dispatchExtensionRequest(
       { status: 405, headers: { allow: "GET" } },
     );
   }
-  return handleExtensionRoute(matched[1]!, backend, order, tokenFile);
+  return handleExtensionRoute(matched[1]!, backend, order, tokenFile, orderSource);
 }
 
 /** `GET /extension/<sub>`: the wrapper's `extension status|browsers|diagnostics`. */
@@ -387,13 +397,14 @@ export async function handleExtensionRoute(
   backend: Parameters<typeof extensionStatusReport>[0],
   order: string[],
   tokenFile?: string,
+  orderInfo?: Parameters<typeof extensionStatusReport>[4],
 ): Promise<Response> {
   const reply = (result: InvokeResult) =>
     new Response(`${JSON.stringify(result)}\n`, { status: result.ok ? 200 : 400 });
   try {
     switch (sub) {
       case "status":
-        return reply({ ok: true, data: await extensionStatusReport(backend, order, tokenFile) } as InvokeResult);
+        return reply({ ok: true, data: await extensionStatusReport(backend, order, tokenFile, 2000, orderInfo) } as InvokeResult);
       case "diagnostics":
         return reply({ ok: true, data: await extensionDiagnosticsReport(backend, order, { tokenFile }) } as InvokeResult);
       case "browsers": {

@@ -94,13 +94,18 @@ describe("browser-control standalone delivery", () => {
   test("named standalone CLI runs the shared implementation", async () => {
     const cliPath = join(browserControlDir, "cli.ts");
 
-    const listProc = Bun.spawn(["bun", cliPath, "--list"], { env: { ...process.env }, stdout: "pipe", stderr: "pipe" });
+    // Keep the machine's real ~/.config/browser-control (e.g. a backends order file) out of the child.
+    const childConfig = await mkdtemp(join(tmpdir(), "bc-standalone-config-"));
+    roots.push(childConfig);
+    const childEnv: Record<string, string | undefined> = { ...process.env, XDG_CONFIG_HOME: childConfig };
+    delete childEnv["BROWSER_CONTROL_BACKENDS"];
+    const listProc = Bun.spawn(["bun", cliPath, "--list"], { stdout: "pipe", stderr: "pipe", env: childEnv });
     const listOut = await new Response(listProc.stdout).text();
     expect(await listProc.exited).toBe(0);
     const listed = JSON.parse(listOut) as Array<{ operation: string }>;
     expect(listed.map((operation) => operation.operation).sort()).toEqual(EXPECTED_OPERATIONS);
 
-    const callProc = Bun.spawn(["bun", cliPath, "list_browsers"], { env: { ...process.env }, stdout: "pipe", stderr: "pipe" });
+    const callProc = Bun.spawn(["bun", cliPath, "list_browsers"], { stdout: "pipe", stderr: "pipe", env: childEnv });
     const callOut = await new Response(callProc.stdout).text();
     expect(await callProc.exited).toBe(0);
     const result = JSON.parse(callOut) as { ok: boolean; data: { browsers: unknown } };

@@ -10,7 +10,7 @@ A backend is the path a command takes to the browser. There are three:
 - `cdp` is direct DevTools, the v1 way. It stays the default when the extension is not paired, and runs whenever asked for by name (`start <browser>`, a DevTools targetId, or `BROWSER_CONTROL_BACKENDS=extension,cdp`). It reaches pages the extension can't run on, such as `chrome://` tabs, the Chrome Web Store, other extensions' pages, and the built-in PDF viewer.
 - `browse` is the optional [opencode browse](https://github.com/anomalyco/browse) adapter (section 7).
 
-The daemon reads the backend order from `<daemon dir>/backends` first (default `$TMPDIR/browser-control-daemon/backends`), then `BROWSER_CONTROL_BACKENDS`, then `~/.config/browser-control/backends`. When none is set, a paired extension defaults to `extension` alone; without pairing, the default is `cdp`. `extension disable` writes `cdp` to `<daemon dir>/backends`; `extension enable` (and `extension setup`) clears that file — including any older `extension,cdp` override — so the default, `BROWSER_CONTROL_BACKENDS`, or `~/.config/browser-control/backends` applies again. The daemon reads the order on every call, so a change needs no restart.
+The daemon reads the backend order from `<daemon dir>/backends` first (default `$TMPDIR/browser-control-daemon/backends`), then `BROWSER_CONTROL_BACKENDS`, then `~/.config/browser-control/backends`. When none is set, a paired extension defaults to `extension` alone; without pairing, the default is `cdp`. `extension disable` writes `cdp` to `<daemon dir>/backends`; `extension enable` clears that file, and `extension setup` clears it too and backs up then rewrites a `~/.config/browser-control/backends` that leaves the extension out — so the default, `BROWSER_CONTROL_BACKENDS`, or the global file applies again. `extension status` reports which source won (`orderSource`) and its value. The daemon reads the order on every call, so a change needs no restart.
 
 Routing rules:
 
@@ -24,7 +24,7 @@ Routing rules:
 
 The user does this once per browser profile. It takes three clicks and no typing.
 
-1. Run `$BCD extension setup` (optionally `$BCD extension setup <extensionDir>`). It creates the shared secret in `~/.config/browser-control/extension-relay.json` (mode `0600`, which makes the default backend order `extension`), writes `extension/pairing.json` beside the extension, and prints the exact path of the `extension/` folder.
+1. Run `$BCD extension setup` (optionally `$BCD extension setup <extensionDir>`). It creates the shared secret in `~/.config/browser-control/extension-relay.json` (mode `0600`, which makes the default backend order `extension`), writes `extension/pairing.json` beside the extension, and prints the exact path of the `extension/` folder. If `~/.config/browser-control/backends` exists and leaves the extension out, it is saved as `backends.bak-<date>` and rewritten to `extension`; if `BROWSER_CONTROL_BACKENDS` overrides it, the JSON reports `overriddenBy` and nothing is changed for the env.
 2. Tell the user the three clicks: open `chrome://extensions`, turn on **Developer mode**, click **Load unpacked** and choose the printed folder.
 3. `extension setup` returns right away. After the user loads the extension, run `$BCD extension browsers` (or `tabs`) to confirm it connected.
 

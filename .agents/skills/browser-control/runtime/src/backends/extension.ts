@@ -2418,6 +2418,7 @@ export async function extensionStatusReport(
   order: string[],
   tokenFile?: string,
   waitMs = 2000,
+  orderInfo?: { source: string; value: string },
 ): Promise<Record<string, unknown>> {
   const enabled = order.includes(NAME) && backend !== undefined;
   const pairing = await relayPairingState(tokenFile);
@@ -2425,6 +2426,7 @@ export async function extensionStatusReport(
     enabled,
     backends: order.join(","),
     paired: pairing === "paired",
+    ...(orderInfo ? { orderSource: orderInfo.source, orderSourceValue: orderInfo.value || order.join(",") } : {}),
     ...(pairing === "bad" ? { pairingProblem: "relay token file is not private or not valid; run: extension setup" } : {}),
   };
   if (!enabled) {
