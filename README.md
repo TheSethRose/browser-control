@@ -112,11 +112,11 @@ network, scrolling, downloads, cookies and artifacts. Each one is a set of steps
 `call`. None of them adds an operation.
 
 With remote debugging (cdp), each new connection makes the user click Allow. Chrome asks
-the person at the keyboard to approve every new remote debugging connection. The extension
-has no Allow prompt. The daemon already holds an approved one. So
-don't restart it, stop it or disconnect it. Never pass a port. If a command waits and
-then reports a timeout, the user hasn't clicked Allow yet. Ask them to, then run the same
-command again.
+the person at the keyboard to approve every new remote debugging connection. The daemon
+already holds an approved one. So don't restart it, stop it or disconnect it. Never pass a
+port. If a cdp connect waits and then times out while Chrome shows the remote debugging
+prompt, ask the user to click Allow, then run the same command again. The extension has no
+Allow prompt; on the extension, follow the fix line in the error instead.
 
 ## Operations
 
