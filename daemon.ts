@@ -207,6 +207,9 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
   } as unknown as Parameters<typeof Bun.serve>[0]);
 
   async function respond(request: Request, url: URL, route: string, operation: string): Promise<Response> {
+    const extReply = await dispatchExtensionRequest(request, url, getRegisteredExtensionBackend(), backendOrder());
+    if (extReply) return extReply;
+
     let targetId = url.searchParams.get("t") || undefined;
     const body = (await request.text()).trim();
     const match = url.searchParams.get("m");
@@ -259,6 +262,11 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
           (typeof parsed.value["targetId"] === "string" && parsed.value["targetId"].trim() !== ""
             ? parsed.value["targetId"].trim()
             : undefined);
+        if (explicitTargetId?.toLowerCase().startsWith("extension:") && !backendOrder().includes("extension")) {
+          return json(
+            failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: the extension backend is disabled; run: extension enable"),
+          );
+        }
         const navScope = browser ? { browser, explicitTargetId } : undefined;
         const shouldWrap = wrap && UNTRUSTED_PAGE_ACTIONS.has(operation) && !parsed.value["out"];
         return text(
@@ -320,8 +328,6 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
           status.ok ? { ok: true, data: { running: true, pid: process.pid, version, build, ...(status.data as Json) } } : status,
         );
       }
-      case "extension":
-        return extensionRoute(operation);
       case "stop":
         setTimeout(stop, 10);
         return json({ ok: true, data: { running: false } });
@@ -329,10 +335,33 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
         return json(failure("OPERATION_NOT_FOUND", `unknown daemon route: /${route}`));
     }
   }
+}
 
-  async function extensionRoute(sub: string): Promise<Response> {
-    return handleExtensionRoute(sub, getRegisteredExtensionBackend(), backendOrder());
+const EXTENSION_ROUTE_RE = /^\/extension\/(status|browsers|diagnostics)$/;
+
+/** Match `GET /extension/(status|browsers|diagnostics)` before shared page parsing. */
+export async function dispatchExtensionRequest(
+  request: Request,
+  url: URL,
+  backend: Parameters<typeof extensionStatusReport>[0],
+  order: string[],
+  tokenFile?: string,
+): Promise<Response | undefined> {
+  if (url.pathname !== "/extension" && !url.pathname.startsWith("/extension/")) return undefined;
+  const matched = EXTENSION_ROUTE_RE.exec(url.pathname);
+  if (!matched) {
+    return new Response(
+      `${JSON.stringify(failure("OPERATION_NOT_FOUND", `unknown daemon route: ${escapeControls(url.pathname)}`))}\n`,
+      { status: 404 },
+    );
   }
+  if (request.method !== "GET") {
+    return new Response(
+      `${JSON.stringify(failure("INPUT_INVALID", `method ${escapeControls(request.method)} not allowed for ${url.pathname}; use GET`))}\n`,
+      { status: 405, headers: { allow: "GET" } },
+    );
+  }
+  return handleExtensionRoute(matched[1]!, backend, order, tokenFile);
 }
 
 /** `GET /extension/<sub>`: the wrapper's `extension status|browsers|diagnostics`. */

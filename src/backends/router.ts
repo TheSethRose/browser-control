@@ -35,11 +35,14 @@ const TAB_OPS = new Set([
   "wait_for_event",
 ]);
 
-let daemonBackendsFile: string | undefined;
+// The bundled daemon and the capability it loads each hold a copy of this module, so the path
+// lives on a process-wide key that both copies read.
+const DAEMON_BACKENDS_FILE = Symbol.for("browser-control.daemonBackendsFile");
+const shared = globalThis as unknown as Record<symbol, string | undefined>;
 
 /** The daemon calls this once at startup with `<daemonDir>/backends`. */
 export function setDaemonBackendsFile(file: string | undefined): void {
-  daemonBackendsFile = file;
+  shared[DAEMON_BACKENDS_FILE] = file;
 }
 
 function readOneLine(file: string): string {
@@ -51,6 +54,7 @@ function readOneLine(file: string): string {
 }
 
 export function backendOrder(): string[] {
+  const daemonBackendsFile = shared[DAEMON_BACKENDS_FILE];
   let raw = daemonBackendsFile ? readOneLine(daemonBackendsFile) : "";
   if (!raw) raw = process.env["BROWSER_CONTROL_BACKENDS"]?.trim() ?? "";
   if (!raw) {
@@ -89,7 +93,14 @@ export function route(
     }
 
     const prefix = prefixOf(input["targetId"]);
-    const named = prefix !== undefined && enabled().includes(prefix) ? byName.get(prefix) : undefined;
+    if (prefix !== undefined && byName.has(prefix) && !enabled().includes(prefix)) {
+      throw new Error(
+        prefix === EXTENSION
+          ? "INPUT_INVALID: the extension backend is disabled; run: extension enable"
+          : `INPUT_INVALID: the ${prefix} backend is disabled`,
+      );
+    }
+    const named = prefix !== undefined ? byName.get(prefix) : undefined;
     if (named) {
       if (!named.handles(op, input, active === named.name)) {
         throw new Error(`INPUT_INVALID: ${op} isn't available on ${named.name} tabs; use a DevTools tab for it`);
