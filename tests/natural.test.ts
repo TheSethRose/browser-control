@@ -501,6 +501,38 @@ describe("page-runner natural motion integration", () => {
     });
   });
 
+  test("off-screen target wheels from the resting pointer when already inside the viewport", async () => {
+    await withNaturalOn(async () => {
+      const mock = makeNaturalMock({ inView: false });
+      const handler = createPageHelperHandler(mock.invoke, undefined, undefined, {
+        sleep: async (ms) => { mock.sleeps.push(ms); },
+        rng: createSeededRng(123),
+        now: () => 0,
+      });
+
+      // Establish a resting pointer inside the viewport far from scroller.point (640, 400).
+      expect((await handler("hover", { xy: [180, 260], quiet: true })).ok).toBe(true);
+      const beforeClick = mock.cdpCalls.length;
+
+      const res = await handler("click", { ref: "e1", quiet: true });
+      expect(res.ok).toBe(true);
+
+      const clickMouse = mock.cdpCalls
+        .slice(beforeClick)
+        .filter((c) => c.method === "Input.dispatchMouseEvent");
+      const firstWheelIdx = clickMouse.findIndex((c) => c.params["type"] === "mouseWheel");
+      expect(firstWheelIdx).toBe(0);
+      expect(clickMouse[0]!.params["x"]).toBe(180);
+      expect(clickMouse[0]!.params["y"]).toBe(260);
+      // Zero mouseMoved events between the last pointer position and the first mouseWheel.
+      expect(clickMouse.slice(0, firstWheelIdx).filter((c) => c.params["type"] === "mouseMoved")).toHaveLength(0);
+      // Still moves to the scrolled-into-view target and clicks it afterward.
+      expect(clickMouse.slice(firstWheelIdx).some((c) => c.params["type"] === "mouseMoved")).toBe(true);
+      expect(clickMouse.some((c) => c.params["type"] === "mousePressed")).toBe(true);
+      expect(clickMouse.some((c) => c.params["type"] === "mouseReleased")).toBe(true);
+    });
+  });
+
   test("natural hover, drag, key hold, dialog abort, and typing switch-off behave per spec", async () => {
     await withNaturalOn(async () => {
       // Hover: multiple moves, zero presses.

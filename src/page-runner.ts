@@ -573,6 +573,26 @@ export function createPageHelperHandler(
     return { ok: true, objectId };
   }
 
+  /** Cumulative debt pacer: absorbs timer slack and IPC latency across steps without distorting mock-clock tests. */
+  function createPacer() {
+    let debtMs = 0;
+    let lastEnd = now();
+    return async (delayMs: number): Promise<void> => {
+      debtMs += Math.max(0, now() - lastEnd);
+      if (delayMs > 0) {
+        const rem = Math.max(0, delayMs - debtMs);
+        debtMs = Math.max(0, debtMs - delayMs);
+        if (rem > 0) {
+          const t0 = now();
+          await pause(rem);
+          const slept = Math.max(0, now() - t0);
+          if (slept > rem) debtMs += slept - rem;
+        }
+      }
+      lastEnd = now();
+    };
+  }
+
   async function movePointer(
     to: Point2D,
     targetId: string | undefined,
@@ -597,13 +617,9 @@ export function createPageHelperHandler(
       overshootProb: opts.overshootProb,
       rng,
     });
-    let prevSendMs = 0;
+    const pace = createPacer();
     for (const step of plan.steps) {
-      if (step.delayMs > 0) {
-        const rem = Math.max(0, step.delayMs - prevSendMs);
-        if (rem > 0) await pause(rem);
-      }
-      const t0 = now();
+      await pace(step.delayMs);
       const res = await cdp(
         "Input.dispatchMouseEvent",
         {
@@ -616,7 +632,6 @@ export function createPageHelperHandler(
         targetId,
         INPUT_TIMEOUT_MS,
       );
-      prevSendMs = Math.max(0, now() - t0);
       if (!res.ok) return res;
       state.pointer = { x: step.x, y: step.y };
     }
@@ -805,15 +820,25 @@ export function createPageHelperHandler(
     const neededDeltaY = Math.round(cur.rect.top + cur.rect.height / 2 - goalY);
 
     if (Math.abs(neededDeltaY) >= 4) {
+      const ptr = motionOf(targetId).pointer;
       let anchor: Point2D;
+      let inScrollArea = false;
       if (scroller?.kind === "element") {
         const cl = Math.max(0, scroller.box.left);
         const ct = Math.max(0, scroller.box.top);
         const cr = Math.min(vw, scroller.box.left + scroller.box.width);
         const cb = Math.min(vh, scroller.box.top + scroller.box.height);
-        anchor = cr - cl >= 4 && cb - ct >= 4
-          ? pickClickPoint({ left: cl, top: ct, width: cr - cl, height: cb - ct }, rng)
-          : { x: Math.round(vw * 0.5), y: Math.round(vh * 0.5) };
+        if (ptr && cr - cl >= 4 && cb - ct >= 4 && ptr.x >= cl && ptr.x < cr && ptr.y >= ct && ptr.y < cb) {
+          anchor = ptr;
+          inScrollArea = true;
+        } else {
+          anchor = cr - cl >= 4 && cb - ct >= 4
+            ? pickClickPoint({ left: cl, top: ct, width: cr - cl, height: cb - ct }, rng)
+            : { x: Math.round(vw * 0.5), y: Math.round(vh * 0.5) };
+        }
+      } else if (ptr && ptr.x >= 0 && ptr.x < vw && ptr.y >= 0 && ptr.y < vh) {
+        anchor = ptr;
+        inScrollArea = true;
       } else if (scroller?.point) {
         anchor = scroller.point;
       } else {
@@ -823,31 +848,24 @@ export function createPageHelperHandler(
         };
       }
 
-      const ptr = motionOf(targetId).pointer;
-      const nearAnchor = ptr !== undefined && Math.hypot(ptr.x - anchor.x, ptr.y - anchor.y) < 25;
-      if (!nearAnchor) {
+      if (!inScrollArea) {
         const moved = await movePointer(anchor, targetId, { viewport: { width: vw, height: vh }, overshootProb: 0 });
         if (!moved.ok) return { ok: false, res: moved };
       }
 
       const plan = planWheelScroll(neededDeltaY, rng);
+      const pace = createPacer();
       for (let fi = 0; fi < plan.flicks.length; fi++) {
         const flick = plan.flicks[fi]!;
         const prevTop = cur.rect.top;
-        let prevSendMs = 0;
         for (const ev of flick.events) {
-          if (ev.delayMs > 0) {
-            const rem = Math.max(0, ev.delayMs - prevSendMs);
-            if (rem > 0) await pause(rem);
-          }
-          const t0 = now();
+          await pace(ev.delayMs);
           const wres = await cdp(
             "Input.dispatchMouseEvent",
             { type: "mouseWheel", x: anchor.x, y: anchor.y, deltaX: 0, deltaY: ev.deltaY },
             targetId,
             INPUT_TIMEOUT_MS,
           );
-          prevSendMs = Math.max(0, now() - t0);
           if (!wres.ok) return { ok: false, res: wres };
         }
         const probe = await evalHelper(
@@ -861,7 +879,7 @@ export function createPageHelperHandler(
         if (next.inView) return { ok: true, detail: next };
         if (Math.abs(next.rect.top - prevTop) < 2) break;
         if (fi < plan.flicks.length - 1 && flick.pauseAfterMs > 0) {
-          await pause(flick.pauseAfterMs);
+          await pace(flick.pauseAfterMs);
         }
       }
     }
@@ -1499,20 +1517,15 @@ export function createPageHelperHandler(
           rng,
         });
         const dispatchSteps = async (stepsSlice: typeof dragPlan.steps): Promise<InvokeResult> => {
-          let prevSendMs = 0;
+          const pace = createPacer();
           for (const step of stepsSlice) {
-            if (step.delayMs > 0) {
-              const rem = Math.max(0, step.delayMs - prevSendMs);
-              if (rem > 0) await pause(rem);
-            }
-            const t0 = now();
+            await pace(step.delayMs);
             const res = await cdp(
               "Input.dispatchMouseEvent",
               { type: "mouseMoved", x: step.x, y: step.y, button: "left", buttons: 1 },
               targetId,
               INPUT_TIMEOUT_MS,
             );
-            prevSendMs = Math.max(0, now() - t0);
             if (!res.ok) return res;
             state.pointer = { x: step.x, y: step.y };
           }
