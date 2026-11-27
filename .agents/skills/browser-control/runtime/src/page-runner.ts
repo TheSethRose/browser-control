@@ -84,6 +84,8 @@ export type Invoker = (operation: string, input?: Json) => Promise<InvokeResult>
 const NEED_INSTALL = "__BC_NEED_INSTALL__";
 /** Input events never return while a JavaScript dialog is open, so don't wait the full CDP timeout. */
 const INPUT_TIMEOUT_MS = 10_000;
+/** Natural typing: a dispatch this far behind its schedule is a stall, not round-trip latency. */
+const STALL_MS = 60;
 const MAX_VIEWPORT_DIM = 10_000_000;
 const DIALOG_HINT = "the page stopped responding; a JavaScript dialog is probably open (references/dom-and-input.md)";
 
@@ -330,7 +332,7 @@ export function createPageHelperHandler(
   /** Active human handoff id per extension tab id (at most one active handoff per tab). */
   const activeHandoffs = new Map<number, string>();
 
-  async function runBcCall(call: ReturnType<typeof normalizeHelperCall>, targetId: string, timeoutMs?: number): Promise<InvokeResult> {
+  async function runBcCall(call: ReturnType<typeof normalizeHelperCall>, targetId: string, timeoutMs?: number, noAttach = false): Promise<InvokeResult> {
     const order = backendOrder();
     const fn = options.bcCall ?? (order.includes("extension") ? getRegisteredExtensionBcCall() : undefined);
     if (!fn) {
@@ -345,6 +347,7 @@ export function createPageHelperHandler(
         steps: call.steps,
         join: call.join,
         ...(timeoutMs ? { timeoutMs } : {}),
+        ...(noAttach ? { noAttach } : {}),
       });
       return { ok: true, data };
     } catch (error) {
@@ -355,10 +358,10 @@ export function createPageHelperHandler(
     }
   }
 
-  async function evalHelper(call: HelperCall, targetId?: string, timeoutMs?: number): Promise<InvokeResult> {
+  async function evalHelper(call: HelperCall, targetId?: string, timeoutMs?: number, noAttach = false): Promise<InvokeResult> {
     const normalized = normalizeHelperCall(call);
     if (extensionTabOf(targetId) !== undefined) {
-      return runBcCall(normalized, targetId!, timeoutMs);
+      return runBcCall(normalized, targetId!, timeoutMs, noAttach);
     }
     const callExpr = renderSteps(normalized);
     const extra = { isolated: true, ...(targetId ? { targetId } : {}), ...(timeoutMs ? { timeoutMs } : {}) };
@@ -1096,22 +1099,19 @@ export function createPageHelperHandler(
       return success("ok");
     }
     // Default: natural typing — human cadence, rollover, real Shift, and self-corrected typos.
-    const plan = planTyping(text, {
-      rng,
-      speedFactor: typingSpeedFactor(),
-      fieldKind: opts.fieldKind ?? "none",
-    });
-    // A key is recorded as down before its keyDown goes out, so one that reached the page but
-    // timed out is still released. Events run against elapsed time, so round trips don't add up.
+    const plan = planTyping(text, { rng, speedFactor: typingSpeedFactor(), fieldKind: opts.fieldKind });
+    // A key is recorded as down before its keyDown goes out, so one that reached the page but timed out is
+    // still released. Events run on elapsed time, absorbing round trips; a stall past STALL_MS shifts the rest.
     const held = heldFor(targetId);
     await releaseKeys(targetId);
-    const start = now();
+    let start = now();
     let plannedAt = 0;
     try {
       for (const step of plan.events) {
         plannedAt += step.delayMs;
         const wait = start + plannedAt - now();
         if (wait > 0) await pause(wait);
+        else if (wait < -STALL_MS) start -= wait;
         // Emoji and other unmapped characters go as key text: keyDown with text, then keyUp.
         const spec: CharKeySpec =
           step.kind === "insert" ? { key: step.text, code: "", windowsVirtualKeyCode: 0, text: step.text } : step.spec;
@@ -1157,7 +1157,7 @@ export function createPageHelperHandler(
 
   /** Typo policy from the focused field's live type and flags (attach-free read); any doubt means none. */
   async function fieldKindOf(text: string, targetId?: string): Promise<FieldKind> {
-    const probe = await evalHelper({ kind: "bc", method: "typingField" }, targetId, 2_000);
+    const probe = await evalHelper({ kind: "bc", method: "typingField" }, targetId, 2_000, true);
     let f: { type?: unknown; flags?: unknown; hint?: unknown } = {};
     try {
       f = (probe.ok && JSON.parse(valueOf(probe))) || {};
@@ -1608,7 +1608,7 @@ export function createPageHelperHandler(
           const isPic = !quiet && (await picture.isPicture(targetId));
           const beforeHash = isPic ? await picture.canvasHash(targetId) : "";
           const before = quiet || isPic ? undefined : await evalHelper({ kind: "bc", method: "baseline" }, targetId);
-          const sent = await dispatchText(text, mode, targetId, { focused: true, fieldKind: "none" });
+          const sent = await dispatchText(text, mode, targetId, { focused: true });
           if (!sent.ok) return inputFailed(sent, "type --focused");
           const line = "type --focused: sent to whatever has focus (not read back)";
           if (isPic) return success(`${line}\n${await picture.pictureChanges(targetId, beforeHash)}`);

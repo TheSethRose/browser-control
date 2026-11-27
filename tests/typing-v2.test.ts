@@ -18,7 +18,7 @@ const PROSE =
 
 const SEEDS = (n: number) => Array.from({ length: n }, (_, i) => i + 1);
 const plan = (text: string, seed: number, opts: HumanTypingOptions = {}): TypingPlan =>
-  planTyping(text, { rng: createSeededRng(seed), ...opts });
+  planTyping(text, { rng: createSeededRng(seed), fieldKind: "prose", ...opts });
 
 /** Replay as a text editor: Shift and keyUp insert nothing, Backspace deletes one grapheme. */
 function replay(events: HumanKeystroke[]): string {
@@ -54,17 +54,13 @@ function charKeys(events: HumanKeystroke[]) {
 
 type Gap = { ms: number; a: string; b: string; shifted: boolean };
 
-function gaps(keys: Key[]): Gap[] {
-  return keys.slice(1).map((b, i) => {
-    const a = keys[i]!;
-    return { ms: b.down - a.down, a: a.ch, b: b.ch, shifted: (a.mod ?? 0) !== 0 || (b.mod ?? 0) !== 0 };
-  });
-}
+const gaps = (keys: Key[]): Gap[] =>
+  keys.slice(1).map((b, i) => ({ ms: b.down - keys[i]!.down, a: keys[i]!.ch, b: b.ch, shifted: Boolean(keys[i]!.mod || b.mod) }));
 
 const median = (xs: number[]): number => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)]!;
 const wpm = (text: string, p: TypingPlan): number => (text.length / 5) / (p.durationMs / 60000);
 
-describe("typing v2: determinism and replay", () => {
+describe("typing v2", () => {
   test("the same seed rebuilds the same plan, a new seed does not", () => {
     expect(plan(PROSE, 99)).toEqual(plan(PROSE, 99));
     expect(plan(PROSE, 100)).not.toEqual(plan(PROSE, 99));
@@ -84,10 +80,10 @@ describe("typing v2: determinism and replay", () => {
     ];
     for (const text of samples) for (const seed of SEEDS(15)) expect(replay(plan(text, seed).events)).toBe(text);
     for (const speedFactor of [0.85, 1, 1.15]) expect(replay(plan(PROSE, 4, { speedFactor }).events)).toBe(PROSE);
-    for (const heavy of ["abcdefghij klmnopqrst uvwxyz 0123456789", "cafe\u0301xyz nai\u0308ve 👍🏽ok Ünï"]) {
+    for (const heavy of ["abcdefghij klmnopqrst uvwxyz 0123456789", "cafe\u0301xyz nai\u0308ve 👍🏽ok Ünï", "\u0600abcdef"]) {
       for (const seed of SEEDS(40)) {
         const p = plan(heavy, seed, { typoRate: 0.6, maxTypos: 30 });
-        expect(p.typos).toBeGreaterThan(1);
+        expect(p.typos).toBeGreaterThan(0);
         expect(replay(p.events)).toBe(heavy);
       }
     }
@@ -97,13 +93,15 @@ describe("typing v2: determinism and replay", () => {
       }
     }
   });
-});
 
-describe("typing v2: speed, rhythm and rollover", () => {
-  test("median prose speed lands in the 75-95 wpm band", () => {
-    const med = median(SEEDS(40).map((seed) => wpm(PROSE, plan(PROSE, seed))));
-    expect(med).toBeGreaterThanOrEqual(75);
-    expect(med).toBeLessThanOrEqual(95);
+  test("median prose speed lands in the 75-95 wpm band, and Shift barely slows title case", () => {
+    const meds = [PROSE, PROSE.replace(/\b[a-z]/g, (c) => c.toUpperCase())].map((text) => {
+      const med = median(SEEDS(61).map((seed) => wpm(text, plan(text, seed))));
+      expect(med).toBeGreaterThanOrEqual(75);
+      expect(med).toBeLessThanOrEqual(95);
+      return med;
+    });
+    expect(meds[1]! / meds[0]!).toBeGreaterThanOrEqual(0.98);
   });
 
   test("within-word gaps sit in 45-100 ms, nothing under 40 ms, and pauses stay rare", () => {
@@ -134,9 +132,7 @@ describe("typing v2: speed, rhythm and rollover", () => {
     expect(rolled / fast).toBeGreaterThanOrEqual(0.2);
     expect(rolled / fast).toBeLessThanOrEqual(0.4);
   });
-});
 
-describe("typing v2: real modifiers", () => {
   test("Shift goes down before and up after every capital and shifted symbol", () => {
     const text = "Hello Big World: 2026! (yes) @ $5 total?";
     const { keys, shiftDowns, shiftUps } = charKeys(plan(text, 5).events);
@@ -174,18 +170,13 @@ describe("typing v2: real modifiers", () => {
     }
     // Consecutive capitals hold one Shift across the run.
     const nasa = charKeys(plan("NASA", 8).events);
-    expect(nasa.shiftDowns).toHaveLength(1);
-    expect(nasa.shiftUps).toHaveLength(1);
+    expect([nasa.shiftDowns.length, nasa.shiftUps.length]).toEqual([1, 1]);
     expect(replay(plan("NASA", 8).events)).toBe("NASA");
   });
-});
 
-describe("typing v2: typos", () => {
   test("typo rates stay in band per field kind, every kind appears, every typo is corrected", () => {
     const stats = (text: string, seeds: number, opts: HumanTypingOptions = {}) => {
-      let typos = 0;
-      let chars = 0;
-      let backspaces = 0;
+      let [typos, chars, backspaces] = [0, 0, 0];
       const kinds = new Set<string>();
       for (const seed of SEEDS(seeds)) {
         const p = plan(text, seed, opts);
@@ -205,12 +196,10 @@ describe("typing v2: typos", () => {
     expect(email.rate).toBeGreaterThanOrEqual(0.005);
     expect(email.rate).toBeLessThanOrEqual(0.01);
   });
-});
 
-describe("typing v2: no typos where they would hurt", () => {
-  test("fast, keys, focused and secure fields (fieldKind none) never type a typo", () => {
+  test("fieldKind none, the default, never types a typo", () => {
     for (const seed of SEEDS(30)) {
-      const p = plan(PROSE, seed, { fieldKind: "none" });
+      const p = planTyping(PROSE, { rng: createSeededRng(seed) });
       expect(p.typos).toBe(0);
       expect(replay(p.events)).toBe(PROSE);
     }

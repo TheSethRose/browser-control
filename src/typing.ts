@@ -187,11 +187,7 @@ const gauss = (rng: () => number): number =>
   Math.sqrt(-2 * Math.log(Math.max(1e-9, rng()))) * Math.cos(2 * Math.PI * rng());
 const logNormal = (rng: () => number, median: number, sigma: number): number => median * Math.exp(sigma * gauss(rng));
 
-interface Unit {
-  ch: string;
-  spec: CharKeySpec | null;
-  back?: boolean;
-}
+type Unit = { ch: string; spec: CharKeySpec | null; back?: boolean };
 
 export type TypoKind = "adjacent" | "transpose" | "double" | "drop";
 
@@ -216,15 +212,18 @@ function planUnits(
   const backspaces = (n: number) => {
     for (let k = 0; k < n; k++) units.push({ ch: "", spec: BACKSPACE_SPEC, back: true });
   };
-  // A typo span stays inside printable ASCII, where one Backspace deletes one typed character.
+  // A typo span stays on printable ASCII characters that are each their own grapheme in the full
+  // text, so one Backspace deletes one typed character and nothing joins a neighbor.
+  const graphemes = [...new Intl.Segmenter().segment(chars.join(""))];
+  const solo = graphemes.flatMap(({ segment }) => [...segment].map((_, _k, cps) => cps.length === 1));
   const asciiRun = new Array<number>(chars.length + 1).fill(0);
-  for (let k = chars.length - 1; k >= 0; k--) asciiRun[k] = /^[ -~]$/.test(chars[k]!) ? asciiRun[k + 1]! + 1 : 0;
+  for (let k = chars.length - 1; k >= 0; k--) asciiRun[k] = solo[k] && /^[ -~]$/.test(chars[k]!) ? asciiRun[k + 1]! + 1 : 0;
   let typos = 0;
   let i = 0;
   while (i < chars.length) {
     const ch = chars[i]!;
     const room = asciiRun[i]! - 2;
-    const plain = !/\s/.test(ch) && !/\s/.test(chars[i - 1] ?? "");
+    const plain = !/\s/.test(ch) && /^[!-~]?$/.test(chars[i - 1] ?? "");
     const wantTypo = typoRate > 0 && typos < maxTypos && plain && room >= 0 && rng() < typoRate;
     if (!wantTypo) {
       pushChar(ch);
@@ -297,11 +296,10 @@ function gapBetween(cur: Unit, next: Unit, rng: () => number): number {
 export function planTyping(text: string, opts: HumanTypingOptions = {}): TypingPlan {
   const rng = opts.rng ?? Math.random;
   const chars = Array.from(text);
-  const fieldKind = opts.fieldKind ?? "prose";
+  const fieldKind = opts.fieldKind ?? "none";
   const speed = clamp(opts.speedFactor ?? 1, 0.6, 1.4);
   const typoRate =
-    opts.typoRate ??
-    (fieldKind === "prose" ? PROSE_TYPO_RATE : fieldKind === "structured" ? STRUCTURED_TYPO_RATE : 0);
+    opts.typoRate ?? (fieldKind === "prose" ? PROSE_TYPO_RATE : fieldKind === "structured" ? STRUCTURED_TYPO_RATE : 0);
   const maxTypos = opts.maxTypos ?? Math.max(1, Math.round(chars.length * 0.05));
   if (chars.length === 0) return { events: [], typos: 0, typoKinds: [], chars: 0, durationMs: 0 };
 
@@ -327,25 +325,19 @@ export function planTyping(text: string, opts: HumanTypingOptions = {}): TypingP
   for (let j = 0; j + 1 < units.length; j++) {
     const cur = units[j]!;
     const next = units[j + 1]!;
-    if (cur.back || next.back || !cur.spec || !next.spec) continue;
-    if ((cur.spec.modifiers ?? 0) !== 0 || (next.spec.modifiers ?? 0) !== 0) continue;
-    if (cur.ch === " " || next.ch === " ") continue;
+    if (cur.back || next.back || !cur.spec || !next.spec || cur.spec.modifiers || next.spec.modifiers) continue;
     // A keyboard can't press the same key twice without releasing it first.
-    if (cur.ch === next.ch) continue;
-    const gap = starts[j + 1]! - starts[j]!;
-    if (gap > FAST_PAIR_MS) continue;
-    if (rng() >= ROLLOVER_CHANCE) continue;
+    if (cur.ch === " " || next.ch === " " || cur.ch === next.ch) continue;
+    if (starts[j + 1]! - starts[j]! > FAST_PAIR_MS || rng() >= ROLLOVER_CHANCE) continue;
     ups[j] = starts[j + 1]! + 5 + rng() * 16;
   }
 
   // Shift runs: Shift goes down after every earlier key is up, spans consecutive capitals or shifted
-  // symbols, and comes up before the next key goes down. Too short a gap delays the later keys.
+  // symbols, and comes up before the next key goes down. A tight gap shortens Shift's lead and lag
+  // to their minimum first; only a gap too short for that delays the later keys.
   const isShifted = (u: Unit) => (u.spec?.modifiers ?? 0) === SHIFT;
   const delayFrom = (from: number, by: number) => {
-    for (let k = from; k < units.length; k++) {
-      starts[k] = starts[k]! + by;
-      ups[k] = ups[k]! + by;
-    }
+    for (let k = from; k < units.length; k++) [starts[k], ups[k]] = [starts[k]! + by, ups[k]! + by];
   };
   const shiftRuns: Array<[number, number]> = [];
   let prevUp = -Infinity;
@@ -358,13 +350,11 @@ export function planTyping(text: string, opts: HumanTypingOptions = {}): TypingP
     let last = j;
     while (last + 1 < units.length && isShifted(units[last + 1]!)) last++;
     for (; scanned < j; scanned++) prevUp = Math.max(prevUp, ups[scanned]!);
-    let down = starts[j]! - (30 + rng() * 58);
-    if (down < prevUp + 4) {
-      delayFrom(j, prevUp + 4 - down);
-      down = prevUp + 4;
-    }
-    const up = ups[last]! + 20 + rng() * 48;
-    if (last + 1 < units.length && starts[last + 1]! < up + 4) delayFrom(last + 1, up + 4 - starts[last + 1]!);
+    const down = Math.max(starts[j]! - (30 + rng() * 58), prevUp + 4);
+    if (starts[j]! < down + 25) delayFrom(j, down + 25 - starts[j]!);
+    const nextAt = last + 1 < units.length ? starts[last + 1]! : Infinity;
+    const up = Math.max(Math.min(ups[last]! + 20 + rng() * 48, nextAt - 4), ups[last]! + 15);
+    if (nextAt < up + 4) delayFrom(last + 1, up + 4 - nextAt);
     shiftRuns.push([down, up]);
     j = last + 1;
   }
@@ -400,11 +390,5 @@ export function planTyping(text: string, opts: HumanTypingOptions = {}): TypingP
     events.push({ ...item.ev, delayMs });
     prevAt = item.at;
   }
-  return {
-    events,
-    typos,
-    typoKinds,
-    chars: chars.length,
-    durationMs: Math.round((out.at(-1)?.at ?? 0) / speed),
-  };
+  return { events, typos, typoKinds, chars: chars.length, durationMs: Math.round((out.at(-1)?.at ?? 0) / speed) };
 }

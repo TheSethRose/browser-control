@@ -745,6 +745,8 @@ export type BcCallInput = {
   join?: string;
   frameId?: number;
   timeoutMs?: number;
+  /** Fail a stalled call plainly; never attach the debugger to probe for a dialog. */
+  noAttach?: boolean;
 };
 
 export type BcCallFn = (input: BcCallInput) => Promise<{ value: unknown }>;
@@ -1870,6 +1872,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
         steps: input.steps,
         ...frameParam(input.frameId ?? extensionFrameOf(input.targetId)),
         ...(typeof input.timeoutMs === "number" ? { timeoutMs: input.timeoutMs } : {}),
+        ...(input.noAttach ? { noAttach: true } : {}),
       },
       reqTimeout,
     )) as { values?: unknown[] };

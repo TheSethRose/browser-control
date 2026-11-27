@@ -290,23 +290,27 @@ describe("daemon page helpers", () => {
     await stuckHandle("dialog", { sub: "accept" });
     expect(keys(stuck.calls).at(-1)).toMatchObject({ type: "keyUp", key: "h" });
 
-    // Events run against elapsed time, so 8 ms per CDP round trip doesn't slow the typing.
+    // Events run against elapsed time, so 8 ms per CDP round trip doesn't slow the typing,
+    // and after one 500 ms stall the later gaps keep their planned length.
     const line = "She packed her bag before dawn, then walked to the station. Nobody spoke on the train.";
-    const typedFor = async (latency: number) => {
+    const dispatchTimes = async (latency: number, stallAt = -1) => {
       let clock = 0;
       const at: number[] = [];
       const m = makeFakeInvoker({
         field: live("text"),
         onCdp: (method) => {
-          if (method === "Input.dispatchKeyEvent") at.push((clock += latency));
+          if (method === "Input.dispatchKeyEvent") at.push((clock += at.length === stallAt ? 500 : latency));
           return undefined;
         },
       });
       const opts = { rng: createSeededRng(7), now: () => clock, sleep: async (ms: number) => void (clock += ms) };
       await createPageHelperHandler(m.invoke, undefined, undefined, opts)("type", { ref: "e2", text: line, quiet: true });
-      return (line.length / 5) / ((at.at(-1)! - at[0]!) / 60000);
+      return at;
     };
-    const [ideal, slow] = [await typedFor(0), await typedFor(8)];
+    const steps = (at: number[]) => at.slice(1).map((t, i) => t - at[i]!);
+    expect(steps(await dispatchTimes(0, 20)).slice(21)).toEqual(steps(await dispatchTimes(0)).slice(21));
+    const wpmOf = (at: number[]) => (line.length / 5) / ((at.at(-1)! - at[0]!) / 60000);
+    const [ideal, slow] = [wpmOf(await dispatchTimes(0)), wpmOf(await dispatchTimes(8))];
     expect(Math.abs(slow - ideal) / ideal).toBeLessThan(0.01);
     expect(slow).toBeGreaterThanOrEqual(75 * 0.85);
     expect(slow).toBeLessThanOrEqual(95 * 1.15);

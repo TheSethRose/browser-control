@@ -668,7 +668,7 @@ export async function runBcSilent(tabId, steps, opts = {}) {
   });
   earlyProbePromise.catch(() => {});
 
-  if (probeDelayMs < timeoutMs) {
+  if (probeDelayMs < timeoutMs && !opts.noAttach) {
     probeTimer = setTimeout(() => {
       if (settled || cancelled || !tabAllowed(tabId)) return;
       const known = debuggerHub.getOpenDialog(tabId);
@@ -718,7 +718,7 @@ export async function runBcSilent(tabId, steps, opts = {}) {
   } catch (err) {
     cancelled = true;
     if (timedOut || String(err?.message || "") === "__BC_TIMEOUT__") {
-      const dialogErr = await probeOpenDialog(tabId, { allowUnconfirmed: true, waitMs: 1_000 });
+      const dialogErr = opts.noAttach ? null : await probeOpenDialog(tabId, { allowUnconfirmed: true, waitMs: 1_000 });
       throw (
         dialogErr ||
         new Error(
@@ -1200,7 +1200,8 @@ async function handleRequest(msg) {
     }
 
     case "bc_call": {
-      const values = await runBcSilent(tabId, params.steps || [], { frameId: params.frameId, timeoutMs: params.timeoutMs });
+      const opts = { frameId: params.frameId, timeoutMs: params.timeoutMs, noAttach: params.noAttach === true };
+      const values = await runBcSilent(tabId, params.steps || [], opts);
       return { values };
     }
 
