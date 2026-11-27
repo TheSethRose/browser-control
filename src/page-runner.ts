@@ -85,6 +85,13 @@ export type Invoker = (operation: string, input?: Json) => Promise<InvokeResult>
 const NEED_INSTALL = "__BC_NEED_INSTALL__";
 /** Input events never return while a JavaScript dialog is open, so don't wait the full CDP timeout. */
 const INPUT_TIMEOUT_MS = 10_000;
+/**
+ * Chrome acks a mouse move or wheel event only once the page has handled it, which for these events waits on the
+ * next painted frame. A page that is not painting (headless CI, a throttled renderer) acks about once a second, so a
+ * 20-40 step natural path took 20-45 s. One ack slower than this, or a path past its budget, ends the human motion.
+ */
+const SLOW_INPUT_ACK_MS = 250;
+const NATURAL_MOTION_BUDGET_MS = 2_500;
 const MAX_VIEWPORT_DIM = 10_000_000;
 const DIALOG_HINT = "the page stopped responding; a JavaScript dialog is probably open (references/dom-and-input.md)";
 
@@ -693,22 +700,35 @@ export function createPageHelperHandler(
       overshootProb: opts.overshootProb,
       rng,
     });
+    return dispatchPath(plan.steps, {
+      ...(opts.button !== undefined ? { button: opts.button } : {}),
+      ...(opts.buttons !== undefined ? { buttons: opts.buttons } : {}),
+    }, targetId);
+  }
+
+  /**
+   * Send a planned pointer path as trusted mouseMoved events. Once a step acks slowly or the path runs past its
+   * budget, the remaining steps collapse into one move to the end point, so the pointer still lands where planned.
+   */
+  async function dispatchPath(
+    steps: ReadonlyArray<{ x: number; y: number; delayMs: number }>,
+    extra: Json,
+    targetId: string | undefined,
+    onMoved?: (at: Point2D) => void,
+  ): Promise<InvokeResult> {
     const pace = createPacer();
-    for (const step of plan.steps) {
+    const start = now();
+    for (let i = 0; i < steps.length; i++) {
+      const step = steps[i]!;
       await pace(step.delayMs);
-      const res = await cdp(
-        "Input.dispatchMouseEvent",
-        {
-          type: "mouseMoved",
-          x: step.x,
-          y: step.y,
-          ...(opts.button !== undefined ? { button: opts.button } : {}),
-          ...(opts.buttons !== undefined ? { buttons: opts.buttons } : {}),
-        },
-        targetId,
-        INPUT_TIMEOUT_MS,
-      );
+      const sent = now();
+      const res = await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: step.x, y: step.y, ...extra }, targetId, INPUT_TIMEOUT_MS);
       if (!res.ok) return res;
+      onMoved?.({ x: step.x, y: step.y });
+      const done = now();
+      if (i < steps.length - 2 && (done - sent > SLOW_INPUT_ACK_MS || done - start > NATURAL_MOTION_BUDGET_MS)) {
+        i = steps.length - 2; // the next pass sends the end point
+      }
     }
     return success("ok");
   }
@@ -919,11 +939,14 @@ export function createPageHelperHandler(
 
       const plan = planWheelScroll(neededDeltaY, rng);
       const pace = createPacer();
-      for (let fi = 0; fi < plan.flicks.length; fi++) {
+      const start = now();
+      let slow = false;
+      for (let fi = 0; fi < plan.flicks.length && !slow; fi++) {
         const flick = plan.flicks[fi]!;
         const prevTop = cur.rect.top;
         for (const ev of flick.events) {
           await pace(ev.delayMs);
+          const sent = now();
           const wres = await cdp(
             "Input.dispatchMouseEvent",
             { type: "mouseWheel", x: anchor.x, y: anchor.y, deltaX: 0, deltaY: ev.deltaY },
@@ -931,7 +954,14 @@ export function createPageHelperHandler(
             INPUT_TIMEOUT_MS,
           );
           if (!wres.ok) return { ok: false, res: wres };
+          const done = now();
+          // A page acking wheel events this slowly scrolls instantly below instead.
+          if (done - sent > SLOW_INPUT_ACK_MS || done - start > NATURAL_MOTION_BUDGET_MS) {
+            slow = true;
+            break;
+          }
         }
+        if (slow) break;
         const probe = await evalHelper(
           { kind: "bc", method: "point", args: [ref, { noScroll: true, detail: true }] },
           targetId,
@@ -1603,21 +1633,8 @@ export function createPageHelperHandler(
           overshootProb: 0,
           rng,
         });
-        const dispatchSteps = async (stepsSlice: typeof dragPlan.steps): Promise<InvokeResult> => {
-          const pace = createPacer();
-          for (const step of stepsSlice) {
-            await pace(step.delayMs);
-            const res = await cdp(
-              "Input.dispatchMouseEvent",
-              { type: "mouseMoved", x: step.x, y: step.y, button: "left", buttons: 1 },
-              targetId,
-              INPUT_TIMEOUT_MS,
-            );
-            if (!res.ok) return res;
-            state.pointer = { x: step.x, y: step.y };
-          }
-          return success("ok");
-        };
+        const dispatchSteps = (stepsSlice: typeof dragPlan.steps): Promise<InvokeResult> =>
+          dispatchPath(stepsSlice, { button: "left", buttons: 1 }, targetId, (at) => { state.pointer = at; });
 
         if (info.draggable) {
           const waitDrag = invoke("wait_for_event", { method: "Input.dragIntercepted", timeoutMs: 1200, ...(targetId ? { targetId } : {}) });
