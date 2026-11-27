@@ -337,12 +337,26 @@ async function main(): Promise<number> {
     await checkEval("handoff-done-cleared", "String(!!document.querySelector('[data-bc-handoff-host]'))", /false/);
     await checkEval("handoff-tab-usable", "document.title", /E2E Fixture/);
 
+    // Restricted chrome:// page refuses with EXTENSION_ONLY and never connects to CDP.
+    await check("restricted-chrome-nav", ["nav", "chrome://version"], /EXTENSION_ONLY/);
+    await check("restricted-chrome-eval", ["eval", "document.title"], /EXTENSION_ONLY/);
+    const statusAfterRestricted = await bc(["status"]);
+    record(
+      "restricted-no-cdp",
+      /"connected":\s*false/.test(statusAfterRestricted) && !/"alsoConnected"/.test(statusAfterRestricted),
+      statusAfterRestricted,
+    );
+    await check("return-after-restricted", ["nav", `${base}/`], /E2E Fixture/);
+
     // The backends file the wrapper writes steers the shipped daemon and outranks the env var.
     const tid = /extension:[A-Za-z0-9:@-]*[A-Za-z0-9]/.exec(await bc(["tabs"]))?.[0] ?? "";
     record("tab-id", tid !== "", tid);
+    const backendsFile = join(daemonDir, "backends");
     await check("disable", ["extension", "disable"], /"backends":"cdp"/);
+    record("disable-wrote-cdp", existsSync(backendsFile) && readFileSync(backendsFile, "utf8").trim() === "cdp", backendsFile);
     await check("disabled-refuses", ["eval", "document.title", tid], /extension backend is disabled/);
-    await check("enable", ["extension", "enable"], /"backends":"extension,cdp"/);
+    await check("enable", ["extension", "enable"], /"orderFile":"removed"/);
+    record("enable-deleted-file", !existsSync(backendsFile), backendsFile);
     await check("enabled-works", ["eval", "document.title", tid], /E2E Fixture/);
     return results.some((r) => !r.ok) ? 1 : 0;
   } catch (error) {

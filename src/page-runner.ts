@@ -10,7 +10,12 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { runBrowse, type Runner } from "./backends/browse";
-import { backendOrder } from "./backends/router";
+import {
+  backendOrder,
+  extensionOnlyMessage,
+  isBackendUnavailable,
+  isExtensionOnlyOrder,
+} from "./backends/router";
 import { extensionFrameTarget, extensionTabOf, getRegisteredExtensionBcCall, type BcCallFn } from "./backends/extension";
 import {
   SHORT_PAGE_CHARS,
@@ -271,9 +276,13 @@ export function createPageHelperHandler(
   const activeHandoffs = new Map<number, string>();
 
   async function runBcCall(call: ReturnType<typeof normalizeHelperCall>, targetId: string, timeoutMs?: number): Promise<InvokeResult> {
-    const fn = options.bcCall ?? (backendOrder().includes("extension") ? getRegisteredExtensionBcCall() : undefined);
+    const order = backendOrder();
+    const fn = options.bcCall ?? (order.includes("extension") ? getRegisteredExtensionBcCall() : undefined);
     if (!fn) {
-      return failure("EXECUTION_FAILED", "BACKEND_UNAVAILABLE: extension backend is not active");
+      const msg = isExtensionOnlyOrder(order)
+        ? extensionOnlyMessage("the extension backend isn't active")
+        : "BACKEND_UNAVAILABLE: extension backend is not active";
+      return failure("EXECUTION_FAILED", msg);
     }
     try {
       const data = await fn({
@@ -284,6 +293,9 @@ export function createPageHelperHandler(
       });
       return { ok: true, data };
     } catch (error) {
+      if (isBackendUnavailable(error) && isExtensionOnlyOrder(order)) {
+        return failure("EXECUTION_FAILED", extensionOnlyMessage(error));
+      }
       return helperError(failure("EXECUTION_FAILED", (error as Error).message));
     }
   }
@@ -328,7 +340,16 @@ export function createPageHelperHandler(
 
   const picture = createPictureTracker(invoke, evalHelper, recognize);
 
-  async function resolveTargetBackend(targetId?: string): Promise<{ browseTab?: number; extensionTarget?: string }> {
+  type ResolvedTarget = {
+    browseTab?: number;
+    extensionTarget?: string;
+    cdpTarget?: string;
+    extensionOnly?: boolean;
+    extensionAvailable?: boolean;
+    activeBackend?: string | null;
+  };
+
+  async function resolveTargetBackend(targetId?: string): Promise<ResolvedTarget> {
     if (targetId !== undefined) {
       return {
         browseTab: browseTabNumber(targetId),
@@ -337,19 +358,30 @@ export function createPageHelperHandler(
     }
     const status = await invoke("get_browser_status");
     if (!status.ok) return {};
-    const backends = (status.data as Json)["backends"] as Json | undefined;
-    if (backends?.["active"] === "browse") {
-      const browseState = backends["browse"] as Json | undefined;
-      return { browseTab: browseTabNumber(browseState?.["activeTargetId"]) };
+    const data = status.data as Json;
+    const backends = data["backends"] as Json | undefined;
+    const activeBackend = typeof backends?.["active"] === "string" ? (backends["active"] as string) : null;
+    const order = Array.isArray(backends?.["order"]) ? (backends["order"] as string[]) : undefined;
+    const extensionOnly = order ? isExtensionOnlyOrder(order) : false;
+    const extState = backends?.["extension"] as Json | undefined;
+    const extensionAvailable = typeof extState?.["available"] === "boolean" ? extState["available"] : undefined;
+    if (activeBackend === "browse") {
+      const browseState = backends?.["browse"] as Json | undefined;
+      return { browseTab: browseTabNumber(browseState?.["activeTargetId"]), extensionOnly, extensionAvailable, activeBackend };
     }
-    if (backends?.["active"] === "extension") {
-      const extState = backends["extension"] as Json | undefined;
+    if (activeBackend === "extension") {
       const activeId = extState?.["activeTargetId"];
-      if (extensionTabOf(activeId) !== undefined) {
-        return { extensionTarget: activeId as string };
-      }
+      return {
+        extensionTarget: extensionTabOf(activeId) !== undefined ? (activeId as string) : undefined,
+        extensionOnly,
+        extensionAvailable,
+        activeBackend,
+      };
     }
-    return {};
+    const cdpAllowed =
+      backends === undefined || activeBackend === "cdp" || (activeBackend === null && (!order || order.includes("cdp")));
+    const cdpTarget = cdpAllowed && typeof data["activeTargetId"] === "string" ? (data["activeTargetId"] as string) : undefined;
+    return { cdpTarget, extensionOnly, extensionAvailable, activeBackend };
   }
 
   async function callBrowse(tool: string, args: Json, timeoutMs = 60_000): Promise<InvokeResult> {
@@ -439,13 +471,17 @@ export function createPageHelperHandler(
   ): Promise<{ ok: true; objectId: string } | { ok: false; res: InvokeResult }> {
     const expr = renderElementStep(target);
     if (extensionTabOf(targetId) !== undefined) {
+      const order = backendOrder();
       const extRequest =
         options.extensionRequest ??
         ((globalThis as Record<symbol, unknown>)[EXTENSION_REQUEST_SYMBOL] as ExtensionRequestFn | undefined);
       if (!extRequest) {
+        const msg = isExtensionOnlyOrder(order)
+          ? extensionOnlyMessage("the extension backend isn't active")
+          : "BACKEND_UNAVAILABLE: extension backend is not active";
         return {
           ok: false,
-          res: failure("EXECUTION_FAILED", "BACKEND_UNAVAILABLE: extension backend is not active"),
+          res: failure("EXECUTION_FAILED", msg),
         };
       }
       const reqParams: Json =
@@ -463,6 +499,9 @@ export function createPageHelperHandler(
         }
         return { ok: true, objectId };
       } catch (err) {
+        if (isBackendUnavailable(err) && isExtensionOnlyOrder(order)) {
+          return { ok: false, res: failure("EXECUTION_FAILED", extensionOnlyMessage(err)) };
+        }
         return { ok: false, res: helperError(failure("EXECUTION_FAILED", (err as Error).message)) };
       }
     }
@@ -1574,15 +1613,15 @@ export function createPageHelperHandler(
   const mediaByTarget = new Map<string, Map<string, string>>();
   const emulateQueue = new Map<string, Promise<unknown>>();
 
-  /** Pin emulate to a real tab id and run one emulate per tab at a time, so the media cache stays right. */
-  async function runEmulate(input: Json, targetId: string | undefined, browseTab: number | undefined): Promise<InvokeResult> {
+  /** Pin emulate to the active route's tab id and run one emulate per tab at a time, so the media cache stays right. */
+  async function runEmulate(
+    input: Json,
+    targetId: string | undefined,
+    browseTab: number | undefined,
+    cdpTarget: string | undefined,
+  ): Promise<InvokeResult> {
     if (browseTab !== undefined) return runEmulateNow(input, targetId, browseTab);
-    let pinned = targetId;
-    if (pinned === undefined) {
-      const status = await invoke("get_browser_status");
-      const active = status.ok ? (status.data as Json)["activeTargetId"] : undefined;
-      if (typeof active === "string") pinned = active;
-    }
+    const pinned = targetId ?? cdpTarget;
     const key = pinned ?? "";
     const run = (emulateQueue.get(key) ?? Promise.resolve()).then(() => runEmulateNow(input, pinned, browseTab));
     const tail = run.catch(() => undefined);
@@ -1734,11 +1773,16 @@ export function createPageHelperHandler(
   async function runHandoff(
     input: Json,
     targetId: string | undefined,
-    extensionTarget: string | undefined,
+    resolved: ResolvedTarget,
   ): Promise<InvokeResult> {
-    const extTarget = extensionTabOf(targetId) !== undefined ? targetId : extensionTarget;
+    const extTarget = extensionTabOf(targetId) !== undefined ? targetId : resolved.extensionTarget;
     const extTabId = extensionTabOf(extTarget);
+    const extOnly = resolved.extensionOnly ?? isExtensionOnlyOrder();
     if (!extTarget || extTabId === undefined) {
+      if (targetId === undefined && extOnly && resolved.activeBackend !== "cdp") {
+        const cause = resolved.extensionAvailable === false ? "extension is not connected" : "no extension tab is selected";
+        return failure("EXECUTION_FAILED", extensionOnlyMessage(cause));
+      }
       return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: handoff requires an extension tab");
     }
 
@@ -1759,12 +1803,18 @@ export function createPageHelperHandler(
 
     const callExtensionHandoff = async (op: "handoff_start" | "handoff_clear", params: Json): Promise<InvokeResult> => {
       if (!extRequest) {
-        return failure("EXECUTION_FAILED", "BACKEND_UNAVAILABLE: handoff requires the browser-control extension relay");
+        const msg = extOnly
+          ? extensionOnlyMessage("handoff requires the browser-control extension relay")
+          : "BACKEND_UNAVAILABLE: handoff requires the browser-control extension relay";
+        return failure("EXECUTION_FAILED", msg);
       }
       try {
         const result = await extRequest(op, { targetId: extTarget, ...params });
         return { ok: true, data: { result } };
       } catch (err) {
+        if (isBackendUnavailable(err) && extOnly) {
+          return failure("EXECUTION_FAILED", extensionOnlyMessage(err));
+        }
         return failure("EXECUTION_FAILED", (err as Error).message);
       }
     };
@@ -2083,7 +2133,8 @@ export function createPageHelperHandler(
   }
 
   async function handlePage(action: string, input: Json, rawTargetId?: string): Promise<InvokeResult> {
-    const { browseTab, extensionTarget } = await resolveTargetBackend(rawTargetId);
+    const resolved = await resolveTargetBackend(rawTargetId);
+    const { browseTab, extensionTarget, cdpTarget } = resolved;
     const targetId = rawTargetId ?? extensionTarget;
     const quiet = input["quiet"] === true;
 
@@ -2203,10 +2254,10 @@ export function createPageHelperHandler(
         return runDialog(input, targetId, browseTab);
 
       case "emulate":
-        return runEmulate(input, targetId, browseTab);
+        return runEmulate(input, targetId, browseTab, cdpTarget);
 
       case "handoff":
-        return runHandoff(input, targetId, extensionTarget);
+        return runHandoff(input, targetId, resolved);
 
       case "do": {
         const steps = parseSteps(input);
@@ -2519,6 +2570,8 @@ export function createPageHelperHandler(
           let wall = "";
           if (state.ok) {
             [final = "", wall = ""] = valueOf(state).split("\n");
+          } else if (messageOf(state).startsWith("EXTENSION_ONLY:")) {
+            return state;
           }
           const challengeBackend = challengeBackendOf(tab);
           const challenge = await checkChallenge(tab, { wallHint: wall, knownUrl: final || url });

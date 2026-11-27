@@ -1,5 +1,6 @@
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createPageHelperHandler, dispatchExtensionRequest, handleExtensionRoute } from "../daemon";
@@ -64,15 +65,16 @@ describe("wrapper extension subcommands", () => {
     });
   }
 
-  test("extension enable / disable write the daemon dir's backends file", async () => {
+  test("extension disable writes cdp and extension enable deletes the daemon dir's backends file", async () => {
     const file = join(dir, "daemon", "backends");
-    let res = await bc("extension", "enable");
+    let res = await bc("extension", "disable");
     expect(res.code).toBe(0);
-    expect(JSON.parse(res.stdout)).toEqual({ ok: true, data: { backends: "extension,cdp" } });
-    expect((await readFile(file, "utf8")).trim()).toBe("extension,cdp");
-    res = await bc("extension", "disable");
-    expect(res.code).toBe(0);
+    expect(JSON.parse(res.stdout)).toEqual({ ok: true, data: { backends: "cdp" } });
     expect((await readFile(file, "utf8")).trim()).toBe("cdp");
+    res = await bc("extension", "enable");
+    expect(res.code).toBe(0);
+    expect(JSON.parse(res.stdout)).toEqual({ ok: true, data: { orderFile: "removed" } });
+    expect(existsSync(file)).toBe(false);
   });
 
   for (const sub of ["pair", "revoke"]) {
@@ -101,29 +103,33 @@ describe("wrapper extension subcommands", () => {
     expect(JSON.parse(res.stdout).error.code).toBe("INPUT_INVALID");
   });
 
-  test("extension setup pairs, enables the backend, and prints no secret", async () => {
+  test("extension setup pairs, removes any old daemon backends override, and prints no secret", async () => {
     const ext = join(dir, "ext");
     await mkdir(ext, { recursive: true });
     await writeFile(join(ext, "manifest.json"), "{}");
-    await rm(join(dir, "daemon", "backends"), { force: true });
+    await writeFile(join(dir, "daemon", "backends"), "extension,cdp\n");
     const res = await bc("extension", "setup", ext);
     expect(res.code).toBe(0);
     const out = JSON.parse(res.stdout);
-    expect(out.data).toMatchObject({ paired: true, backends: "extension,cdp", extensionDir: ext });
+    expect(out.data).toMatchObject({ paired: true, orderFile: "removed", extensionDir: ext });
+    expect(out.data.backends).toBeUndefined();
     const pairing = JSON.parse(await readFile(join(ext, "pairing.json"), "utf8")) as { token: string };
     expect(pairing.token).toMatch(/^[0-9a-f]{64}$/);
     expect(res.stdout).not.toContain(pairing.token);
     expect((await stat(join(ext, "pairing.json"))).mode & 0o777).toBe(0o600);
-    expect((await readFile(join(dir, "daemon", "backends"), "utf8")).trim()).toBe("extension,cdp");
+    expect(existsSync(join(dir, "daemon", "backends"))).toBe(false);
   });
 });
 
-describe("daemon backends file", () => {
+describe("daemon backends file and paired default", () => {
   const saved = process.env["BROWSER_CONTROL_BACKENDS"];
+  const savedXdg = process.env["XDG_CONFIG_HOME"];
   afterEach(() => {
     setDaemonBackendsFile(undefined);
     if (saved === undefined) delete process.env["BROWSER_CONTROL_BACKENDS"];
     else process.env["BROWSER_CONTROL_BACKENDS"] = saved;
+    if (savedXdg === undefined) delete process.env["XDG_CONFIG_HOME"];
+    else process.env["XDG_CONFIG_HOME"] = savedXdg;
   });
 
   test("the daemon dir's file wins over BROWSER_CONTROL_BACKENDS and is re-read on every call", async () => {
@@ -135,6 +141,40 @@ describe("daemon backends file", () => {
     expect(backendOrder()).toEqual(["cdp"]);
     await writeFile(file, "extension,cdp\n");
     expect(backendOrder()).toEqual(["extension", "cdp"]);
+    await rm(file, { force: true });
+    expect(backendOrder()).toEqual(["extension"]);
+  });
+
+  test("with no order set, unpaired defaults to cdp and paired defaults to extension", async () => {
+    const isoXdg = await mkdtemp(join(tmpdir(), "bc-order-xdg-"));
+    try {
+      delete process.env["BROWSER_CONTROL_BACKENDS"];
+      process.env["XDG_CONFIG_HOME"] = isoXdg;
+      setDaemonBackendsFile(join(isoXdg, "missing-backends"));
+
+      // No pairing, no settings -> v1 default cdp.
+      expect(backendOrder()).toEqual(["cdp"]);
+
+      // Non-private or invalid token file -> still cdp (same check as extension status paired).
+      const cfgDir = join(isoXdg, "browser-control");
+      await mkdir(cfgDir, { recursive: true, mode: 0o700 });
+      const tokenFile = join(cfgDir, "extension-relay.json");
+      await writeFile(tokenFile, JSON.stringify({ token: TOKEN }), { mode: 0o644 });
+      await chmod(tokenFile, 0o644);
+      expect(backendOrder()).toEqual(["cdp"]);
+
+      // Valid private 0600 token file -> extension alone.
+      await chmod(tokenFile, 0o600);
+      expect(backendOrder()).toEqual(["extension"]);
+
+      // Explicit config file and env var still override the paired default.
+      await writeFile(join(cfgDir, "backends"), "extension,cdp\n");
+      expect(backendOrder()).toEqual(["extension", "cdp"]);
+      process.env["BROWSER_CONTROL_BACKENDS"] = "cdp";
+      expect(backendOrder()).toEqual(["cdp"]);
+    } finally {
+      await rm(isoXdg, { recursive: true, force: true });
+    }
   });
 });
 

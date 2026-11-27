@@ -6,24 +6,25 @@ Set up and pick a backend, manage browsers and tabs, call raw CDP operations, an
 
 A backend is the path a command takes to the browser. There are three:
 
-- `extension` is the default once it is set up. The Browser Control extension in the user's own Chrome talks to the daemon over a local relay (a WebSocket on `127.0.0.1`, ports `49222`-`49229`). It needs no remote-debugging setting and no "Allow" click.
-- `cdp` is direct DevTools, the v1 way. It is the fallback. It reaches pages the extension can't run on, such as `chrome://` tabs, the Chrome Web Store, other extensions' pages, and the built-in PDF viewer.
+- `extension` is the sole default once paired (when `~/.config/browser-control/extension-relay.json` exists and is valid). The Browser Control extension in the user's own Chrome talks to the daemon over a local relay (a WebSocket on `127.0.0.1`, ports `49222`-`49229`). It needs no remote-debugging setting and no "Allow" click, and never falls back to `cdp` implicitly.
+- `cdp` is direct DevTools, the v1 way. It stays the default when the extension is not paired, and runs whenever asked for by name (`start <browser>`, a DevTools targetId, or `BROWSER_CONTROL_BACKENDS=extension,cdp`). It reaches pages the extension can't run on, such as `chrome://` tabs, the Chrome Web Store, other extensions' pages, and the built-in PDF viewer.
 - `browse` is the optional [opencode browse](https://github.com/anomalyco/browse) adapter (section 7).
 
-`extension setup` and `extension enable` write `extension,cdp` to `<daemon dir>/backends` (default `$TMPDIR/browser-control-daemon/backends`). `extension disable` writes `cdp` there. The daemon reads that file first, then `BROWSER_CONTROL_BACKENDS`, then `~/.config/browser-control/backends`, and falls back to `cdp`. It reads the order on every call, so a change needs no restart.
+The daemon reads the backend order from `<daemon dir>/backends` first (default `$TMPDIR/browser-control-daemon/backends`), then `BROWSER_CONTROL_BACKENDS`, then `~/.config/browser-control/backends`. When none is set, a paired extension defaults to `extension` alone; without pairing, the default is `cdp`. `extension disable` writes `cdp` to `<daemon dir>/backends`; `extension enable` (and `extension setup`) clears that file — including any older `extension,cdp` override — so the default, `BROWSER_CONTROL_BACKENDS`, or `~/.config/browser-control/backends` applies again. The daemon reads the order on every call, so a change needs no restart.
 
 Routing rules:
 
 - A target id with a backend prefix always goes to that backend: `extension:<tabId>` (or `extension:<slug>:<tabId>` when more than one browser is connected) and `browse:<n>`.
-- Otherwise the router tries backends in order. If one is missing, not connected, or lacks the operation, the next one gets the call.
-- When the extension reports `RESTRICTED_PAGE`, the call falls back to `cdp`.
+- Explicit CDP requests (`start <browser>`, a DevTools targetId with no backend prefix, or `select_target` of a DevTools target) always run on `cdp`, even when the order is `extension`. After an explicit `start` or `select_target`, untargeted calls stay on that CDP tab and `tabs` includes CDP targets; `clear_target` or `nav --browser <slug>` returns to the extension.
+- With order `extension`, nothing reaches `cdp` implicitly: a disconnected extension, a restricted page (`chrome://`, Chrome Web Store, PDF viewer), an unhandled op, or a browser-level CDP method refuses with `EXTENSION_ONLY` naming the cause and how to opt into `cdp`.
+- Fallback to `cdp` happens only when the effective order explicitly lists `cdp` (for example `BROWSER_CONTROL_BACKENDS=extension,cdp` or `browse,cdp`).
 - While a backend's tab is selected, a tab operation that backend lacks fails with a clear message. It never runs on a different tab instead.
 
 ## 2. One-time extension setup
 
 The user does this once per browser profile. It takes three clicks and no typing.
 
-1. Run `$BCD extension setup` (optionally `$BCD extension setup <extensionDir>`). It creates the shared secret in `~/.config/browser-control/extension-relay.json` (mode `0600`), writes `extension/pairing.json` beside the extension, sets the backend order to `extension,cdp`, and prints the exact path of the `extension/` folder.
+1. Run `$BCD extension setup` (optionally `$BCD extension setup <extensionDir>`). It creates the shared secret in `~/.config/browser-control/extension-relay.json` (mode `0600`, which makes the default backend order `extension`), writes `extension/pairing.json` beside the extension, and prints the exact path of the `extension/` folder.
 2. Tell the user the three clicks: open `chrome://extensions`, turn on **Developer mode**, click **Load unpacked** and choose the printed folder.
 3. `extension setup` returns right away. After the user loads the extension, run `$BCD extension browsers` (or `tabs`) to confirm it connected.
 
@@ -36,8 +37,8 @@ Other `extension` subcommands:
 | `extension status` | Relay port, connected browsers, protocol and helper versions, pairing state. |
 | `extension browsers` | Connected browsers and their slugs (for `--browser`). |
 | `extension diagnostics` | The extension's recent log plus the daemon's relay state. Use it for bug reports. |
-| `extension enable` | Set the backend order to `extension,cdp`. |
-| `extension disable` | Set the backend order to `cdp` (DevTools only). |
+| `extension enable` | Clear `<daemon dir>/backends` (including any older `extension,cdp` or `cdp` override) so the default (`extension` when paired), `BROWSER_CONTROL_BACKENDS`, or `~/.config/browser-control/backends` applies. |
+| `extension disable` | Write `cdp` to `<daemon dir>/backends` (DevTools only). |
 | `extension pair`, `extension revoke` | Not built yet. They wait for a later Web Store build and return an error saying so. |
 
 If the extension doesn't connect:
@@ -60,7 +61,7 @@ If the extension doesn't connect:
 - **Lending.** The popup has `All tabs` and `Lent only` modes. In `Lent only`, the extension refuses any tab the user hasn't lent (`REFUSED: tab <id> is not lent to Browser Control`). Ask the user to lend the tab with the toolbar button. Don't switch to `cdp` to get around it.
 - **Two tiers.** Reads (`tabs`, `nav`, `snap`, `text`, `form`, `query`, `read-urls`, `value`, `verdict`, `health`, `wait`, native `select`, typed inputs, a plain `shot` of the active tab) run without the debugger, so Chrome shows no yellow banner. Commands that need trusted input or DevTools (`click`, `hover`, `type`, `key`, `drag`, `upload`, `dialog`, `emulate`, `styles`, `issues`, `perf`, `capture_pdf`, `snap --ax`, `eval`, `call`, `flow record`, `ocr`, `shot --full|--ref|--marks`) attach the debugger. Chrome then shows a yellow "started debugging" banner.
 - **Auto-detach.** The debugger detaches after 30 s idle and the banner goes away. Long work such as `perf`, `flow record`, or a long `wait_for_event` holds it up to 10 minutes.
-- **Raw `call`.** On extension tabs, `execute_cdp` covers the CDP domains Chrome allows extensions. `Browser.*` is not one of them. Those calls go to `cdp` if it is connected, or fail with a reason.
+- **Raw `call`.** On extension tabs, `execute_cdp` covers the CDP domains Chrome allows extensions. `Browser.*` is not one of them. With order `extension`, browser-level calls refuse with `EXTENSION_ONLY`; opt into CDP with `start <browser>` or `BROWSER_CONTROL_BACKENDS=extension,cdp`.
 
 ## 5. Sessions on `cdp`
 
