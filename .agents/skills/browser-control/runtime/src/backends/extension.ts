@@ -741,7 +741,7 @@ export function registerExtensionBcCall(fn: BcCallFn | undefined): void {
 }
 
 const EXTENSION_REQUEST_SYMBOL = Symbol.for("browser-control.extension-request");
-const TARGET_REQUEST_OPS = new Set(["handoff_start", "handoff_clear"]);
+const TARGET_REQUEST_OPS = new Set(["handoff_start", "handoff_clear", "resolve_bc_node"]);
 
 export type ExtensionRequestFn = (
   op: string,
@@ -1649,7 +1649,12 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
           const res = (await requestOnLink(
             resolved.link,
             "eval",
-            { tabId: resolved.tabId, expression, isolated: input["isolated"] === true },
+            {
+              tabId: resolved.tabId,
+              expression,
+              isolated: input["isolated"] === true,
+              ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+            },
             timeoutMs ?? DEFAULT_REQ_TIMEOUT_MS,
           )) as { value?: unknown; contextId?: number };
           return {

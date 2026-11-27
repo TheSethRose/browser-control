@@ -438,6 +438,34 @@ export function createPageHelperHandler(
     targetId?: string,
   ): Promise<{ ok: true; objectId: string } | { ok: false; res: InvokeResult }> {
     const expr = renderElementStep(target);
+    if (extensionTabOf(targetId) !== undefined) {
+      const extRequest =
+        options.extensionRequest ??
+        ((globalThis as Record<symbol, unknown>)[EXTENSION_REQUEST_SYMBOL] as ExtensionRequestFn | undefined);
+      if (!extRequest) {
+        return {
+          ok: false,
+          res: failure("EXECUTION_FAILED", "BACKEND_UNAVAILABLE: extension backend is not active"),
+        };
+      }
+      const reqParams: Json =
+        target.kind === "bc"
+          ? { targetId, ref: target.args[0], mode: "ref" }
+          : { targetId, ref: target.selector, mode: "selector" };
+      try {
+        const resolved = (await extRequest("resolve_bc_node", reqParams)) as { objectId?: unknown } | undefined;
+        const objectId = typeof resolved?.objectId === "string" && resolved.objectId !== "" ? resolved.objectId : undefined;
+        if (!objectId) {
+          return {
+            ok: false,
+            res: failure("EXECUTION_FAILED", `NO_MATCH: could not resolve element (${expr})`),
+          };
+        }
+        return { ok: true, objectId };
+      } catch (err) {
+        return { ok: false, res: helperError(failure("EXECUTION_FAILED", (err as Error).message)) };
+      }
+    }
     const ctxId = contextIds.get(targetId ?? "");
     const evalObj = await cdp(
       "Runtime.evaluate",
