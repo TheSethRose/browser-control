@@ -778,7 +778,7 @@ describe("tab-cleanup", () => {
       lastUsedAt: new Map([[22, 0]]),
       idleCleanupMinutes: 1,
       now: 10 * 60_000,
-      closeTab: (tabId, opts) => closeTabSafely(tabId, opts, fake.chrome),
+      closeTab: (tabId: number, opts: { onlyIf?: () => boolean }) => closeTabSafely(tabId, opts, fake.chrome),
     });
     agentTabs.delete(22);
     await Promise.all([blocker, swept]);
