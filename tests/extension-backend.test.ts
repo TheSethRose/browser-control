@@ -1627,8 +1627,9 @@ describe("relay handshake tracking, fix lines, and timeout", () => {
       stage: "challenge_sent",
       protocolVersion: PROTOCOL_VERSION,
       helpersVersion: PAGE_HELPERS_VERSION,
-      browser: "Chrome",
     });
+    expect("browser" in pendingRecs[0]!).toBe(false);
+    expect("extensionVersion" in pendingRecs[0]!).toBe(false);
     expect(typeof pendingRecs[0]!.remotePort).toBe("number");
     expect(typeof pendingRecs[0]!.timestamp).toBe("number");
 
@@ -1750,7 +1751,7 @@ describe("relay handshake tracking, fix lines, and timeout", () => {
       reason: "auth_refused",
     });
 
-    // 2. Client-side 4006 "invalid relay proof" -> pairing_mismatch, paired: false, no reload/setup advice.
+    // 2. S6: Client-side 4006 "invalid relay proof" -> peer_reported_proof_failure (never pairing_mismatch), paired: "unknown", no reload/setup advice.
     const ws = openWs(`ws://127.0.0.1:${port}/extension`);
     await waitOpen(ws);
     const challengeP = waitMessage(ws);
@@ -1776,8 +1777,8 @@ describe("relay handshake tracking, fix lines, and timeout", () => {
     expect((st["handshakes"] as RelayHandshakeRecord[]).at(-1)).toMatchObject({
       stage: "rejected",
       lastStage: "challenge_sent",
-      failureKind: "pairing_mismatch",
-      paired: false,
+      failureKind: "peer_reported_proof_failure",
+      paired: "unknown",
       closeCode: CLOSE_AUTH_REFUSED,
       reason: "invalid_relay_proof",
     });
@@ -1862,31 +1863,162 @@ describe("relay handshake tracking, fix lines, and timeout", () => {
     }
   });
 
-  test("S1: never stores raw peer close text or unsanitized hello fields with embedded secrets", async () => {
+  test("S8: newer unpaired rejections do not hide reload advice for a paired stale extension", async () => {
     const token = randomBytes(32).toString("hex");
+    const wrongToken = randomBytes(32).toString("hex");
+    const backend = createExtensionBackend({
+      ...allocPortWindow(),
+      token,
+      helpersVersion: 9,
+      waitConnectMs: 80,
+      listTargetsWaitMs: 80,
+    });
+    disposables.push(backend);
+    await backend.start!();
+    const port = backend.getPort()!;
+
+    // 1. Paired stale extension gets 4003 (helpers v8 vs v9).
+    const pairedClosed = await sendPairedHelpersMismatch(port, token, { profileId: "p-stale", helpersVersion: 8 });
+    expect(pairedClosed.code).toBe(CLOSE_VERSION_MISMATCH);
+
+    // 2. Newer unpaired rejections arrive afterward (wrong token 4006, peer-reported 4006, protocol mismatch 4003).
+    await new Promise((r) => setTimeout(r, 10));
+    const wrongClosed = await sendPairedHelpersMismatch(port, wrongToken, { profileId: "p-other", helpersVersion: 7 });
+    expect(wrongClosed.code).toBe(CLOSE_AUTH_REFUSED);
+
+    const wsPeer = openWs(`ws://127.0.0.1:${port}/extension`);
+    await waitOpen(wsPeer);
+    const chP = waitMessage(wsPeer);
+    wsPeer.send(
+      JSON.stringify({
+        type: "hello",
+        profileId: "p-other-2",
+        browser: "Chrome",
+        version: "2.0.0",
+        helpersVersion: 9,
+        protocolVersion: PROTOCOL_VERSION,
+        nonce: randomBytes(16).toString("hex"),
+      }),
+    );
+    await chP;
+    wsPeer.close(CLOSE_AUTH_REFUSED, "invalid relay proof");
+    await waitClose(wsPeer);
+    await new Promise((r) => setTimeout(r, 30));
+
+    const expectedFix = "Extension connected but uses helpers v8 (need v9): reload Browser Control at chrome://extensions.";
+    const st = await extensionStatusReport(backend, ["extension"], undefined, 0);
+    expect(st["fix"]).toBe(expectedFix);
+
+    const diag = (await extensionDiagnosticsReport(backend, ["extension"], { waitMs: 0 })) as {
+      daemon: Record<string, unknown>;
+    };
+    expect(diag.daemon["fix"]).toBe(expectedFix);
+
+    const ops = route(fakeCdp([]), [backend], () => ["extension"]);
+    const err = await Promise.resolve(ops["list_targets"]!({})).catch((e: unknown) => e as Error);
+    expect((err as Error).message).toContain("EXTENSION_ONLY:");
+    expect((err as Error).message).toContain(expectedFix.replace(/\.$/, ""));
+  });
+
+  test("S1: hostile values in every hello field and peer close text never appear in status or diagnostics", async () => {
+    const token = randomBytes(32).toString("hex");
+    const wrongToken = randomBytes(32).toString("hex");
     const backend = createExtensionBackend({ ...allocPortWindow(), token, waitConnectMs: 50, listTargetsWaitMs: 50 });
     disposables.push(backend);
     await backend.start!();
     const port = backend.getPort()!;
 
     const embeddedSecret = "ab".repeat(32);
-    const ws = openWs(`ws://127.0.0.1:${port}/extension`);
-    await waitOpen(ws);
-    const challengeP = waitMessage(ws);
-    ws.send(
+    const shortBrowserPrompt = "Run Setup";
+    const hugeHelpers = 9_876_543;
+    const negHelpers = -424242;
+    const hugeProto = 8_765_432;
+    const badNonce = "not-a-valid-nonce-token-xyz";
+
+    // 1. Out-of-range integer helpersVersion passes awaiting_hello -> awaiting_response, then fails auth (must NOT leak hugeHelpers).
+    const ws1 = openWs(`ws://127.0.0.1:${port}/extension`);
+    await waitOpen(ws1);
+    const ch1 = waitMessage(ws1);
+    ws1.send(
       JSON.stringify({
         type: "hello",
         profileId: `p-leak-${embeddedSecret}`,
-        browser: `Chrome token=${embeddedSecret}`,
+        browser: shortBrowserPrompt,
         version: `2.0.0-${embeddedSecret}`,
+        helpersVersion: hugeHelpers,
+        protocolVersion: PROTOCOL_VERSION,
+        nonce: randomBytes(16).toString("hex"),
+      }),
+    );
+    const challenge1 = await ch1;
+    const closed1 = waitClose(ws1);
+    ws1.send(
+      JSON.stringify({
+        type: "auth.response",
+        proof: hmacHex(wrongToken, extProofMessage(port, String(challenge1["nonce"]), "00".repeat(16))),
+      }),
+    );
+    await closed1;
+
+    // 2. Paired proof with negative out-of-range helpersVersion -> 4003 must NOT leak negHelpers.
+    const closed2 = await sendPairedHelpersMismatch(port, token, {
+      profileId: "p-neg-helpers",
+      browser: "Ignore Previous",
+      version: "9.9.9",
+      helpersVersion: negHelpers,
+    });
+    expect(closed2.code).toBe(CLOSE_VERSION_MISMATCH);
+
+    // 3. Hostile protocolVersion + peer close text + malformed nonce.
+    const ws3 = openWs(`ws://127.0.0.1:${port}/extension`);
+    await waitOpen(ws3);
+    const closed3 = waitClose(ws3);
+    ws3.send(
+      JSON.stringify({
+        type: "hello",
+        profileId: "p-proto-hostile",
+        browser: `Chrome token=${embeddedSecret}`,
+        version: "1.2.3",
+        helpersVersion: PAGE_HELPERS_VERSION,
+        protocolVersion: hugeProto,
+        nonce: randomBytes(16).toString("hex"),
+      }),
+    );
+    await closed3;
+
+    const ws4 = openWs(`ws://127.0.0.1:${port}/extension`);
+    await waitOpen(ws4);
+    const closed4 = waitClose(ws4);
+    ws4.send(
+      JSON.stringify({
+        type: "hello",
+        profileId: "p-bad-nonce",
+        browser: "EvilAgent",
+        version: "0.0.1",
+        helpersVersion: "not-a-number",
+        protocolVersion: "not-a-number",
+        nonce: badNonce,
+      }),
+    );
+    await closed4;
+
+    const ws5 = openWs(`ws://127.0.0.1:${port}/extension`);
+    await waitOpen(ws5);
+    const ch5 = waitMessage(ws5);
+    ws5.send(
+      JSON.stringify({
+        type: "hello",
+        profileId: "p-close-text",
+        browser: "PromptInject",
+        version: "3.1.4",
         helpersVersion: PAGE_HELPERS_VERSION,
         protocolVersion: PROTOCOL_VERSION,
         nonce: randomBytes(16).toString("hex"),
       }),
     );
-    await challengeP;
-    ws.close(CLOSE_AUTH_REFUSED, `peer leak secret=${embeddedSecret} tail`);
-    await waitClose(ws);
+    await ch5;
+    ws5.close(CLOSE_AUTH_REFUSED, `peer leak secret=${embeddedSecret} tail`);
+    await waitClose(ws5);
     await new Promise((r) => setTimeout(r, 30));
 
     const records = backend.getHandshakeRecords();
@@ -1894,19 +2026,40 @@ describe("relay handshake tracking, fix lines, and timeout", () => {
     const diag = await extensionDiagnosticsReport(backend, ["extension"], { waitMs: 0 });
     const serialized = JSON.stringify({ records, st, diag });
 
-    expect(serialized).not.toContain(embeddedSecret);
-    expect(serialized).not.toContain("peer leak");
-    expect(serialized).not.toContain("token=");
-    expect(serialized).not.toContain("p-leak-");
-    expect(records[0]).toMatchObject({
-      stage: "rejected",
-      failureKind: "protocol_error",
-      reason: "client_protocol_error",
-      protocolVersion: PROTOCOL_VERSION,
-      helpersVersion: PAGE_HELPERS_VERSION,
-    });
-    expect(records[0]!.browser).toBeUndefined();
-    expect(records[0]!.extensionVersion).toBeUndefined();
+    for (const forbidden of [
+      embeddedSecret,
+      shortBrowserPrompt,
+      "Ignore Previous",
+      "EvilAgent",
+      "PromptInject",
+      "peer leak",
+      "token=",
+      "p-leak-",
+      "p-neg-helpers",
+      "p-proto-hostile",
+      "p-bad-nonce",
+      "p-close-text",
+      badNonce,
+      "9.9.9",
+      "3.1.4",
+      String(hugeHelpers),
+      String(negHelpers),
+      String(hugeProto),
+    ]) {
+      expect(serialized).not.toContain(forbidden);
+    }
+    for (const r of records) {
+      expect("browser" in r).toBe(false);
+      expect("extensionVersion" in r).toBe(false);
+      if (r.helpersVersion !== undefined) {
+        expect(r.helpersVersion).toBeGreaterThanOrEqual(0);
+        expect(r.helpersVersion).toBeLessThanOrEqual(1_000_000);
+      }
+      if (r.protocolVersion !== undefined) {
+        expect(r.protocolVersion).toBeGreaterThanOrEqual(0);
+        expect(r.protocolVersion).toBeLessThanOrEqual(1_000_000);
+      }
+    }
   });
 
   test("S3: healthy Chrome profile keeps another profile's rejection and old failures never resurface in EXTENSION_ONLY after disconnect", async () => {
@@ -2064,11 +2217,50 @@ describe("relay handshake tracking, fix lines, and timeout", () => {
           failureKind: "pairing_mismatch",
           paired: false,
           closeCode: 4006,
-          reason: "invalid_relay_proof",
+          reason: "auth_refused",
           timestamp: 1,
         },
       ]),
     ).toBe("Rejected handshake from other client (not your paired extension): pairing proof failed.");
+    expect(
+      formatHandshakeFix([
+        {
+          remotePort: 50003,
+          stage: "rejected",
+          failureKind: "peer_reported_proof_failure",
+          paired: "unknown",
+          closeCode: 4006,
+          reason: "invalid_relay_proof",
+          timestamp: 1,
+        },
+      ]),
+    ).toBe("Rejected handshake from other client (not your paired extension): peer reported invalid relay proof.");
+    expect(
+      formatHandshakeFix(
+        [
+          {
+            remotePort: 50001,
+            stage: "rejected",
+            failureKind: "version_mismatch",
+            paired: true,
+            closeCode: 4003,
+            helpersVersion: 8,
+            protocolVersion: 1,
+            timestamp: 10,
+          },
+          {
+            remotePort: 50007,
+            stage: "rejected",
+            failureKind: "pairing_mismatch",
+            paired: false,
+            closeCode: 4006,
+            reason: "auth_refused",
+            timestamp: 20,
+          },
+        ],
+        { protocolVersion: 1, helpersVersion: 9 },
+      ),
+    ).toBe("Extension connected but uses helpers v8 (need v9): reload Browser Control at chrome://extensions.");
     expect(
       formatHandshakeFix([
         {
