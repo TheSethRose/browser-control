@@ -12,6 +12,7 @@ import {
   planWheelScroll,
   synthesizeStartPoint,
 } from "../src/natural";
+import { PAGE_HELPERS_SOURCE, PAGE_HELPERS_VERSION } from "../src/page-helpers";
 
 const tempDirs: string[] = [];
 afterEach(async () => {
@@ -355,6 +356,121 @@ describe("isNaturalEnabled switch precedence", () => {
       else process.env["XDG_CONFIG_HOME"] = prevXdg;
       if (prevEnv === undefined) delete process.env["BROWSER_CONTROL_NATURAL"];
       else process.env["BROWSER_CONTROL_NATURAL"] = prevEnv;
+    }
+  });
+});
+
+describe("page-helpers v10 — point detail/noScroll, hitCheck, pageScrollPoint", () => {
+  test("VERSION is 10 and new helpers work in isolated DOM", async () => {
+    expect(PAGE_HELPERS_VERSION).toBe(10);
+
+    const btn: any = {
+      nodeType: 1,
+      tagName: "BUTTON",
+      localName: "button",
+      id: "go",
+      className: "",
+      disabled: false,
+      isConnected: true,
+      innerText: "Go",
+      textContent: "Go",
+      labels: [],
+      scrolled: false,
+      rect: { x: 100, y: 1200, left: 100, top: 1200, right: 260, bottom: 1240, width: 160, height: 40 },
+      scrollIntoView() {
+        this.scrolled = true;
+        this.rect = { x: 100, y: 380, left: 100, top: 380, right: 260, bottom: 420, width: 160, height: 40 };
+      },
+      getBoundingClientRect() { return this.rect; },
+      getClientRects() { return [this.rect]; },
+      getRootNode() { return doc; },
+      getAttribute: () => null,
+      closest: () => null,
+      matches: () => true,
+      contains(other: any) { return other === btn; },
+      querySelectorAll: () => [],
+      querySelector: () => null,
+      parentElement: null,
+    };
+    const sidebar: any = {
+      nodeType: 1,
+      tagName: "DIV",
+      localName: "div",
+      scrollHeight: 2000,
+      clientHeight: 400,
+      scrollWidth: 200,
+      clientWidth: 200,
+      parentElement: null,
+    };
+    const mainBg: any = { nodeType: 1, tagName: "MAIN", localName: "main", parentElement: null };
+    const doc: any = {
+      title: "V10",
+      hidden: true,
+      body: { innerText: "Go", querySelectorAll: () => [] },
+      documentElement: { lang: "en", scrollTop: 0, scrollLeft: 0, scrollHeight: 2400, clientHeight: 800 },
+      scrollingElement: { scrollTop: 0, scrollLeft: 0, scrollHeight: 2400, clientHeight: 800 },
+      images: [],
+      querySelectorAll: (sel: string) => (sel.includes("button") ? [btn] : []),
+      querySelector: () => null,
+      createTreeWalker: () => ({ nextNode: () => null }),
+      elementFromPoint(x: number, y: number) {
+        if (x === 500 && y === 400) return sidebar; // center hits nested scroller
+        if (x >= btn.rect.left && x <= btn.rect.right && y >= btn.rect.top && y <= btn.rect.bottom) return btn;
+        return mainBg;
+      },
+    };
+    btn.ownerDocument = doc;
+    sidebar.parentElement = doc.body;
+    mainBg.parentElement = doc.body;
+
+    const prev: Record<string, any> = {};
+    const keys = ["__bc", "document", "location", "getComputedStyle", "innerWidth", "innerHeight", "scrollX", "scrollY", "NodeFilter"];
+    for (const k of keys) prev[k] = (globalThis as any)[k];
+
+    try {
+      delete (globalThis as any).__bc;
+      (globalThis as any).document = doc;
+      (globalThis as any).location = { href: "https://v10.test/", origin: "https://v10.test", pathname: "/", hostname: "v10.test" };
+      (globalThis as any).getComputedStyle = (el: any) =>
+        el === sidebar
+          ? { display: "block", visibility: "visible", opacity: "1", position: "static", overflowY: "auto", overflowX: "hidden" }
+          : { display: "block", visibility: "visible", opacity: "1", position: "static", overflowY: "visible", overflowX: "visible" };
+      (globalThis as any).innerWidth = 1000;
+      (globalThis as any).innerHeight = 800;
+      (globalThis as any).scrollX = 0;
+      (globalThis as any).scrollY = 0;
+      (globalThis as any).NodeFilter = { SHOW_ELEMENT: 1 };
+
+      new Function(PAGE_HELPERS_SOURCE)();
+      const bc = (globalThis as any).__bc;
+      expect(bc.v).toBe(10);
+      bc.snapshot();
+
+      // noScroll reports inView: false without calling scrollIntoView.
+      const off = JSON.parse(await bc.point("e1", { noScroll: true, detail: true }));
+      expect(off.inView).toBe(false);
+      expect(btn.scrolled).toBe(false);
+      expect(off.viewport).toEqual({ width: 1000, height: 800 });
+      expect(off.scroller.kind).toBe("document");
+      // pageScrollPoint skips center (500,400) because it hits nested scroller `sidebar`.
+      const sp = JSON.parse(bc.pageScrollPoint());
+      expect(sp).not.toBeNull();
+      expect(sp).not.toEqual({ x: 500, y: 400 });
+
+      // Default point() scrolls into view and returns legacy string for existing callers.
+      const legacy = await bc.point("e1");
+      expect(btn.scrolled).toBe(true);
+      expect(legacy).toBe("180 400 hidden");
+
+      // hitCheck matches inside button and reports miss outside.
+      expect(JSON.parse(bc.hitCheck("e1", 180, 400))).toEqual({ ok: true });
+      expect(JSON.parse(bc.hitCheck("e1", 10, 10)).ok).toBe(false);
+    } finally {
+      delete (globalThis as any).__bc;
+      for (const k of keys) {
+        if (prev[k] === undefined) delete (globalThis as any)[k];
+        else (globalThis as any)[k] = prev[k];
+      }
     }
   });
 });

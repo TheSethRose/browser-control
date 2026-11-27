@@ -1,5 +1,5 @@
 (() => {
-  const VERSION = 9;
+  const VERSION = 10;
   if (globalThis.__bc && globalThis.__bc.v === VERSION) return;
 
   const INTERACTIVE = [
@@ -733,18 +733,195 @@
     return `covered by ${describe(best)} [${bRef}]${dismiss}`;
   };
 
+  const frameDelta = (el) => {
+    let x = 0, y = 0;
+    for (let w = el.ownerDocument?.defaultView; w && w !== w.parent && w.frameElement; w = w.parent) {
+      const fr = w.frameElement.getBoundingClientRect();
+      x += fr.left + w.frameElement.clientLeft;
+      y += fr.top + w.frameElement.clientTop;
+    }
+    return { x, y };
+  };
+
+  const hitMatches = (el, hit) =>
+    !!(hit && (hit === el || el.contains(hit) || (el.labels && [...el.labels].some((l) => l.contains(hit)))));
+
+  const stickyInsets = (vw, vh) => {
+    let stickyTop = 0, stickyBottom = 0;
+    const probe = (y, fromTop) => {
+      if (typeof document.elementFromPoint !== 'function') return 0;
+      const hit = document.elementFromPoint(Math.round(vw / 2), y);
+      for (let cur = hit; cur && cur !== document.body && cur !== document.documentElement; cur = cur.parentElement) {
+        const pos = getComputedStyle(cur).position;
+        if (pos === 'fixed' || pos === 'sticky') {
+          const r = cur.getBoundingClientRect();
+          if (r.height > 0 && r.height < vh * 0.35 && r.width > vw * 0.3) {
+            return fromTop ? Math.max(0, Math.round(r.bottom)) : Math.max(0, Math.round(vh - r.top));
+          }
+        }
+      }
+      return 0;
+    };
+    if (vw > 0 && vh > 16) {
+      stickyTop = probe(4, true);
+      stickyBottom = probe(vh - 4, false);
+    }
+    return { stickyTop, stickyBottom };
+  };
+
+  // pageScrollPoint adapted from anomalyco/browse (MIT License).
+  function pageScrollPointRaw() {
+    if (typeof document.elementFromPoint !== 'function') return null;
+    const root = document.scrollingElement || document.documentElement;
+    const nested = (element) => {
+      for (let e = element; e && e !== root && e !== document.body && e !== document.documentElement; e = e.parentElement) {
+        const style = getComputedStyle(e);
+        const scrollsY = /(auto|scroll|overlay)/.test(style.overflowY) && e.scrollHeight > e.clientHeight + 1;
+        const scrollsX = /(auto|scroll|overlay)/.test(style.overflowX) && e.scrollWidth > e.clientWidth + 1;
+        if (scrollsY || scrollsX) return true;
+      }
+      return false;
+    };
+    const width = innerWidth, height = innerHeight;
+    const points = [[0.5, 0.5]];
+    for (const fy of [0.3, 0.7, 0.15, 0.85]) for (const fx of [0.5, 0.25, 0.75, 0.1, 0.9]) points.push([fx, fy]);
+    for (const [fx, fy] of points) {
+      const x = Math.round(width * fx), y = Math.round(height * fy);
+      const element = document.elementFromPoint(x, y);
+      if (element && element.localName !== 'iframe' && !nested(element)) return { x, y };
+    }
+    return null;
+  }
+
+  function pageScrollPoint() {
+    return JSON.stringify(pageScrollPointRaw());
+  }
+
+  const findScroller = (el, fd, vw, vh) => {
+    const root = el.ownerDocument?.scrollingElement || el.ownerDocument?.documentElement || document.documentElement;
+    for (let cur = el.parentElement; cur && cur !== root && cur !== document.body && cur !== document.documentElement; cur = cur.parentElement) {
+      const st = getComputedStyle(cur);
+      const scrollsY = /(auto|scroll|overlay)/.test(st.overflowY) && cur.scrollHeight > cur.clientHeight + 1;
+      const scrollsX = /(auto|scroll|overlay)/.test(st.overflowX) && cur.scrollWidth > cur.clientWidth + 1;
+      if (scrollsY || scrollsX) {
+        const r = cur.getBoundingClientRect();
+        return {
+          kind: 'element',
+          box: { left: r.left + fd.x, top: r.top + fd.y, width: r.width, height: r.height },
+          scrollTop: cur.scrollTop,
+          scrollLeft: cur.scrollLeft,
+          scrollHeight: cur.scrollHeight,
+          clientHeight: cur.clientHeight,
+        };
+      }
+    }
+    return {
+      kind: 'document',
+      box: { left: 0, top: 0, width: vw, height: vh },
+      scrollTop: root ? root.scrollTop : scrollY,
+      scrollLeft: root ? root.scrollLeft : scrollX,
+      scrollHeight: root ? root.scrollHeight : vh,
+      clientHeight: root ? root.clientHeight : vh,
+      point: pageScrollPointRaw(),
+    };
+  };
+
+  const visibleGeometry = (el, b, fd, vw, vh, scroller) => {
+    let pick = b;
+    try {
+      const rects = el.getClientRects?.();
+      if (rects && rects.length > 1) {
+        for (const r of rects) {
+          if (r.width <= 0 || r.height <= 0) continue;
+          const l = r.left + fd.x, t = r.top + fd.y;
+          if (l + r.width > 0 && l < vw && t + r.height > 0 && t < vh) {
+            pick = r;
+            break;
+          }
+        }
+      }
+    } catch { /* fallback to bounding rect */ }
+    const rect = {
+      left: pick.left + fd.x,
+      top: pick.top + fd.y,
+      right: pick.left + fd.x + pick.width,
+      bottom: pick.top + fd.y + pick.height,
+      width: pick.width,
+      height: pick.height,
+    };
+    const clipLeft = scroller.kind === 'element' ? Math.max(0, scroller.box.left) : 0;
+    const clipTop = scroller.kind === 'element' ? Math.max(0, scroller.box.top) : 0;
+    const clipRight = scroller.kind === 'element' ? Math.min(vw, scroller.box.left + scroller.box.width) : vw;
+    const clipBottom = scroller.kind === 'element' ? Math.min(vh, scroller.box.top + scroller.box.height) : vh;
+    const vl = Math.max(rect.left, clipLeft);
+    const vt = Math.max(rect.top, clipTop);
+    const vr = Math.min(rect.right, clipRight);
+    const vb = Math.min(rect.bottom, clipBottom);
+    const box = {
+      left: Math.round(vl * 10) / 10,
+      top: Math.round(vt * 10) / 10,
+      width: Math.max(0, Math.round((vr - vl) * 10) / 10),
+      height: Math.max(0, Math.round((vb - vt) * 10) / 10),
+    };
+    return { rect, box };
+  };
+
+  function hitCheck(ref, x, y) {
+    const el = resolve(ref);
+    const fd = frameDelta(el);
+    const root = el.getRootNode();
+    const doc = root.elementFromPoint ? root : el.ownerDocument;
+    const hit = doc.elementFromPoint(x - fd.x, y - fd.y);
+    if (hitMatches(el, hit)) return JSON.stringify({ ok: true });
+    return JSON.stringify({ ok: false, reason: hit ? findBlocker(hit, el) : 'covered by nothing (off screen)' });
+  }
+
   async function point(ref, opts = {}) {
     const el = resolve(ref);
     const deadline = performance.now() + (opts.timeoutMs || 3000);
     const disabledDeadline = performance.now() + (opts.disabledWaitMs ?? 1500);
-    el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+    const wantDetail = opts.detail === true || opts.noScroll === true;
+    const vw = innerWidth, vh = innerHeight;
+    if (!opts.noScroll) {
+      el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+    } else {
+      if (!shown(el)) throw new Error(`NOT_ACTIONABLE: ${String(ref).replace(/^@/, '')} not visible`);
+      const b0 = el.getBoundingClientRect();
+      const fd = frameDelta(el);
+      const { stickyTop, stickyBottom } = stickyInsets(vw, vh);
+      const scroller = findScroller(el, fd, vw, vh);
+      const { rect, box } = visibleGeometry(el, b0, fd, vw, vh, scroller);
+      const safeTop = stickyTop + 16;
+      const safeBottom = Math.max(safeTop, vh - stickyBottom - 16);
+      const inScroller = scroller.kind !== 'element'
+        || (rect.top >= scroller.box.top && rect.bottom <= scroller.box.top + scroller.box.height
+          && rect.left >= scroller.box.left && rect.right <= scroller.box.left + scroller.box.width);
+      const fitsVert = (rect.top >= safeTop && rect.bottom <= safeBottom)
+        || (box.height >= Math.min(40, rect.height) && box.top >= stickyTop && box.top + box.height <= vh - stickyBottom);
+      const fitsHoriz = rect.left >= 0 && rect.right <= vw && box.width >= Math.min(2, rect.width);
+      const inView = inScroller && fitsVert && fitsHoriz && box.width >= 1 && box.height >= 1;
+      if (!inView) {
+        return JSON.stringify({
+          x: Math.round(rect.left + rect.width / 2),
+          y: Math.round(rect.top + rect.height / 2),
+          hidden: document.hidden,
+          inView: false,
+          box,
+          rect: { left: Math.round(rect.left * 10) / 10, top: Math.round(rect.top * 10) / 10, width: Math.round(rect.width * 10) / 10, height: Math.round(rect.height * 10) / 10 },
+          viewport: { width: vw, height: vh },
+          stickyTop,
+          stickyBottom,
+          scroller,
+        });
+      }
+    }
     const check = (a, b) => {
       if (!shown(el)) return 'not visible';
       if (flagsOf(el).includes('disabled')) return 'disabled';
       if (a.x !== b.x || a.y !== b.y || a.width !== b.width || a.height !== b.height) return 'still moving';
       const root = el.getRootNode();
       const hit = (root.elementFromPoint ? root : el.ownerDocument).elementFromPoint(b.left + b.width / 2, b.top + b.height / 2);
-      const ok = hit && (hit === el || el.contains(hit) || (el.labels && [...el.labels].some((l) => l.contains(hit))));
+      const ok = hitMatches(el, hit);
       return ok ? null : (hit ? findBlocker(hit, el) : 'covered by nothing (off screen)');
     };
     let reason;
@@ -756,11 +933,25 @@
       const b = el.getBoundingClientRect();
       reason = check(a, b);
       if (!reason) {
-        let px = b.left + b.width / 2, py = b.top + b.height / 2;
-        for (let w = el.ownerDocument.defaultView; w && w !== w.parent && w.frameElement; w = w.parent) {
-          const fr = w.frameElement.getBoundingClientRect();
-          px += fr.left + w.frameElement.clientLeft;
-          py += fr.top + w.frameElement.clientTop;
+        const fd = frameDelta(el);
+        const px = b.left + b.width / 2 + fd.x;
+        const py = b.top + b.height / 2 + fd.y;
+        if (wantDetail) {
+          const { stickyTop, stickyBottom } = stickyInsets(vw, vh);
+          const scroller = findScroller(el, fd, vw, vh);
+          const { rect, box } = visibleGeometry(el, b, fd, vw, vh, scroller);
+          return JSON.stringify({
+            x: Math.round(px),
+            y: Math.round(py),
+            hidden: document.hidden,
+            inView: true,
+            box,
+            rect: { left: Math.round(rect.left * 10) / 10, top: Math.round(rect.top * 10) / 10, width: Math.round(rect.width * 10) / 10, height: Math.round(rect.height * 10) / 10 },
+            viewport: { width: vw, height: vh },
+            stickyTop,
+            stickyBottom,
+            scroller,
+          });
         }
         return `${Math.round(px)} ${Math.round(py)} ${document.hidden ? 'hidden' : 'visible'}`;
       }
@@ -1631,7 +1822,7 @@
 
   Object.defineProperty(globalThis, '__bc', {
     value: {
-      v: VERSION, snapshot, wall, surface, canvasHash, point, guard, guardFocused, focusForType,
+      v: VERSION, snapshot, wall, surface, canvasHash, point, hitCheck, pageScrollPoint, guard, guardFocused, focusForType,
       setTypedValue, verifyRef, healRef, armInputProbe, readInputProbe, cellInfo, cellEditor, cellRead,
       dragInfo, listPosition, select, locateOption, locateFile, el: resolve, checkWait, value,
       verdict, health, frames, tagFrames, frameTag, frameOffset, baseline, settle, diff, locate, hit, rect, viewport,
