@@ -2827,7 +2827,52 @@ export function createPageHelperHandler(
         let challengeReport: string | undefined;
         const challengeBackend = challengeBackendOf(targetId);
         const naturalPacing = isNatural(input);
+        // Nothing looks at the page until a step has run, so a batch would act on a challenge page before the
+        // post-step check could see it. Probe once up front on the same terms as that check: a wall or challenge
+        // stops the batch with every step unrun. Attach-free: one bc_call read plus the silent probe.
+        if (browseTab === undefined) {
+          const before = await evalHelper(
+            { steps: [{ kind: "href" }, { kind: "bc", method: "wall", fallback: "" }], join: "\n" },
+            targetId,
+            4_000,
+          );
+          let preWall = "";
+          if (before.ok) {
+            const [beforeUrl = "", beforeWall = ""] = valueOf(before).split("\n");
+            if (beforeUrl) prevUrl = beforeUrl;
+            preWall = beforeWall;
+          }
+          const challenge = await checkChallenge(targetId, { wallHint: preWall, knownUrl: prevUrl || startUrl });
+          if (challenge.status === "block" || challenge.status === "interactive" || challenge.status === "non-interactive-timeout") {
+            challengeReport = formatChallengeOutput(challenge.detection, challenge.url || prevUrl, {
+              backend: challengeBackend,
+              untrustedBoundary: true,
+            });
+            stopped =
+              challenge.status === "block"
+                ? `blocked by ${challenge.detection.vendor} before step 1`
+                : `${challenge.detection.vendor} challenge before step 1`;
+          } else {
+            if (challenge.waited) {
+              const after = await evalHelper(
+                { steps: [{ kind: "href" }, { kind: "bc", method: "wall", fallback: "" }], join: "\n" },
+                targetId,
+                4_000,
+              );
+              if (after.ok) {
+                const [afterUrl = "", afterWall = ""] = valueOf(after).split("\n");
+                if (afterUrl) prevUrl = afterUrl;
+                preWall = afterWall;
+              } else if (challenge.url) prevUrl = challenge.url;
+            }
+            // A captcha or rate-limit wall the probe could not classify still stops the batch unrun.
+            if (preWall === "captcha" || preWall === "rate-limit") {
+              stopped = `the page is a ${preWall} wall before step 1`;
+            }
+          }
+        }
         for (const [i, step] of steps.entries()) {
+          if (stopped) break;
           const stepInput: Json = {
             ...(input["fast"] === true ? { fast: true } : {}),
             ...(step.fast ? { fast: true } : {}),
