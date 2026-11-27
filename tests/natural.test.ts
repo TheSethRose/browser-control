@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import type { InvokeResult } from "@agent-software/core";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,6 +14,7 @@ import {
   synthesizeStartPoint,
 } from "../src/natural";
 import { PAGE_HELPERS_SOURCE, PAGE_HELPERS_VERSION } from "../src/page-helpers";
+import { createPageHelperHandler } from "../src/page-runner";
 
 const tempDirs: string[] = [];
 afterEach(async () => {
@@ -357,6 +359,230 @@ describe("isNaturalEnabled switch precedence", () => {
       if (prevEnv === undefined) delete process.env["BROWSER_CONTROL_NATURAL"];
       else process.env["BROWSER_CONTROL_NATURAL"] = prevEnv;
     }
+  });
+});
+
+describe("page-runner natural motion integration", () => {
+  type CdpCall = { method: string; params: Record<string, unknown>; targetId?: string };
+
+  function makeNaturalMock(opts: {
+    inView?: boolean;
+    scrollDeltaPerWheel?: number;
+    failAtMouseMoveIndex?: number;
+    failMessage?: string;
+    draggable?: boolean;
+  } = {}) {
+    const cdpCalls: CdpCall[] = [];
+    const evalExprs: string[] = [];
+    const sleeps: number[] = [];
+    let currentTop = opts.inView === false ? 1200 : 200;
+    let mouseMoveCount = 0;
+
+    const makeDetail = (forceInView: boolean) => {
+      const inView = forceInView || (currentTop >= 16 && currentTop + 40 <= 784);
+      const top = forceInView ? 380 : currentTop;
+      return JSON.stringify({
+        x: 350,
+        y: Math.round(top + 20),
+        hidden: false,
+        inView,
+        box: { left: 250, top: inView ? top : 0, width: 200, height: inView ? 40 : 0 },
+        rect: { left: 250, top, width: 200, height: 40 },
+        viewport: { width: 1280, height: 800 },
+        stickyTop: 0,
+        stickyBottom: 0,
+        scroller: {
+          kind: "document",
+          box: { left: 0, top: 0, width: 1280, height: 800 },
+          scrollTop: 0,
+          scrollLeft: 0,
+          scrollHeight: 3000,
+          clientHeight: 800,
+          point: { x: 640, y: 400 },
+        },
+      });
+    };
+
+    const invoke = async (op: string, input: Record<string, unknown> = {}): Promise<InvokeResult> => {
+      if (op === "get_browser_status") return { ok: true, data: { connected: true } };
+      if (op === "navigate") return { ok: true, data: { loaded: true, targetId: input["targetId"] } };
+      if (op === "wait_for_event") return { ok: true, data: { found: false } };
+      if (op === "evaluate") {
+        const expr = String(input["expression"] ?? "");
+        evalExprs.push(expr);
+        if (expr.includes("__bc.verifyRef")) return { ok: true, data: { value: "e1" } };
+        if (expr.includes("__bc.hitCheck")) return { ok: true, data: { value: JSON.stringify({ ok: true }) } };
+        if (expr.includes("__bc.point")) {
+          const isNoScroll = expr.includes('"noScroll":true');
+          const isDetail = expr.includes('"detail":true') || isNoScroll;
+          if (!isDetail) {
+            return {
+              ok: true,
+              data: { value: expr.includes("__bc.baseline()") ? "https://a.test/ 350 220 visible" : "350 220 visible" },
+            };
+          }
+          const detail = makeDetail(!isNoScroll);
+          return {
+            ok: true,
+            data: { value: expr.includes("__bc.baseline()") ? `https://a.test/\n${detail}` : detail },
+          };
+        }
+        if (expr.includes("__bc.dragInfo")) {
+          return {
+            ok: true,
+            data: {
+              value: JSON.stringify({
+                sx: 120,
+                sy: 200,
+                dx: 520,
+                dy: 460,
+                draggable: opts.draggable === true,
+                listMeta: null,
+              }),
+            },
+          };
+        }
+        if (expr.includes("__bc.setTypedValue")) return { ok: true, data: { value: "__not_typed__" } };
+        if (expr.includes("__bc.cellInfo")) return { ok: true, data: { value: "__not_cell__" } };
+        if (expr.includes("__bc.focusForType")) return { ok: true, data: { value: "focused" } };
+        if (expr.includes("__bc.value")) return { ok: true, data: { value: "hello" } };
+        if (expr.includes("__bc.readInputProbe")) return { ok: true, data: { value: '{"mousedown":1,"mouseup":1}' } };
+        if (expr.includes("__bc.hit(")) return { ok: true, data: { value: "https://a.test/\nhit: button#ok" } };
+        if (expr.includes("__bc.diff")) return { ok: true, data: { value: "# no visible change yet" } };
+        return { ok: true, data: { value: "ok" } };
+      }
+      if (op === "execute_cdp") {
+        const method = String(input["method"]);
+        const params = (input["params"] ?? {}) as Record<string, unknown>;
+        cdpCalls.push({ method, params, targetId: input["targetId"] as string | undefined });
+        if (method === "Input.dispatchMouseEvent" && params["type"] === "mouseMoved") {
+          mouseMoveCount++;
+          if (opts.failAtMouseMoveIndex !== undefined && mouseMoveCount === opts.failAtMouseMoveIndex) {
+            return {
+              ok: false,
+              error: { code: "EXECUTION_FAILED", message: opts.failMessage ?? "DIALOG_OPEN: alert open" },
+            };
+          }
+        }
+        if (method === "Input.dispatchMouseEvent" && params["type"] === "mouseWheel") {
+          const delta = opts.scrollDeltaPerWheel ?? Number(params["deltaY"] ?? 0);
+          currentTop -= delta;
+        }
+        return { ok: true, data: { result: {} } };
+      }
+      return { ok: true, data: {} };
+    };
+
+    return { invoke, cdpCalls, evalExprs, sleeps };
+  }
+
+  async function withNaturalOn<T>(fn: () => Promise<T>): Promise<T> {
+    const xdg = await mkdtemp(join(tmpdir(), "bc-nat-on-"));
+    tempDirs.push(xdg);
+    const prevEnv = process.env["BROWSER_CONTROL_NATURAL"];
+    const prevXdg = process.env["XDG_CONFIG_HOME"];
+    delete process.env["BROWSER_CONTROL_NATURAL"];
+    process.env["XDG_CONFIG_HOME"] = xdg;
+    try {
+      return await fn();
+    } finally {
+      if (prevEnv === undefined) delete process.env["BROWSER_CONTROL_NATURAL"];
+      else process.env["BROWSER_CONTROL_NATURAL"] = prevEnv;
+      if (prevXdg === undefined) delete process.env["XDG_CONFIG_HOME"];
+      else process.env["XDG_CONFIG_HOME"] = prevXdg;
+    }
+  }
+
+  test("natural click emits multiple mouseMoved events, nonzero dwell/hold, and zero mouseWheel when in view; --fast emits legacy 3-event sequence", async () => {
+    await withNaturalOn(async () => {
+      // Natural click on in-view element.
+      const nat = makeNaturalMock({ inView: true });
+      const handleNat = createPageHelperHandler(nat.invoke, undefined, undefined, {
+        sleep: async (ms) => { nat.sleeps.push(ms); },
+        rng: createSeededRng(77),
+        now: () => 0,
+      });
+
+      const res = await handleNat("click", { ref: "e1", quiet: true });
+      expect(res.ok).toBe(true);
+
+      const mouseEvents = nat.cdpCalls.filter((c) => c.method === "Input.dispatchMouseEvent");
+      const moves = mouseEvents.filter((e) => e.params["type"] === "mouseMoved");
+      const presses = mouseEvents.filter((e) => e.params["type"] === "mousePressed");
+      const releases = mouseEvents.filter((e) => e.params["type"] === "mouseReleased");
+      const wheels = mouseEvents.filter((e) => e.params["type"] === "mouseWheel");
+
+      expect(moves.length).toBeGreaterThanOrEqual(4);
+      expect(moves.length).toBeLessThanOrEqual(29);
+      expect(presses).toHaveLength(1);
+      expect(releases).toHaveLength(1);
+      expect(wheels).toHaveLength(0);
+      // Last move matches pressed/released landing point inside inset box [260..440] x [208..232].
+      const lastMove = moves.at(-1)!.params;
+      expect(presses[0]!.params["x"]).toBe(lastMove["x"]);
+      expect(presses[0]!.params["y"]).toBe(lastMove["y"]);
+      expect(Number(lastMove["x"])).toBeGreaterThanOrEqual(260);
+      expect(Number(lastMove["x"])).toBeLessThanOrEqual(440);
+      expect(Number(lastMove["y"])).toBeGreaterThanOrEqual(208);
+      expect(Number(lastMove["y"])).toBeLessThanOrEqual(232);
+      // Dwell + press hold are the last two sleeps.
+      const holdMs = nat.sleeps.at(-1)!;
+      const dwellMs = nat.sleeps.at(-2)!;
+      expect(dwellMs).toBeGreaterThanOrEqual(45);
+      expect(dwellMs).toBeLessThanOrEqual(115);
+      expect(holdMs).toBeGreaterThanOrEqual(55);
+      expect(holdMs).toBeLessThanOrEqual(130);
+
+      // --fast click emits exact legacy 3-event sequence with zero sleep.
+      const fast = makeNaturalMock({ inView: true });
+      const handleFast = createPageHelperHandler(fast.invoke, undefined, undefined, {
+        sleep: async (ms) => { fast.sleeps.push(ms); },
+        rng: createSeededRng(77),
+        now: () => 0,
+      });
+      const fastRes = await handleFast("click", { ref: "e1", fast: true, quiet: true });
+      expect(fastRes.ok).toBe(true);
+      const fastMouse = fast.cdpCalls.filter((c) => c.method === "Input.dispatchMouseEvent");
+      expect(fastMouse.map((e) => e.params["type"])).toEqual(["mouseMoved", "mousePressed", "mouseReleased"]);
+      expect(fastMouse[0]!.params).toEqual({ type: "mouseMoved", x: 350, y: 220 });
+      expect(fast.sleeps).toHaveLength(0);
+    });
+  });
+
+  test("off-screen target emits eased mouseWheel events and falls back to instant scrollIntoView when stagnant", async () => {
+    await withNaturalOn(async () => {
+      // Scrollable target moves into view via mouseWheel.
+      const scrollOk = makeNaturalMock({ inView: false });
+      const h1 = createPageHelperHandler(scrollOk.invoke, undefined, undefined, {
+        sleep: async (ms) => { scrollOk.sleeps.push(ms); },
+        rng: createSeededRng(123),
+        now: () => 0,
+      });
+      const r1 = await h1("click", { ref: "e1", quiet: true });
+      expect(r1.ok).toBe(true);
+      const wheels1 = scrollOk.cdpCalls.filter(
+        (c) => c.method === "Input.dispatchMouseEvent" && c.params["type"] === "mouseWheel",
+      );
+      expect(wheels1.length).toBeGreaterThanOrEqual(4);
+      // Never needed instant scrollIntoView fallback because wheel brought it into view.
+      expect(scrollOk.evalExprs.some((e) => e.includes('__bc.point("e1", {"detail":true})'))).toBe(false);
+
+      // Stagnant page (wheel does not move rect.top) breaks after first flick and falls back to instant scrollIntoView.
+      const stagnant = makeNaturalMock({ inView: false, scrollDeltaPerWheel: 0 });
+      const h2 = createPageHelperHandler(stagnant.invoke, undefined, undefined, {
+        sleep: async (ms) => { stagnant.sleeps.push(ms); },
+        rng: createSeededRng(123),
+        now: () => 0,
+      });
+      const r2 = await h2("click", { ref: "e1", quiet: true });
+      expect(r2.ok).toBe(true);
+      const wheels2 = stagnant.cdpCalls.filter(
+        (c) => c.method === "Input.dispatchMouseEvent" && c.params["type"] === "mouseWheel",
+      );
+      expect(wheels2.length).toBeGreaterThanOrEqual(4);
+      expect(wheels2.length).toBeLessThanOrEqual(12); // stopped after 1 flick
+      expect(stagnant.evalExprs.some((e) => e.includes('__bc.point("e1", {"detail":true})'))).toBe(true);
+    });
   });
 });
 
