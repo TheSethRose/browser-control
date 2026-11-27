@@ -743,8 +743,38 @@
     return { x, y };
   };
 
-  const hitMatches = (el, hit) =>
-    !!(hit && (hit === el || el.contains(hit) || (el.labels && [...el.labels].some((l) => l.contains(hit)))));
+  const parentOf = (el) => {
+    const p = el?.assignedSlot || el?.parentElement || el?.getRootNode?.()?.host || null;
+    return p === el ? null : p;
+  };
+  const deepHitIn = (doc, x, y) => {
+    let el = typeof doc?.elementFromPoint === 'function' ? doc.elementFromPoint(x, y) : null;
+    while (el?.shadowRoot?.elementFromPoint) {
+      const inner = el.shadowRoot.elementFromPoint(x, y);
+      if (!inner || inner === el) break;
+      el = inner;
+    }
+    return el;
+  };
+  const inTree = (anc, node) => { for (let c = node; c; c = parentOf(c)) if (c === anc) return true; return false; };
+  const hitMatches = (el, hit) => !!(hit && (hit === el || el.contains?.(hit) || inTree(el, hit) || (el.labels && [...el.labels].some((l) => l.contains?.(hit) || inTree(l, hit)))));
+  const hitReason = (el, x, y, fd) => {
+    const frames = [];
+    for (let w = el.ownerDocument?.defaultView; w && w !== w.parent && w.frameElement; w = w.parent) frames.push(w.frameElement);
+    for (let i = frames.length - 1, cx = x, cy = y; i >= 0; i--) {
+      const fe = frames[i];
+      if (typeof fe.ownerDocument?.elementFromPoint === 'function') {
+        const fh = deepHitIn(fe.ownerDocument, cx, cy);
+        if (fh !== fe) return fh ? findBlocker(fh, fe) : 'covered by nothing (off screen)';
+      }
+      const fr = fe.getBoundingClientRect();
+      cx -= fr.left + (fe.clientLeft || 0); cy -= fr.top + (fe.clientTop || 0);
+    }
+    const hit = typeof el.ownerDocument?.elementFromPoint === 'function'
+      ? deepHitIn(el.ownerDocument, x - fd.x, y - fd.y)
+      : (el.getRootNode?.()?.elementFromPoint?.(x - fd.x, y - fd.y) || null);
+    return hitMatches(el, hit) ? null : (hit ? findBlocker(hit, el) : 'covered by nothing (off screen)');
+  };
 
   const stickyInsets = (vw, vh) => {
     let stickyTop = 0, stickyBottom = 0;
@@ -770,11 +800,12 @@
   };
 
   // pageScrollPoint adapted from anomalyco/browse (MIT License).
-  function pageScrollPointRaw() {
+  /** With (px, py), that point wins when it is over the document scroller; otherwise search the usual grid. */
+  function pageScrollPointRaw(px, py) {
     if (typeof document.elementFromPoint !== 'function') return null;
     const root = document.scrollingElement || document.documentElement;
     const nested = (element) => {
-      for (let e = element; e && e !== root && e !== document.body && e !== document.documentElement; e = e.parentElement) {
+      for (let e = element; e && e !== root && e !== document.body && e !== document.documentElement; e = parentOf(e)) {
         const style = getComputedStyle(e);
         const scrollsY = /(auto|scroll|overlay)/.test(style.overflowY) && e.scrollHeight > e.clientHeight + 1;
         const scrollsX = /(auto|scroll|overlay)/.test(style.overflowX) && e.scrollWidth > e.clientWidth + 1;
@@ -785,29 +816,38 @@
     const width = innerWidth, height = innerHeight;
     const points = [[0.5, 0.5]];
     for (const fy of [0.3, 0.7, 0.15, 0.85]) for (const fx of [0.5, 0.25, 0.75, 0.1, 0.9]) points.push([fx, fy]);
-    for (const [fx, fy] of points) {
-      const x = Math.round(width * fx), y = Math.round(height * fy);
-      const element = document.elementFromPoint(x, y);
+    const cands = Number.isFinite(px) && Number.isFinite(py) ? [[px, py]] : [];
+    for (const [fx, fy] of points) cands.push([Math.round(width * fx), Math.round(height * fy)]);
+    for (const [x, y] of cands) {
+      const element = deepHitIn(document, x, y);
       if (element && element.localName !== 'iframe' && !nested(element)) return { x, y };
     }
     return null;
   }
 
-  function pageScrollPoint() {
-    return JSON.stringify(pageScrollPointRaw());
+  function pageScrollPoint(px, py) {
+    return JSON.stringify(pageScrollPointRaw(px, py));
   }
 
+  const clientBox = (cur, fd) => {
+    const r = cur.getBoundingClientRect();
+    const cl = cur.clientLeft || 0, ct = cur.clientTop || 0;
+    const width = typeof cur.clientWidth === 'number' ? Math.min(cur.clientWidth, Math.max(0, r.width - cl)) : r.width;
+    const height = typeof cur.clientHeight === 'number' ? Math.min(cur.clientHeight, Math.max(0, r.height - ct)) : r.height;
+    return { left: r.left + fd.x + cl, top: r.top + fd.y + ct, width, height };
+  };
+
   const findScroller = (el, fd, vw, vh) => {
-    const root = el.ownerDocument?.scrollingElement || el.ownerDocument?.documentElement || document.documentElement;
-    for (let cur = el.parentElement; cur && cur !== root && cur !== document.body && cur !== document.documentElement; cur = cur.parentElement) {
+    const doc = el.ownerDocument || document;
+    const docRoot = doc.scrollingElement || doc.documentElement;
+    for (let cur = parentOf(el); cur && cur !== docRoot && cur !== doc.body && cur !== doc.documentElement; cur = parentOf(cur)) {
       const st = getComputedStyle(cur);
       const scrollsY = /(auto|scroll|overlay)/.test(st.overflowY) && cur.scrollHeight > cur.clientHeight + 1;
       const scrollsX = /(auto|scroll|overlay)/.test(st.overflowX) && cur.scrollWidth > cur.clientWidth + 1;
       if (scrollsY || scrollsX) {
-        const r = cur.getBoundingClientRect();
         return {
           kind: 'element',
-          box: { left: r.left + fd.x, top: r.top + fd.y, width: r.width, height: r.height },
+          box: clientBox(cur, fd),
           scrollTop: cur.scrollTop,
           scrollLeft: cur.scrollLeft,
           scrollHeight: cur.scrollHeight,
@@ -815,6 +855,12 @@
         };
       }
     }
+    if (doc !== document && docRoot && (docRoot.scrollHeight > docRoot.clientHeight + 1 || docRoot.scrollWidth > docRoot.clientWidth + 1)) {
+      const fw = doc.defaultView?.innerWidth || docRoot.clientWidth || vw;
+      const fh = doc.defaultView?.innerHeight || docRoot.clientHeight || vh;
+      return { kind: 'element', box: { left: fd.x, top: fd.y, width: fw, height: fh }, scrollTop: docRoot.scrollTop, scrollLeft: docRoot.scrollLeft, scrollHeight: docRoot.scrollHeight, clientHeight: docRoot.clientHeight };
+    }
+    const root = document.scrollingElement || document.documentElement;
     return {
       kind: 'document',
       box: { left: 0, top: 0, width: vw, height: vh },
@@ -826,7 +872,34 @@
     };
   };
 
-  const visibleGeometry = (el, b, fd, vw, vh, scroller) => {
+  const clipBounds = (el, fd, vw, vh) => {
+    let left = 0, top = 0, right = vw, bottom = vh;
+    const win = el.ownerDocument?.defaultView;
+    if (win && win !== globalThis && win.innerWidth > 0 && win.innerHeight > 0) {
+      left = Math.max(left, fd.x); top = Math.max(top, fd.y);
+      right = Math.min(right, fd.x + win.innerWidth); bottom = Math.min(bottom, fd.y + win.innerHeight);
+    }
+    const root = el.ownerDocument?.documentElement, body = el.ownerDocument?.body;
+    let prevPos = getComputedStyle(el).position;
+    for (let cur = parentOf(el); cur && cur !== body && cur !== root; cur = parentOf(cur)) {
+      if (prevPos === 'fixed') break;
+      const st = getComputedStyle(cur);
+      if (st.display !== 'inline' && st.display !== 'contents' && cur.getBoundingClientRect) {
+        const cx = (st.overflowX || st.overflow || 'visible') !== 'visible';
+        const cy = (st.overflowY || st.overflow || 'visible') !== 'visible';
+        if (cx || cy) {
+          const cb = clientBox(cur, fd);
+          if (cx) { left = Math.max(left, cb.left); right = Math.min(right, cb.left + cb.width); }
+          if (cy) { top = Math.max(top, cb.top); bottom = Math.min(bottom, cb.top + cb.height); }
+        }
+      }
+      prevPos = st.position;
+    }
+    return { left, top, right, bottom };
+  };
+
+  const visibleGeometry = (el, b, fd, vw, vh) => {
+    const clip = clipBounds(el, fd, vw, vh);
     let pick = b;
     try {
       const rects = el.getClientRects?.();
@@ -834,7 +907,7 @@
         for (const r of rects) {
           if (r.width <= 0 || r.height <= 0) continue;
           const l = r.left + fd.x, t = r.top + fd.y;
-          if (l + r.width > 0 && l < vw && t + r.height > 0 && t < vh) {
+          if (l + r.width > clip.left && l < clip.right && t + r.height > clip.top && t < clip.bottom) {
             pick = r;
             break;
           }
@@ -849,31 +922,23 @@
       width: pick.width,
       height: pick.height,
     };
-    const clipLeft = scroller.kind === 'element' ? Math.max(0, scroller.box.left) : 0;
-    const clipTop = scroller.kind === 'element' ? Math.max(0, scroller.box.top) : 0;
-    const clipRight = scroller.kind === 'element' ? Math.min(vw, scroller.box.left + scroller.box.width) : vw;
-    const clipBottom = scroller.kind === 'element' ? Math.min(vh, scroller.box.top + scroller.box.height) : vh;
-    const vl = Math.max(rect.left, clipLeft);
-    const vt = Math.max(rect.top, clipTop);
-    const vr = Math.min(rect.right, clipRight);
-    const vb = Math.min(rect.bottom, clipBottom);
+    const vl = Math.max(rect.left, clip.left);
+    const vt = Math.max(rect.top, clip.top);
+    const vr = Math.min(rect.right, clip.right);
+    const vb = Math.min(rect.bottom, clip.bottom);
     const box = {
       left: Math.round(vl * 10) / 10,
       top: Math.round(vt * 10) / 10,
       width: Math.max(0, Math.round((vr - vl) * 10) / 10),
       height: Math.max(0, Math.round((vb - vt) * 10) / 10),
     };
-    return { rect, box };
+    return { rect, box, clip };
   };
 
   function hitCheck(ref, x, y) {
     const el = resolve(ref);
-    const fd = frameDelta(el);
-    const root = el.getRootNode();
-    const doc = root.elementFromPoint ? root : el.ownerDocument;
-    const hit = doc.elementFromPoint(x - fd.x, y - fd.y);
-    if (hitMatches(el, hit)) return JSON.stringify({ ok: true });
-    return JSON.stringify({ ok: false, reason: hit ? findBlocker(hit, el) : 'covered by nothing (off screen)' });
+    const reason = hitReason(el, x, y, frameDelta(el));
+    return JSON.stringify(reason ? { ok: false, reason } : { ok: true });
   }
 
   async function point(ref, opts = {}) {
@@ -890,16 +955,13 @@
       const fd = frameDelta(el);
       const { stickyTop, stickyBottom } = stickyInsets(vw, vh);
       const scroller = findScroller(el, fd, vw, vh);
-      const { rect, box } = visibleGeometry(el, b0, fd, vw, vh, scroller);
-      const safeTop = stickyTop + 16;
-      const safeBottom = Math.max(safeTop, vh - stickyBottom - 16);
-      const inScroller = scroller.kind !== 'element'
-        || (rect.top >= scroller.box.top && rect.bottom <= scroller.box.top + scroller.box.height
-          && rect.left >= scroller.box.left && rect.right <= scroller.box.left + scroller.box.width);
+      const { rect, box, clip } = visibleGeometry(el, b0, fd, vw, vh);
+      const safeTop = Math.max(clip.top, stickyTop + 16);
+      const safeBottom = Math.min(clip.bottom, Math.max(stickyTop + 16, vh - stickyBottom - 16));
       const fitsVert = (rect.top >= safeTop && rect.bottom <= safeBottom)
         || (box.height >= Math.min(40, rect.height) && box.top >= stickyTop && box.top + box.height <= vh - stickyBottom);
-      const fitsHoriz = rect.left >= 0 && rect.right <= vw && box.width >= Math.min(2, rect.width);
-      const inView = inScroller && fitsVert && fitsHoriz && box.width >= 1 && box.height >= 1;
+      const fitsHoriz = (rect.left >= clip.left && rect.right <= clip.right) || box.width >= Math.min(40, rect.width);
+      const inView = fitsVert && fitsHoriz && box.width >= 1 && box.height >= 1;
       if (!inView) {
         return JSON.stringify({
           x: Math.round(rect.left + rect.width / 2),
@@ -915,14 +977,18 @@
         });
       }
     }
+    let hitGeom = null;
     const check = (a, b) => {
       if (!shown(el)) return 'not visible';
       if (flagsOf(el).includes('disabled')) return 'disabled';
       if (a.x !== b.x || a.y !== b.y || a.width !== b.width || a.height !== b.height) return 'still moving';
-      const root = el.getRootNode();
-      const hit = (root.elementFromPoint ? root : el.ownerDocument).elementFromPoint(b.left + b.width / 2, b.top + b.height / 2);
-      const ok = hitMatches(el, hit);
-      return ok ? null : (hit ? findBlocker(hit, el) : 'covered by nothing (off screen)');
+      const fd = frameDelta(el);
+      if (wantDetail) {
+        hitGeom = visibleGeometry(el, b, fd, vw, vh);
+        if (hitGeom.box.width <= 0 || hitGeom.box.height <= 0) return 'covered by nothing (off screen)';
+        return hitReason(el, Math.round(hitGeom.box.left + hitGeom.box.width / 2), Math.round(hitGeom.box.top + hitGeom.box.height / 2), fd);
+      }
+      return hitReason(el, b.left + b.width / 2 + fd.x, b.top + b.height / 2 + fd.y, fd);
     };
     let reason;
     do {
@@ -934,12 +1000,12 @@
       reason = check(a, b);
       if (!reason) {
         const fd = frameDelta(el);
-        const px = b.left + b.width / 2 + fd.x;
-        const py = b.top + b.height / 2 + fd.y;
+        const px = wantDetail ? hitGeom.box.left + hitGeom.box.width / 2 : b.left + b.width / 2 + fd.x;
+        const py = wantDetail ? hitGeom.box.top + hitGeom.box.height / 2 : b.top + b.height / 2 + fd.y;
         if (wantDetail) {
           const { stickyTop, stickyBottom } = stickyInsets(vw, vh);
           const scroller = findScroller(el, fd, vw, vh);
-          const { rect, box } = visibleGeometry(el, b, fd, vw, vh, scroller);
+          const { rect, box } = hitGeom;
           return JSON.stringify({
             x: Math.round(px),
             y: Math.round(py),
@@ -1359,11 +1425,7 @@
     return JSON.stringify(out);
   }
 
-  const deepHit = (x, y) => {
-    let el = document.elementFromPoint(x, y);
-    while (el && el.shadowRoot && el.shadowRoot.elementFromPoint(x, y) && el.shadowRoot.elementFromPoint(x, y) !== el) el = el.shadowRoot.elementFromPoint(x, y);
-    return el;
-  };
+  const deepHit = (x, y) => deepHitIn(document, x, y);
 
   function hit(x, y) {
     const el = deepHit(x, y);
