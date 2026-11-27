@@ -118,6 +118,12 @@ describe("extension setup and the global order file", () => {
     const res2 = await setup(ext2, second.daemonDir);
     expect(res2.data["globalOrder"]).toBeUndefined();
     expect(await readFile(second.globalFile, "utf8")).toBe("cdp\nextension\n");
+    // A form feed is whitespace to the router too: cdp<FF>extension includes the extension.
+    const third = await isolate("setup-formfeed");
+    const ext3 = await extFolder(third.root);
+    await writeFile(third.globalFile, "cdp\fextension\n");
+    const res3 = await setup(ext3, third.daemonDir);
+    expect(res3.data["globalOrder"]).toBeUndefined();
   });
 
   test("the rewritten global file and its backup keep the original file mode", async () => {

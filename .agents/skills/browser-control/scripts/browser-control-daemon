@@ -628,9 +628,11 @@ case "$cmd" in
         extra=""
         gpath="${XDG_CONFIG_HOME:-$HOME/.config}/browser-control/backends"
         if [[ -f "$gpath" ]]; then
-          # Same reading as the router: the whole file, split on commas and whitespace.
-          gorder="$(tr -s '\n\r\t ' '    ' <"$gpath" 2>/dev/null | sed 's/^ *//;s/ *$//' || true)"
-          if [[ -n "$gorder" ]] && ! order_has_extension "$gorder"; then
+          # Parse exactly like the router (backendOrder): whole file, split on /[\s,]+/, lowercased.
+          # Prints the normalized order on line 1 and 1/0 (has extension) on line 2.
+          gparsed="$(bun -e 'const n=require("fs").readFileSync(process.argv[1],"utf8").split(/[\s,]+/).map((x)=>x.trim().toLowerCase()).filter(Boolean);process.stdout.write(n.join(",")+"\n"+(n.includes("extension")?1:0))' "$gpath" 2>/dev/null || true)"
+          gorder="${gparsed%%$'\n'*}" ghas="${gparsed##*$'\n'}"
+          if [[ -n "$gorder" && "$ghas" == 0 ]]; then
             # Create the backup exclusively (noclobber), taking the next -N suffix if one exists.
             gbase="$gpath.bak-$(date +%Y-%m-%d)" gbackup="" n=1
             while [[ $n -lt 100 ]]; do
@@ -642,7 +644,11 @@ case "$cmd" in
             [[ -n "$gbackup" ]] || fail EXECUTION_FAILED "could not back up $gpath"
             # Write a same-directory temp copy (keeps the file mode), then rename it into place.
             gtmp="$gpath.tmp.$$"
-            if ! { cp -p "$gpath" "$gtmp" && chmod "$(stat -f %Lp "$gpath" 2>/dev/null || stat -c %a "$gpath")" "$gbackup" && printf 'extension\n' >"$gtmp" && mv -f "$gtmp" "$gpath"; }; then
+            # GNU stat first (BSD stat rejects -c); accept only a plain octal mode.
+            gmode="$(stat -c %a "$gpath" 2>/dev/null || true)"
+            [[ "$gmode" =~ ^[0-7]{3,4}$ ]] || gmode="$(stat -f %Lp "$gpath" 2>/dev/null || true)"
+            [[ "$gmode" =~ ^[0-7]{3,4}$ ]] || gmode=600
+            if ! { cp -p "$gpath" "$gtmp" && chmod "$gmode" "$gbackup" && printf 'extension\n' >"$gtmp" && mv -f "$gtmp" "$gpath"; }; then
               rm -f "$gtmp" 2>/dev/null || true
               fail EXECUTION_FAILED "could not write $gpath"
             fi
