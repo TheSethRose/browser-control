@@ -1073,6 +1073,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
   const recentRejections: TrackedRejection[] = [];
   let handshakeSeq = 0;
   let lastSuccessfulHandshakeSeq = 0;
+  let latestPairedMismatch: { record: RelayHandshakeRecord; seq: number; profileKey?: string } | undefined;
   // Short target id (`extension:<tabId>`) -> profileId that it was issued for
   const shortTargetOwners = new Map<number, string>();
   let activeTab: ActiveTabRef | undefined;
@@ -1151,11 +1152,14 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
       reason,
       timestamp: now(),
     };
-    recentRejections.push({
+    const entry = {
       record,
       seq: ++handshakeSeq,
       ...(ws.data.profileKey !== undefined ? { profileKey: ws.data.profileKey } : {}),
-    });
+    };
+    recentRejections.push(entry);
+    // Kept outside the capped list so other clients can't push the reload advice out.
+    if (paired === true && failureKind === "version_mismatch") latestPairedMismatch = entry;
     while (recentRejections.length > MAX_TRACKED_HANDSHAKES) {
       recentRejections.shift();
     }
@@ -1184,14 +1188,15 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
       .slice(-MAX_TRACKED_HANDSHAKES)
       .map((ws) => ({ ...ws.data.handshake }));
     const rejectedBudget = MAX_TRACKED_HANDSHAKES - pending.length;
-    const rejected =
-      rejectedBudget > 0
-        ? recentRejections
-            .filter((e) => e.seq > minSeq)
-            .slice(-rejectedBudget)
-            .map((e) => ({ ...e.record }))
-        : [];
-    return [...rejected, ...pending];
+    const rejectedEntries =
+      rejectedBudget > 0 ? recentRejections.filter((e) => e.seq > minSeq).slice(-rejectedBudget) : [];
+    const records = [...rejectedEntries.map((e) => ({ ...e.record })), ...pending];
+    const reserved = latestPairedMismatch;
+    if (reserved && reserved.seq > minSeq && !rejectedEntries.includes(reserved)) {
+      if (records.length >= MAX_TRACKED_HANDSHAKES) records.shift();
+      records.unshift({ ...reserved.record });
+    }
+    return records;
   }
 
   function getHandshakeRecords(): RelayHandshakeRecord[] {
@@ -1286,6 +1291,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
           recentRejections.splice(i, 1);
         }
       }
+      if (latestPairedMismatch?.profileKey === profileKey) latestPairedMismatch = undefined;
     }
     data.stage = "ready";
     data.authenticated = true;
