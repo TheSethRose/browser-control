@@ -296,6 +296,27 @@ describe("element handles: exact extension context matching and invalidation", (
     await hub.detachAll();
   });
 
+  test("S10: findExtensionContext propagates DIALOG_OPEN from the frame lookup", async () => {
+    const extId = "gdoaemlogkgnnojmjcgjfaphohadilcf";
+    const fake = makeFakeChrome({
+      extensionId: extId,
+      windows: [{ id: 1, type: "normal", state: "normal", focused: true }],
+      tabs: [{ id: 13, windowId: 1, url: "https://app.test", active: true, groupId: -1 }],
+    });
+    const hub = createDebuggerHub({ chrome: fake.chrome, idleMs: 60_000 });
+    const seen: string[] = [];
+    fake.debuggerHandlers.sendCommand = async (_target, method) => {
+      seen.push(method);
+      if (method === "Page.getFrameTree") throw new Error("DIALOG_OPEN: a JavaScript confirm dialog is open on tab 13");
+      return {};
+    };
+    await expect(
+      hub.findExtensionContext(13, { expectedOrigin: `chrome-extension://${extId}`, forceRefresh: true, timeoutMs: 20 }),
+    ).rejects.toThrow(/^DIALOG_OPEN:/);
+    expect(seen).not.toContain("Runtime.enable");
+    await hub.detachAll();
+  });
+
   test("page-runner upload and styles route element resolution through resolve_bc_node on extension tabs", async () => {
     const dir = mkdtempSync(join(tmpdir(), "bc-p3-upload-"));
     const sampleFile = join(dir, "resume.txt");
@@ -663,7 +684,7 @@ describe("handoff end refocuses user's previous tab and re-collapses Agents grou
     expect(fake.groupMap.get(groupId!)?.collapsed).toBe(true);
   });
 
-  test("cross-window: restoreAfterHandoff activates previous tab when handoff window is focused without focusing another window", async () => {
+  test("cross-window: restoreAfterHandoff activates previous tab and refocuses its window while the handoff window is focused", async () => {
     const fake = makeFakeChrome({
       windows: [
         { id: 1, type: "normal", state: "normal", focused: true },
@@ -691,9 +712,10 @@ describe("handoff end refocuses user's previous tab and re-collapses Agents grou
     const restored = await wg.restoreAfterHandoff(20, prev);
     expect(restored).toEqual({ restoredTabId: 10, restoredWindowId: 1 });
     expect(fake.tabMap.get(10)?.active).toBe(true);
-    // S5: never call windows.update({ focused: true }) during restore.
+    // S5: the handoff window held focus, so restore hands focus back to the user's window.
     const restoreWindowCalls = fake.calls.slice(callsBeforeRestore).filter((c) => c.api === "windows.update");
-    expect(restoreWindowCalls).toEqual([]);
+    expect(restoreWindowCalls.length).toBe(1);
+    expect(fake.winMap.get(1)?.focused).toBe(true);
   });
 
   test("S5: switching to another app during cross-window handoff does not restore or pull Chrome to foreground", async () => {

@@ -587,7 +587,10 @@ export function createDebuggerHub({
           ? undefined
           : entry.mainFrameId;
     if (!targetFrameId) {
-      const tree = await sendCommand(tabId, "Page.getFrameTree", {}).catch(() => null);
+      const tree = await sendCommand(tabId, "Page.getFrameTree", {}).catch((err) => {
+        if (String(err?.message || err).startsWith("DIALOG_OPEN:")) throw err;
+        return null;
+      });
       if (typeof tree?.frameTree?.frame?.id === "string" && tree.frameTree.frame.id !== "") {
         entry.mainFrameId = tree.frameTree.frame.id;
         targetFrameId = entry.mainFrameId;
@@ -596,7 +599,9 @@ export function createDebuggerHub({
     if (!targetFrameId) return undefined;
 
     if (forceRefresh && entry.runtimeEnabled) {
-      await sendCommand(tabId, "Runtime.disable", {}).catch(() => {});
+      await sendCommand(tabId, "Runtime.disable", {}).catch((err) => {
+        if (String(err?.message || err).startsWith("DIALOG_OPEN:")) throw err;
+      });
     }
 
     if (!entry.runtimeEnabled) {

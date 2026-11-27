@@ -401,8 +401,8 @@ export function createWindowGroups({
 
   /**
    * After a handoff ends (done, cleared, or timeout), reactivate the user's previously
-   * active tab only while the handoff tab's window is the focused Chrome window, never
-   * focusing a window to restore, and re-collapse the "Agents · N" group.
+   * active tab (and its window) only while the handoff tab's window is the focused Chrome
+   * window, and re-collapse the "Agents · N" group.
    */
   async function restoreAfterHandoff(handoffTabId, previous = null) {
     const handoffTab = await chromeApi.tabs.get(handoffTabId).catch(() => null);
@@ -434,6 +434,10 @@ export function createWindowGroups({
       if (prevTab) {
         const prevWinId = typeof prevTab.windowId === "number" ? prevTab.windowId : previous.windowId;
         await chromeApi.tabs.update(prevTab.id, { active: true }).catch(() => {});
+        // The handoff window holds focus, so moving it back to the user's prior window is safe.
+        if (typeof prevWinId === "number" && prevWinId !== handoffWinId) {
+          await chromeApi.windows?.update?.(prevWinId, { focused: true }).catch(() => {});
+        }
         if (typeof prevWinId === "number") {
           currentActiveByWindow.set(prevWinId, prevTab.id);
         }
