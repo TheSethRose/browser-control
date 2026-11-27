@@ -588,12 +588,13 @@ case "$cmd" in
         ext_dir="$(cd "$ext_dir" && pwd)"
         command -v bun >/dev/null 2>&1 || { echo "browser-control-daemon: bun is required (https://bun.sh)" >&2; exit 127; }
         bun "$here/../runtime/cli.js" extension-setup "$ext_dir" >/dev/null || fail EXECUTION_FAILED "pairing setup failed; see the error above"
-        printf '%s\n' '{"ok":true,"data":{"paired":true,"backends":"extension","extensionDir":'"$(json_str "$ext_dir")"',"next":"In Chrome open chrome://extensions, turn on Developer mode, click Load unpacked, and pick extensionDir. Then run: browser-control-daemon extension browsers"}}'
+        rm -f "$dir/backends" 2>/dev/null || fail EXECUTION_FAILED "could not remove $dir/backends"
+        printf '%s\n' '{"ok":true,"data":{"paired":true,"orderFile":"removed","extensionDir":'"$(json_str "$ext_dir")"',"next":"In Chrome open chrome://extensions, turn on Developer mode, click Load unpacked, and pick extensionDir. Then run: browser-control-daemon extension browsers"}}'
         ;;
       status | browsers | diagnostics) run GET "extension/$sub" ;;
       enable)
         rm -f "$dir/backends" 2>/dev/null || fail EXECUTION_FAILED "could not remove $dir/backends"
-        printf '%s\n' '{"ok":true,"data":{"backends":"extension"}}'
+        printf '%s\n' '{"ok":true,"data":{"orderFile":"removed"}}'
         ;;
       disable)
         write_backends "cdp"

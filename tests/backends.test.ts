@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { OperationHandler } from "@agent-software/core";
 import { createBrowseBackend, type Runner } from "../src/backends/browse";
-import { route } from "../src/backends/router";
+import { route, withAutoConnect } from "../src/backends/router";
 import { BackendUnavailable, type Backend } from "../src/backends/types";
 import { createPageHelperHandler } from "../src/page-runner";
 
@@ -297,10 +297,10 @@ describe("router with extension only (no implicit cdp fallback)", () => {
     const ops = route(fakeCdp(log), [ext], () => ["extension"]);
     await ops["select_target"]!({ targetId: "extension:5" });
     await expect(ops["evaluate"]!({ expression: "document.title" })).rejects.toThrow(
-      /^EXTENSION_ONLY: chrome:\/\/ pages can't be driven by the extension\. CDP is used only when asked:/,
+      /^EXTENSION_ONLY: RESTRICTED_PAGE:.*chrome:\/\/.*CDP is used only when asked:/,
     );
     await expect(ops["evaluate"]!({ expression: "document.title", targetId: "extension:5" })).rejects.toThrow(
-      /^EXTENSION_ONLY: chrome:\/\/ pages can't be driven by the extension\./,
+      /^EXTENSION_ONLY: RESTRICTED_PAGE:.*chrome:\/\//,
     );
     expect(log).toEqual([]);
   });
@@ -317,10 +317,10 @@ describe("router with extension only (no implicit cdp fallback)", () => {
     });
     const opsDisconnected = route(fakeCdp(log), [disconnected], () => ["extension"]);
     await expect(opsDisconnected["navigate"]!({ url: "https://example.com" })).rejects.toThrow(
-      /^EXTENSION_ONLY: the extension isn't connected\. CDP is used only when asked:/,
+      /^EXTENSION_ONLY: extension is not connected\. CDP is used only when asked:/,
     );
     await expect(opsDisconnected["list_targets"]!({})).rejects.toThrow(
-      /^EXTENSION_ONLY: the extension isn't connected\./,
+      /^EXTENSION_ONLY: extension is not connected\./,
     );
 
     const notLent = fakeExtension({
@@ -330,7 +330,7 @@ describe("router with extension only (no implicit cdp fallback)", () => {
     });
     const opsNotLent = route(fakeCdp(log), [notLent], () => ["extension"]);
     await expect(opsNotLent["navigate"]!({ url: "https://example.com" })).rejects.toThrow(
-      /^EXTENSION_ONLY: this tab isn't lent\. CDP is used only when asked:/,
+      /^EXTENSION_ONLY: tab 5 is not lent\. CDP is used only when asked:/,
     );
     expect(log).toEqual([]);
   });
@@ -467,10 +467,168 @@ describe("router with extension only (no implicit cdp fallback)", () => {
     });
     const navRes = await handlePage("nav", { url: "chrome://version" });
     expect(navRes.ok).toBe(false);
-    if (!navRes.ok) expect(navRes.error.message).toMatch(/^EXTENSION_ONLY: chrome:\/\/ pages can't be driven by the extension/);
+    if (!navRes.ok) expect(navRes.error.message).toMatch(/^EXTENSION_ONLY: RESTRICTED_PAGE:.*chrome:\/\//);
     const snapRes = await handlePage("snap", {}, "extension:5");
     expect(snapRes.ok).toBe(false);
-    if (!snapRes.ok) expect(snapRes.error.message).toMatch(/^EXTENSION_ONLY: chrome:\/\/ pages can't be driven by the extension/);
+    if (!snapRes.ok) expect(snapRes.error.message).toMatch(/^EXTENSION_ONLY: RESTRICTED_PAGE:.*chrome:\/\//);
     expect(cdpLog).toEqual([]);
+  });
+
+  test("S1: automatic reconnect in CDP mode does not pin CDP after switching back to extension", async () => {
+    const log: string[] = [];
+    const extCalls: string[] = [];
+    let cdpConnected = false;
+    let order = ["cdp"];
+    const cdp = {
+      ...fakeCdp(log),
+      connect_browser: async () => {
+        cdpConnected = true;
+        log.push("connect_browser:");
+        return { connected: true, browser: "Chrome" };
+      },
+      list_targets: async () => {
+        log.push("list_targets:");
+        if (!cdpConnected) throw new Error("NOT_CONNECTED: call connect_browser first");
+        return { targets: [{ targetId: "ABC", type: "page", title: "t", url: "u" }] };
+      },
+    };
+    const ext = fakeExtension({
+      invoke: async (op) => {
+        extCalls.push(op);
+        return { via: "extension", targetId: "extension:5" };
+      },
+    });
+    const ops = route(cdp, [ext], () => order);
+
+    // Simulate daemon auto-reconnect on `tabs` while in CDP mode.
+    await expect(ops["list_targets"]!({})).rejects.toThrow(/^NOT_CONNECTED/);
+    await withAutoConnect(() => ops["connect_browser"]!({}));
+    const cdpTabs = (await ops["list_targets"]!({})) as { targets: Array<{ targetId: string }> };
+    expect(cdpTabs.targets.map((t) => t.targetId)).toEqual(["ABC"]);
+
+    // `extension enable` restores order to ["extension"]; untargeted calls must not stay pinned on CDP.
+    order = ["extension"];
+    log.length = 0;
+    await ops["navigate"]!({ url: "https://ext.test/" });
+    const extTabs = (await ops["list_targets"]!({})) as { targets: Array<{ targetId: string }> };
+    expect(extTabs.targets.map((t) => t.targetId)).toEqual(["extension:5"]);
+    expect(extCalls).toEqual(["navigate"]);
+    expect(log).toEqual([]);
+  });
+
+  test("S2: untargeted emulate after nav --browser and relay disconnect never reuses parked CDP target", async () => {
+    const log: string[] = [];
+    let connected = true;
+    const cdp = {
+      ...fakeCdp(log),
+      get_browser_status: async () => {
+        log.push("get_browser_status:");
+        return { connected: true, activeTargetId: "CDP-1" };
+      },
+    };
+    const ext = fakeExtension({
+      invoke: async (op) => {
+        if (!connected) throw new BackendUnavailable("extension", "extension is not connected");
+        return { via: "extension", op, targetId: "extension:5" };
+      },
+      status: async () => ({
+        available: connected,
+        listening: true,
+        activeTargetId: connected ? "extension:5" : null,
+      }),
+    });
+    const ops = route(cdp, [ext], () => ["extension"]);
+    const invoke = async (op: string, input: Record<string, unknown> = {}) => {
+      try {
+        return { ok: true as const, data: await ops[op]!(input) };
+      } catch (err) {
+        return { ok: false as const, error: { code: "EXECUTION_FAILED" as const, message: (err as Error).message } };
+      }
+    };
+    const handlePage = createPageHelperHandler(invoke);
+
+    // Park a CDP target, then switch the active route to extension via nav --browser.
+    await ops["select_target"]!({ targetId: "CDP-1" });
+    await ops["navigate"]!({ url: "https://ext.test/", browser: "chrome-abc123" });
+    connected = false;
+    log.length = 0;
+
+    const res = await handlePage("emulate", { colorScheme: "dark" });
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error.message).toMatch(/^EXTENSION_ONLY:.*CDP is used only when asked:/);
+    expect(log.filter((entry) => entry.startsWith("execute_cdp:"))).toEqual([]);
+  });
+
+  test("S3: list_targets rethrows NOT_CONNECTED when CDP is the active route so daemon reconnects", async () => {
+    const log: string[] = [];
+    let cdpConnected = false;
+    const cdp = {
+      ...fakeCdp(log),
+      connect_browser: async () => {
+        cdpConnected = true;
+        log.push("connect_browser:");
+        return { connected: true, browser: "Chrome" };
+      },
+      list_targets: async () => {
+        log.push("list_targets:");
+        if (!cdpConnected) throw new Error("NOT_CONNECTED: call connect_browser first");
+        return { targets: [{ targetId: "ABC", type: "page", title: "t", url: "u" }] };
+      },
+    };
+    const ops = route(cdp, [fakeExtension()], () => ["extension"]);
+
+    await ops["connect_browser"]!({ browser: "chrome" });
+    cdpConnected = false; // CDP connection drops after explicit start.
+
+    await expect(ops["list_targets"]!({})).rejects.toThrow(/^NOT_CONNECTED/);
+    await withAutoConnect(() => ops["connect_browser"]!({}));
+    const listed = (await ops["list_targets"]!({})) as { targets: Array<{ targetId: string }> };
+    expect(listed.targets.map((t) => t.targetId)).toEqual(["extension:5", "ABC"]);
+  });
+
+  test("S5: untargeted handoff with no extension tab returns EXTENSION_ONLY in extension-only mode", async () => {
+    const log: string[] = [];
+    let available = true;
+    const ext = fakeExtension({
+      status: async () => ({ available, listening: true, activeTargetId: null }),
+    });
+    const ops = route(fakeCdp(log), [ext], () => ["extension"]);
+    const invoke = async (op: string, input: Record<string, unknown> = {}) => {
+      try {
+        return { ok: true as const, data: await ops[op]!(input) };
+      } catch (err) {
+        return { ok: false as const, error: { code: "EXECUTION_FAILED" as const, message: (err as Error).message } };
+      }
+    };
+    const handlePage = createPageHelperHandler(invoke);
+
+    const noTab = await handlePage("handoff", { message: "Sign in" });
+    expect(noTab.ok).toBe(false);
+    if (!noTab.ok) {
+      expect(noTab.error.message).toMatch(/^EXTENSION_ONLY: no extension tab is selected\. CDP is used only when asked:/);
+    }
+
+    available = false;
+    const disconnected = await handlePage("handoff", { message: "Sign in" });
+    expect(disconnected.ok).toBe(false);
+    if (!disconnected.ok) {
+      expect(disconnected.error.message).toMatch(/^EXTENSION_ONLY: extension is not connected\. CDP is used only when asked:/);
+    }
+
+    // Explicit CDP targetId still rejects with INPUT_INVALID.
+    const onCdpTarget = await handlePage("handoff", { message: "Sign in" }, "ABC");
+    expect(onCdpTarget.ok).toBe(false);
+    if (!onCdpTarget.ok) expect(onCdpTarget.error.message).toBe("INPUT_INVALID: handoff requires an extension tab");
+    expect(log).toEqual([]);
+  });
+
+  test("S6: router resolves order once per status request", async () => {
+    let calls = 0;
+    const ops = route(fakeCdp([]), [fakeExtension()], () => {
+      calls += 1;
+      return ["extension"];
+    });
+    await ops["get_browser_status"]!({});
+    expect(calls).toBe(1);
   });
 });

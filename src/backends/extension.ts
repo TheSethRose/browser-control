@@ -11,15 +11,17 @@
  */
 
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { link as fsLink, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
+import { link as fsLink, mkdir, rename, unlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import type { Server, ServerWebSocket } from "bun";
 import { EventBuffer, eventMatches, type CdpEvent, type EventMatcher } from "../events";
 import { PAGE_HELPERS_VERSION, type HelperStep, type NormalizedHelperCall } from "../page-helpers";
 import { isBlockedCdpMethod, isBrowserLevelMethod } from "../session";
-import { backendOrder } from "./router";
+import { backendOrder, defaultTokenFilePath, readPrivateTokenSync } from "./router";
 import { BackendUnavailable, prefixOf, type Backend, type BackendTarget, type OpInput } from "./types";
+
+export { defaultTokenFilePath };
 
 export const NAME = "extension";
 export const EXTENSION_ID = "gdoaemlogkgnnojmjcgjfaphohadilcf";
@@ -85,33 +87,6 @@ function safeEqualHex(expectedHex: string, actualHex: unknown): boolean {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
-export function defaultTokenFilePath(): string {
-  const config = process.env["XDG_CONFIG_HOME"] || join(homedir(), ".config");
-  return join(config, "browser-control", "extension-relay.json");
-}
-
-type TokenRead = { token: string } | { state: "missing" | "bad" };
-
-async function readPrivateToken(tokenFile: string): Promise<TokenRead> {
-  let info;
-  try {
-    info = await stat(tokenFile);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { state: "missing" };
-    throw error;
-  }
-  if ((info.mode & 0o077) !== 0 || (typeof process.getuid === "function" && info.uid !== process.getuid())) {
-    return { state: "bad" };
-  }
-  try {
-    const parsed = JSON.parse(await readFile(tokenFile, "utf8")) as { token?: unknown };
-    if (typeof parsed.token === "string" && HEX_64_RE.test(parsed.token)) return { token: parsed.token.toLowerCase() };
-  } catch {
-    /* unreadable or not JSON */
-  }
-  return { state: "bad" };
-}
-
 /** Write `body` to a new 0600 temp file beside `file`, then publish it. `replace: false` keeps an existing file. */
 async function publishPrivateFile(file: string, body: string, replace: boolean): Promise<boolean> {
   const tmp = `${file}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
@@ -143,7 +118,7 @@ const newTokenBody = (token: string) => `${JSON.stringify({ token }, null, 2)}\n
 export async function ensureRelayToken(tokenFile: string = defaultTokenFilePath()): Promise<string> {
   await mkdir(dirname(tokenFile), { recursive: true, mode: 0o700 });
   for (let attempt = 0; attempt < 2; attempt++) {
-    const read = await readPrivateToken(tokenFile);
+    const read = readPrivateTokenSync(tokenFile);
     if ("token" in read) return read.token;
     if (read.state === "bad") {
       throw new Error(
@@ -159,7 +134,7 @@ export async function ensureRelayToken(tokenFile: string = defaultTokenFilePath(
 /** Replace a broken or non-private token file with a new private one (user-run setup only). */
 async function repairRelayToken(tokenFile: string): Promise<string> {
   await mkdir(dirname(tokenFile), { recursive: true, mode: 0o700 });
-  const read = await readPrivateToken(tokenFile);
+  const read = readPrivateTokenSync(tokenFile);
   if (!("token" in read) && read.state === "bad") {
     await publishPrivateFile(tokenFile, newTokenBody(randomBytes(32).toString("hex")), true);
   }
@@ -2009,12 +1984,8 @@ export type ExtensionReportBackend = Pick<
 
 /** `paired` when the relay token file exists, is private, and is valid. */
 export async function relayPairingState(tokenFile: string = defaultTokenFilePath()): Promise<"paired" | "missing" | "bad"> {
-  try {
-    const read = await readPrivateToken(tokenFile);
-    return "token" in read ? "paired" : read.state;
-  } catch {
-    return "bad";
-  }
+  const read = readPrivateTokenSync(tokenFile);
+  return "token" in read ? "paired" : read.state;
 }
 
 const SECRET_KEY_RE = /token|secret|nonce|proof|password|hmac|cookie|key$/i;

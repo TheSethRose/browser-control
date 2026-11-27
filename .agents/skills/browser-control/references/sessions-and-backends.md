@@ -10,7 +10,7 @@ A backend is the path a command takes to the browser. There are three:
 - `cdp` is direct DevTools, the v1 way. It stays the default when the extension is not paired, and runs whenever asked for by name (`start <browser>`, a DevTools targetId, or `BROWSER_CONTROL_BACKENDS=extension,cdp`). It reaches pages the extension can't run on, such as `chrome://` tabs, the Chrome Web Store, other extensions' pages, and the built-in PDF viewer.
 - `browse` is the optional [opencode browse](https://github.com/anomalyco/browse) adapter (section 7).
 
-The daemon reads the backend order from `<daemon dir>/backends` first (default `$TMPDIR/browser-control-daemon/backends`), then `BROWSER_CONTROL_BACKENDS`, then `~/.config/browser-control/backends`. When none is set, a paired extension defaults to `extension` alone; without pairing, the default is `cdp`. `extension disable` writes `cdp` to `<daemon dir>/backends`; `extension enable` removes that file so the default (or env var) applies again. The daemon reads the order on every call, so a change needs no restart.
+The daemon reads the backend order from `<daemon dir>/backends` first (default `$TMPDIR/browser-control-daemon/backends`), then `BROWSER_CONTROL_BACKENDS`, then `~/.config/browser-control/backends`. When none is set, a paired extension defaults to `extension` alone; without pairing, the default is `cdp`. `extension disable` writes `cdp` to `<daemon dir>/backends`; `extension enable` (and `extension setup`) clears that file — including any older `extension,cdp` override — so the default, `BROWSER_CONTROL_BACKENDS`, or `~/.config/browser-control/backends` applies again. The daemon reads the order on every call, so a change needs no restart.
 
 Routing rules:
 
@@ -37,7 +37,7 @@ Other `extension` subcommands:
 | `extension status` | Relay port, connected browsers, protocol and helper versions, pairing state. |
 | `extension browsers` | Connected browsers and their slugs (for `--browser`). |
 | `extension diagnostics` | The extension's recent log plus the daemon's relay state. Use it for bug reports. |
-| `extension enable` | Delete `<daemon dir>/backends` so the default (`extension` when paired) or `BROWSER_CONTROL_BACKENDS` applies. |
+| `extension enable` | Clear `<daemon dir>/backends` (including any older `extension,cdp` or `cdp` override) so the default (`extension` when paired), `BROWSER_CONTROL_BACKENDS`, or `~/.config/browser-control/backends` applies. |
 | `extension disable` | Write `cdp` to `<daemon dir>/backends` (DevTools only). |
 | `extension pair`, `extension revoke` | Not built yet. They wait for a later Web Store build and return an error saying so. |
 

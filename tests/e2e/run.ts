@@ -355,7 +355,7 @@ async function main(): Promise<number> {
     await check("disable", ["extension", "disable"], /"backends":"cdp"/);
     record("disable-wrote-cdp", existsSync(backendsFile) && readFileSync(backendsFile, "utf8").trim() === "cdp", backendsFile);
     await check("disabled-refuses", ["eval", "document.title", tid], /extension backend is disabled/);
-    await check("enable", ["extension", "enable"], /"backends":"extension"/);
+    await check("enable", ["extension", "enable"], /"orderFile":"removed"/);
     record("enable-deleted-file", !existsSync(backendsFile), backendsFile);
     await check("enabled-works", ["eval", "document.title", tid], /E2E Fixture/);
     return results.some((r) => !r.ok) ? 1 : 0;

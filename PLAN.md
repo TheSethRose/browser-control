@@ -312,7 +312,7 @@ Additional subcommands:
 - `extension pair` and `extension revoke <slug>` — deferred to **Later: Web Store build** (they need per-browser tokens).
 - `extension status` — port, connected browsers, protocol/helper versions, pairing state.
 - `extension diagnostics` — pulls the extension's ring-buffer log + daemon relay state for bug reports.
-- `extension enable` / `extension disable` — remove `<daemon dir>/backends` (returning to default `extension` or env) vs write `cdp`.
+- `extension enable` / `extension disable` — clear any old `<daemon dir>/backends` override (returning to default `extension`, env, or config) vs write `cdp`.
 
 ---
 

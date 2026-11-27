@@ -227,7 +227,7 @@ These environment variables are optional. None of them holds a credential.
 | Variable | What it sets |
 | --- | --- |
 | `BROWSER_CONTROL_BROWSER` | The browser to use when a connect names none (`beta`, `chrome`, …). It overrides the one-line file `~/.config/browser-control/default-browser`. |
-| `BROWSER_CONTROL_BACKENDS` | The backend order, for example `extension`, `extension,cdp`, or `browse,cdp`. The daemon reads the order from `<daemon dir>/backends` first (written by `extension disable`, removed by `extension enable`), then this variable, then the one-line file `~/.config/browser-control/backends`. With none of them, a paired extension defaults to `extension` alone; otherwise the order is `cdp` (DevTools only). See [Backends](#backends). |
+| `BROWSER_CONTROL_BACKENDS` | The backend order, for example `extension`, `extension,cdp`, or `browse,cdp`. The daemon reads the order from `<daemon dir>/backends` first (written by `extension disable`, cleared by `extension enable` and `extension setup`), then this variable, then the one-line file `~/.config/browser-control/backends`. With none of them, a paired extension defaults to `extension` alone; otherwise the order is `cdp` (DevTools only). See [Backends](#backends). |
 | `BROWSER_CDP_CALL_TIMEOUT_MS` | How long a CDP call waits for a reply when it sets no timeout. Default 120000. |
 | `BROWSER_CONTROL_MAX_OUTPUT` | Daemon only. The most characters `eval`, `nav` and `tabs` print. Default 50000. |
 | `BROWSER_CDP_WS_URL` | The browser's WebSocket address, when finding it automatically fails. |
@@ -280,8 +280,9 @@ On extension tabs:
 - The popup can limit the extension to tabs you lend it (`Lent only`).
 
 The `extension` command manages the link: `extension setup [extensionDir]`,
-`extension status`, `extension browsers`, `extension diagnostics`, `extension enable` (removes
-`<daemon dir>/backends` so the default `extension` or env var applies) and `extension disable`
+`extension status`, `extension browsers`, `extension diagnostics`, `extension enable` (clears
+any old `<daemon dir>/backends` override such as `cdp` or an earlier `extension,cdp` so the
+default `extension`, env var, or config file applies) and `extension disable`
 (writes `cdp`). `extension pair` and
 `extension revoke` wait for a later Web Store build and return an error for now.
 

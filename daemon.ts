@@ -28,7 +28,7 @@ import {
   extensionStatusReport,
   getRegisteredExtensionBackend,
 } from "./src/backends/extension";
-import { backendOrder, setDaemonBackendsFile } from "./src/backends/router";
+import { backendOrder, setDaemonBackendsFile, withAutoConnect } from "./src/backends/router";
 import { disposeOcr } from "./src/ocr";
 import { createPageHelperHandler, formatAxTree, matchTab } from "./src/page-runner";
 import { imageWidth } from "./src/picture";
@@ -152,7 +152,7 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
       return result;
     }
     if (result.ok || !result.error.message.startsWith("NOT_CONNECTED")) return result;
-    const reconnected = await invokeOnce("connect_browser", reconnectInput);
+    const reconnected = await withAutoConnect(() => invokeOnce("connect_browser", reconnectInput));
     return reconnected.ok ? invokeOnce(operation, effectiveInput) : reconnected;
   };
 
@@ -207,8 +207,10 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
   } as unknown as Parameters<typeof Bun.serve>[0]);
 
   async function respond(request: Request, url: URL, route: string, operation: string): Promise<Response> {
-    const extReply = await dispatchExtensionRequest(request, url, getRegisteredExtensionBackend(), backendOrder());
-    if (extReply) return extReply;
+    if (url.pathname === "/extension" || url.pathname.startsWith("/extension/")) {
+      const extReply = await dispatchExtensionRequest(request, url, getRegisteredExtensionBackend(), backendOrder());
+      if (extReply) return extReply;
+    }
 
     let targetId = url.searchParams.get("t") || undefined;
     const body = (await request.text()).trim();

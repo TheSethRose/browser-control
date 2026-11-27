@@ -73,7 +73,7 @@ describe("wrapper extension subcommands", () => {
     expect((await readFile(file, "utf8")).trim()).toBe("cdp");
     res = await bc("extension", "enable");
     expect(res.code).toBe(0);
-    expect(JSON.parse(res.stdout)).toEqual({ ok: true, data: { backends: "extension" } });
+    expect(JSON.parse(res.stdout)).toEqual({ ok: true, data: { orderFile: "removed" } });
     expect(existsSync(file)).toBe(false);
   });
 
@@ -103,15 +103,16 @@ describe("wrapper extension subcommands", () => {
     expect(JSON.parse(res.stdout).error.code).toBe("INPUT_INVALID");
   });
 
-  test("extension setup pairs, leaves no daemon backends file, and prints no secret", async () => {
+  test("extension setup pairs, removes any old daemon backends override, and prints no secret", async () => {
     const ext = join(dir, "ext");
     await mkdir(ext, { recursive: true });
     await writeFile(join(ext, "manifest.json"), "{}");
-    await rm(join(dir, "daemon", "backends"), { force: true });
+    await writeFile(join(dir, "daemon", "backends"), "extension,cdp\n");
     const res = await bc("extension", "setup", ext);
     expect(res.code).toBe(0);
     const out = JSON.parse(res.stdout);
-    expect(out.data).toMatchObject({ paired: true, backends: "extension", extensionDir: ext });
+    expect(out.data).toMatchObject({ paired: true, orderFile: "removed", extensionDir: ext });
+    expect(out.data.backends).toBeUndefined();
     const pairing = JSON.parse(await readFile(join(ext, "pairing.json"), "utf8")) as { token: string };
     expect(pairing.token).toMatch(/^[0-9a-f]{64}$/);
     expect(res.stdout).not.toContain(pairing.token);

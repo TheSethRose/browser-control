@@ -20,6 +20,7 @@
  *   message instead of silently acting on a different (CDP) tab.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -45,14 +46,24 @@ const TAB_OPS = new Set([
   "wait_for_event",
 ]);
 
-// The bundled daemon and the capability it loads each hold a copy of this module, so the path
-// lives on a process-wide key that both copies read.
+// The bundled daemon and the capability it loads each hold a copy of this module, so shared
+// process-wide handles live on global symbols that both copies read.
 const DAEMON_BACKENDS_FILE = Symbol.for("browser-control.daemonBackendsFile");
-const shared = globalThis as unknown as Record<symbol, string | undefined>;
+const AUTO_CONNECT = Symbol.for("browser-control.autoConnect");
+const shared = globalThis as unknown as Record<symbol, unknown>;
 
 /** The daemon calls this once at startup with `<daemonDir>/backends`. */
 export function setDaemonBackendsFile(file: string | undefined): void {
   shared[DAEMON_BACKENDS_FILE] = file;
+}
+
+function autoConnectStorage(): AsyncLocalStorage<boolean> {
+  return (shared[AUTO_CONNECT] ??= new AsyncLocalStorage<boolean>()) as AsyncLocalStorage<boolean>;
+}
+
+/** Run an automatic reconnect so the router does not pin CDP as the explicit active route. */
+export function withAutoConnect<T>(fn: () => T): T {
+  return autoConnectStorage().run(true, fn);
 }
 
 function readOneLine(file: string): string {
@@ -63,31 +74,46 @@ function readOneLine(file: string): string {
   }
 }
 
-/** True when the relay token file exists, is private (0600, owned by us), and holds a 64-hex token. */
-export function isExtensionPaired(tokenFile?: string): boolean {
+export type RelayTokenRead = { token: string } | { state: "missing" | "bad" };
+
+export function defaultTokenFilePath(): string {
   const config = process.env["XDG_CONFIG_HOME"] || join(homedir(), ".config");
-  const file = tokenFile ?? join(config, "browser-control", "extension-relay.json");
+  return join(config, "browser-control", "extension-relay.json");
+}
+
+/** Read and validate a private (0600, owned by us) relay token file holding a 64-hex token. */
+export function readPrivateTokenSync(tokenFile: string = defaultTokenFilePath()): RelayTokenRead {
+  let info;
   try {
-    const info = statSync(file);
-    if ((info.mode & 0o077) !== 0) return false;
-    if (typeof process.getuid === "function" && info.uid !== process.getuid()) return false;
-    const parsed = JSON.parse(readFileSync(file, "utf8")) as { token?: unknown };
-    return typeof parsed.token === "string" && HEX_64_RE.test(parsed.token);
-  } catch {
-    return false;
+    info = statSync(tokenFile);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { state: "missing" };
+    return { state: "bad" };
   }
+  if ((info.mode & 0o077) !== 0 || (typeof process.getuid === "function" && info.uid !== process.getuid())) {
+    return { state: "bad" };
+  }
+  try {
+    const parsed = JSON.parse(readFileSync(tokenFile, "utf8")) as { token?: unknown };
+    if (typeof parsed.token === "string" && HEX_64_RE.test(parsed.token)) {
+      return { token: parsed.token.toLowerCase() };
+    }
+  } catch {
+    /* unreadable or not JSON */
+  }
+  return { state: "bad" };
 }
 
 export function backendOrder(): string[] {
-  const daemonBackendsFile = shared[DAEMON_BACKENDS_FILE];
+  const daemonBackendsFile = shared[DAEMON_BACKENDS_FILE] as string | undefined;
   let raw = daemonBackendsFile ? readOneLine(daemonBackendsFile) : "";
   if (!raw) raw = process.env["BROWSER_CONTROL_BACKENDS"]?.trim() ?? "";
   if (!raw) {
     const config = process.env["XDG_CONFIG_HOME"] || join(homedir(), ".config");
     raw = readOneLine(join(config, "browser-control", "backends"));
   }
-  const fallback = isExtensionPaired() ? EXTENSION : CDP;
-  const names = (raw || fallback)
+  if (!raw) raw = "token" in readPrivateTokenSync() ? EXTENSION : CDP;
+  const names = raw
     .split(/[\s,]+/)
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean);
@@ -104,64 +130,20 @@ export function isExtensionOnlyOrder(order: string[] = backendOrder()): boolean 
   return order.includes(EXTENSION) && !order.includes(CDP);
 }
 
-/** Format a stable `EXTENSION_ONLY:` refusal naming the cause plus the CDP opt-in. */
-export function extensionOnlyMessage(cause: string): string {
-  const trimmed = cause.trim().replace(/\.+$/, "");
-  return `EXTENSION_ONLY: ${trimmed}. ${EXTENSION_ONLY_HINT}`;
+/** Format a stable `EXTENSION_ONLY:` refusal keeping the backend's reason plus the CDP opt-in. */
+export function extensionOnlyMessage(reason: string | Error): string {
+  const raw = (reason instanceof Error ? reason.message : reason)
+    .replace(/^BACKEND_UNAVAILABLE:\s*extension:\s*/i, "")
+    .trim()
+    .replace(/\.+$/, "");
+  return `EXTENSION_ONLY: ${raw || "the extension can't handle this request"}. ${EXTENSION_ONLY_HINT}`;
 }
 
-/** Distill an extension `BackendUnavailable` error into a clear user-facing cause. */
-export function extensionOnlyCauseFromError(error: Error): string {
-  const raw = error.message.replace(/^BACKEND_UNAVAILABLE:\s*extension:\s*/i, "").trim();
-  if (/^RESTRICTED_PAGE:/i.test(raw)) {
-    const detail = raw
-      .replace(/^RESTRICTED_PAGE:\s*/i, "")
-      .replace(/;\s*use a DevTools \(cdp\) tab for it\.?$/i, "")
-      .trim();
-    if (/chrome:\/\//i.test(detail)) {
-      return "chrome:// pages can't be driven by the extension";
-    }
-    if (/extensions gallery|web ?store/i.test(detail)) {
-      return "Chrome Web Store pages can't be driven by the extension";
-    }
-    if (/pdf/i.test(detail)) {
-      return "built-in PDF viewer pages can't be driven by the extension";
-    }
-    return detail
-      ? `this restricted page can't be driven by the extension (${detail})`
-      : "this restricted page can't be driven by the extension";
-  }
-  if (/not lent/i.test(raw)) {
-    return "this tab isn't lent";
-  }
-  if (/^extension is not connected$/i.test(raw)) {
-    return "the extension isn't connected";
-  }
-  if (/^extension did not connect\b/i.test(raw)) {
-    return `the extension isn't connected (${raw})`;
-  }
-  if (/^extension disconnected$/i.test(raw)) {
-    return "the extension disconnected";
-  }
-  if (/^no extension tab selected$/i.test(raw)) {
-    return "no extension tab is selected";
-  }
-  return raw || "the extension can't handle this request";
-}
-
-function unhandledExtensionOnlyMessage(op: string, input: OpInput, ext?: Backend): string {
+function unhandledExtensionReason(op: string, input: OpInput): string {
   if (op === "execute_cdp" && typeof input["method"] === "string" && isBrowserLevelMethod(input["method"])) {
-    return extensionOnlyMessage(`browser-level CDP method "${input["method"]}" can't run on the extension`);
+    return `browser-level CDP method "${input["method"]}" can't run on the extension`;
   }
-  if (
-    ext &&
-    TAB_OPS.has(op) &&
-    input["targetId"] === undefined &&
-    ext.handles(op, { ...input, targetId: `${EXTENSION}:0` }, true)
-  ) {
-    return extensionOnlyMessage("no extension tab is selected");
-  }
-  return extensionOnlyMessage(`${op} isn't handled by the extension`);
+  return `${op} isn't handled by the extension`;
 }
 
 export function route(
@@ -173,7 +155,17 @@ export function route(
   let cdpUsed = false;
   const byName = new Map(backends.map((b) => [b.name, b]));
   const enabled = () => order().filter((n) => n === CDP || byName.has(n));
-  const enabledBackends = () => enabled().flatMap((n) => (n === CDP ? [] : [byName.get(n)!]));
+
+  async function invokeNamed(backend: Backend, op: string, input: OpInput, wrapExtensionOnly: boolean): Promise<unknown> {
+    try {
+      const result = await backend.invoke(op, input);
+      active = backend.name;
+      return result;
+    } catch (error) {
+      if (wrapExtensionOnly && isBackendUnavailable(error)) throw new Error(extensionOnlyMessage(error));
+      throw error;
+    }
+  }
 
   async function runOp(op: string, input: OpInput): Promise<unknown> {
     const orderNow = enabled();
@@ -186,16 +178,7 @@ export function route(
     if (op === "navigate" && typeof input["browser"] === "string") {
       const ext = orderNow.includes(EXTENSION) ? byName.get(EXTENSION) : undefined;
       if (!ext) throw new Error("INPUT_INVALID: --browser needs the extension backend enabled");
-      try {
-        const result = await ext.invoke(op, input);
-        active = ext.name;
-        return result;
-      } catch (error) {
-        if (extensionOnly && isBackendUnavailable(error)) {
-          throw new Error(extensionOnlyMessage(extensionOnlyCauseFromError(error)));
-        }
-        throw error;
-      }
+      return invokeNamed(ext, op, input, extensionOnly);
     }
 
     const prefix = prefixOf(input["targetId"]);
@@ -210,20 +193,11 @@ export function route(
     if (named) {
       if (!named.handles(op, input, active === named.name)) {
         if (named.name === EXTENSION && extensionOnly) {
-          throw new Error(unhandledExtensionOnlyMessage(op, input));
+          throw new Error(extensionOnlyMessage(unhandledExtensionReason(op, input)));
         }
         throw new Error(`INPUT_INVALID: ${op} isn't available on ${named.name} tabs; use a DevTools tab for it`);
       }
-      try {
-        const result = await named.invoke(op, input);
-        active = named.name;
-        return result;
-      } catch (error) {
-        if (named.name === EXTENSION && extensionOnly && isBackendUnavailable(error)) {
-          throw new Error(extensionOnlyMessage(extensionOnlyCauseFromError(error)));
-        }
-        throw error;
-      }
+      return invokeNamed(named, op, input, named.name === EXTENSION && extensionOnly);
     }
 
     // Explicit CDP by name works even when the effective order is `extension` alone:
@@ -243,7 +217,7 @@ export function route(
       if (!handler) throw new Error(`OPERATION_NOT_FOUND: ${op}`);
       const result = await handler(input);
       cdpUsed = true;
-      if (op === "connect_browser" || op === "select_target") active = CDP;
+      if ((op === "connect_browser" && !autoConnectStorage().getStore()) || op === "select_target") active = CDP;
       if (op === "disconnect_browser") active = undefined;
       return result;
     }
@@ -291,10 +265,7 @@ export function route(
       }
     }
     if (extensionOnly) {
-      if (skipped.length > 0) {
-        throw new Error(extensionOnlyMessage(extensionOnlyCauseFromError(skipped[0]!)));
-      }
-      throw new Error(unhandledExtensionOnlyMessage(op, input, byName.get(EXTENSION)));
+      throw new Error(extensionOnlyMessage(skipped[0] ?? unhandledExtensionReason(op, input)));
     }
     const detail = skipped.length > 0 ? ` (${skipped.map((e) => e.message).join("; ")})` : "";
     throw new Error(`BACKEND_UNAVAILABLE: no enabled backend can run ${op}${detail}`);
@@ -330,16 +301,14 @@ export function route(
           targets.push(...(await byName.get(name)!.listTargets()));
         }
       } catch (error) {
-        // CDP failing alone keeps its own error; with other backends answering, report it.
-        if (name === CDP && names.length === 1) throw error;
+        // Rethrow when CDP is alone or is the active route (so daemon auto-reconnect still fires).
+        if (name === CDP && (names.length === 1 || active === CDP)) throw error;
         if (name === EXTENSION) extensionError = error as Error;
         errors.push(`${name}: ${(error as Error).message}`);
       }
     }
     if (extensionOnly && !includeCdp && targets.length === 0 && extensionError) {
-      if (isBackendUnavailable(extensionError)) {
-        throw new Error(extensionOnlyMessage(extensionOnlyCauseFromError(extensionError)));
-      }
+      if (isBackendUnavailable(extensionError)) throw new Error(extensionOnlyMessage(extensionError));
       throw extensionError;
     }
     return errors.length > 0 ? { targets, errors } : { targets };
@@ -355,7 +324,9 @@ export function route(
         ? ((await cdpOps["get_browser_status"]!(input)) as Record<string, unknown>)
         : { connected: false, activeTargetId: null };
     const extra: Record<string, unknown> = {};
-    for (const b of enabledBackends()) extra[b.name] = await b.status();
+    for (const name of orderNow) {
+      if (name !== CDP) extra[name] = await byName.get(name)!.status();
+    }
     return { ...base, backends: { order: orderNow, active: active ?? null, ...extra } };
   };
 
