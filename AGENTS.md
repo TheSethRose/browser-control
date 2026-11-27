@@ -12,6 +12,7 @@ phases and their "Done when" gates; a phase ends at its gate.
 - `bun run typecheck`
 - `bun test`
 - `bun run build:skill` (rebuilds `.agents/skills/browser-control/runtime/`; commit the result)
+- `bun run test:e2e` (the `tests/e2e/` suite, which needs Chrome for Testing as described below. CI skips it.)
 
 Run typecheck and tests before every commit. CI (`.github/workflows/ci.yml`) runs install,
 typecheck, and tests on every PR into `v2` and `main`.
@@ -41,10 +42,17 @@ typecheck, and tests on every PR into `v2` and `main`.
 ### Launching browsers (tests, E2E, probes)
 
 - Every Chrome / Chrome for Testing / Chromium launch passes `--use-mock-keychain` and
-  `--password-store=basic`, plus a throwaway `--user-data-dir`. Without them macOS shows
+  `--password-store=basic`, plus a throwaway `--user-data-dir` (a new temp folder per run). Without them macOS shows
   Keychain password prompts to the user. This applies to `tests/e2e/`, every launcher helper,
   and one-off probes. Never launch a browser without both flags.
 - Never launch or drive the user's own Chrome profile from tests.
+- Live runs (probes, manual checks, delegate tasks) set `BROWSER_CONTROL_BACKENDS=extension`, with no
+  `cdp`. With `extension,cdp`, a command no extension browser answers falls through to CDP and
+  reaches the user's real Chrome.
+- `tests/e2e/` runs Chrome for Testing with the unpacked `extension/` loaded
+  (`--load-extension` plus `--disable-extensions-except`) against a local fixture page. Install
+  it with `bunx @puppeteer/browsers install chrome@stable`. Run it with `bun run test:e2e`.
+  `bun test` and CI skip it.
 
 ### File ownership for parallel slices
 
@@ -61,7 +69,9 @@ typecheck, and tests on every PR into `v2` and `main`.
 **Agent** means any compatible reasoning/coding agent working in this repository.
 
 `browser-control` drives a real, already-running Chromium browser (Chrome, Chromium, Edge,
-Brave, Arc, Vivaldi, Opera, Comet, Canary) over the Chrome DevTools Protocol. It is an
+Brave, Arc, Vivaldi, Opera, Comet, Canary). v2 reaches it through the Browser Control MV3
+extension (`extension/`) and a loopback relay by default, with the Chrome DevTools Protocol as
+the fallback. It is an
 **infrastructure capability**: the domain is the browser's own control surface, so the
 operations are deliberately low-level protocol primitives rather than user-story verbs.
 `execute_cdp` is the general operation; `evaluate`, `navigate`, `capture_screenshot`,
@@ -82,9 +92,17 @@ profile.
   `dispose()` lifecycle hooks.
 - `src/session.ts` — browser discovery (process table + `DevToolsActivePort`), connection,
   target routing, and CDP call plumbing.
-- `src/backends/` — optional extra backends beside CDP: `types.ts` (the `Backend` interface),
+- `src/backends/` — backends beside CDP: `types.ts` (the `Backend` interface),
   `router.ts` (per-call routing and the backend order), `registry.ts` (the list), and one file per
-  backend (`browse.ts`). CDP in `src/index.ts` stays the fallback for every operation.
+  backend (`extension.ts` for the relay server and pairing, `browse.ts` for the optional opencode
+  adapter). CDP in `src/index.ts` stays the fallback for every operation.
+- `src/challenges.ts` — the bot-challenge and block-page classifier behind `CHALLENGE:` and
+  `BLOCKED:` lines (adapted from `anomalyco/browse`, MIT).
+- `extension/` — the MV3 extension: `manifest.json` (fixed `key`), `background.js` (service
+  worker), `lib/` (`pairing.js`, `debugger-hub.js`, `window-groups.js`, `tab-cleanup.js`,
+  `frames.js`), `content-overlay.js` (the handoff card), `popup.html`/`popup.js`, and
+  `page-helpers.js` (copied from `src/page-helpers.js.txt`). `extension/pairing.json` is
+  written by `extension setup`, is gitignored, and is never committed.
 - `src/events.ts` — the bounded cross-call event ring buffer and `wait_for_event`.
 - `cli.ts` — thin standalone CLI bootstrap, and `--serve <socket>` to run the daemon.
 - `daemon.ts` — thin Unix-socket server over the same runtime, so one CDP connection
@@ -98,7 +116,10 @@ profile.
 - `mcp.ts` — thin standalone MCP bootstrap (plain tool names: `execute_cdp`, not
   `browser-control__execute_cdp`).
 - `tests/` — `bun test` suites: manifest validity, operation behavior, session routing,
-  standalone adapters, page helpers.
+  standalone adapters, page helpers, helper steps, challenges, and the extension backend (with a
+  mock extension client).
+- `tests/e2e/` — real Chrome for Testing runs against a local fixture page
+  (`bun run test:e2e`; skipped in CI).
 - `src/page-helpers.ts` + `src/page-helpers.js.txt` — the in-page helper script (`__bc`),
   written as plain JavaScript in the `.js.txt` file and imported as text. `src/page-runner.ts`
   injects it lazily once per document. `PAGE_HELPERS_VERSION` is parsed directly from
@@ -125,11 +146,15 @@ ls ../agent-software/core   # required: the sibling checkout that provides @agen
 bun install
 ```
 
-Bun is the only runtime requirement. There are no credentials and no configuration files:
-the browser must merely allow remote debugging (in current Chrome, open
-`chrome://inspect/#remote-debugging` and check "Allow remote debugging for this browser
-instance"). The port changes on every browser restart, which is why callers must never pass
-a port — `connect_browser` discovers the live one.
+Bun is the only runtime requirement. To use the extension backend, run
+`.agents/skills/browser-control/scripts/browser-control-daemon extension setup` and load
+`extension/` unpacked in `chrome://extensions` (Developer mode, then Load unpacked). Setup
+writes the relay secret to `~/.config/browser-control/extension-relay.json` and
+`extension/pairing.json`; never commit either. For the CDP fallback, the browser must allow
+remote debugging (in current Chrome, open `chrome://inspect/#remote-debugging` and check
+"Allow remote debugging for this browser instance"). The CDP port changes on every browser
+restart, which is why callers must never pass a port — `connect_browser` discovers the live
+one.
 
 ## Commands
 
