@@ -20,6 +20,7 @@ import {
   verifyHmacHex,
 } from "./lib/pairing.js";
 import { createSessionTabs, validSessionKey } from "./lib/session-tabs.js";
+import { createTabBusy, withDeadline } from "./lib/tab-busy.js";
 import { createTabCleanup } from "./lib/tab-cleanup.js";
 import { createWindowGroups, normalizeNavigateUrl } from "./lib/window-groups.js";
 
@@ -28,6 +29,9 @@ const PORT_RANGE_START = 49222;
 const PORT_RANGE_END = 49229;
 const VERSION_PROBE_TIMEOUT_MS = 800;
 const DEBUGGER_IDLE_MS = 30_000;
+// Every relayed request is bounded, so a Chrome API that never settles frees its tab's busy slot.
+const REQUEST_MIN_DEADLINE_MS = 120_000;
+const REQUEST_DEADLINE_GRACE_MS = 60_000;
 const KEEPALIVE_MS = 20_000;
 const PAGE_HELPERS_FILE = "page-helpers.js";
 const PAGE_HELPERS_VERSION = 11;
@@ -53,7 +57,7 @@ let lastError = "";
 const lentTabs = new Set();
 const agentTabs = new Set();
 const handoffTabs = new Map(); // tabId -> { handoffId, message, origin, notifId }
-const busyTabs = new Map(); // tabId -> in-flight request count
+const tabBusy = createTabBusy();
 const connections = new Map(); // port -> { port, ws, state, extNonce, instanceId, keepaliveTimer, touchedTabs }
 
 let scanTimer = null;
@@ -397,15 +401,8 @@ const sessionTabs = createSessionTabs({
   chrome,
   isAgentTab: (tabId) => agentTabs.has(tabId),
   isTabInHandoff: (tabId) => handoffTabs.has(tabId),
-  isTabBusy: (tabId) => (busyTabs.get(tabId) ?? 0) > 0,
+  isTabBusy: (tabId) => tabBusy.isBusy(tabId),
 });
-
-function markBusy(tabId, delta) {
-  if (typeof tabId !== "number" || Number.isNaN(tabId)) return;
-  const n = (busyTabs.get(tabId) ?? 0) + delta;
-  if (n > 0) busyTabs.set(tabId, n);
-  else busyTabs.delete(tabId);
-}
 
 // Tab ids are reused after a browser restart, so lent/agent tab sets and idle metadata live in session storage only.
 const tabSetsReady = tabCleanup.stateReady;
@@ -1302,6 +1299,11 @@ async function navigateTab(tabId, rawUrl, until, timeoutMs, opts = {}) {
   };
 }
 
+function requestLimitMs(msg) {
+  const asked = Number(msg?.params?.timeoutMs);
+  return Math.max(REQUEST_MIN_DEADLINE_MS, (Number.isFinite(asked) ? asked : 0) + REQUEST_DEADLINE_GRACE_MS);
+}
+
 async function handleRequest(msg) {
   const { op, params = {} } = msg;
   const tabId = params.tabId !== undefined ? Number(params.tabId) : undefined;
@@ -1381,19 +1383,24 @@ async function handleRequest(msg) {
       const timeoutMs = Number(params.timeoutMs) || 30_000;
       const sessionKey = validSessionKey(params.sessionKey);
       const forceNew = params.newTab === true || params.newWindow === true;
-      const reusedTab = tabId === undefined && sessionKey && !forceNew ? await sessionTabs.reusableTab(sessionKey) : undefined;
-      const target = tabId ?? reusedTab;
-      if (reusedTab !== undefined) tabCleanup.touchTab(reusedTab);
-      markBusy(reusedTab, 1);
+      // reserve() takes the tab in one synchronous step, so two calls for one session can't share it.
+      const reserved =
+        tabId === undefined && sessionKey && !forceNew ? await sessionTabs.reserve(sessionKey) : undefined;
+      let target = tabId ?? reserved;
+      if (reserved !== undefined) tabCleanup.touchTab(reserved);
+      const releaseBusy = tabBusy.hold(target);
       try {
+        // The user can claim or pin the tab while this request waits; then it is not ours to reuse.
+        if (reserved !== undefined && !(await sessionTabs.confirm(sessionKey, reserved))) target = undefined;
         const res = await navigateTab(target, params.url, params.until, timeoutMs, {
           newWindow: params.newWindow === true,
           keepOpen: params.keepOpen === true,
         });
         if (sessionKey && typeof res?.tabId === "number") await sessionTabs.remember(sessionKey, res.tabId);
-        return reusedTab !== undefined ? { ...res, reused: true } : res;
+        return reserved !== undefined && target === reserved ? { ...res, reused: true } : res;
       } finally {
-        markBusy(reusedTab, -1);
+        releaseBusy();
+        if (reserved !== undefined) sessionTabs.release(reserved);
       }
     }
 
@@ -1719,25 +1726,23 @@ async function openRelaySocket(port, versionInfo) {
     }
 
     if (entry.state === "ready" && msg.type === "req" && msg.id !== undefined) {
+      const releaseBusy = tabBusy.hold(msg.params && msg.params.tabId !== undefined ? Number(msg.params.tabId) : undefined);
       try {
         await tabSetsReady;
         const reqTabId = msg.params && msg.params.tabId !== undefined ? Number(msg.params.tabId) : undefined;
         if (reqTabId !== undefined) {
           entry.touchedTabs.add(reqTabId);
         }
-        markBusy(reqTabId, 1);
-        let result;
-        try {
-          result = await handleRequest(msg);
-        } finally {
-          markBusy(reqTabId, -1);
-        }
+        // A Chrome command that never settles must not hold this tab's slot for the worker's life.
+        const result = await withDeadline(handleRequest(msg), requestLimitMs(msg), msg.op || "request");
         if (result && typeof result.tabId === "number") {
           entry.touchedTabs.add(result.tabId);
         }
         sendJsonTo(entry, { type: "res", id: msg.id, ok: true, result });
       } catch (err) {
         sendJsonTo(entry, { type: "res", id: msg.id, ok: false, error: String(err?.message || err) });
+      } finally {
+        releaseBusy();
       }
     }
   });
@@ -1811,8 +1816,22 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 
 chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
-  tabCleanup.handleTabReplaced(addedTabId, removedTabId);
+  // Chrome swaps a tab id (prerender/instant). Move ownership and the session mapping to the new id
+  // before the purge of the old one runs, or the mapping dies with the purge.
+  const wasAgent = agentTabs.has(removedTabId);
+  const wasKeepOpen = tabCleanup.keepOpenTabs.has(removedTabId);
   sessionTabs.replace(addedTabId, removedTabId).catch(() => {});
+  if (wasAgent) {
+    agentTabs.add(addedTabId);
+    tabCleanup.touchTab(addedTabId);
+    if (wasKeepOpen) tabCleanup.markKeepOpen(addedTabId, true);
+    tabCleanup.protect(addedTabId).catch(() => {});
+    for (const conn of connections.values()) {
+      if (conn.touchedTabs.has(removedTabId)) conn.touchedTabs.add(addedTabId);
+    }
+    saveTabSets().catch(() => {});
+  }
+  tabCleanup.handleTabReplaced(addedTabId, removedTabId);
 });
 
 chrome.tabs.onActivated.addListener((activeInfo) => {

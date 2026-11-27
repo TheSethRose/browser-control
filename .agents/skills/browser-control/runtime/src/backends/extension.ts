@@ -69,6 +69,7 @@ const DEFAULT_LIST_WAIT_MS = 5_000;
 const DEFAULT_REQ_TIMEOUT_MS = 60_000;
 const DEFAULT_MAX_FRAME_BYTES = 900 * 1024;
 const MAX_SHORT_TARGET_OWNERS = 2048;
+const MAX_SESSION_PROFILES = 512;
 
 const OPS = new Set([
   "select_target",
@@ -1108,6 +1109,9 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
   // Short target id (`extension:<tabId>`) -> profileId that it was issued for
   const shortTargetOwners = new Map<number, string>();
   let activeTab: ActiveTabRef | undefined;
+  // Session key -> profileId that session's tab-less navs last used. Another session switching the
+  // daemon-wide active profile must not send this one's tab-less nav to a different browser.
+  const sessionProfiles = new Map<string, string>();
   let nextReqId = 1;
   const connectWaiters = new Set<{ resolve: () => void; reject: (err: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   const events = new EventBuffer(options.eventBufferSize ?? 1000);
@@ -1153,6 +1157,20 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
 
   function connectedSlugs(): string[] {
     return [...links.values()].map((l) => l.slug);
+  }
+
+  /** The browser this session last used, while it is still connected. */
+  function sessionLink(sessionKey: string): BrowserLink | undefined {
+    const profileId = sessionProfiles.get(sessionKey);
+    return profileId === undefined ? undefined : links.get(profileId);
+  }
+
+  function rememberSessionLink(sessionKey: string, profileId: string): void {
+    sessionProfiles.delete(sessionKey);
+    sessionProfiles.set(sessionKey, profileId);
+    while (sessionProfiles.size > MAX_SESSION_PROFILES) {
+      sessionProfiles.delete(sessionProfiles.keys().next().value!);
+    }
   }
 
   function clearHandshakeTimer(ws: ServerWebSocket<WsState>): void {
@@ -2038,16 +2056,24 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
             targetLink = resolved.link;
             tabId = resolved.tabId;
           } else {
-            const resolved = resolveTarget(undefined);
-            if (resolved) {
-              targetLink = resolved.link;
-              // A session key asks the extension for that session's own tab, not the daemon-wide one.
-              tabId = sessionKey ? undefined : resolved.tabId;
-            } else {
-              const fallback = defaultLink();
-              if (!fallback) throw new BackendUnavailable(NAME, "extension is not connected");
-              targetLink = fallback;
+            // A session key's tab-less nav stays on the browser that session last used, so another
+            // session switching the daemon-wide active profile cannot move it.
+            const ownLink = sessionKey ? sessionLink(sessionKey) : undefined;
+            if (ownLink) {
+              targetLink = ownLink;
               tabId = undefined;
+            } else {
+              const resolved = resolveTarget(undefined);
+              if (resolved) {
+                targetLink = resolved.link;
+                // A session key asks the extension for that session's own tab, not the daemon-wide one.
+                tabId = sessionKey ? undefined : resolved.tabId;
+              } else {
+                const fallback = defaultLink();
+                if (!fallback) throw new BackendUnavailable(NAME, "extension is not connected");
+                targetLink = fallback;
+                tabId = undefined;
+              }
             }
           }
 
@@ -2077,6 +2103,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
           if (tid !== undefined) {
             activeTab = { profileId: targetLink.profileId, slug: targetLink.slug, tabId: tid };
           }
+          if (sessionKey) rememberSessionLink(sessionKey, targetLink.profileId);
           // Created only when the extension returned a tab id other than the one we passed in.
           const created =
             typeof res?.tabId === "number" &&

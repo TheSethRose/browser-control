@@ -229,7 +229,8 @@ ensure() {
   mkdir -p "$dir"; chmod 700 "$dir"
   find "$lock" -maxdepth 0 -mmin +1 -exec rmdir {} \; 2>/dev/null || true
   if mkdir "$lock" 2>/dev/null; then
-    up || { rm -f "$sock" "$build_file"; nohup bun "$here/../runtime/cli.js" --serve "$sock" >"$log" 2>&1 & }
+    # The daemon serves every caller, so it must not inherit one caller's raw session ids.
+    up || { rm -f "$sock" "$build_file"; nohup env -u BROWSER_CONTROL_SESSION -u CLAUDE_CODE_SESSION_ID -u T3CODE_THREAD_ID -u CODEX_THREAD_ID -u CODEX_SESSION_ID bun "$here/../runtime/cli.js" --serve "$sock" >"$log" 2>&1 & }
   fi
   for _ in $(seq 100); do up && break; sleep 0.05; done
   rmdir "$lock" 2>/dev/null || true
