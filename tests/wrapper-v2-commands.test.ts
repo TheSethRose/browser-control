@@ -137,6 +137,31 @@ describe("wrapper v2 page commands", () => {
     expect(new URLSearchParams(req.query).get("browser")).toBe("brave");
   });
 
+  test("dialog dismiss takes a target, not prompt text", async () => {
+    const r = await call("dialog", "dismiss", "extension:42");
+    expect(JSON.parse(r.body)).toEqual({ sub: "dismiss" });
+    expect(r.query).toContain("extension%3A42");
+  });
+
+  test("dialog accept sends a literal dash as prompt text", async () => {
+    const r = await call("dialog", "accept", "-");
+    expect(JSON.parse(r.body)).toEqual({ sub: "accept", text: "-" });
+  });
+
+  test("hover --xy rejects a coordinate without a leading digit", async () => {
+    const before = seen.length;
+    const res = await bc("hover", "--xy", ".5,20");
+    expect(res.code).not.toBe(0);
+    expect(seen.slice(before).filter((r) => r.path !== "/status")).toHaveLength(0);
+  });
+
+  test("handoff rejects --timeout 0 and reads 08 as 8 seconds", async () => {
+    const res = await bc("handoff", "x", "--timeout", "0");
+    expect(res.code).not.toBe(0);
+    const r = await call("handoff", "x", "--timeout", "08");
+    expect(JSON.parse(r.body)).toEqual({ message: "x", timeout: 8 });
+  });
+
   test("help lists the new commands", async () => {
     const res = await bc("help");
     expect(res.code).toBe(0);

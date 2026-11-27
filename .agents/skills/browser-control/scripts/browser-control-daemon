@@ -363,7 +363,7 @@ case "$cmd" in
     ;;
   hover)
     if [[ -n "$xy" ]]; then
-      [[ "$xy" =~ ^[0-9.]+,[0-9.]+$ ]] || fail INPUT_INVALID "--xy takes x,y in CSS pixels, e.g. --xy 120,240"
+      [[ "$xy" =~ ^[0-9]+(\.[0-9]+)?,[0-9]+(\.[0-9]+)?$ ]] || fail INPUT_INVALID "--xy takes x,y in CSS pixels, e.g. --xy 120,240"
       run POST "page/hover$(query "$(arg 0)")" '{"xy":['"$xy"']}'
     else
       [[ -n "$(arg 0)" ]] || fail INPUT_INVALID "usage: browser-control-daemon hover <ref|label> [targetId] | hover --xy x,y [targetId]"
@@ -377,8 +377,12 @@ case "$cmd" in
       *) fail INPUT_INVALID "usage: browser-control-daemon dialog accept [promptText] [targetId] | dialog dismiss [targetId]" ;;
     esac
     input='{"sub":'"$(json_str "$sub")"
-    [[ -z "$(arg 1)" ]] || input+=',"text":'"$(json_str "$(body "$(arg 1)")")"
-    run POST "page/dialog$(query "$(arg 2)")" "$input}"
+    if [[ "$sub" == dismiss ]]; then
+      run POST "page/dialog$(query "$(arg 1)")" "$input}"
+    else
+      [[ -z "$(arg 1)" ]] || input+=',"text":'"$(json_str "$(arg 1)")"
+      run POST "page/dialog$(query "$(arg 2)")" "$input}"
+    fi
     ;;
   emulate)
     [[ -z "$color_scheme" || "$color_scheme" == dark || "$color_scheme" == light ]] || fail INPUT_INVALID "--color-scheme takes dark or light"
@@ -399,8 +403,8 @@ case "$cmd" in
   handoff)
     secs=600
     if [[ -n "$timeout" ]]; then
-      [[ "$timeout" =~ ^[0-9]+$ ]] || fail INPUT_INVALID "--timeout takes whole seconds, e.g. --timeout 120"
-      secs="$timeout"
+      [[ "$timeout" =~ ^[0-9]+$ ]] && (( 10#$timeout > 0 )) || fail INPUT_INVALID "--timeout takes whole seconds above 0, e.g. --timeout 120"
+      secs=$((10#$timeout))
     fi
     # The call blocks until the user finishes or the server times out, so curl must wait longer.
     max_time=$((secs + 30))
