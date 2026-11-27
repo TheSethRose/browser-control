@@ -289,7 +289,9 @@ function updateBadge() {
   if (state === actionState) return;
   actionState = state;
   try {
-    chrome.action.setIcon?.({ path: ACTION_ICONS[state] })?.catch?.(() => {});
+    chrome.action.setIcon?.({ path: ACTION_ICONS[state] })?.catch?.(() => {
+      actionState = "";
+    });
   } catch {
     /* ignore */
   }
