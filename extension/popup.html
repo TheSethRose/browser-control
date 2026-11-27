@@ -5,7 +5,7 @@
   <title>Browser Control</title>
   <style>
     :root { color-scheme: light dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-    body { margin: 0; padding: 14px; width: 280px; font-size: 13px; }
+    body { margin: 0; padding: 14px; width: 290px; font-size: 13px; }
     h1 { margin: 0 0 8px; font-size: 14px; display: flex; align-items: center; justify-content: space-between; }
     .pill { font-size: 11px; padding: 2px 8px; border-radius: 99px; font-weight: 600; }
     .on { background: #16a34a22; color: #16a34a; }
@@ -15,9 +15,18 @@
     button { flex: 1; padding: 7px 10px; border-radius: 6px; border: 1px solid currentColor; background: transparent; cursor: pointer; font-size: 12px; font-weight: 500; }
     button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
     button.danger { color: #dc2626; border-color: #dc262688; }
+    .handoff-box { display: none; margin: 8px 0; padding: 9px 10px; border-radius: 7px; border: 1px solid #2563eb88; background: #2563eb14; }
+    .handoff-box.active { display: block; }
+    .handoff-title { font-size: 12px; font-weight: 600; color: #2563eb; margin-bottom: 3px; }
+    .handoff-msg { font-size: 12px; margin: 0 0 8px; line-height: 1.35; }
+    .section { margin-top: 8px; border-top: 1px solid #8883; padding-top: 8px; }
+    .setting { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 7px; font-size: 12px; }
+    .setting label { flex: 1; }
+    select { padding: 4px 6px; border-radius: 5px; border: 1px solid #8885; background: transparent; font-size: 12px; }
+    input[type="checkbox"] { width: auto; margin: 0; }
     details { margin-top: 8px; border-top: 1px solid #8883; padding-top: 8px; }
     summary { cursor: pointer; font-size: 12px; opacity: 0.8; }
-    input { width: 100%; box-sizing: border-box; margin: 5px 0; padding: 6px 8px; border-radius: 5px; border: 1px solid #8885; background: transparent; font-size: 12px; }
+    input[type="number"], input[type="password"] { width: 100%; box-sizing: border-box; margin: 5px 0; padding: 6px 8px; border-radius: 5px; border: 1px solid #8885; background: transparent; font-size: 12px; }
   </style>
 </head>
 <body>
@@ -26,6 +35,12 @@
     <span id="status" class="pill off">Offline</span>
   </h1>
   <div id="info" class="muted">Checking daemon...</div>
+
+  <div id="handoffBox" class="handoff-box">
+    <div class="handoff-title">Your turn</div>
+    <p id="handoffMsg" class="handoff-msg"></p>
+    <button id="handoffDoneBtn" class="primary" style="width:100%">Continue</button>
+  </div>
 
   <div class="row">
     <button id="modeAll">All tabs</button>
@@ -41,8 +56,36 @@
     <button id="reconnectBtn">Reconnect</button>
   </div>
 
+  <div class="section">
+    <div class="setting">
+      <label for="tabGroupMode">Tab group</label>
+      <select id="tabGroupMode">
+        <option value="shared">Shared (Agents)</option>
+        <option value="none">None</option>
+      </select>
+    </div>
+    <div class="setting">
+      <label for="autoCollapse">Auto-collapse group</label>
+      <input id="autoCollapse" type="checkbox" />
+    </div>
+    <div class="setting">
+      <label for="idleCleanup">Idle cleanup</label>
+      <select id="idleCleanup">
+        <option value="15">15 min</option>
+        <option value="30">30 min</option>
+        <option value="60">60 min</option>
+        <option value="120">2 hours</option>
+        <option value="0">Never</option>
+      </select>
+    </div>
+    <div class="setting">
+      <label for="muteAgentTabs">Mute agent tabs</label>
+      <input id="muteAgentTabs" type="checkbox" />
+    </div>
+  </div>
+
   <details>
-    <summary>Manual pairing (Web Store / custom port)</summary>
+    <summary>Manual pairing (paste relay token)</summary>
     <input id="portInput" type="number" placeholder="Port (default 49222)" />
     <input id="tokenInput" type="password" placeholder="Relay token from extension-relay.json" />
     <button id="pairBtn" style="width:100%">Save &amp; Connect</button>
