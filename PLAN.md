@@ -399,6 +399,42 @@ Done when: `bun run build:skill`, `typecheck`, `bun test`, `tests/e2e/`, and all
 - Remove the staging unpacked extension from Chrome and load `browser-control/extension` instead; run `extension setup` once.
 - Release as `v2.0.0` only on Seth's go-ahead. Delete the `browser-control-v2/` staging folder and its worktrees after a week of clean use.
 
+### Phase 6 — Natural browsing (2026-11-27)
+
+**Goal:** agent input in Seth's real browser should look like a person using it, so sites don't flag his accounts. Natural typing already exists (`src/typing.ts`, default on, `--fast` opts out). Phase 6 adds the same for the pointer, clicks, scrolling and pacing.
+
+**Research (2026-11-27).**
+- `anomalyco/browse` (MIT): curved, minimum-jerk mouse paths from a tracked pointer position, elapsed-time-compensated frame pacing, eased wheel scrolling that stops when the page stops moving, and a page scroll point that avoids nested scrollers. Adapted code carries attribution.
+- `ardia-browser/ardia` (GPL-3.0, ideas only, no code): it doesn't humanize motion. Ideas we use: aim inside the element's *visible* box, and re-check what sits under the pointer after moving and before pressing, since hover can open menus that cover the target.
+- browser-control today: clicks teleport to the exact center with zero-delay press and release. `point()` always runs an instant `scrollIntoView`. The pointer position isn't tracked. `do`/`fill` steps have no pause between them. `nav` has no reading dwell. `--fast` reaches only `type` and `fill`.
+
+**Spec.** All planners live in a pure module, `src/natural.ts`, and take an injected `rng` (seedable Mulberry32), so tests are deterministic.
+
+| Piece | Natural behavior | Bounds |
+|---|---|---|
+| Pointer path | Cubic Bezier from the last pointer position (first move starts 120–280 px / 80–180 px away, never 0,0), minimum-jerk easing, tapering tremor | Fitts-like `65 + 75·log2(d/W + 1)` ms × 0.85–1.18, clamped 90–460 ms, target width clamped to 16–120 px for the Fitts term; bow 5–16% of distance, max 110 px; 12–20 ms steps, max 24; under 3 px means one move |
+| Overshoot | Past the target along the approach, then back | 18% when distance ≥ 220 px; 4–11 px, 3–5 steps, 45–85 ms |
+| Click point | Center-weighted random point inside the visible box, inset by a margin, hit-checked (3 tries, then center). `--xy` lands exactly | margin min(20%, 10 px) x, min(20%, 8 px) y (15% under 14 px) |
+| Click timing | Hover dwell, press hold, gap between multi-clicks | 45–115 ms, 55–130 ms, 65–135 ms |
+| Key hold | `key` command | 35–85 ms |
+| Scroll into view | Already in view: nothing. Otherwise 1–4 eased wheel flicks over the target's scroller toward 32–54% of the viewport height; stops when the page stops moving, then falls back to an instant `scrollIntoView` | flicks 280–680 px (scrolls shorter than 280 px use one flick of exactly that length; lengths are whole pixels), 4–12 events at 15–19 ms (fewer when the flick is too short to split), 75–175 ms apart; total ≤ 650 ms |
+| `do`/`fill` pacing | Think pause between steps, minus time already spent settling; none after `wait` or the last step | 160–420 ms |
+| Post-`nav` dwell | Applied lazily before the next input, not inside `nav`, so reads and slow agent turns add nothing | `clamp(220 + 0.08·chars·(0.8–1.25), 220, 850)` ms |
+| Pagination | A same-host navigation within 4 s of the last one waits out a jittered minimum gap | 1.6–2.8 s |
+| `text --scroll` | Jittered step size and pauses, still attach-free | 0.72–0.92 × height; 140–290 ms; 10% chance of 320–600 ms |
+
+**Switches.** Natural browsing is on by default, and one switch also covers typing. In order: `--fast` on the command (or `"fast": true` on a `do`/`script` step); `BROWSER_CONTROL_NATURAL=on|off`; the one-line file `~/.config/browser-control/natural` (`on`/`off`, read on each call); default on.
+
+**Stays true.** Reads (`snap`, `text`, `form`, `query`, `read-urls`, `nav`) never send input and stay attach-free. Input stays `isTrusted` through `Input.dispatch*`. No `Runtime.enable` and no `navigator.webdriver` change. Each motion caps its event count, so the extension relay isn't flooded. A dialog that opens mid-motion stops the motion.
+
+**Guardrails (unchanged).** Never solve CAPTCHAs or challenges. `WALL:`, `CHALLENGE:` and `BLOCKED:` still stop and hand off. No fingerprint spoofing beyond `emulate`. Rate limits in `references/safety.md` still apply. Natural browsing makes input look human. It is not a way around a site's limits.
+
+**Time budget.** Typical flows land at 1.0–1.46× of today. Reads 1.0×. An agent `nav → click` 1.2×. A 3-field `fill` 1.23×. A 5-step `do` 1.31×. A tight scripted `nav → click` 1.46×. Pagination loops in scripts are paced to about 2 s on purpose.
+
+**Ships as two PRs into `main`.**
+1. Part 1: `src/natural.ts` (the planners), the switch helper, unit tests, and this spec. No wiring.
+2. Part 2: wiring into pointer, click, hover, drag, `key` and wheel scroll. Page helpers v10 add a JSON `point` with visible box and in-view flag, `hitCheck` and `pageScrollPoint`. The wrapper forwards `--fast` everywhere. Pacing (`do`/`fill`, `nav` dwell, pagination, `text --scroll`). An e2e fixture records the real event stream: mousemove count, path curvature, dwell, wheel deltas and `isTrusted`. A before/after timing comparison. Docs.
+
 ### Later: Web Store build (deferred from Phase 2)
 
 Deferred on 2026-11-26 ("ship it smaller"): the one-time pairing code (`extension pair`, `onboarding.html#code=...`), per-browser tokens, and `extension revoke <slug>`.
