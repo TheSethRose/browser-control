@@ -1030,6 +1030,7 @@ function makeBackgroundChrome(opts: {
   extensionId?: string;
   tabs?: FakeTab[];
   executeScript?: (details: unknown) => Promise<unknown>;
+  frames?: () => Array<{ frameId: number; parentFrameId: number; documentId: string }>;
   sendCommand?: (
     target: { tabId: number; sessionId?: string },
     method: string,
@@ -1043,7 +1044,11 @@ function makeBackgroundChrome(opts: {
     tabs: opts.tabs ?? [{ id: 7, windowId: 1, url: "https://app.test", active: true, groupId: -1 }],
   });
   const noopListener = { addListener: () => {}, removeListener: () => {} };
-  const commitListeners = new Set<(d: { tabId: number; frameId: number }) => void>();
+  type Commit = { tabId: number; frameId: number; documentId?: string; documentLifecycle?: string };
+  const commitListeners = new Set<(d: Commit) => void>();
+  const replacedListeners = new Set<(d: { replacedTabId: number; tabId: number }) => void>();
+  const updatedListeners = new Set<(id: number, info: Record<string, unknown>, tab?: unknown) => void>();
+  const listenerSet = <F,>(set: Set<F>) => ({ addListener: (fn: F) => set.add(fn), removeListener: (fn: F) => set.delete(fn) });
   const debuggerEventListeners: Array<(source: { tabId: number }, method: string, params: unknown) => void> = [];
   const messageListeners: Array<
     (msg: Record<string, unknown>, sender: unknown, sendResponse: (res: unknown) => void) => unknown
@@ -1095,25 +1100,46 @@ function makeBackgroundChrome(opts: {
     tabs: {
       ...fake.chrome.tabs,
       onActivated: noopListener,
-      onUpdated: noopListener,
+      onUpdated: listenerSet(updatedListeners),
       onRemoved: noopListener,
       onReplaced: noopListener,
       sendMessage: async () => ({ ok: true }),
     },
     webNavigation: {
       onCreatedNavigationTarget: noopListener,
-      onCommitted: {
-        addListener: (fn: (d: { tabId: number; frameId: number }) => void) => commitListeners.add(fn),
-        removeListener: (fn: (d: { tabId: number; frameId: number }) => void) => commitListeners.delete(fn),
-      },
+      onCommitted: listenerSet(commitListeners),
+      onTabReplaced: listenerSet(replacedListeners),
+      ...(opts.frames
+        ? {
+            getAllFrames: async () => opts.frames!(),
+            getFrame: async ({ frameId }: { frameId: number }) => opts.frames!().find((f) => f.frameId === frameId) ?? null,
+          }
+        : {}),
     },
     storage: { ...fake.chrome.storage, onChanged: noopListener },
   };
-  const emitCommitted = (tabId: number, frameId = 0) => {
-    for (const fn of [...commitListeners]) fn({ tabId, frameId });
+  const emitCommitted = (tabId: number, frameId = 0, extra: Partial<Commit> = {}) => {
+    for (const fn of [...commitListeners]) fn({ tabId, frameId, ...extra });
+  };
+  const emitTabReplaced = (replacedTabId: number, tabId: number) => {
+    for (const fn of [...replacedListeners]) fn({ replacedTabId, tabId });
+  };
+  const emitUpdated = (tabId: number, info: Record<string, unknown>) => {
+    for (const fn of [...updatedListeners]) fn(tabId, info, { id: tabId });
   };
 
-  return { fullChrome, calls: fake.calls, cdpCalls, executeScriptCalls, emitDebuggerEvent, sendRuntimeMessage, emitCommitted, commitListeners };
+  return {
+    fullChrome,
+    calls: fake.calls,
+    cdpCalls,
+    executeScriptCalls,
+    emitDebuggerEvent,
+    sendRuntimeMessage,
+    emitCommitted,
+    emitTabReplaced,
+    emitUpdated,
+    commitListeners,
+  };
 }
 
 async function withBackgroundModule<T>(
@@ -1561,19 +1587,40 @@ describe("background.js resolveBcNode & runBcSilent review fixes (S1, S3, S6, S7
     });
   });
 
-  test("N2: a write lost to a new document fails fast instead of repeating it on the new page", async () => {
+  const mainRuns = (env: ReturnType<typeof makeBackgroundChrome>) =>
+    env.executeScriptCalls.filter((c) => Array.isArray((c as { args?: unknown[] }).args?.[0]));
+
+  for (const [name, step, want] of [
+    ["select with a ref", { kind: "bc", method: "select", args: ["e3", "Canada"] }, /refs from the old page are gone/],
+    ["point that may scroll", { kind: "bc", method: "point", args: ["e3", { detail: true }] }, /refs from the old page are gone/],
+    ["point without scrolling", { kind: "bc", method: "point", args: ["e3", { noScroll: true }] }, /refs from the old page are gone/],
+    ["snapshot within a ref", { kind: "bc", method: "snapshot", args: [{ within: "e9" }] }, /refs from the old page are gone/],
+    ["marks", { kind: "bc", method: "marks", args: [true] }, /loaded a new page while the step ran/],
+    ["armInputProbe", { kind: "bc", method: "armInputProbe" }, /loaded a new page while the step ran/],
+    ["readInputProbe", { kind: "bc", method: "readInputProbe" }, /loaded a new page while the step ran/],
+  ] as const) {
+    test(`N2: ${name} lost to a new document fails fast and never runs twice`, async () => {
+      let env!: ReturnType<typeof makeBackgroundChrome>;
+      env = makeBackgroundChrome({
+        executeScript: lostOnFirstRun(() => setTimeout(() => env.emitCommitted(7), 10), "done"),
+      });
+      await withBackgroundModule(`n2-${step.method}-${name.length}`, env.fullChrome, async (bg) => {
+        const t0 = Date.now();
+        await expect(bg.runBcSilent(7, [step], { timeoutMs: 10_000 })).rejects.toThrow(want);
+        expect(Date.now() - t0).toBeLessThan(1_000);
+        expect(mainRuns(env).length).toBe(1);
+      });
+    });
+  }
+
+  test("N2b: markBoxes only reads coordinates, so it reruns on the new page", async () => {
     let env!: ReturnType<typeof makeBackgroundChrome>;
     env = makeBackgroundChrome({
-      executeScript: lostOnFirstRun(() => setTimeout(() => env.emitCommitted(7), 10), "selected"),
+      executeScript: lostOnFirstRun(() => setTimeout(() => env.emitCommitted(7), 10), "[]"),
     });
-    await withBackgroundModule("n2-nav-write", env.fullChrome, async (bg) => {
-      const t0 = Date.now();
-      await expect(
-        bg.runBcSilent(7, [{ kind: "bc", method: "select", args: ["e3", "Canada"] }], { timeoutMs: 10_000 }),
-      ).rejects.toThrow(/loaded a new page while the step ran/);
-      expect(Date.now() - t0).toBeLessThan(1_000);
-      const runs = env.executeScriptCalls.filter((c) => Array.isArray((c as { args?: unknown[] }).args?.[0]));
-      expect(runs.length).toBe(1);
+    await withBackgroundModule("n2b-markboxes", env.fullChrome, async (bg) => {
+      expect(await bg.runBcSilent(7, [{ kind: "bc", method: "markBoxes" }], { timeoutMs: 10_000 })).toEqual(["[]"]);
+      expect(mainRuns(env).length).toBe(2);
     });
   });
 
@@ -1615,6 +1662,131 @@ describe("background.js resolveBcNode & runBcSilent review fixes (S1, S3, S6, S7
       }
       expect(msg).toContain("got no answer in 150 ms (no dialog detected");
       expect(msg).not.toContain("dialog may be blocking");
+      expect(env.cdpCalls.length).toBe(0);
+    });
+  });
+
+  test("N5: a rerun rechecks sharing, so a tab the user stopped sharing is never read again", async () => {
+    let env!: ReturnType<typeof makeBackgroundChrome>;
+    env = makeBackgroundChrome({
+      executeScript: lostOnFirstRun(() => {
+        void env.sendRuntimeMessage({ type: "setMode", mode: "lent" }).then(() => env.emitCommitted(7));
+      }, "https://app.test/next"),
+    });
+    await withBackgroundModule("n5-unshared-rerun", env.fullChrome, async (bg) => {
+      await expect(bg.runBcSilent(7, [{ kind: "href" }], { timeoutMs: 5_000 })).rejects.toThrow(/Share this tab/);
+      expect(mainRuns(env).length).toBe(1);
+    });
+  });
+
+  test("N6: a liveness probe stranded on the old document never attaches the debugger", async () => {
+    let env!: ReturnType<typeof makeBackgroundChrome>;
+    let doc = "doc-1";
+    env = makeBackgroundChrome({
+      frames: () => [{ frameId: 0, parentFrameId: -1, documentId: doc }],
+      executeScript: async (details) => {
+        const d = details as { args?: unknown[]; files?: unknown; target: { documentIds?: string[] } };
+        const onOld = d.target.documentIds?.[0] === "doc-1";
+        if (Array.isArray(d.args) && typeof d.args[0] === "number") return [{ result: true }];
+        if (Array.isArray(d.args) && Array.isArray(d.args[0])) {
+          if (onOld) return new Promise(() => {});
+          await new Promise((r) => setTimeout(r, 200));
+          return [{ result: { ok: true, values: ["new"] } }];
+        }
+        if (onOld) {
+          // The liveness probe lands on the old document; the commit arrives while it is pending.
+          setTimeout(() => {
+            doc = "doc-2";
+            env.emitCommitted(7, 0, { documentId: "doc-2" });
+          }, 15);
+          return new Promise(() => {});
+        }
+        return [{ result: 1 }];
+      },
+    });
+    await withBackgroundModule("n6-stranded-probe", env.fullChrome, async (bg) => {
+      const values = await bg.runBcSilent(7, [{ kind: "href" }], {
+        timeoutMs: 5_000,
+        dialogProbeDelayMs: 20,
+        livenessProbeTimeoutMs: 60,
+      });
+      expect(values).toEqual(["new"]);
+      expect(env.cdpCalls.length).toBe(0);
+      expect(mainRuns(env).map((c) => (c as { target: { documentIds: string[] } }).target.documentIds[0])).toEqual([
+        "doc-1",
+        "doc-2",
+      ]);
+    });
+  });
+
+  test("N7: a parent frame commit that removes the target frame fails promptly", async () => {
+    let env!: ReturnType<typeof makeBackgroundChrome>;
+    env = makeBackgroundChrome({
+      frames: () => [
+        { frameId: 0, parentFrameId: -1, documentId: "top" },
+        { frameId: 3, parentFrameId: 0, documentId: "mid" },
+        { frameId: 5, parentFrameId: 3, documentId: "leaf" },
+        { frameId: 9, parentFrameId: 0, documentId: "ad" },
+      ],
+      executeScript: lostOnFirstRun(() => {
+        setTimeout(() => {
+          env.emitCommitted(7, 9, { documentId: "ad-2" });
+          env.emitCommitted(7, 3, { documentId: "mid-2" });
+        }, 10);
+      }, "x"),
+    });
+    await withBackgroundModule("n7-frame-gone", env.fullChrome, async (bg) => {
+      const t0 = Date.now();
+      await expect(bg.runBcSilent(7, [{ kind: "href" }], { frameId: 5, timeoutMs: 10_000 })).rejects.toThrow(
+        /frame 5 of tab 7 is gone/,
+      );
+      expect(Date.now() - t0).toBeLessThan(1_000);
+      expect(mainRuns(env).length).toBe(1);
+    });
+  });
+
+  test("N8: a replaced tab fails the call promptly", async () => {
+    let env!: ReturnType<typeof makeBackgroundChrome>;
+    env = makeBackgroundChrome({
+      executeScript: lostOnFirstRun(() => setTimeout(() => env.emitTabReplaced(7, 70), 10), "x"),
+    });
+    await withBackgroundModule("n8-tab-replaced", env.fullChrome, async (bg) => {
+      await expect(bg.runBcSilent(7, [{ kind: "href" }], { timeoutMs: 10_000 })).rejects.toThrow(/tab 7 was replaced/);
+    });
+  });
+
+  test("N9: same-document URL changes are ignored; a bfcache swap of the document reruns", async () => {
+    let env!: ReturnType<typeof makeBackgroundChrome>;
+    let doc = "doc-1";
+    let runs = 0;
+    env = makeBackgroundChrome({
+      frames: () => [{ frameId: 0, parentFrameId: -1, documentId: doc }],
+      executeScript: async (details) => {
+        const d = details as { args?: unknown[] };
+        if (Array.isArray(d.args) && typeof d.args[0] === "number") return [{ result: true }];
+        if (Array.isArray(d.args) && Array.isArray(d.args[0])) {
+          if (++runs === 1) {
+            setTimeout(() => {
+              env.emitUpdated(7, { url: "https://app.test/#hash" });
+              env.emitCommitted(7, 0, { documentId: "doc-1" });
+            }, 5);
+            setTimeout(() => {
+              doc = "doc-2";
+              env.emitUpdated(7, { status: "loading" });
+            }, 40);
+            return new Promise(() => {});
+          }
+          return [{ result: { ok: true, values: ["restored"] } }];
+        }
+        return [{ result: 1 }];
+      },
+    });
+    await withBackgroundModule("n9-document-id", env.fullChrome, async (bg) => {
+      const t0 = Date.now();
+      expect(await bg.runBcSilent(7, [{ kind: "title" }], { timeoutMs: 10_000 })).toEqual(["restored"]);
+      expect(Date.now() - t0).toBeGreaterThanOrEqual(35);
+      expect(Date.now() - t0).toBeLessThan(1_000);
+      expect(runs).toBe(2);
     });
   });
 

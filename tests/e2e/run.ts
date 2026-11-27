@@ -293,7 +293,14 @@ async function main(): Promise<number> {
     // Fixture servers: two origins (different ports and hostnames) so the iframes are cross-origin.
     const read = (f: string) => readFileSync(join(FIXTURES, f), "utf8");
     const html = { headers: { "content-type": "text/html; charset=utf-8" } };
-    const frameServer = Bun.serve({ port: 0, hostname: "localhost", fetch: () => new Response(read("frame.html"), html) });
+    const frameServer = Bun.serve({
+      port: 0,
+      hostname: "localhost",
+      fetch: (req) =>
+        new URL(req.url).pathname === "/next"
+          ? new Response("<!doctype html><title>E2E Next</title><p>next page ready</p>", html)
+          : new Response(read("frame.html"), html),
+    });
     servers.push(frameServer);
     const frameUrl = `http://localhost:${frameServer.port}/frame`;
     const pageServer = Bun.serve({
@@ -302,6 +309,7 @@ async function main(): Promise<number> {
       fetch(req) {
         const path = new URL(req.url).pathname;
         if (path === "/form") return new Response(read("form.html"), html);
+        if (path === "/busy") return new Response("<!doctype html><title>E2E Busy</title><p>busy page</p>", html);
         // Keeps the form page loading for 3 s after DOMContentLoaded, as slow trackers do on real sites.
         if (path === "/slow.png") return sleep(3000).then(() => new Response(PIXEL, { headers: { "content-type": "image/png" } }));
         if (path === "/challenge") return new Response(read("challenge.html"), { ...html, status: 403 });
@@ -512,6 +520,56 @@ async function main(): Promise<number> {
       if (formTab) await bc(["close", formTab]);
     }
     console.log(`TIMING natural-fill-fresh ms=${fillMs.join(",")}`);
+
+    // A 600-character natural type in one step must not hit a per-call timer, and must read back exactly.
+    const longText = Array.from({ length: 600 }, (_, i) => "abcdefghij klmnopqrst uvwxyz.,"[i % 30]).join("");
+    await bc(["call", "clear_target"]);
+    const longNav = await bc(["nav", `${base}/form`]);
+    const longTab = /"targetId":"(extension:[^"]+)"/.exec(longNav)?.[1] ?? "";
+    const typeT0 = Date.now();
+    const longOut = await bc(["do", JSON.stringify([{ type: ["Notes", longText] }])], 300_000);
+    const typeMs = Date.now() - typeT0;
+    const longGot = await evalJs(`String(document.getElementById('f-notes').value === ${JSON.stringify(longText)})`);
+    record("natural-type-600", !/FAILED|STOPPED/.test(longOut) && /true/.test(longGot), `${longGot} ${typeMs}ms :: ${longOut}`);
+    console.log(`TIMING natural-type-600 ms=${typeMs}`);
+    if (longTab) await bc(["close", longTab]);
+
+    // A browser-side tabs.update commits a new document while a helper call waits on a busy page.
+    // Chrome never answers the old document's executeScript; the call must rerun on the new page.
+    await bc(["call", "clear_target"]);
+    const busyNav = await bc(["nav", `${base}/busy`]);
+    const busyTab = /"targetId":"(extension:[^"]+)"/.exec(busyNav)?.[1] ?? "";
+    await evalJs("setTimeout(()=>{const t=performance.now()+6000;while(performance.now()<t);},300);1");
+    await sleep(450);
+    const replaceT0 = Date.now();
+    const pendingRead = bc(["text"], 60_000);
+    await sleep(1200);
+    const sw = ((await cdp.send("Target.getTargets")).targetInfos as Array<{ type: string; url: string; targetId: string }>).find(
+      (x) => x.type === "service_worker" && x.url.startsWith("chrome-extension://"),
+    );
+    let updated = "no extension service worker";
+    if (sw) {
+      const { sessionId } = await cdp.send("Target.attachToTarget", { targetId: sw.targetId, flatten: true });
+      const res = await cdp.send(
+        "Runtime.evaluate",
+        {
+          expression: `(async()=>{const t=(await chrome.tabs.query({})).find((x)=>(x.url||"").includes("/busy"));if(!t)return "no busy tab";await chrome.tabs.update(t.id,{url:${JSON.stringify(`http://localhost:${frameServer.port}/next`)}});return "updated";})()`,
+          awaitPromise: true,
+          returnByValue: true,
+        },
+        sessionId,
+      );
+      updated = String(res?.result?.value ?? JSON.stringify(res));
+      await cdp.send("Target.detachFromTarget", { sessionId }).catch(() => {});
+    }
+    const replacedOut = await pendingRead;
+    const replaceMs = Date.now() - replaceT0;
+    record(
+      "nav-replace-during-call",
+      updated === "updated" && /next page ready/.test(replacedOut) && replaceMs < 15_000,
+      `${updated} ${replaceMs}ms :: ${replacedOut}`,
+    );
+    if (busyTab) await bc(["close", busyTab]);
 
     // The backends file the wrapper writes steers the shipped daemon and outranks the env var.
     const tid = /extension:[A-Za-z0-9:@-]*[A-Za-z0-9]/.exec(await bc(["tabs"]))?.[0] ?? "";
