@@ -212,7 +212,16 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
 
   async function respond(request: Request, url: URL, route: string, operation: string): Promise<Response> {
     if (url.pathname === "/extension" || url.pathname.startsWith("/extension/")) {
-      const extReply = await dispatchExtensionRequest(request, url, getRegisteredExtensionBackend(), backendOrder());
+      // One read of the order config, so status's order and its source always agree.
+      const orderSource = backendOrderSource();
+      const extReply = await dispatchExtensionRequest(
+        request,
+        url,
+        getRegisteredExtensionBackend(),
+        backendOrder(orderSource),
+        undefined,
+        orderSource,
+      );
       if (extReply) return extReply;
     }
 
@@ -362,6 +371,7 @@ export async function dispatchExtensionRequest(
   backend: Parameters<typeof extensionStatusReport>[0],
   order: string[],
   tokenFile?: string,
+  orderSource: ReturnType<typeof backendOrderSource> = backendOrderSource(),
 ): Promise<Response | undefined> {
   if (url.pathname !== "/extension" && !url.pathname.startsWith("/extension/")) return undefined;
   const matched = EXTENSION_ROUTE_RE.exec(url.pathname);
@@ -377,7 +387,7 @@ export async function dispatchExtensionRequest(
       { status: 405, headers: { allow: "GET" } },
     );
   }
-  return handleExtensionRoute(matched[1]!, backend, order, tokenFile, backendOrderSource());
+  return handleExtensionRoute(matched[1]!, backend, order, tokenFile, orderSource);
 }
 
 /** `GET /extension/<sub>`: the wrapper's `extension status|browsers|diagnostics`. */

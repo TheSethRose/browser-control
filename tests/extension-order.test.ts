@@ -1,6 +1,6 @@
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { dispatchExtensionRequest } from "../daemon";
@@ -101,6 +101,36 @@ describe("extension setup and the global order file", () => {
     expect((res.data["globalOrder"] as Record<string, unknown>)["backup"]).toBe(`${globalFile}.bak-${today()}-2`);
     expect((await readFile(`${globalFile}.bak-${today()}`, "utf8")).trim()).toBe("older");
     expect((await readFile(`${globalFile}.bak-${today()}-2`, "utf8")).trim()).toBe("cdp");
+  });
+
+  test("setup reads the whole global file like the router does", async () => {
+    const { root, daemonDir, globalFile } = await isolate("setup-multiline");
+    const ext = await extFolder(root);
+    // A blank first line followed by cdp leaves the extension out: rewritten.
+    await writeFile(globalFile, "\ncdp\n");
+    const res = await setup(ext, daemonDir);
+    expect((res.data["globalOrder"] as Record<string, unknown>)["was"]).toBe("cdp");
+    expect((await readFile(globalFile, "utf8")).trim()).toBe("extension");
+    // cdp then extension on the next line already includes the extension: untouched.
+    const second = await isolate("setup-multiline-keep");
+    const ext2 = await extFolder(second.root);
+    await writeFile(second.globalFile, "cdp\nextension\n");
+    const res2 = await setup(ext2, second.daemonDir);
+    expect(res2.data["globalOrder"]).toBeUndefined();
+    expect(await readFile(second.globalFile, "utf8")).toBe("cdp\nextension\n");
+  });
+
+  test("the rewritten global file and its backup keep the original file mode", async () => {
+    const { root, daemonDir, globalFile } = await isolate("setup-mode");
+    const ext = await extFolder(root);
+    await writeFile(globalFile, "cdp\n", { mode: 0o600 });
+    await chmod(globalFile, 0o600);
+    const res = await setup(ext, daemonDir);
+    const backup = (res.data["globalOrder"] as Record<string, string>)["backup"]!;
+    expect((await stat(globalFile)).mode & 0o777).toBe(0o600);
+    expect((await stat(backup)).mode & 0o777).toBe(0o600);
+    const leftovers = (await readdir(join(globalFile, ".."))).filter((f) => f.includes(".tmp."));
+    expect(leftovers).toEqual([]);
   });
 
   test("a global file that already includes extension is left untouched", async () => {

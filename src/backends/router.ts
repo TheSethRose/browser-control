@@ -122,8 +122,8 @@ export function backendOrderSource(): { source: BackendOrderSource; value: strin
   return { source: "default", value: "" };
 }
 
-export function backendOrder(): string[] {
-  let raw = backendOrderSource().value;
+export function backendOrder(source: { value: string } = backendOrderSource()): string[] {
+  let raw = source.value;
   if (!raw) raw = "token" in readPrivateTokenSync() ? EXTENSION : CDP;
   const names = raw
     .split(/[\s,]+/)
