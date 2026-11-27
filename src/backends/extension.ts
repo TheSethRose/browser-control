@@ -55,6 +55,7 @@ const MAX_SHORT_TARGET_OWNERS = 2048;
 
 const OPS = new Set([
   "select_target",
+  "close_target",
   "navigate",
   "evaluate",
   "execute_cdp",
@@ -855,6 +856,7 @@ type WsState = {
   browser?: string;
   extensionVersion?: string;
   helpersVersion?: number;
+  agentClose?: boolean;
   slug?: string;
 };
 
@@ -869,6 +871,8 @@ type BrowserLink = {
   slug: string;
   browser: string;
   extensionVersion: string;
+  // Hello listed "agent_close": close_tab only closes tabs the extension opened.
+  agentClose: boolean;
   ws: ServerWebSocket<WsState>;
   outbound: OutboundFrameQueue;
   pending: Map<number, PendingReq>;
@@ -1330,6 +1334,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
       slug,
       browser,
       extensionVersion: data.extensionVersion ?? "",
+      agentClose: data.agentClose === true,
       ws,
       outbound: new OutboundFrameQueue(ws, options.backpressureLimit),
       pending,
@@ -1471,6 +1476,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
       data.browser = browser;
       data.extensionVersion = version;
       data.helpersVersion = helpersVersion;
+      data.agentClose = Array.isArray(msg["features"]) && (msg["features"] as unknown[]).includes("agent_close");
       data.stage = "awaiting_response";
       data.handshake.stage = "challenge_sent";
       data.handshake.timestamp = now();
@@ -1919,6 +1925,36 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
           return { activeTargetId: targetId, targetId, browser: resolved.link.slug, backend: NAME };
         }
 
+        case "close_target": {
+          await waitForConnection();
+          const resolved = resolveTarget(input["targetId"]);
+          if (!resolved) throw new BackendUnavailable(NAME, "no extension tab selected");
+          const targetId = formatTargetId(resolved.link, resolved.tabId);
+          if (!resolved.link.agentClose) {
+            throw new Error(
+              "REFUSED: this Browser Control extension is too old to close tabs safely. Reload Browser Control at chrome://extensions, then try again.",
+            );
+          }
+          const res = (await requestOnLink(
+            resolved.link,
+            "close_tab",
+            { tabId: resolved.tabId },
+            timeoutMs ?? DEFAULT_REQ_TIMEOUT_MS,
+          )) as { ok?: boolean; closed?: boolean };
+          if (
+            activeTab &&
+            activeTab.profileId === resolved.link.profileId &&
+            activeTab.tabId === resolved.tabId
+          ) {
+            activeTab = undefined;
+          }
+          return {
+            closed: res?.closed !== false,
+            targetId,
+            backend: NAME,
+          };
+        }
+
         case "navigate": {
           const url = String(input["url"] ?? "");
           if (!url) throw new Error("INPUT_INVALID: url is required");
@@ -1980,6 +2016,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
           const keepOpen = input["keepOpen"] === true;
           // A new window always means a new tab, so the resolved tab only picks the browser.
           if (newWindow) tabId = undefined;
+          const createdNewTab = tabId === undefined;
 
           const res = (await requestOnLink(
             targetLink,
@@ -1993,11 +2030,14 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
               ...(timeoutMs !== undefined ? { timeoutMs } : {}),
             },
             (timeoutMs ?? 30_000) + 10_000,
-          )) as { tabId?: number; loaded?: boolean; url?: string; title?: string };
+          )) as { tabId?: number; loaded?: boolean; url?: string; title?: string; created?: boolean };
           const tid = typeof res?.tabId === "number" ? res.tabId : tabId;
           if (tid !== undefined) {
             activeTab = { profileId: targetLink.profileId, slug: targetLink.slug, tabId: tid };
           }
+          // Created only when the extension returned a tab id other than the one we passed in.
+          const created =
+            typeof res?.tabId === "number" && res.tabId !== tabId && (res?.created === true || createdNewTab);
           return {
             loaded: res?.loaded !== false,
             targetId: tid === undefined ? null : formatTargetId(targetLink, tid),
@@ -2005,6 +2045,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
             title: res?.title ?? "",
             browser: targetLink.slug,
             backend: NAME,
+            ...(created ? { created: true } : {}),
           };
         }
 

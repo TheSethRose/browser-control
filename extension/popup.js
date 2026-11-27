@@ -44,7 +44,7 @@ async function refresh() {
   modeAll.setAttribute("aria-pressed", String(s.mode === "all"));
   modeLent.setAttribute("aria-pressed", String(s.mode === "lent"));
   lendBtn.style.display = s.mode === "lent" ? "" : "none";
-  lendBtn.textContent = s.activeTabLent ? "Revoke this tab" : "Lend this tab";
+  lendBtn.textContent = s.activeTabLent ? "Stop sharing this tab" : "Share this tab";
   lendBtn.className = "wide secondary";
   portInput.value = String(s.port || 49222);
 

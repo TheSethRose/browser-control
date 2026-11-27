@@ -99,8 +99,11 @@ function makeFakeChrome({
         if (id === undefined || !winMap.has(id)) throw new Error("No window");
         return { ...winMap.get(id)! };
       },
-      async getAll() {
-        return [...winMap.values()].map((w) => ({ ...w }));
+      async getAll(opts?: { populate?: boolean }) {
+        return [...winMap.values()].map((w) => ({
+          ...w,
+          ...(opts?.populate ? { tabs: [...tabMap.values()].filter((t) => t.windowId === w.id).map((t) => ({ ...t })) } : {}),
+        }));
       },
       async get(windowId: number) {
         const w = winMap.get(windowId);
@@ -156,6 +159,23 @@ function makeFakeChrome({
           if (t) t.groupId = groupId;
         }
         return groupId;
+      },
+      async create(opts: { windowId?: number; url?: string; active?: boolean }) {
+        record("tabs.create", opts);
+        const id = Math.max(0, ...tabMap.keys()) + 1;
+        const t: FakeTab = {
+          id,
+          windowId: opts.windowId ?? 1,
+          url: opts.url ?? "about:blank",
+          active: opts.active === true,
+          groupId: -1,
+        };
+        tabMap.set(id, t);
+        return { ...t };
+      },
+      async remove(tabId: number) {
+        record("tabs.remove", tabId);
+        tabMap.delete(tabId);
       },
     },
     tabGroups: {
@@ -1092,6 +1112,9 @@ async function withBackgroundModule<T>(
   fn: (bg: {
     resolveBcNode: (tabId: number, refOrSelector: string, opts?: Record<string, unknown>) => Promise<Record<string, unknown>>;
     runBcSilent: (tabId: number, steps: unknown[], opts?: Record<string, unknown>) => Promise<unknown>;
+    handoffStart: (tabId: number, rawMessage?: string, rawHandoffId?: string) => Promise<Record<string, unknown>>;
+    closeTab: (tabId: number) => Promise<Record<string, unknown>>;
+    agentTabs: Set<number>;
   }) => Promise<T>,
 ): Promise<T> {
   const prevChrome = (globalThis as Record<string, unknown>)["chrome"];
@@ -1100,6 +1123,9 @@ async function withBackgroundModule<T>(
     const bg = (await import(`../extension/background.js?${tag}`)) as {
       resolveBcNode: (tabId: number, refOrSelector: string, opts?: Record<string, unknown>) => Promise<Record<string, unknown>>;
       runBcSilent: (tabId: number, steps: unknown[], opts?: Record<string, unknown>) => Promise<unknown>;
+      handoffStart: (tabId: number, rawMessage?: string, rawHandoffId?: string) => Promise<Record<string, unknown>>;
+      closeTab: (tabId: number) => Promise<Record<string, unknown>>;
+      agentTabs: Set<number>;
     };
     return await fn(bg);
   } finally {
@@ -1490,6 +1516,72 @@ describe("background.js resolveBcNode & runBcSilent review fixes (S1, S3, S6, S7
       expect(values).toEqual(["https://app.test/slow"]);
       expect(envSlow.calls.some((c) => c.api === "debugger.attach")).toBe(false);
       expect(envSlow.cdpCalls.length).toBe(0);
+    });
+  });
+
+  test("F1: non-shared tab refusal uses exact Share this tab wording across background.js and debugger-hub.js", async () => {
+    const env = makeBackgroundChrome({});
+    const expected =
+      "REFUSED: tab 7 isn't shared with Browser Control. Click the Browser Control icon on that tab, then Share this tab.";
+    await withBackgroundModule("f1-share-wording", env.fullChrome, async (bg) => {
+      await env.sendRuntimeMessage({ type: "setMode", mode: "lent" });
+      await expect(bg.runBcSilent(7, [{ kind: "href" }])).rejects.toThrow(expected);
+      await expect(bg.resolveBcNode(7, "#box", { mode: "selector" })).rejects.toThrow(expected);
+      await expect(bg.handoffStart(7, "Sign in")).rejects.toThrow(expected);
+    });
+
+    const fake = makeFakeChrome();
+    const hub = createDebuggerHub({ chrome: fake.chrome, isTabAllowed: () => false });
+    await expect(hub.ensureAttached(7)).rejects.toThrow(expected);
+  });
+
+  test("F3: closeTab closes agent tabs and refuses user tabs (All tabs, shared, and non-shared)", async () => {
+    const env = makeBackgroundChrome({
+      tabs: [
+        { id: 1, windowId: 1, url: "https://user.test", active: true, groupId: -1 },
+        { id: 2, windowId: 1, url: "https://shared.test", active: false, groupId: -1 },
+        { id: 3, windowId: 1, url: "https://unshared.test", active: false, groupId: -1 },
+        { id: 4, windowId: 1, url: "https://agent.test", active: false, groupId: -1 },
+      ],
+    });
+    await withBackgroundModule("f3-close-tab", env.fullChrome, async (bg) => {
+      bg.agentTabs.add(4);
+
+      // 1. User tab in All tabs mode -> refused.
+      await env.sendRuntimeMessage({ type: "setMode", mode: "all" });
+      await expect(bg.closeTab(1)).rejects.toThrow(
+        "REFUSED: tab 1 wasn't opened by Browser Control. Browser Control only closes tabs it opened.",
+      );
+      expect(env.calls.some((c) => c.api === "tabs.remove")).toBe(false);
+
+      // 2. Shared user tab in Only tabs I share mode -> still refused.
+      await env.sendRuntimeMessage({ type: "setMode", mode: "lent" });
+      await env.sendRuntimeMessage({ type: "toggleLend", tabId: 2 });
+      await expect(bg.closeTab(2)).rejects.toThrow(
+        "REFUSED: tab 2 wasn't opened by Browser Control. Browser Control only closes tabs it opened.",
+      );
+      expect(env.calls.some((c) => c.api === "tabs.remove")).toBe(false);
+
+      // 3. Non-shared tab in Only tabs I share mode -> refused.
+      await expect(bg.closeTab(3)).rejects.toThrow(/^REFUSED:.*only closes tabs it opened/);
+      expect(env.calls.some((c) => c.api === "tabs.remove")).toBe(false);
+
+      // Ownership moves to the user while the close is in flight -> refused, tabs.remove never runs.
+      bg.agentTabs.add(3);
+      const origGetAll = env.fullChrome.windows.getAll;
+      env.fullChrome.windows.getAll = async (opts) => {
+        bg.agentTabs.delete(3);
+        return origGetAll(opts);
+      };
+      await expect(bg.closeTab(3)).rejects.toThrow(/^REFUSED:.*only closes tabs it opened/);
+      env.fullChrome.windows.getAll = origGetAll;
+      expect(env.calls.some((c) => c.api === "tabs.remove" && c.args[0] === 3)).toBe(false);
+
+      // 4. Agent tab -> closes cleanly even in Only tabs I share mode.
+      const res = await bg.closeTab(4);
+      expect(res).toEqual({ ok: true, closed: true });
+      expect(env.calls.some((c) => c.api === "tabs.remove" && c.args[0] === 4)).toBe(true);
+      expect(bg.agentTabs.has(4)).toBe(false);
     });
   });
 });

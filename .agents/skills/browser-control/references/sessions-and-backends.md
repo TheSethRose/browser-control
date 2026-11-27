@@ -58,7 +58,7 @@ If the extension doesn't connect:
 - **Background tabs.** Agent tabs open in the background, in the user's last focused window that is not minimized. They don't steal focus. Popups from `target="_blank"` or `window.open` are adopted the same way.
 - **Tab group.** Agent tabs can sit in one collapsed tab group named `Agents · N` after the pinned tabs. It collapses when the user switches away and expands during a `handoff`. Dragging a tab out of the group, or pinning it, gives it back to the user.
 - **`nav --new-window`** opens the tab in a new window. **`nav --keep-open`** keeps the tab past idle cleanup. Both work on extension tabs only.
-- **Lending.** The popup has `All tabs` and `Lent only` modes. In `Lent only`, the extension refuses any tab the user hasn't lent (`REFUSED: tab <id> is not lent to Browser Control`). Ask the user to lend the tab with the toolbar button. Don't switch to `cdp` to get around it.
+- **Tab sharing.** The popup has `All tabs` and `Only tabs I share` modes. In `Only tabs I share`, the extension refuses any tab you haven't shared (`REFUSED: tab <id> isn't shared with Browser Control. Click the Browser Control icon on that tab, then Share this tab.`). Ask the user to click the Browser Control icon on that tab, then **Share this tab**. Don't switch to `cdp` to get around it.
 - **Two tiers.** Reads (`tabs`, `nav`, `snap`, `text`, `form`, `query`, `read-urls`, `value`, `verdict`, `health`, `wait`, native `select`, typed inputs, a plain `shot` of the active tab) run without the debugger, so Chrome shows no yellow banner. Commands that need trusted input or DevTools (`click`, `hover`, `type`, `key`, `drag`, `upload`, `dialog`, `emulate`, `styles`, `issues`, `perf`, `capture_pdf`, `snap --ax`, `eval`, `call`, `flow record`, `ocr`, `shot --full|--ref|--marks`) attach the debugger. Chrome then shows a yellow "started debugging" banner.
 - **Auto-detach.** The debugger detaches after 30 s idle and the banner goes away. Long work such as `perf`, `flow record`, or a long `wait_for_event` holds it up to 10 minutes.
 - **Raw `call`.** On extension tabs, `execute_cdp` covers the CDP domains Chrome allows extensions. `Browser.*` is not one of them. With order `extension`, browser-level calls refuse with `EXTENSION_ONLY`; opt into CDP with `start <browser>` or `BROWSER_CONTROL_BACKENDS=extension,cdp`.
@@ -76,7 +76,7 @@ If the extension doesn't connect:
 - **Route calls:** pass `targetId` or `--match <text>` on each command. Use `call select_target '{"targetId":"<id>"}'` only when routing must persist. `select_target` changes shared state, so run dependent steps one after another.
 - **Create:** on the extension, `nav <url>` with no tab opens a background tab. On `cdp`, run `call execute_cdp '{"method":"Target.createTarget","params":{"url":"about:blank","background":true}}'`, then `nav <url> <targetId>` (a real URL in `createTarget` can return before navigation starts).
 - **Foreground:** `select_target` does not switch the visible tab. On `cdp`, call `execute_cdp { "method": "Target.activateTarget", "params": { "targetId": "<id>" } }` when the user should see it. On the extension, `handoff` brings the tab forward.
-- **Close:** `execute_cdp { "method": "Target.closeTarget", "params": { "targetId": "<id>" } }`, then `call clear_target` if it was selected. The extension never closes the last tab of the last window. It opens a blank tab first.
+- **Close:** on the extension, run `$BCD close [targetId]` (closes only tabs Browser Control opened, and never closes the last tab of the last window — it opens a blank tab first). On `cdp`, run `execute_cdp { "method": "Target.closeTarget", "params": { "targetId": "<id>" } }`, then `call clear_target` if it was selected.
 
 ## 7. The optional `browse` backend
 
@@ -90,10 +90,10 @@ If the extension doesn't connect:
 
 ## 8. Raw CDP operations and MCP / CLI delivery
 
-All 14 capability operations. Call them with `$BCD call <op> '<json>'`. Check exact schemas with `$BCD ops` or `runtime/capability.json`.
+All 15 capability operations. Call them with `$BCD call <op> '<json>'`. Check exact schemas with `$BCD ops` or `runtime/capability.json`.
 
-- **Connection and routing:** `list_browsers`, `connect_browser`, `get_browser_status`, `list_targets`, `select_target`, `clear_target`, `disconnect_browser` (the daemon refuses it).
+- **Connection and routing:** `list_browsers`, `connect_browser`, `get_browser_status`, `list_targets`, `select_target`, `clear_target`, `close_target`, `disconnect_browser` (the daemon refuses it).
 - **Page and events:** `evaluate`, `navigate`, `capture_screenshot`, `capture_pdf` (both take an optional `path`), `execute_cdp` (any `Domain.command`), `read_events`, `wait_for_event`.
-- **MCP server** (the 14 raw operations only, not the `/page/*` helpers):
+- **MCP server** (the 15 raw operations only, not the `/page/*` helpers):
   `claude mcp add browser-control -- <skill-dir>/scripts/browser-control-mcp`
 - **Plain CLI wrapper:** `<skill-dir>/scripts/browser-control <op> '<json>'` sends operation calls through the same daemon.

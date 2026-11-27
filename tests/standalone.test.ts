@@ -23,6 +23,7 @@ const EXPECTED_OPERATIONS = [
   "capture_pdf",
   "capture_screenshot",
   "clear_target",
+  "close_target",
   "connect_browser",
   "disconnect_browser",
   "evaluate",

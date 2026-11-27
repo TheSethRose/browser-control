@@ -92,4 +92,9 @@ describe("browser-control operations without a browser", () => {
     expect(result.nextSeq).toBeGreaterThan(0);
     expect(result.dropped).toBe(0);
   });
+
+  test("close_target refuses on the cdp backend", async () => {
+    await initialize();
+    await expect(call("close_target")).rejects.toThrow(/INPUT_INVALID:.*extension/);
+  });
 });

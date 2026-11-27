@@ -135,6 +135,23 @@
       }
     },
     {
+      "name": "close_target",
+      "description": "Close an agent-opened tab on the extension backend. Refuses tabs Browser Control did not open. With no targetId, closes the active extension tab.",
+      "inputs": {
+        "type": "object",
+        "properties": {
+          "targetId": { "type": "string" }
+        }
+      },
+      "outputs": {
+        "type": "object",
+        "properties": {
+          "closed": { "type": "boolean" },
+          "targetId": { "type": "string" }
+        }
+      }
+    },
+    {
       "name": "execute_cdp",
       "description": "Call any Chrome DevTools Protocol method (Domain.command) and return its raw result. Browser.*, Target.*, and Extensions.* go to the browser endpoint; other methods route to the active target unless sessionId or targetId is given.",
       "inputs": {

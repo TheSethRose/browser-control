@@ -5,6 +5,7 @@
 //   POST /call/<operation>   JSON object body -> InvokeResult JSON (HTTP 400 when ok:false)
 //   POST /eval               JavaScript body  -> the value as text
 //   POST /nav                URL body         -> navigate result as text (?until=load&snap=1&new_window=1&keep_open=1)
+//   POST /close              empty body       -> close an agent-opened extension tab (?t=<targetId> or ?m=<match>)
 //   POST /page/<action>      JSON body        -> page helper result as text
 //        actions: snap, text, form, query, read-urls, click, hover, dialog, emulate, type,
 //                 select, upload, drag, wait, key, value, ocr, do, shot, verdict, health,
@@ -234,6 +235,12 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
       }
       case "eval":
         return text(await invoke("evaluate", { expression: body, targetId }), (data) => data.value, wrap);
+      case "close":
+        return text(
+          await invoke("close_target", targetId ? { targetId } : {}),
+          (data) => (data.closed === false ? `not closed ${data.targetId ?? ""}` : `closed ${data.targetId ?? ""}`).trim(),
+          false,
+        );
       case "nav": {
         const browser = url.searchParams.get("browser")?.trim() || undefined;
         const navScope = browser ? { browser, explicitTargetId: targetId } : undefined;

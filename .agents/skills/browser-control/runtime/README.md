@@ -133,6 +133,7 @@ Others, like `evaluate` and `navigate`, would take too much code to write by han
 | `list_targets` | Lists targets (pages, out-of-process iframes and workers). It hides `chrome://` and `devtools://` pages. |
 | `select_target` | Attaches to one target and sends later tab calls to it. |
 | `clear_target` | Stops sending calls to the selected target. |
+| `close_target` | Closes an agent-opened extension tab. Refuses tabs Browser Control did not open. |
 | `execute_cdp` | Calls any `Domain.command` and returns the raw result. |
 | `evaluate` | Runs JavaScript and returns its value. Top-level `await` works and promises are awaited. |
 | `navigate` | Navigates and waits for the load event. |
@@ -156,7 +157,7 @@ connect_browser -> list_targets -> select_target
 The daemon is `cli.ts --serve <socket>`, built in `daemon.ts` (with page execution in
 `src/page-runner.ts` and OCR/picture tracking in `src/picture.ts`). Its client is
 `.agents/skills/browser-control/scripts/browser-control-daemon`, a small `curl` wrapper with
-these commands: `start`, `eval`, `nav`, `tabs`, `call`, `ops`, `default`, `status`,
+these commands: `start`, `eval`, `nav`, `close`, `tabs`, `call`, `ops`, `default`, `status`,
 `check-update`, `stop --force` and `extension`. It also exposes page helpers through the
 daemon (`snap`, `text`, `form`, `query`, `read-urls`, `ocr`, `shot`, `click`, `hover`, `type`,
 `select`, `upload`, `drag`, `wait`, `key`, `fill`, `do`, `dialog`, `emulate`, `handoff`,
@@ -278,7 +279,7 @@ On extension tabs:
   Use it for logins, 2FA, CAPTCHAs and payments.
 - `nav --browser <slug>` picks a browser when more than one is connected.
   `extension browsers` lists the slugs.
-- The popup can limit the extension to tabs you lend it (`Lent only`).
+- The popup can limit the extension to tabs you share (`Only tabs I share`).
 
 The `extension` command manages the link: `extension setup [extensionDir]`,
 `extension status`, `extension browsers`, `extension diagnostics`, `extension enable` (clears
@@ -311,7 +312,7 @@ go to DevTools.
 
 browse runs `navigate`, `evaluate`, `capture_screenshot` and tab selection with no debugging
 port and no Allow click. Its tabs open in the background. It sees only tabs it opened or tabs
-the user lent it. Everything else, like `execute_cdp`, `capture_pdf` and events, stays on
+the user shared with it. Everything else, like `execute_cdp`, `capture_pdf` and events, stays on
 DevTools. The order is read on every call, so changing it needs no restart.
 
 ## Limits

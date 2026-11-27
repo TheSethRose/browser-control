@@ -195,10 +195,28 @@ describe("wrapper v2 page commands", () => {
     }
   });
 
+  test("close posts to /close with optional targetId or --match", async () => {
+    const bare = await call("close");
+    expect(bare.method).toBe("POST");
+    expect(bare.path).toBe("/close");
+    expect(bare.query).toBe("");
+
+    const targeted = await call("close", "extension:42");
+    expect(targeted.method).toBe("POST");
+    expect(targeted.path).toBe("/close");
+    expect(new URLSearchParams(targeted.query).get("t")).toBe("extension:42");
+
+    const matched = await call("close", "--match", "example.com");
+    expect(matched.method).toBe("POST");
+    expect(matched.path).toBe("/close");
+    expect(new URLSearchParams(matched.query).get("m")).toBe("example.com");
+  });
+
   test("help lists the new commands", async () => {
     const res = await bc("help");
     expect(res.code).toBe(0);
     for (const line of [
+      "close [targetId]",
       "hover <ref|label>",
       "dialog accept",
       "emulate [--viewport",

@@ -103,7 +103,11 @@ function findHandoffButton(node: DomNode, insideHost = false): number | undefine
   return undefined;
 }
 
-async function clickHandoffContinue(cdp: Cdp, urlPrefix: string): Promise<string> {
+async function interactWithHandoff(
+  cdp: Cdp,
+  urlPrefix: string,
+  typeOpts?: { selector: string; text: string },
+): Promise<{ clicked: string; typedValue?: string; cardUpDuringType?: boolean }> {
   for (let i = 0; i < 40; i++) {
     const { targetInfos } = await cdp.send("Target.getTargets");
     const pages = (targetInfos as any[]).filter((t) => t.type === "page" && String(t.url).startsWith(urlPrefix));
@@ -113,6 +117,48 @@ async function clickHandoffContinue(cdp: Cdp, urlPrefix: string): Promise<string
         const { root } = await cdp.send("DOM.getDocument", { depth: -1, pierce: true }, sessionId);
         const nodeId = findHandoffButton(root);
         if (nodeId === undefined) continue;
+
+        let typedValue: string | undefined;
+        let cardUpDuringType: boolean | undefined;
+        if (typeOpts) {
+          const { nodeId: inputNodeId } = await cdp.send(
+            "DOM.querySelector",
+            { nodeId: root.nodeId, selector: typeOpts.selector },
+            sessionId,
+          );
+          if (inputNodeId) {
+            const { model: inputModel } = await cdp.send("DOM.getBoxModel", { nodeId: inputNodeId }, sessionId);
+            const iq: number[] = inputModel.content;
+            const ix = (iq[0]! + iq[4]!) / 2;
+            const iy = (iq[1]! + iq[5]!) / 2;
+            for (const type of ["mousePressed", "mouseReleased"]) {
+              await cdp.send("Input.dispatchMouseEvent", { type, x: ix, y: iy, button: "left", clickCount: 1 }, sessionId);
+            }
+            for (const ch of typeOpts.text) {
+              await cdp.send(
+                "Input.dispatchKeyEvent",
+                { type: "keyDown", text: ch, unmodifiedText: ch, key: ch },
+                sessionId,
+              );
+              await cdp.send("Input.dispatchKeyEvent", { type: "keyUp", key: ch }, sessionId);
+            }
+            const evalRes = await cdp.send(
+              "Runtime.evaluate",
+              {
+                expression: `JSON.stringify({ value: document.querySelector(${JSON.stringify(typeOpts.selector)})?.value ?? "", cardUp: !!document.querySelector('[data-bc-handoff-host]') })`,
+                returnByValue: true,
+              },
+              sessionId,
+            );
+            const parsed = JSON.parse(String(evalRes?.result?.value ?? "{}")) as {
+              value?: string;
+              cardUp?: boolean;
+            };
+            typedValue = parsed.value;
+            cardUpDuringType = parsed.cardUp;
+          }
+        }
+
         const { model } = await cdp.send("DOM.getBoxModel", { nodeId }, sessionId);
         const q: number[] = model.content;
         const x = (q[0]! + q[4]!) / 2;
@@ -120,14 +166,14 @@ async function clickHandoffContinue(cdp: Cdp, urlPrefix: string): Promise<string
         for (const type of ["mousePressed", "mouseReleased"]) {
           await cdp.send("Input.dispatchMouseEvent", { type, x, y, button: "left", clickCount: 1 }, sessionId);
         }
-        return "clicked";
+        return { clicked: "clicked", typedValue, cardUpDuringType };
       } finally {
         await cdp.send("Target.detachFromTarget", { sessionId }).catch(() => {});
       }
     }
     await sleep(250);
   }
-  return "Continue button never appeared";
+  return { clicked: "Continue button never appeared" };
 }
 
 // ---- main ----
@@ -328,17 +374,28 @@ async function main(): Promise<number> {
     await check("handoff-timeout", ["handoff", "E2E handoff", "--timeout", "2"], /HANDOFF_TIMEOUT/, 60_000);
     await checkEval("handoff-timeout-cleared", "String(!!document.querySelector('[data-bc-handoff-host]'))", /false/);
 
-    // Handoff 2: the user presses Continue (trusted click over CDP); the command returns "done".
+    // Handoff 2: while the card is up, the user can focus and type on the page, then click Continue -> "done".
     const pending = bc(["handoff", "E2E continue", "--timeout", "30"], 60_000);
     await sleep(500);
-    const clicked = await clickHandoffContinue(cdp, base);
-    record("handoff-continue-click", clicked === "clicked", clicked);
+    const handoffAction = await interactWithHandoff(cdp, base, {
+      selector: "#handoff-input",
+      text: "human-ok",
+    });
+    record(
+      "handoff-type-while-up",
+      handoffAction.cardUpDuringType === true && handoffAction.typedValue === "human-ok",
+      JSON.stringify(handoffAction),
+    );
+    record("handoff-continue-click", handoffAction.clicked === "clicked", handoffAction.clicked);
     const done = await Promise.race([pending, sleep(15_000).then(() => "TIMED OUT waiting for handoff to return")]);
     record("handoff-done", /handoff: done/.test(done), done);
     await checkEval("handoff-done-cleared", "String(!!document.querySelector('[data-bc-handoff-host]'))", /false/);
     await checkEval("handoff-tab-usable", "document.title", /E2E Fixture/);
 
     // Restricted chrome:// page refuses with EXTENSION_ONLY and never connects to CDP.
+    const pageCount = async () =>
+      ((await cdp!.send("Target.getTargets")).targetInfos as Array<{ type: string }>).filter((t) => t.type === "page")
+        .length;
     await check("restricted-chrome-nav", ["nav", "chrome://version"], /EXTENSION_ONLY/);
     await check("restricted-chrome-eval", ["eval", "document.title"], /EXTENSION_ONLY/);
     const statusAfterRestricted = await bc(["status"]);
@@ -348,6 +405,33 @@ async function main(): Promise<number> {
       statusAfterRestricted,
     );
     await check("return-after-restricted", ["nav", `${base}/`], /E2E Fixture/);
+
+    // Refused nav that creates a new tab closes that tab before returning the error.
+    await bc(["call", "clear_target"]);
+    const tabsBeforeRefusedNew = await pageCount();
+    await check("restricted-new-tab-refused", ["nav", "chrome://version"], /EXTENSION_ONLY/);
+    await sleep(300);
+    const tabsAfterRefusedNew = await pageCount();
+    record(
+      "restricted-new-tab-closed",
+      tabsAfterRefusedNew === tabsBeforeRefusedNew,
+      `before=${tabsBeforeRefusedNew} after=${tabsAfterRefusedNew}`,
+    );
+
+    // close: open a new agent tab, close it, confirm it is gone.
+    const openedOut = await check("close-open-agent-tab", ["nav", `${base}/`], /E2E Fixture/);
+    const openedId = /"targetId":"(extension:[^"]+)"/.exec(openedOut)?.[1] ?? "";
+    record("close-open-agent-tab-id", openedId !== "", openedOut);
+    const tabsBeforeClose = await pageCount();
+    await check("close-agent-tab", ["close", openedId], /closed extension:/);
+    await sleep(300);
+    const tabsAfterClose = await pageCount();
+    const tabsAfterCloseList = await bc(["tabs"]);
+    record(
+      "close-agent-tab-gone",
+      tabsAfterClose === tabsBeforeClose - 1 && openedId !== "" && !tabsAfterCloseList.includes(openedId),
+      `before=${tabsBeforeClose} after=${tabsAfterClose} id=${openedId}`,
+    );
 
     // The backends file the wrapper writes steers the shipped daemon and outranks the env var.
     const tid = /extension:[A-Za-z0-9:@-]*[A-Za-z0-9]/.exec(await bc(["tabs"]))?.[0] ?? "";

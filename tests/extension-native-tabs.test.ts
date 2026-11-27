@@ -595,6 +595,23 @@ describe("window-groups", () => {
 });
 
 describe("tab-cleanup", () => {
+  test("a tab claimed during the window lookup is neither ungrouped nor removed", async () => {
+    const fake = makeFakeChrome({
+      windows: [{ id: 1, type: "normal", state: "normal", focused: true }],
+      tabs: [
+        { id: 11, windowId: 1, url: "https://agent.test", active: false, groupId: 10 },
+        { id: 12, windowId: 1, url: "https://user.test", active: true, groupId: -1 },
+      ],
+      groups: [{ id: 10, windowId: 1, title: "Agents · 1", color: "blue", collapsed: false }],
+    });
+    let checks = 0;
+    const res = await closeTabSafely(11, { onlyIf: () => ++checks === 1 }, fake.chrome);
+    expect(res.closed).toBe(false);
+    const apis = fake.calls.map((c) => c.api);
+    expect(apis).not.toContain("tabs.ungroup");
+    expect(apis).not.toContain("tabs.remove");
+  });
+
   test("leaveLastWindowOpen creates a replacement tab and ungroups before removing", async () => {
     const fake = makeFakeChrome({
       windows: [{ id: 1, type: "normal", state: "normal", focused: true }],
