@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [v2, main]
+  push:
+    branches: [v2]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out browser-control
+        uses: actions/checkout@v4
+        with:
+          path: browser-control
+
+      # @agent-software/core resolves as file:../agent-software/core, a private sibling repo.
+      # AGENT_SOFTWARE_TOKEN is a fine-grained token with read-only Contents on TheSethRose/agent-software.
+      - name: Check agent-software token
+        env:
+          TOKEN: ${{ secrets.AGENT_SOFTWARE_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::Secret AGENT_SOFTWARE_TOKEN is not set. Add a fine-grained, read-only (Contents) token for TheSethRose/agent-software."
+            exit 1
+          fi
+
+      - name: Check out agent-software
+        uses: actions/checkout@v4
+        with:
+          repository: TheSethRose/agent-software
+          token: ${{ secrets.AGENT_SOFTWARE_TOKEN }}
+          path: agent-software
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+
+      - name: Install
+        working-directory: browser-control
+        run: bun install
+
+      - name: Typecheck
+        working-directory: browser-control
+        run: bun run typecheck
+
+      - name: Test
+        working-directory: browser-control
+        run: bun test

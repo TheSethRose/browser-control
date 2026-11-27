@@ -20,7 +20,7 @@ import {
   type PageTarget,
 } from "./session";
 import { createBackends } from "./backends/registry";
-import { route } from "./backends/router";
+import { backendOrder, route } from "./backends/router";
 
 /** The connection operations act on. */
 let connection: CdpConnection | undefined;
@@ -147,6 +147,14 @@ export const initialize: NonNullable<CapabilityModule["initialize"]> = async () 
     /* surfacing happens on the first artifact write */
   });
   getConnection();
+  const order = backendOrder();
+  for (const b of backends) {
+    if (order.includes(b.name)) {
+      await Promise.resolve(b.start?.()).catch(() => {
+        /* unavailability surfaces cleanly on the first call / status */
+      });
+    }
+  }
 };
 
 export const dispose: NonNullable<CapabilityModule["dispose"]> = async () => {
@@ -156,7 +164,7 @@ export const dispose: NonNullable<CapabilityModule["dispose"]> = async () => {
   for (const b of backends) await b.dispose?.();
 };
 
-/** The built-in DevTools (CDP) operations: every operation, and the fallback for other backends. */
+/** The built-in DevTools (CDP) operations: default when unpaired, explicit by name, or opt-in fallback. */
 const cdpOperations: Record<string, OperationHandler> = {
   list_browsers: async () => {
     const browsers = await detectBrowsers();
@@ -231,6 +239,10 @@ const cdpOperations: Record<string, OperationHandler> = {
   clear_target: async () => {
     getConnection().clearActive();
     return { activeTargetId: null, activeSessionId: null };
+  },
+
+  close_target: async () => {
+    throw new Error("INPUT_INVALID: close_target is only available on extension tabs; on cdp use execute_cdp with Target.closeTarget");
   },
 
   execute_cdp: async (input) => {
@@ -453,7 +465,7 @@ const cdpOperations: Record<string, OperationHandler> = {
   },
 };
 
-/** Extra backends (see `src/backends/`); CDP stays the fallback for whatever they lack. */
+/** Extra backends (see `src/backends/`); CDP handles explicit requests and opt-in fallback orders. */
 const backends = createBackends();
 
 export const operations: Record<string, OperationHandler> = route(cdpOperations, backends);

@@ -6,3 +6,6 @@ data/
 .env
 .env.*
 !.env.example
+
+# v2 extension pairing secret (written by `extension setup`)
+extension/pairing.json

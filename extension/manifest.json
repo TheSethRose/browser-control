@@ -1,0 +1,39 @@
+{
+  "manifest_version": 3,
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAmj7ESwB2MBhByklz8GkgCpFm95N/Gy7uCjt1jFL924Zxk1G7s+eIeRskCLM5gogHMGvbKbfD2m9asnhuWFOoXm4EFnQ6xEnv0064eaoRiop85H+h7Hs0HlqKRyz992TY1IHBlhB4UEhegk5UFFCgRAsyEa5jfh0gm47I+QaKh58E0FTDWIK0f2isFfEbwzyZSEuq0VXzw4DwKznbPkgnraJh4mlilG95dvFqPadA8NRB2iCwp0gkLlUC/LwzIjeK8eyowUgvC5RmLQ073w1QDyzVg/JYcd8K2JGM/IiLXjkLePGyC1gGKF2rjSTffOGjsM6GuWoQaAdMmgZJOfF7IwIDAQAB",
+  "name": "Browser Control Companion",
+  "version": "2.0.0",
+  "minimum_chrome_version": "125",
+  "description": "Local-only companion for browser-control: silent isolated-world reads, on-demand tab CDP, and per-tab sharing without remote-debugging flags.",
+  "permissions": [
+    "tabs",
+    "tabGroups",
+    "scripting",
+    "debugger",
+    "storage",
+    "alarms",
+    "webNavigation",
+    "notifications"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "action": {
+    "default_title": "Browser Control Companion",
+    "default_icon": {
+      "16": "icons/state-off-16.png",
+      "32": "icons/state-off-32.png"
+    },
+    "default_popup": "popup.html"
+  }
+}

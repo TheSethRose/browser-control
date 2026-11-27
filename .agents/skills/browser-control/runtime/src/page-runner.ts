@@ -10,6 +10,30 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { runBrowse, type Runner } from "./backends/browse";
+import {
+  backendOrder,
+  extensionOnlyMessage,
+  isBackendUnavailable,
+  isExtensionOnlyOrder,
+} from "./backends/router";
+import { extensionFrameTarget, extensionTabOf, getRegisteredExtensionBcCall, type BcCallFn } from "./backends/extension";
+import {
+  SHORT_PAGE_CHARS,
+  buildChallengeProbeExpression,
+  classifyChallenge,
+  fastVendorSelectors,
+  formatChallengeOutput,
+  isDenialTitle,
+  isSuspiciousSnapshot,
+  isSuspiciousTitle,
+  isSuspiciousUrl,
+  matchProbeSelectorsFromRows,
+  parseBcQueryRows,
+  parseBcTextForProbe,
+  probeSelectors,
+  type ChallengeDetection,
+  type ChallengeProbe,
+} from "./challenges";
 import { inspectIssues, inspectPerf, inspectStyles } from "./devtools";
 import {
   buildFlow,
@@ -30,12 +54,17 @@ import {
   PAGE_HELPERS_SOURCE,
   PAGE_HELPERS_VERSION,
   PAYMENT_FIELD,
+  normalizeHelperCall,
   parseLocator,
+  renderElementStep,
+  renderSteps,
+  type ElementStep,
+  type HelperCall,
   type Locator,
 } from "./page-helpers";
 import { createPictureTracker, imageWidth, resizeImage } from "./picture";
 import { buildHumanKeystrokes } from "./typing";
-import { didYouMean, withRemedy } from "./safety";
+import { didYouMean, withRemedy, wrapUntrusted } from "./safety";
 import { createScriptRunner, writeOutputFile } from "./script";
 
 type Json = Record<string, unknown>;
@@ -44,13 +73,32 @@ export type Invoker = (operation: string, input?: Json) => Promise<InvokeResult>
 const NEED_INSTALL = "__BC_NEED_INSTALL__";
 /** Input events never return while a JavaScript dialog is open, so don't wait the full CDP timeout. */
 const INPUT_TIMEOUT_MS = 10_000;
+const MAX_VIEWPORT_DIM = 10_000_000;
 const DIALOG_HINT = "the page stopped responding; a JavaScript dialog is probably open (references/dom-and-input.md)";
 
 const PAGE_ACTIONS = [
-  "snap", "text", "form", "query", "read-urls", "ocr", "shot", "click", "type", "select",
+  "snap", "text", "form", "query", "read-urls", "ocr", "shot", "click", "hover", "type", "select",
   "upload", "drag", "wait", "key", "fill", "do", "value", "nav", "verdict", "health",
-  "styles", "issues", "perf", "notes", "flow", "script",
+  "styles", "issues", "perf", "dialog", "emulate", "handoff", "notes", "flow", "script",
 ] as const;
+
+const DEFAULT_HANDOFF_TIMEOUT_MS = 10 * 60 * 1000;
+const CHALLENGE_WAIT_MAX_MS = 8_000;
+const CHALLENGE_POLL_MS = 500;
+const CHALLENGE_PROBE_RESERVE_MS = 250;
+const CHALLENGE_PROBE_SEP = "\n__BC_CHALLENGE_SEP__\n";
+const CHALLENGE_PROBE_EXPR = buildChallengeProbeExpression(false);
+const FAST_VENDOR_CSS = fastVendorSelectors.join(",");
+/** One cheap querySelector-style check for known challenge markers (`# N row(s)` header). */
+const VENDOR_MARKER_STEP = {
+  kind: "bc",
+  method: "query",
+  args: [{ selector: FAST_VENDOR_CSS, fields: { id: "@id" }, limit: 1, all: true }],
+  fallback: "",
+} as const;
+const PROBE_SELECTORS_CSS = probeSelectors.join(",");
+const EXTENSION_REQUEST_SYMBOL = Symbol.for("browser-control.extension-request");
+type ExtensionRequestFn = (op: string, params?: Json, timeoutMs?: number) => Promise<unknown>;
 
 const failure = (code: string, message: string): InvokeResult =>
   ({ ok: false, error: { code, message } }) as InvokeResult;
@@ -65,6 +113,25 @@ function browseTabNumber(targetId: unknown): number | undefined {
   const n = Number(targetId.slice("browse:".length));
   return Number.isInteger(n) ? n : undefined;
 }
+
+function stripHash(url: string): string {
+  const idx = url.indexOf("#");
+  return idx >= 0 ? url.slice(0, idx) : url;
+}
+
+type ProbeReadResult =
+  | { kind: "skip"; url?: string }
+  | { kind: "probe"; probe: ChallengeProbe }
+  | { kind: "error" };
+
+type ChallengeCheckResult =
+  | { status: "clear"; waited: boolean; url?: string }
+  | {
+      status: "interactive" | "block" | "non-interactive-timeout";
+      detection: ChallengeDetection;
+      url: string;
+      waited: boolean;
+    };
 
 function hostOf(url: string): string {
   try {
@@ -189,6 +256,9 @@ export function createPageHelperHandler(
     sessionId?: string;
     sleep?: (ms: number) => Promise<void>;
     rng?: () => number;
+    bcCall?: BcCallFn;
+    extensionRequest?: ExtensionRequestFn;
+    challengeWaitMaxMs?: number;
   } = {},
 ) {
   const daemonSessionId = options.sessionId ?? randomUUID().slice(0, 12);
@@ -202,8 +272,40 @@ export function createPageHelperHandler(
   const browseCache = new Map<number, Map<string, BrowseEntry>>();
   /** Non-secret typed values remembered per tab for `flow save` parameterization. */
   const recentTyped = new Map<string, Record<string, string>>();
+  /** Active human handoff id per extension tab id (at most one active handoff per tab). */
+  const activeHandoffs = new Map<number, string>();
 
-  async function evalHelper(callExpr: string, targetId?: string, timeoutMs?: number): Promise<InvokeResult> {
+  async function runBcCall(call: ReturnType<typeof normalizeHelperCall>, targetId: string, timeoutMs?: number): Promise<InvokeResult> {
+    const order = backendOrder();
+    const fn = options.bcCall ?? (order.includes("extension") ? getRegisteredExtensionBcCall() : undefined);
+    if (!fn) {
+      const msg = isExtensionOnlyOrder(order)
+        ? extensionOnlyMessage("the extension backend isn't active")
+        : "BACKEND_UNAVAILABLE: extension backend is not active";
+      return failure("EXECUTION_FAILED", msg);
+    }
+    try {
+      const data = await fn({
+        targetId,
+        steps: call.steps,
+        join: call.join,
+        ...(timeoutMs ? { timeoutMs } : {}),
+      });
+      return { ok: true, data };
+    } catch (error) {
+      if (isBackendUnavailable(error) && isExtensionOnlyOrder(order)) {
+        return failure("EXECUTION_FAILED", extensionOnlyMessage(error));
+      }
+      return helperError(failure("EXECUTION_FAILED", (error as Error).message));
+    }
+  }
+
+  async function evalHelper(call: HelperCall, targetId?: string, timeoutMs?: number): Promise<InvokeResult> {
+    const normalized = normalizeHelperCall(call);
+    if (extensionTabOf(targetId) !== undefined) {
+      return runBcCall(normalized, targetId!, timeoutMs);
+    }
+    const callExpr = renderSteps(normalized);
     const extra = { isolated: true, ...(targetId ? { targetId } : {}), ...(timeoutMs ? { timeoutMs } : {}) };
     const probe = `globalThis.__bc && globalThis.__bc.v === ${PAGE_HELPERS_VERSION} ? (${callExpr}) : "${NEED_INSTALL}"`;
     const first = await invoke("evaluate", { expression: probe, ...extra });
@@ -219,16 +321,67 @@ export function createPageHelperHandler(
     return helperError(second);
   }
 
+  /** A plain page property read: no __bc probe, and it never updates the helper context cache. */
+  function readProperty(
+    kind: "readyState" | "origin" | "host" | "href",
+    targetId?: string,
+    opts: { isolated?: boolean; timeoutMs?: number } = {},
+  ): Promise<InvokeResult> {
+    if (extensionTabOf(targetId) !== undefined) {
+      return runBcCall({ steps: [{ kind }] }, targetId!, opts.timeoutMs);
+    }
+    return invoke("evaluate", {
+      expression: renderSteps(normalizeHelperCall({ kind })),
+      ...(opts.isolated ? { isolated: true } : {}),
+      ...(targetId ? { targetId } : {}),
+      ...(opts.timeoutMs ? { timeoutMs: opts.timeoutMs } : {}),
+    });
+  }
+
   const picture = createPictureTracker(invoke, evalHelper, recognize);
 
-  async function resolveBrowseTab(targetId?: string): Promise<number | undefined> {
-    if (targetId !== undefined) return browseTabNumber(targetId);
+  type ResolvedTarget = {
+    browseTab?: number;
+    extensionTarget?: string;
+    cdpTarget?: string;
+    extensionOnly?: boolean;
+    extensionAvailable?: boolean;
+    activeBackend?: string | null;
+  };
+
+  async function resolveTargetBackend(targetId?: string): Promise<ResolvedTarget> {
+    if (targetId !== undefined) {
+      return {
+        browseTab: browseTabNumber(targetId),
+        extensionTarget: extensionTabOf(targetId) !== undefined ? targetId : undefined,
+      };
+    }
     const status = await invoke("get_browser_status");
-    if (!status.ok) return undefined;
-    const backends = (status.data as Json)["backends"] as Json | undefined;
-    if (backends?.["active"] !== "browse") return undefined;
-    const browseState = backends["browse"] as Json | undefined;
-    return browseTabNumber(browseState?.["activeTargetId"]);
+    if (!status.ok) return {};
+    const data = status.data as Json;
+    const backends = data["backends"] as Json | undefined;
+    const activeBackend = typeof backends?.["active"] === "string" ? (backends["active"] as string) : null;
+    const order = Array.isArray(backends?.["order"]) ? (backends["order"] as string[]) : undefined;
+    const extensionOnly = order ? isExtensionOnlyOrder(order) : false;
+    const extState = backends?.["extension"] as Json | undefined;
+    const extensionAvailable = typeof extState?.["available"] === "boolean" ? extState["available"] : undefined;
+    if (activeBackend === "browse") {
+      const browseState = backends?.["browse"] as Json | undefined;
+      return { browseTab: browseTabNumber(browseState?.["activeTargetId"]), extensionOnly, extensionAvailable, activeBackend };
+    }
+    if (activeBackend === "extension") {
+      const activeId = extState?.["activeTargetId"];
+      return {
+        extensionTarget: extensionTabOf(activeId) !== undefined ? (activeId as string) : undefined,
+        extensionOnly,
+        extensionAvailable,
+        activeBackend,
+      };
+    }
+    const cdpAllowed =
+      backends === undefined || activeBackend === "cdp" || (activeBackend === null && (!order || order.includes("cdp")));
+    const cdpTarget = cdpAllowed && typeof data["activeTargetId"] === "string" ? (data["activeTargetId"] as string) : undefined;
+    return { cdpTarget, extensionOnly, extensionAvailable, activeBackend };
   }
 
   async function callBrowse(tool: string, args: Json, timeoutMs = 60_000): Promise<InvokeResult> {
@@ -311,11 +464,47 @@ export function createPageHelperHandler(
     });
   }
 
-  /** Resolve a JS expression into a CDP RemoteObjectId in the same world where `__bc` lives. */
+  /** Resolve a structured element target into a CDP RemoteObjectId in the same world where `__bc` lives. */
   async function resolveObject(
-    expr: string,
+    target: ElementStep,
     targetId?: string,
   ): Promise<{ ok: true; objectId: string } | { ok: false; res: InvokeResult }> {
+    const expr = renderElementStep(target);
+    if (extensionTabOf(targetId) !== undefined) {
+      const order = backendOrder();
+      const extRequest =
+        options.extensionRequest ??
+        ((globalThis as Record<symbol, unknown>)[EXTENSION_REQUEST_SYMBOL] as ExtensionRequestFn | undefined);
+      if (!extRequest) {
+        const msg = isExtensionOnlyOrder(order)
+          ? extensionOnlyMessage("the extension backend isn't active")
+          : "BACKEND_UNAVAILABLE: extension backend is not active";
+        return {
+          ok: false,
+          res: failure("EXECUTION_FAILED", msg),
+        };
+      }
+      const reqParams: Json =
+        target.kind === "bc"
+          ? { targetId, ref: target.args[0], mode: "ref" }
+          : { targetId, ref: target.selector, mode: "selector" };
+      try {
+        const resolved = (await extRequest("resolve_bc_node", reqParams)) as { objectId?: unknown } | undefined;
+        const objectId = typeof resolved?.objectId === "string" && resolved.objectId !== "" ? resolved.objectId : undefined;
+        if (!objectId) {
+          return {
+            ok: false,
+            res: failure("EXECUTION_FAILED", `NO_MATCH: could not resolve element (${expr})`),
+          };
+        }
+        return { ok: true, objectId };
+      } catch (err) {
+        if (isBackendUnavailable(err) && isExtensionOnlyOrder(order)) {
+          return { ok: false, res: failure("EXECUTION_FAILED", extensionOnlyMessage(err)) };
+        }
+        return { ok: false, res: helperError(failure("EXECUTION_FAILED", (err as Error).message)) };
+      }
+    }
     const ctxId = contextIds.get(targetId ?? "");
     const evalObj = await cdp(
       "Runtime.evaluate",
@@ -369,10 +558,10 @@ export function createPageHelperHandler(
     }
     if (loc.kind !== "label") {
       if (loc.kind === "dom") {
-        const ver = await evalHelper(`__bc.verifyRef(${js(loc.ref)})`, targetId);
+        const ver = await evalHelper({ kind: "bc", method: "verifyRef", args: [loc.ref] }, targetId);
         if (!ver.ok) {
           if (healInBatch && messageOf(ver).startsWith("STALE_REF")) {
-            const healed = await evalHelper(`__bc.healRef(${js(loc.ref)})`, targetId);
+            const healed = await evalHelper({ kind: "bc", method: "healRef", args: [loc.ref] }, targetId);
             if (healed.ok && /^e\d+$/.test(valueOf(healed))) {
               return { ok: true, loc: { kind: "dom", ref: valueOf(healed) }, healedFrom: loc.ref };
             }
@@ -382,8 +571,14 @@ export function createPageHelperHandler(
       }
       return { ok: true, loc };
     }
-    const found = await evalHelper(`__bc.locate(${js(loc.label)}, ${js(kind)})`, targetId);
-    if (!found.ok) return { ok: false, res: found };
+    const found = await evalHelper({ kind: "bc", method: "locate", args: [loc.label, kind] }, targetId);
+    if (!found.ok) {
+      if (messageOf(found).includes("NO_MATCH:")) {
+        const hit = await locateInFrames("locate", [loc.label, kind], targetId);
+        if (hit) return { ok: true, loc: { kind: "frame", frame: hit.frame, ref: hit.ref, target: hit.target } };
+      }
+      return { ok: false, res: found };
+    }
     return { ok: true, loc: { kind: "dom", ref: valueOf(found) } };
   }
 
@@ -402,7 +597,7 @@ export function createPageHelperHandler(
   ): Promise<{ ok: true; pt: Point } | { ok: false; res: InvokeResult }> {
     const bad = (res: InvokeResult) => ({ ok: false as const, res });
     if (loc.kind === "ax") {
-      const before = baseline ? await evalHelper("__bc.baseline()", targetId) : undefined;
+      const before = baseline ? await evalHelper({ kind: "bc", method: "baseline" }, targetId) : undefined;
       await cdp("DOM.scrollIntoViewIfNeeded", { backendNodeId: loc.node }, targetId);
       const quads = await cdp("DOM.getContentQuads", { backendNodeId: loc.node }, targetId);
       if (!quads.ok) return bad(quads);
@@ -420,15 +615,15 @@ export function createPageHelperHandler(
         },
       };
     }
-    const where = loc.kind === "frame" ? frameTarget(loc.frame, targetId) : targetId;
+    const where = loc.kind === "frame" ? (loc.target ?? frameTarget(loc.frame, targetId)) : targetId;
     if (loc.kind === "frame" && !where) {
       return bad(failure("EXECUTION_FAILED", `STALE_REF: iframe f${loc.frame} is not known for this tab. Run snap again.`));
     }
-    const before = baseline && loc.kind === "frame" ? await evalHelper("__bc.baseline()", targetId) : undefined;
-    const expr = baseline && loc.kind === "dom"
-      ? `[__bc.baseline(), await __bc.point(${js(loc.ref)})].join(" ")`
-      : `await __bc.point(${js(loc.ref)})`;
-    const res = await evalHelper(expr, where);
+    const before = baseline && loc.kind === "frame" ? await evalHelper({ kind: "bc", method: "baseline" }, targetId) : undefined;
+    const call: HelperCall = baseline && loc.kind === "dom"
+      ? { steps: [{ kind: "bc", method: "baseline" }, { kind: "bc", method: "point", args: [loc.ref] }], join: " " }
+      : { kind: "bc", method: "point", args: [loc.ref] };
+    const res = await evalHelper(call, where);
     if (!res.ok) return bad(res);
     const parts = valueOf(res).split(" ");
     const href = baseline && loc.kind === "dom" ? parts.shift() : before?.ok ? valueOf(before) : undefined;
@@ -438,7 +633,12 @@ export function createPageHelperHandler(
       return bad(failure("EXECUTION_FAILED", `unexpected point output: ${valueOf(res)}`));
     }
     if (loc.kind === "frame") {
-      const off = await evalHelper(`__bc.frameOffset(${loc.frame})`, targetId);
+      // Offset the iframe element that hosts the frame the point came from, not whatever sits in slot f<n> now.
+      const slot = (await crossFrames(targetId)).find((f) => f.target === where)?.i;
+      if (slot === undefined) {
+        return bad(failure("EXECUTION_FAILED", `STALE_REF: iframe f${loc.frame} is gone. Run snap again.`));
+      }
+      const off = await evalHelper({ kind: "bc", method: "frameOffset", args: [slot] }, targetId);
       if (!off.ok) return bad(off);
       const [ox, oy] = valueOf(off).split(" ").map(Number);
       x = Math.round(x + (ox ?? 0));
@@ -457,7 +657,7 @@ export function createPageHelperHandler(
 
   /** Arm isolated-world event probe and read back trusted event counts after input. */
   async function readProbe(targetId?: string): Promise<Record<string, number> | undefined> {
-    const res = await evalHelper("__bc.readInputProbe()", targetId, 2_000);
+    const res = await evalHelper({ kind: "bc", method: "readInputProbe" }, targetId, 2_000);
     if (!res.ok) return undefined;
     try {
       const parsed = JSON.parse(valueOf(res)) as Record<string, number>;
@@ -542,23 +742,21 @@ export function createPageHelperHandler(
 
   async function waitParsed(targetId?: string): Promise<void> {
     for (let i = 0; i < 40; i++) {
-      const ready = await invoke("evaluate", {
-        expression: "document.readyState",
-        ...(targetId ? { targetId } : {}),
-        timeoutMs: 2_000,
-      });
+      const ready = await readProperty("readyState", targetId, { timeoutMs: 2_000 });
       if (ready.ok && valueOf(ready) !== "loading") return;
       await sleep(125);
     }
   }
 
   async function changes(before: string | undefined, targetId?: string): Promise<string> {
-    const expr = `(await __bc.settle(), __bc.diff(${js({ from: before ?? "" })}))`;
-    let res = await evalHelper(expr, targetId, 8_000);
+    const call: HelperCall = {
+      steps: [{ kind: "bc", method: "settle" }, { kind: "bc", method: "diff", args: [{ from: before ?? "" }] }],
+    };
+    let res = await evalHelper(call, targetId, 8_000);
     if (!res.ok && messageOf(res).startsWith("CDP_TIMEOUT")) return `# ${DIALOG_HINT}`;
     if (!res.ok) {
       await waitParsed(targetId);
-      res = await evalHelper(expr, targetId, 8_000);
+      res = await evalHelper(call, targetId, 8_000);
     }
     return res.ok ? valueOf(res) : `# could not read what changed: ${messageOf(res).slice(0, 160)}`;
   }
@@ -569,8 +767,55 @@ export function createPageHelperHandler(
   const inputFailed = (res: InvokeResult, what: string): InvokeResult =>
     messageOf(res).startsWith("CDP_TIMEOUT") ? success(`${what}: delivered_unverified (${DIALOG_HINT})`) : res;
 
-  async function snapFrames(opts: Json, targetId?: string): Promise<string[]> {
-    const listed = await evalHelper("__bc.frames()", targetId);
+  /** Targets that can run helpers inside a child frame: OOPIF targets on CDP, frame ids on extension tabs. */
+  async function frameTargetPool(targetId?: string): Promise<Array<{ targetId: string; url: string }>> {
+    if (extensionTabOf(targetId) !== undefined) {
+      const extRequest =
+        options.extensionRequest ??
+        ((globalThis as Record<symbol, unknown>)[EXTENSION_REQUEST_SYMBOL] as ExtensionRequestFn | undefined);
+      if (!extRequest) return [];
+      try {
+        const res = (await extRequest("list_frames", { targetId })) as
+          | { frames?: Array<{ frameId: number; url: string }> }
+          | undefined;
+        return (res?.frames ?? [])
+          .filter((fr) => typeof fr.frameId === "number" && fr.frameId !== 0)
+          .map((fr) => ({ targetId: extensionFrameTarget(targetId!, fr.frameId), url: fr.url }));
+      } catch {
+        return [];
+      }
+    }
+    const targets = await invoke("list_targets", { types: ["iframe"] });
+    if (!targets.ok) return [];
+    const all = ((targets.data as Json)["targets"] as Array<{ targetId: string; url: string; parentFrameId?: string }>) ?? [];
+    // list_targets covers every tab: keep only iframes whose parent chain reaches this tab's frame tree.
+    const tree = await cdp("Page.getFrameTree", {}, targetId);
+    if (!tree.ok) return [];
+    const mine = new Set<string>();
+    const walk = (node: Json | undefined) => {
+      const id = (node?.["frame"] as Json | undefined)?.["id"];
+      if (typeof id === "string") mine.add(id);
+      for (const child of (node?.["childFrames"] as Json[] | undefined) ?? []) walk(child);
+    };
+    walk(((tree.data as Json)["result"] as Json | undefined)?.["frameTree"] as Json | undefined);
+    const pool: Array<{ targetId: string; url: string }> = [];
+    for (let grew = true; grew; ) {
+      grew = false;
+      for (const t of all) {
+        if (mine.has(t.targetId) || !t.parentFrameId || !mine.has(t.parentFrameId)) continue;
+        mine.add(t.targetId);
+        pool.push({ targetId: t.targetId, url: t.url });
+        grew = true;
+      }
+    }
+    return pool;
+  }
+
+  /** The top page's cross-origin iframes (first 8), each matched to a helper target when one is reachable. */
+  async function crossFrames(
+    targetId?: string,
+  ): Promise<Array<{ i: number; src: string; title: string; target?: string }>> {
+    const listed = await evalHelper({ kind: "bc", method: "frames" }, targetId);
     if (!listed.ok) return [];
     let frames: Array<{ i: number; src: string; title: string }>;
     try {
@@ -579,44 +824,95 @@ export function createPageHelperHandler(
       return [];
     }
     if (frames.length === 0) return [];
-    const targets = await invoke("list_targets", { types: ["iframe"] });
-    const pool = targets.ok ? [...(((targets.data as Json)["targets"] as Array<{ targetId: string; url: string }>) ?? [])] : [];
-    const path = (u: string) => {
-      try {
-        const p = new URL(u);
-        return p.origin + p.pathname;
-      } catch {
-        return u;
-      }
-    };
-    const origin = (u: string) => {
-      try {
-        return new URL(u).origin;
-      } catch {
-        return u;
-      }
-    };
-    const take = (test: (t: { url: string }) => boolean) => {
-      const at = pool.findIndex(test);
-      return at === -1 ? undefined : pool.splice(at, 1)[0];
-    };
-    const ids: string[] = [];
+    const first8 = frames.slice(0, 8);
+    const pool = await frameTargetPool(targetId);
+    if (pool.length === 0) return first8;
+    // Pair each <iframe> with the frame it really hosts: post a random tag into every iframe, then ask
+    // each frame which tag it got. URLs can't do this (a frame may have navigated to a sibling's src),
+    // so an iframe whose frame doesn't report its tag stays unbound instead of guessed.
+    const readTags = async (mine?: string[]) =>
+      new Map(
+        (
+          await Promise.all(
+            pool.map(async (t) => {
+              const r = await evalHelper({ kind: "bc", method: "frameTag", ...(mine ? { args: [mine] } : {}) }, t.targetId, 2_000);
+              return [r.ok ? valueOf(r) : "", t.targetId] as const;
+            }),
+          )
+        ).filter(([tag]) => tag !== ""),
+      );
+    await readTags(); // loads the helper (and its message listener) in every candidate frame
+    const tags = first8.map(() => randomUUID().replaceAll("-", ""));
+    const sent = await evalHelper({ kind: "bc", method: "tagFrames", args: [tags, first8.map((f) => f.src)] }, targetId);
+    if (!sent.ok) return first8;
+    let owners = await readTags(tags);
+    if (tags.some((t) => !owners.has(t))) {
+      await new Promise((r) => setTimeout(r, 50));
+      owners = await readTags(tags);
+    }
+    return first8.map((f, k) => {
+      const target = owners.get(tags[k]!);
+      return { ...f, ...(target ? { target } : {}) };
+    });
+  }
+
+  /**
+   * Number frames by identity: a frame target keeps its `f<n>` for the life of the tab and numbers
+   * are never reused, so a saved `f<n>:e<m>` ref can't silently move to another frame after a reorder.
+   */
+  function frameNumbers(frames: Array<{ target?: string }>, targetId?: string): Map<string, number> {
+    const ids = frameTargets.get(targetId ?? "") ?? [];
+    const nums = new Map<string, number>();
+    for (const f of frames) {
+      if (!f.target) continue;
+      let at = ids.indexOf(f.target);
+      if (at === -1) at = ids.push(f.target) - 1;
+      nums.set(f.target, at + 1);
+    }
+    frameTargets.set(targetId ?? "", ids);
+    return nums;
+  }
+
+  /** Run a label lookup helper inside each reachable cross-origin iframe; first hit wins. */
+  async function locateInFrames(
+    method: "locate" | "locateFile",
+    args: string[],
+    targetId?: string,
+  ): Promise<{ frame: number; ref: string; target: string } | undefined> {
+    const frames = await crossFrames(targetId);
+    if (frames.length === 0) return undefined;
+    const nums = frameNumbers(frames, targetId);
+    for (const f of frames) {
+      if (!f.target) continue;
+      const hit = await evalHelper({ kind: "bc", method, args }, f.target, 5_000);
+      if (hit.ok && /^e\d+$/.test(valueOf(hit))) return { frame: nums.get(f.target)!, ref: valueOf(hit), target: f.target };
+    }
+    return undefined;
+  }
+
+  async function snapFrames(opts: Json, targetId?: string): Promise<string[]> {
+    const frames = await crossFrames(targetId);
+    if (frames.length === 0) return [];
     const out: string[] = [];
-    for (const f of frames.slice(0, 8)) {
-      const t = take((x) => x.url === f.src) ?? take((x) => path(x.url) === path(f.src)) ?? take((x) => origin(x.url) === origin(f.src));
-      const label = `f${f.i}${f.title ? ` "${f.title}"` : ""} ${hostOf(f.src)}`;
-      if (!t) {
-        ids[f.i - 1] = "";
+    const nums = frameNumbers(frames, targetId);
+    for (const f of frames) {
+      const n = f.target ? nums.get(f.target)! : undefined;
+      const label = `${n === undefined ? `#${f.i}` : `f${n}`}${f.title ? ` "${f.title}"` : ""} ${hostOf(f.src)}`;
+      if (!f.target) {
         out.push(`# iframe ${label}: not reachable; click by coordinates (click --xy) or see references/dom-and-input.md`);
         continue;
       }
-      ids[f.i - 1] = t.targetId;
-      const inner = await evalHelper(`__bc.snapshot(${js({ all: opts["all"] === true, find: opts["find"] })})`, t.targetId, 5_000);
-      const lines = inner.ok ? valueOf(inner).split("\n").filter((l) => l.startsWith("- ")) : [];
-      out.push(`# iframe ${label}: ${lines.length} control(s)`);
-      out.push(...lines.map((l) => l.replace(/\[e(\d+)\]/, `[f${f.i}:e$1]`)));
+      const inner = await evalHelper(
+        { kind: "bc", method: "snapshot", args: [{ all: opts["all"] === true, find: opts["find"], ...(opts["full"] === true ? { full: true } : {}) }] },
+        f.target,
+        5_000,
+      );
+      const text = inner.ok ? valueOf(inner) : "";
+      const lines = text.split("\n").filter((l) => /^[-+~] /.test(l));
+      const diff = /^# snap diff .*$/m.exec(text)?.[0];
+      out.push(`# iframe ${label}: ${lines.length} control(s)${diff ? ` changed; ${diff.slice(2)}` : ""}`);
+      out.push(...lines.map((l) => l.replace(/\[e(\d+)\]/, `[f${n}:e$1]`)));
     }
-    frameTargets.set(targetId ?? "", ids);
     return out;
   }
 
@@ -692,7 +988,7 @@ export function createPageHelperHandler(
     const deadline = started + timeoutMs;
     let lastWall = "";
     for (;;) {
-      const check = await evalHelper(`__bc.checkWait(${js(opts)})`, targetId, 5_000);
+      const check = await evalHelper({ kind: "bc", method: "checkWait", args: [opts] }, targetId, 5_000);
       if (!check.ok) {
         if (messageOf(check).startsWith("INPUT_INVALID")) return check;
       } else {
@@ -742,9 +1038,12 @@ export function createPageHelperHandler(
     if (fromLoc.loc.kind !== "dom" || toLoc.loc.kind !== "dom") {
       return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: drag requires DOM refs or labels on the main page");
     }
-    const before = quiet ? undefined : await evalHelper("__bc.baseline()", targetId);
+    const before = quiet ? undefined : await evalHelper({ kind: "bc", method: "baseline" }, targetId);
     const side = input["side"] === "before" || input["side"] === "after" ? input["side"] : "";
-    const infoRes = await evalHelper(`__bc.dragInfo(${js(fromLoc.loc.ref)}, ${js(toLoc.loc.ref)}, ${js(side)})`, targetId);
+    const infoRes = await evalHelper(
+      { kind: "bc", method: "dragInfo", args: [fromLoc.loc.ref, toLoc.loc.ref, side] },
+      targetId,
+    );
     if (!infoRes.ok) return infoRes;
     const info = JSON.parse(valueOf(infoRes)) as {
       sx: number; sy: number; dx: number; dy: number; draggable: boolean; listMeta: Json | null;
@@ -792,7 +1091,9 @@ export function createPageHelperHandler(
       }
     }
 
-    const posRes = info.listMeta ? await evalHelper(`__bc.listPosition(${js(info.listMeta)})`, targetId) : undefined;
+    const posRes = info.listMeta
+      ? await evalHelper({ kind: "bc", method: "listPosition", args: [info.listMeta] }, targetId)
+      : undefined;
     const posNote = posRes?.ok && valueOf(posRes) ? ` (${valueOf(posRes)})` : "";
     const mode = info.draggable ? (html5Dropped ? "HTML5 drag and drop" : "mouse drag fallback") : "mouse drag";
     return withChanges(
@@ -819,7 +1120,10 @@ export function createPageHelperHandler(
             return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: --xy takes x,y in CSS pixels");
           }
           if (browseTab !== undefined) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: --xy needs a DevTools tab");
-          const hit = await evalHelper(`[__bc.baseline(), __bc.hit(${x}, ${y})].join("\\n")`, targetId);
+          const hit = await evalHelper(
+            { steps: [{ kind: "bc", method: "baseline" }, { kind: "bc", method: "hit", args: [x!, y!] }], join: "\n" },
+            targetId,
+          );
           if (!hit.ok) return hit;
           const [before, what] = valueOf(hit).split("\n");
           const isCanvas = !quiet && /^hit: canvas/.test(what ?? "");
@@ -839,7 +1143,7 @@ export function createPageHelperHandler(
         if (!found.ok) return found.res;
         const at = await pointOf(found.loc, targetId, !quiet);
         if (!at.ok) return at.res;
-        if (found.loc.kind === "dom") await evalHelper("__bc.armInputProbe()", targetId, 2_000).catch(() => {});
+        if (found.loc.kind === "dom") await evalHelper({ kind: "bc", method: "armInputProbe" }, targetId, 2_000).catch(() => {});
         const clicked = await clickAt(at.pt, targetId);
         if (!clicked.ok) return inputFailed(clicked, `click ${nameOf(found.loc)}`);
         const probe = found.loc.kind === "dom" ? await readProbe(targetId) : undefined;
@@ -869,11 +1173,11 @@ export function createPageHelperHandler(
           return res.ok && !quiet ? browseDelta(res, browseTab) : res;
         }
         if (input["focused"] === true) {
-          const g = await evalHelper("__bc.guardFocused()", targetId);
+          const g = await evalHelper({ kind: "bc", method: "guardFocused" }, targetId);
           if (!g.ok) return g;
           const isPic = !quiet && (await picture.isPicture(targetId));
           const beforeHash = isPic ? await picture.canvasHash(targetId) : "";
-          const before = quiet || isPic ? undefined : await evalHelper("__bc.baseline()", targetId);
+          const before = quiet || isPic ? undefined : await evalHelper({ kind: "bc", method: "baseline" }, targetId);
           const sent = await dispatchText(text, mode, targetId, { focused: true });
           if (!sent.ok) return inputFailed(sent, "type --focused");
           const line = "type --focused: sent to whatever has focus (not read back)";
@@ -885,50 +1189,50 @@ export function createPageHelperHandler(
         const loc = found.loc;
         let name = nameOf(loc);
         const healPrefix = found.healedFrom ? `↻ ${found.healedFrom}->${name} ` : "";
-        const fieldTarget = loc.kind === "frame" ? frameTarget(loc.frame, targetId) : targetId;
+        const fieldTarget = loc.kind === "frame" ? (loc.target ?? frameTarget(loc.frame, targetId)) : targetId;
 
         if (loc.kind !== "ax") {
-          const g = await evalHelper(`__bc.guard(${js(loc.ref)})`, fieldTarget);
+          const g = await evalHelper({ kind: "bc", method: "guard", args: [loc.ref] }, fieldTarget);
           if (!g.ok) return g;
 
           // Native date/time/month/week/color/range inputs set .value cleanly without segmented key quirks.
-          const typedCheck = await evalHelper(`__bc.setTypedValue(${js(loc.ref)}, ${js(text)})`, fieldTarget);
+          const typedCheck = await evalHelper({ kind: "bc", method: "setTypedValue", args: [loc.ref, text] }, fieldTarget);
           if (!typedCheck.ok) return typedCheck;
           if (valueOf(typedCheck).startsWith('{"typed":true')) {
             const parsed = JSON.parse(valueOf(typedCheck)) as { type: string; value: string; matched: boolean };
-            const before = quiet ? undefined : await evalHelper("__bc.baseline()", targetId);
+            const before = quiet ? undefined : await evalHelper({ kind: "bc", method: "baseline" }, targetId);
             const note = parsed.matched ? "read back matches" : `normalized to "${parsed.value}"`;
             return withChanges(`${healPrefix}type ${name} (${parsed.type}): delivered (${note})`, before?.ok ? valueOf(before) : undefined, quiet, targetId);
           }
 
           // Spreadsheet / ARIA grid cell editing: double-click or Enter, fill editor, Enter to commit.
-          const cellCheck = await evalHelper(`__bc.cellInfo(${js(loc.ref)})`, fieldTarget);
+          const cellCheck = await evalHelper({ kind: "bc", method: "cellInfo", args: [loc.ref] }, fieldTarget);
           if (cellCheck.ok && valueOf(cellCheck).startsWith('{"cell":true')) {
             const cInfo = JSON.parse(valueOf(cellCheck)) as { before: string; editorRef: string | null };
-            const before = quiet ? undefined : await evalHelper("__bc.baseline()", targetId);
+            const before = quiet ? undefined : await evalHelper({ kind: "bc", method: "baseline" }, targetId);
             let editorRef = cInfo.editorRef;
             if (!editorRef) {
               const pt = await pointOf(loc, targetId, false);
               if (!pt.ok) return pt.res;
               await clickAt(pt.pt, targetId, 2);
               await sleep(150);
-              const ed = await evalHelper("__bc.cellEditor()", fieldTarget);
+              const ed = await evalHelper({ kind: "bc", method: "cellEditor" }, fieldTarget);
               editorRef = ed.ok && /^e\d+$/.test(valueOf(ed)) ? valueOf(ed) : null;
               if (!editorRef) {
                 await pressKey("Enter", targetId);
                 await sleep(150);
-                const ed2 = await evalHelper("__bc.cellEditor()", fieldTarget);
+                const ed2 = await evalHelper({ kind: "bc", method: "cellEditor" }, fieldTarget);
                 editorRef = ed2.ok && /^e\d+$/.test(valueOf(ed2)) ? valueOf(ed2) : null;
               }
             }
             if (editorRef) {
-              await evalHelper(`__bc.focusForType(${js(editorRef)})`, fieldTarget);
+              await evalHelper({ kind: "bc", method: "focusForType", args: [editorRef] }, fieldTarget);
             }
             const sent = await dispatchText(text, mode, targetId);
             if (!sent.ok) return inputFailed(sent, `type ${name}`);
             await pressKey("Enter", targetId);
             await sleep(150);
-            const afterRes = await evalHelper(`__bc.cellRead(${js(loc.ref)}, ${js(cInfo.before)})`, fieldTarget);
+            const afterRes = await evalHelper({ kind: "bc", method: "cellRead", args: [loc.ref, cInfo.before] }, fieldTarget);
             if (afterRes.ok) {
               const after = JSON.parse(valueOf(afterRes)) as { after: string; before: string; error: string };
               if (after.error) {
@@ -952,7 +1256,7 @@ export function createPageHelperHandler(
         let activeRef = loc.kind === "ax" ? "" : loc.ref;
         let retargetNote = "";
         if (loc.kind !== "ax") {
-          const st = await evalHelper(`__bc.focusForType(${js(loc.ref)})`, fieldTarget);
+          const st = await evalHelper({ kind: "bc", method: "focusForType", args: [loc.ref] }, fieldTarget);
           if (!st.ok) return st;
           const stVal = valueOf(st);
           if (stVal.startsWith("retargeted:")) {
@@ -968,7 +1272,7 @@ export function createPageHelperHandler(
         if (loc.kind === "ax") {
           return withChanges(`${healPrefix}type ${name}: delivered_unverified (accessibility ref, not read back)`, at.pt.before, quiet, targetId);
         }
-        const readback = await evalHelper(`__bc.value(${js(activeRef)})`, fieldTarget);
+        const readback = await evalHelper({ kind: "bc", method: "value", args: [activeRef] }, fieldTarget);
         const got = readback.ok ? valueOf(readback) : "__unknown__";
         if (got !== "__secure__" && typeof input["ref"] === "string" && text.length >= 2) {
           const key = input["ref"].replace(/^@/, "").replace(/[^a-zA-Z0-9_]/g, "_").toLowerCase().slice(0, 20) || "q";
@@ -998,12 +1302,12 @@ export function createPageHelperHandler(
         if (loc.kind === "ax") {
           return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: select needs a DOM ref or label, not an accessibility ref");
         }
-        const fieldTarget = loc.kind === "frame" ? frameTarget(loc.frame, targetId) : targetId;
+        const fieldTarget = loc.kind === "frame" ? (loc.target ?? frameTarget(loc.frame, targetId)) : targetId;
         if (loc.kind === "frame" && !fieldTarget) {
           return failure("EXECUTION_FAILED", `STALE_REF: iframe f${loc.frame} is not known for this tab. Run snap again.`);
         }
-        const before = quiet ? undefined : await evalHelper("__bc.baseline()", targetId);
-        const native = await evalHelper(`__bc.select(${js(loc.ref)}, ${js(option)})`, fieldTarget);
+        const before = quiet ? undefined : await evalHelper({ kind: "bc", method: "baseline" }, targetId);
+        const native = await evalHelper({ kind: "bc", method: "select", args: [loc.ref, option] }, fieldTarget);
         if (!native.ok) return native;
         if (valueOf(native) !== "__not_native__") {
           return withChanges(
@@ -1017,12 +1321,12 @@ export function createPageHelperHandler(
         if (!at.ok) return at.res;
         const opened = await clickAt(at.pt, targetId);
         if (!opened.ok) return inputFailed(opened, `select ${nameOf(loc)}`);
-        await evalHelper("await __bc.settle(300, 80)", fieldTarget, 4_000);
-        const optRef = await evalHelper(`__bc.locateOption(${js(option)})`, fieldTarget);
+        await evalHelper({ kind: "bc", method: "settle", args: [300, 80] }, fieldTarget, 4_000);
+        const optRef = await evalHelper({ kind: "bc", method: "locateOption", args: [option] }, fieldTarget);
         if (!optRef.ok) return optRef;
         const optLoc: Exclude<Locator, { kind: "label" }> =
           loc.kind === "frame"
-            ? { kind: "frame", frame: loc.frame, ref: valueOf(optRef) }
+            ? { kind: "frame", frame: loc.frame, ref: valueOf(optRef), ...(loc.target ? { target: loc.target } : {}) }
             : { kind: "dom", ref: valueOf(optRef) };
         const optAt = await pointOf(optLoc, targetId, false);
         if (!optAt.ok) return optAt.res;
@@ -1052,15 +1356,29 @@ export function createPageHelperHandler(
           return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: a file input ref, label, or CSS selector is required");
         }
         const frame = /^@?f([0-9]+):(e[0-9]+)$/.exec(refInput);
-        const fieldTarget = frame ? frameTarget(Number(frame[1]), targetId) : targetId;
+        let fileFrame = frame ? Number(frame[1]) : undefined;
+        let fieldTarget = frame ? frameTarget(Number(frame[1]), targetId) : targetId;
         if (frame && !fieldTarget) {
           return failure("EXECUTION_FAILED", `STALE_REF: iframe f${frame[1]} is not known for this tab. Run snap again.`);
         }
-        const before = quiet ? undefined : await evalHelper("__bc.baseline()", targetId);
-        const located = await evalHelper(`__bc.locateFile(${js(frame ? frame[2]! : refInput)})`, fieldTarget);
-        if (!located.ok) return located;
-        const fileRef = valueOf(located);
-        const objRes = await resolveObject(`__bc.el(${js(fileRef)})`, fieldTarget);
+        const before = quiet ? undefined : await evalHelper({ kind: "bc", method: "baseline" }, targetId);
+        const located = await evalHelper(
+          { kind: "bc", method: "locateFile", args: [frame ? frame[2]! : refInput] },
+          fieldTarget,
+        );
+        let fileRef: string;
+        if (located.ok) {
+          fileRef = valueOf(located);
+        } else {
+          const hit = !frame && messageOf(located).includes("NO_MATCH:")
+            ? await locateInFrames("locateFile", [refInput], targetId)
+            : undefined;
+          if (!hit) return located;
+          fileRef = hit.ref;
+          fileFrame = hit.frame;
+          fieldTarget = hit.target;
+        }
+        const objRes = await resolveObject({ kind: "bc", method: "el", args: [fileRef] }, fieldTarget);
         if (!objRes.ok) return objRes.res;
         try {
           const set = await cdp("DOM.setFileInputFiles", { objectId: objRes.objectId, files: [filePath] }, fieldTarget);
@@ -1068,7 +1386,7 @@ export function createPageHelperHandler(
         } finally {
           await cdp("Runtime.releaseObject", { objectId: objRes.objectId }, fieldTarget).catch(() => {});
         }
-        const label = frame ? `f${frame[1]}:${fileRef}` : fileRef;
+        const label = fileFrame !== undefined ? `f${fileFrame}:${fileRef}` : fileRef;
         return withChanges(`upload ${label} <- ${filePath}: delivered`, before?.ok ? valueOf(before) : undefined, quiet, targetId);
       }
 
@@ -1091,7 +1409,7 @@ export function createPageHelperHandler(
         }
         const isPic = !quiet && (await picture.isPicture(targetId));
         const beforeHash = isPic ? await picture.canvasHash(targetId) : "";
-        const before = quiet || isPic ? undefined : await evalHelper("__bc.baseline()", targetId);
+        const before = quiet || isPic ? undefined : await evalHelper({ kind: "bc", method: "baseline" }, targetId);
         const res = await pressKey(keyName, targetId);
         if (!res.ok) return inputFailed(res, `key ${keyName}`);
         if (isPic) return success(`key ${keyName}: sent\n${await picture.pictureChanges(targetId, beforeHash)}`);
@@ -1105,7 +1423,7 @@ export function createPageHelperHandler(
 
   /** Capture recent first-party 2xx GET JSON responses from buffered CDP Network events. */
   async function captureRecordedGets(targetId?: string): Promise<RecordedGet[]> {
-    const hrefRes = await invoke("evaluate", { expression: "location.origin", isolated: true, ...(targetId ? { targetId } : {}) });
+    const hrefRes = await readProperty("origin", targetId, { isolated: true });
     const pageOrigin = hrefRes.ok ? valueOf(hrefRes) : "";
     const evRes = await invoke("read_events", { method: "Network.responseReceived", limit: 200, clear: false, ...(targetId ? { targetId } : {}) });
     if (!evRes.ok) return [];
@@ -1139,7 +1457,7 @@ export function createPageHelperHandler(
     let site = typeof input["site"] === "string" && input["site"].trim() !== "" ? input["site"].trim() : "";
     if (sub === "list") return success(await listNotes(options.notesDir));
     if (!site) {
-      const urlRes = await invoke("evaluate", { expression: "location.host", isolated: true, ...(targetId ? { targetId } : {}) });
+      const urlRes = await readProperty("host", targetId, { isolated: true });
       if (!urlRes.ok || !valueOf(urlRes)) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: pass a site host or select a tab");
       site = valueOf(urlRes);
     }
@@ -1227,20 +1545,597 @@ export function createPageHelperHandler(
 
   let runScript: ReturnType<typeof createScriptRunner>;
 
+  /** Move the pointer onto a ref/label or `--xy` point without pressing a button. */
+  async function runHover(
+    input: Json,
+    targetId: string | undefined,
+    quiet: boolean,
+    browseTab: number | undefined,
+  ): Promise<InvokeResult> {
+    if (browseTab !== undefined) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: hover needs a DevTools tab");
+    if (Array.isArray(input["xy"])) {
+      const [x, y] = (input["xy"] as unknown[]).map(Number);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) {
+        return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: --xy takes x,y in CSS pixels");
+      }
+      const hit = await evalHelper(
+        { steps: [{ kind: "bc", method: "baseline" }, { kind: "bc", method: "hit", args: [x!, y!] }], join: "\n" },
+        targetId,
+      );
+      if (!hit.ok) return hit;
+      const [before, what] = valueOf(hit).split("\n");
+      const moved = await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: x!, y: y! }, targetId, INPUT_TIMEOUT_MS);
+      if (!moved.ok) return inputFailed(moved, `hover ${x},${y}`);
+      return withChanges(`hover ${x},${y}: delivered. ${what ?? ""}`.trimEnd(), before, quiet, targetId);
+    }
+    const found = await locate(input["ref"], "click", targetId);
+    if (!found.ok) return found.res;
+    const at = await pointOf(found.loc, targetId, !quiet);
+    if (!at.ok) return at.res;
+    if (at.pt.hidden) {
+      const foc = await cdp("Emulation.setFocusEmulationEnabled", { enabled: true }, targetId);
+      if (!foc.ok) return foc;
+    }
+    const moved = await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: at.pt.x, y: at.pt.y }, targetId, INPUT_TIMEOUT_MS);
+    if (!moved.ok) return inputFailed(moved, `hover ${nameOf(found.loc)}`);
+    return withChanges(`hover ${nameOf(found.loc)} at ${at.pt.x},${at.pt.y}: delivered`, at.pt.before, quiet, targetId);
+  }
+
+  /** Accept or dismiss an open JavaScript alert/confirm/prompt/beforeunload dialog. */
+  async function runDialog(input: Json, targetId: string | undefined, browseTab: number | undefined): Promise<InvokeResult> {
+    const sub = String(input["sub"] ?? "").toLowerCase();
+    if (sub !== "accept" && sub !== "dismiss") {
+      return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: dialog subcommand must be accept or dismiss");
+    }
+    if (browseTab !== undefined) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: dialog needs a DevTools tab");
+    const text = input["text"];
+    if (text !== undefined && typeof text !== "string") {
+      return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: dialog prompt text must be a string");
+    }
+    const accept = sub === "accept";
+    const params: Json = { accept };
+    if (accept && typeof text === "string" && text !== "") params["promptText"] = text;
+    // Page is enabled on attach (session.ts ensureSession); a second Page.enable would block behind an open dialog.
+    const res = await cdp("Page.handleJavaScriptDialog", params, targetId, INPUT_TIMEOUT_MS);
+    if (!res.ok) {
+      if (/no dialog|not showing|not open/i.test(messageOf(res))) {
+        return failure(
+          "EXECUTION_FAILED",
+          "NO_MATCH: no JavaScript dialog is open\nremedy: open the alert, confirm, or prompt first, then run dialog again",
+        );
+      }
+      return res;
+    }
+    if (accept) return success(typeof params["promptText"] === "string" ? `dialog accept: accepted with prompt text ${js(params["promptText"])}` : "dialog accept: accepted");
+    return success("dialog dismiss: dismissed");
+  }
+
+  const mediaByTarget = new Map<string, Map<string, string>>();
+  const emulateQueue = new Map<string, Promise<unknown>>();
+
+  /** Pin emulate to the active route's tab id and run one emulate per tab at a time, so the media cache stays right. */
+  async function runEmulate(
+    input: Json,
+    targetId: string | undefined,
+    browseTab: number | undefined,
+    cdpTarget: string | undefined,
+  ): Promise<InvokeResult> {
+    if (browseTab !== undefined) return runEmulateNow(input, targetId, browseTab);
+    const pinned = targetId ?? cdpTarget;
+    const key = pinned ?? "";
+    const run = (emulateQueue.get(key) ?? Promise.resolve()).then(() => runEmulateNow(input, pinned, browseTab));
+    const tail = run.catch(() => undefined);
+    emulateQueue.set(key, tail);
+    try {
+      return await run;
+    } finally {
+      if (emulateQueue.get(key) === tail) emulateQueue.delete(key);
+    }
+  }
+
+  /** Device, media, network, and user-agent emulation. Reset uses Chrome's double-clear race fix. */
+  async function runEmulateNow(input: Json, targetId: string | undefined, browseTab: number | undefined): Promise<InvokeResult> {
+    if (browseTab !== undefined) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: emulate needs a DevTools tab");
+    const keys = ["viewport", "mobile", "colorScheme", "reducedMotion", "offline", "ua", "reset"] as const;
+
+    let width = 0;
+    let height = 0;
+    let scale: number | undefined;
+    const viewport = input["viewport"];
+    if (viewport !== undefined) {
+      const match = typeof viewport === "string" ? /^(\d+)x(\d+)(?:@(\d+(?:\.\d+)?))?$/.exec(viewport) : null;
+      if (!match) {
+        return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: viewport must be WxH or WxH@scale, e.g. 390x844 or 390x844@3");
+      }
+      width = Number(match[1]);
+      height = Number(match[2]);
+      scale = match[3] !== undefined ? Number(match[3]) : undefined;
+      if (width <= 0 || height <= 0 || (scale !== undefined && !(scale > 0))) {
+        return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: viewport width, height, and scale must be greater than zero");
+      }
+      // Chrome's Emulation.setDeviceMetricsOverride limit.
+      if (width > MAX_VIEWPORT_DIM || height > MAX_VIEWPORT_DIM || (scale !== undefined && !Number.isFinite(scale))) {
+        return failure("INPUT_VALIDATION_FAILED", `INPUT_INVALID: viewport width and height must be at most ${MAX_VIEWPORT_DIM}`);
+      }
+    }
+    const mobile = input["mobile"];
+    if (mobile !== undefined && typeof mobile !== "boolean") {
+      return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: mobile takes true or false");
+    }
+    const colorScheme = input["colorScheme"];
+    if (colorScheme !== undefined && colorScheme !== "dark" && colorScheme !== "light") {
+      return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: colorScheme must be dark or light");
+    }
+    const reducedMotion = input["reducedMotion"];
+    if (reducedMotion !== undefined && typeof reducedMotion !== "boolean") {
+      return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: reducedMotion takes true or false");
+    }
+    const offline = input["offline"];
+    if (offline !== undefined && typeof offline !== "boolean") {
+      return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: offline takes true or false");
+    }
+    const ua = input["ua"];
+    if (ua !== undefined && typeof ua !== "string") {
+      return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: ua takes a user-agent string");
+    }
+    const reset = input["reset"];
+    if (reset !== undefined && typeof reset !== "boolean") {
+      return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: reset takes true or false");
+    }
+    const wantReset = reset === true;
+    const optionsGiven = keys.filter((key) => key !== "reset" && input[key] !== undefined).length;
+    if (optionsGiven === 0 && !wantReset) {
+      return failure(
+        "INPUT_VALIDATION_FAILED",
+        "INPUT_INVALID: emulate needs at least one option: viewport, mobile, colorScheme, reducedMotion, offline, ua, or reset",
+      );
+    }
+
+    const applied: string[] = [];
+    if (wantReset) {
+      const first = await cdp("Emulation.clearDeviceMetricsOverride", {}, targetId);
+      if (!first.ok) return first;
+      await pause(100);
+      const second = await cdp("Emulation.clearDeviceMetricsOverride", {}, targetId);
+      if (!second.ok) return second;
+      const touchOff = await cdp("Emulation.setTouchEmulationEnabled", { enabled: false }, targetId);
+      if (!touchOff.ok) return touchOff;
+      const media = await cdp("Emulation.setEmulatedMedia", { features: [] }, targetId);
+      if (!media.ok) return media;
+      mediaByTarget.delete(targetId ?? "");
+      const online = await cdp("Network.emulateNetworkConditions", {
+        offline: false,
+        latency: 0,
+        downloadThroughput: -1,
+        uploadThroughput: -1,
+      }, targetId);
+      if (!online.ok) return online;
+      const uaOff = await cdp("Emulation.setUserAgentOverride", { userAgent: "" }, targetId);
+      if (!uaOff.ok) return uaOff;
+      applied.push("reset");
+    }
+    if (viewport !== undefined) {
+      const metrics: Json = { width, height, deviceScaleFactor: scale ?? 0, mobile: mobile === true };
+      const set = await cdp("Emulation.setDeviceMetricsOverride", metrics, targetId);
+      if (!set.ok) return set;
+      applied.push(`viewport ${width}x${height}${scale !== undefined ? `@${scale}` : ""}`);
+    }
+    if (mobile === true) {
+      const touch = await cdp("Emulation.setTouchEmulationEnabled", { enabled: true }, targetId);
+      if (!touch.ok) return touch;
+      applied.push("mobile");
+    }
+    if (colorScheme !== undefined || reducedMotion !== undefined) {
+      // setEmulatedMedia replaces every feature, so merge with what this tab already has.
+      const key = targetId ?? "";
+      const kept = new Map(mediaByTarget.get(key) ?? []);
+      if (colorScheme !== undefined) kept.set("prefers-color-scheme", colorScheme);
+      if (reducedMotion !== undefined) kept.set("prefers-reduced-motion", reducedMotion === true ? "reduce" : "no-preference");
+      const features: Json[] = [...kept].map(([name, value]) => ({ name, value }));
+      const media = await cdp("Emulation.setEmulatedMedia", { features }, targetId);
+      if (!media.ok) return media;
+      mediaByTarget.set(key, kept);
+      if (colorScheme !== undefined) applied.push(`color-scheme ${colorScheme}`);
+      if (reducedMotion !== undefined) applied.push(`reduced-motion ${reducedMotion === true ? "reduce" : "no-preference"}`);
+    }
+    if (offline !== undefined) {
+      const net = await cdp("Network.emulateNetworkConditions", {
+        offline,
+        latency: 0,
+        downloadThroughput: -1,
+        uploadThroughput: -1,
+      }, targetId);
+      if (!net.ok) return net;
+      applied.push(offline ? "offline" : "online");
+    }
+    if (ua !== undefined) {
+      const override = await cdp("Emulation.setUserAgentOverride", { userAgent: ua }, targetId);
+      if (!override.ok) return override;
+      applied.push("ua");
+    }
+    return success(`emulate: ${applied.join(", ")}`);
+  }
+
   async function maybeSaveOut(res: InvokeResult, input: Json): Promise<InvokeResult> {
     const outPath = typeof input["out"] === "string" && input["out"].trim() !== "" ? input["out"].trim() : "";
     if (!outPath || !res.ok) return res;
     try {
       const digest = await writeOutputFile(outPath, valueOf(res));
       const preview = valueOf(res).split("\n").slice(0, 12).join("\n");
-      return success(`${digest}\n${preview}`);
+      const challenge = (res.data as Json | undefined)?.["challenge"];
+      const value = `${digest}\n${preview}`;
+      return challenge !== undefined ? { ok: true, data: { value, challenge } } : success(value);
     } catch (err) {
       return failure("EXECUTION_FAILED", `ARTIFACT_WRITE_FAILED: ${(err as Error).message}`);
     }
   }
 
-  async function handlePage(action: string, input: Json, targetId?: string): Promise<InvokeResult> {
-    const browseTab = await resolveBrowseTab(targetId);
+  async function runHandoff(
+    input: Json,
+    targetId: string | undefined,
+    resolved: ResolvedTarget,
+  ): Promise<InvokeResult> {
+    const extTarget = extensionTabOf(targetId) !== undefined ? targetId : resolved.extensionTarget;
+    const extTabId = extensionTabOf(extTarget);
+    const extOnly = resolved.extensionOnly ?? isExtensionOnlyOrder();
+    if (!extTarget || extTabId === undefined) {
+      if (targetId === undefined && extOnly && resolved.activeBackend !== "cdp") {
+        const cause = resolved.extensionAvailable === false ? "extension is not connected" : "no extension tab is selected";
+        return failure("EXECUTION_FAILED", extensionOnlyMessage(cause));
+      }
+      return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: handoff requires an extension tab");
+    }
+
+    const message =
+      typeof input["message"] === "string" && input["message"].trim() !== ""
+        ? input["message"].trim()
+        : "Complete this step in the browser, then click Continue.";
+    const timeoutMs =
+      typeof input["timeoutMs"] === "number" && Number.isFinite(input["timeoutMs"]) && input["timeoutMs"] > 0
+        ? input["timeoutMs"]
+        : typeof input["timeout"] === "number" && Number.isFinite(input["timeout"]) && input["timeout"] > 0
+          ? Math.round(input["timeout"] * 1000)
+          : DEFAULT_HANDOFF_TIMEOUT_MS;
+
+    const extRequest =
+      options.extensionRequest ??
+      ((globalThis as Record<symbol, unknown>)[EXTENSION_REQUEST_SYMBOL] as ExtensionRequestFn | undefined);
+
+    const callExtensionHandoff = async (op: "handoff_start" | "handoff_clear", params: Json): Promise<InvokeResult> => {
+      if (!extRequest) {
+        const msg = extOnly
+          ? extensionOnlyMessage("handoff requires the browser-control extension relay")
+          : "BACKEND_UNAVAILABLE: handoff requires the browser-control extension relay";
+        return failure("EXECUTION_FAILED", msg);
+      }
+      try {
+        const result = await extRequest(op, { targetId: extTarget, ...params });
+        return { ok: true, data: { result } };
+      } catch (err) {
+        if (isBackendUnavailable(err) && extOnly) {
+          return failure("EXECUTION_FAILED", extensionOnlyMessage(err));
+        }
+        return failure("EXECUTION_FAILED", (err as Error).message);
+      }
+    };
+
+    if (activeHandoffs.has(extTabId)) {
+      return failure(
+        "EXECUTION_FAILED",
+        `HANDOFF_IN_PROGRESS: tab ${extTarget} already has an active handoff`,
+      );
+    }
+
+    const handoffId = randomUUID();
+    activeHandoffs.set(extTabId, handoffId);
+
+    try {
+      // Drop any stale handoff completion events for this tab before showing the overlay.
+      await invoke("read_events", { method: "bc.handoffDone", targetId: extTarget, clear: true }).catch(() => {});
+
+      const started = await callExtensionHandoff("handoff_start", { message, handoffId });
+      if (!started.ok) return started;
+
+      const deadline = Date.now() + timeoutMs;
+      while (true) {
+        const remainingMs = Math.max(1, deadline - Date.now());
+        const waited = await invoke("wait_for_event", {
+          method: "bc.handoffDone",
+          targetId: extTarget,
+          match: { handoffId },
+          timeoutMs: remainingMs,
+          consumeBuffer: true,
+        });
+        if (!waited.ok) {
+          await callExtensionHandoff("handoff_clear", { handoffId }).catch(() => {});
+          return waited;
+        }
+
+        const data = waited.data as Json | undefined;
+        if (data?.["found"] === true) {
+          const eventParams = (data["event"] as Json | undefined)?.["params"] as Json | undefined;
+          if (eventParams?.["handoffId"] === handoffId) {
+            return success("handoff: done");
+          }
+          if (Date.now() >= deadline) break;
+          continue;
+        }
+        break;
+      }
+
+      await callExtensionHandoff("handoff_clear", { handoffId }).catch(() => {});
+      const secs = Math.max(1, Math.round(timeoutMs / 1000));
+      return failure("EXECUTION_FAILED", `HANDOFF_TIMEOUT: handoff timed out after ${secs}s`);
+    } finally {
+      if (activeHandoffs.get(extTabId) === handoffId) {
+        activeHandoffs.delete(extTabId);
+      }
+    }
+  }
+
+  const challengeBackendOf = (tid: string | undefined): "extension" | "cdp" =>
+    extensionTabOf(tid) !== undefined ? "extension" : "cdp";
+
+  function challengeDataOf(
+    detection: ChallengeDetection,
+    status: "interactive" | "non-interactive-timeout",
+    targetUrl: string,
+    backend: "extension" | "cdp",
+  ) {
+    return {
+      kind: detection.kind,
+      vendor: detection.vendor,
+      status,
+      url: targetUrl,
+      message: formatChallengeOutput(detection, targetUrl, { backend, untrustedBoundary: true }),
+    };
+  }
+
+  async function raceDeadline<T>(promise: Promise<T>, deadline: number | undefined, onTimeout: T): Promise<T> {
+    if (deadline === undefined) return promise;
+    const rem = deadline - Date.now();
+    if (rem <= 0) return onTimeout;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        promise.catch(() => onTimeout),
+        new Promise<T>((resolve) => {
+          timer = setTimeout(() => resolve(onTimeout), rem);
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  async function readChallengeProbeCdp(
+    targetId: string | undefined,
+    timeoutMs = 4_000,
+    deadline?: number,
+  ): Promise<ProbeReadResult> {
+    const budget = deadline !== undefined ? Math.min(timeoutMs, deadline - Date.now()) : timeoutMs;
+    if (budget <= 0) return { kind: "error" };
+    const res = await raceDeadline(
+      invoke("evaluate", {
+        expression: CHALLENGE_PROBE_EXPR,
+        isolated: true,
+        ...(targetId ? { targetId } : {}),
+        timeoutMs: Math.max(1, Math.floor(budget)),
+      }),
+      deadline,
+      failure("EXECUTION_FAILED", "CHALLENGE_PROBE_TIMEOUT"),
+    );
+    if (!res.ok) return { kind: "error" };
+    const raw = valueOf(res);
+    if (!raw || !raw.startsWith("{")) return { kind: "skip" };
+    try {
+      const parsed = JSON.parse(raw) as { skip?: boolean; url?: string; probe?: ChallengeProbe };
+      if (parsed.skip) return { kind: "skip", url: typeof parsed.url === "string" ? parsed.url : undefined };
+      if (parsed.probe && typeof parsed.probe === "object") return { kind: "probe", probe: parsed.probe };
+      return { kind: "skip" };
+    } catch {
+      return { kind: "skip" };
+    }
+  }
+
+  /**
+   * Read a lightweight bot-challenge probe for the current page.
+   * - On extension tabs: stays on the silent `evalHelper` (`bc_call`) tier so normal pages never attach `chrome.debugger`.
+   * - During a non-interactive interstitial wait, if a throttled/collapsed background extension tab stops answering
+   *   `bc_call`, falls back to `evaluate` (which enables focus emulation so the interstitial's timers can finish).
+   * - On CDP tabs: runs a single self-contained `evaluate` expression that exits early on normal long pages.
+   */
+  async function readChallengeProbe(
+    targetId: string | undefined,
+    opts: { wallHint?: string; reprobe?: boolean; deadline?: number } = {},
+  ): Promise<ProbeReadResult> {
+    const remaining = (cap: number): number =>
+      opts.deadline !== undefined ? Math.min(cap, opts.deadline - Date.now()) : cap;
+
+    if (extensionTabOf(targetId) !== undefined) {
+      const baseTimeout = opts.reprobe ? 1_500 : 4_000;
+      const quickBudget = remaining(baseTimeout);
+      if (quickBudget <= 0) return { kind: "error" };
+      const quick = await raceDeadline(
+        evalHelper(
+          {
+            steps: [
+              { kind: "href" },
+              { kind: "title" },
+              { kind: "bc", method: "text", args: [{ all: true, max: 3000 }] },
+              { kind: "bc", method: "query", args: [{ selector: FAST_VENDOR_CSS, fields: { id: "@id" }, limit: 1, all: true }] },
+            ],
+            join: CHALLENGE_PROBE_SEP,
+          },
+          targetId,
+          Math.max(1, Math.floor(quickBudget)),
+        ),
+        opts.deadline,
+        failure("EXECUTION_FAILED", "CHALLENGE_PROBE_TIMEOUT"),
+      );
+      if (!quick.ok) {
+        return opts.reprobe ? readChallengeProbeCdp(targetId, baseTimeout, opts.deadline) : { kind: "error" };
+      }
+      const rawQuick = valueOf(quick);
+      if (!rawQuick.includes(CHALLENGE_PROBE_SEP)) return { kind: "skip" };
+      const [url = "", title = "", rawText = "", rawVendor = ""] = rawQuick.split(CHALLENGE_PROBE_SEP);
+      const { text, textLength } = parseBcTextForProbe(rawText);
+      const hasVendor = parseBcQueryRows(rawVendor).length > 0;
+      const suspicious =
+        opts.wallHint === "captcha" ||
+        opts.wallHint === "rate-limit" ||
+        textLength < SHORT_PAGE_CHARS ||
+        hasVendor ||
+        isSuspiciousTitle(title) ||
+        isSuspiciousUrl(url);
+      if (!suspicious) return { kind: "skip", url };
+
+      const markersBudget = remaining(baseTimeout);
+      if (markersBudget <= 0) return { kind: "error" };
+      const markers = await raceDeadline(
+        evalHelper(
+          {
+            steps: [
+              { kind: "bc", method: "query", args: [{ selector: "iframe[src]", fields: { src: "@src" }, limit: 20, all: true }] },
+              { kind: "bc", method: "query", args: [{ selector: "script[src]", fields: { src: "@src" }, limit: 50, all: true }] },
+              {
+                kind: "bc",
+                method: "query",
+                args: [{ selector: PROBE_SELECTORS_CSS, fields: { id: "@id", cls: "@class", src: "@src", title: "@title" }, limit: 20, all: true }],
+              },
+              {
+                kind: "bc",
+                method: "query",
+                args: [{ selector: PROBE_SELECTORS_CSS, fields: { id: "@id", cls: "@class", src: "@src", title: "@title" }, limit: 20, all: false }],
+              },
+              { kind: "bc", method: "query", args: [{ selector: "awswaf-captcha", fields: { id: "@id" }, limit: 1, all: true }] },
+            ],
+            join: CHALLENGE_PROBE_SEP,
+          },
+          targetId,
+          Math.max(1, Math.floor(markersBudget)),
+        ),
+        opts.deadline,
+        failure("EXECUTION_FAILED", "CHALLENGE_PROBE_TIMEOUT"),
+      );
+      const [rawFrames = "", rawScripts = "", rawSel = "", rawVis = "", rawAws = ""] = markers.ok
+        ? valueOf(markers).split(CHALLENGE_PROBE_SEP)
+        : [];
+      const frameUrls = parseBcQueryRows(rawFrames).map((r) => r["src"]).filter((s): s is string => Boolean(s));
+      const scriptSrcs = parseBcQueryRows(rawScripts).map((r) => r["src"]).filter((s): s is string => Boolean(s));
+      const hasAws = parseBcQueryRows(rawAws).length > 0;
+      const selectors = matchProbeSelectorsFromRows(parseBcQueryRows(rawSel), hasAws);
+      const visibleSelectors = matchProbeSelectorsFromRows(parseBcQueryRows(rawVis), false);
+      const probe: ChallengeProbe = {
+        url,
+        title: title.trim(),
+        text,
+        textLength,
+        frameUrls,
+        scriptSrcs,
+        selectors,
+        visibleSelectors,
+      };
+      // Check HTTP navigation status before accepting a non-block match on a denial-titled page
+      // (e.g. a long "403 Access Denied" page with a CAPTCHA) or a short AWS WAF SDK page.
+      const preliminary = classifyChallenge(probe);
+      const needsStatus =
+        preliminary?.kind !== "block" &&
+        (isDenialTitle(title) || (textLength < SHORT_PAGE_CHARS && scriptSrcs.some((s) => /\.awswaf\.com\//.test(s))));
+      if (needsStatus) {
+        const statusBudget = remaining(2_000);
+        if (statusBudget > 0) {
+          const statusRes = await raceDeadline(
+            invoke("evaluate", {
+              expression: '(() => { const n = performance.getEntriesByType && performance.getEntriesByType("navigation")[0]; return n && typeof n.responseStatus === "number" ? n.responseStatus : 0; })()',
+              isolated: true,
+              ...(targetId ? { targetId } : {}),
+              timeoutMs: Math.max(1, Math.floor(statusBudget)),
+            }),
+            opts.deadline,
+            failure("EXECUTION_FAILED", "CHALLENGE_PROBE_TIMEOUT"),
+          );
+          const statusNum = statusRes.ok ? Number((statusRes.data as Json)["value"]) : 0;
+          if (Number.isInteger(statusNum) && statusNum > 0) {
+            return { kind: "probe", probe: { ...probe, status: statusNum } };
+          }
+        }
+      }
+      return { kind: "probe", probe };
+    }
+
+    return readChallengeProbeCdp(targetId, opts.reprobe ? 1_500 : 4_000, opts.deadline);
+  }
+
+  /**
+   * Run the challenge classifier; auto-wait boundedly (~8 s) on `non-interactive` interstitials,
+   * and immediately report `interactive` or `block` without retrying.
+   */
+  async function checkChallenge(
+    targetId: string | undefined,
+    opts: { wallHint?: string; knownUrl?: string } = {},
+  ): Promise<ChallengeCheckResult> {
+    const first = await readChallengeProbe(targetId, { wallHint: opts.wallHint });
+    if (first.kind !== "probe") {
+      return { status: "clear", waited: false, url: first.kind === "skip" ? first.url : opts.knownUrl };
+    }
+    let lastProbe = first.probe;
+    let detection = classifyChallenge(lastProbe);
+    if (!detection) return { status: "clear", waited: false, url: lastProbe.url };
+    if (detection.kind === "block") {
+      return { status: "block", detection, url: lastProbe.url || opts.knownUrl || "", waited: false };
+    }
+    if (detection.kind === "interactive") {
+      return { status: "interactive", detection, url: lastProbe.url || opts.knownUrl || "", waited: false };
+    }
+
+    const waitMaxMs = options.challengeWaitMaxMs ?? CHALLENGE_WAIT_MAX_MS;
+    const started = Date.now();
+    const deadline = started + waitMaxMs;
+    let waitedMs = 0;
+    const remainingBudget = () => Math.max(0, Math.min(deadline - Date.now(), waitMaxMs - waitedMs));
+    while (remainingBudget() > 0) {
+      // Keep part of the budget for one last probe so a page that clears near the deadline is seen.
+      const rem = remainingBudget();
+      const reserve = Math.min(CHALLENGE_PROBE_RESERVE_MS, Math.floor(rem / 2));
+      const last = rem - reserve <= CHALLENGE_POLL_MS;
+      const step = Math.min(CHALLENGE_POLL_MS, rem - reserve);
+      if (step <= 0) break;
+      await pause(step);
+      waitedMs += step;
+      if (deadline - Date.now() <= 0) break;
+      const next = await readChallengeProbe(targetId, { reprobe: true, deadline });
+      if (next.kind === "error") continue;
+      if (next.kind === "skip") {
+        return { status: "clear", waited: true, url: next.url || opts.knownUrl };
+      }
+      lastProbe = next.probe;
+      const nextDetection = classifyChallenge(lastProbe);
+      if (!nextDetection) {
+        return { status: "clear", waited: true, url: lastProbe.url };
+      }
+      detection = nextDetection;
+      if (detection.kind === "block") {
+        return { status: "block", detection, url: lastProbe.url || opts.knownUrl || "", waited: true };
+      }
+      if (detection.kind === "interactive") {
+        return { status: "interactive", detection, url: lastProbe.url || opts.knownUrl || "", waited: true };
+      }
+      if (last) break;
+    }
+
+    return {
+      status: "non-interactive-timeout",
+      detection,
+      url: lastProbe.url || opts.knownUrl || "",
+      waited: true,
+    };
+  }
+
+  async function handlePage(action: string, input: Json, rawTargetId?: string): Promise<InvokeResult> {
+    const resolved = await resolveTargetBackend(rawTargetId);
+    const { browseTab, extensionTarget, cdpTarget } = resolved;
+    const targetId = rawTargetId ?? extensionTarget;
     const quiet = input["quiet"] === true;
 
     switch (action) {
@@ -1266,9 +2161,37 @@ export function createPageHelperHandler(
           ...(find ? { find } : {}),
           ...(within ? { within } : {}),
         };
-        const res = await evalHelper(`__bc.snapshot(${js(opts)})`, targetId);
+        const res = await evalHelper({ kind: "bc", method: "snapshot", args: [opts] }, targetId);
         if (!res.ok) return res;
         let out = valueOf(res);
+        let challengePrefix = "";
+        let challengeMeta: ReturnType<typeof challengeDataOf> | undefined;
+        if (!find && !within && input["_skipChallengeCheck"] !== true && isSuspiciousSnapshot(out)) {
+          const wallHint = out.includes("# WALL: captcha") ? "captcha" : out.includes("# WALL: rate-limit") ? "rate-limit" : undefined;
+          const snapUrl = /^# .* \| (https?:\/\/[^\s]+)/.exec(out)?.[1];
+          const challengeBackend = challengeBackendOf(targetId);
+          const challenge = await checkChallenge(targetId, { wallHint, knownUrl: snapUrl });
+          if (challenge.status === "block") {
+            return failure(
+              "EXECUTION_FAILED",
+              formatChallengeOutput(challenge.detection, challenge.url || snapUrl || "", {
+                backend: challengeBackend,
+                untrustedBoundary: true,
+              }),
+            );
+          }
+          if (challenge.status === "interactive" || challenge.status === "non-interactive-timeout") {
+            const targetUrl = challenge.url || snapUrl || "";
+            challengePrefix = formatChallengeOutput(challenge.detection, targetUrl, {
+              backend: challengeBackend,
+              untrustedBoundary: true,
+            });
+            challengeMeta = challengeDataOf(challenge.detection, challenge.status, targetUrl, challengeBackend);
+          } else if (challenge.waited) {
+            const refreshed = await evalHelper({ kind: "bc", method: "snapshot", args: [opts] }, targetId);
+            if (refreshed.ok) out = valueOf(refreshed);
+          }
+        }
         // Attach per-site agent notes if present for the page's origin.
         const urlMatch = /^# .* \| (https?:\/\/[^\s]+)/.exec(out);
         if (urlMatch?.[1]) {
@@ -1279,17 +2202,18 @@ export function createPageHelperHandler(
           const frames = await snapFrames(opts, targetId);
           if (frames.length) out += `\n${frames.join("\n")}`;
         }
-        if (!find && !within && !out.includes("\n- ") && !out.includes("# WALL:") && !out.includes("# snap diff")) {
+        if (!challengePrefix && !find && !within && !out.includes("\n- ") && !out.includes("# WALL:") && !out.includes("# snap diff")) {
           const ax = await snapAx(undefined, targetId);
           if (ax.ok && valueOf(ax).includes("\n- ")) out += `\n# No controls found in the DOM.\n${valueOf(ax)}`;
         }
-        return maybeSaveOut(success(out), input);
+        if (challengePrefix) out = `${challengePrefix}\n${out}`;
+        return maybeSaveOut(challengeMeta ? { ok: true, data: { value: out, challenge: challengeMeta } } : success(out), input);
       }
 
       case "form": {
         if (browseTab !== undefined) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: form needs a DevTools tab");
         const opts: Json = typeof input["within"] === "string" && input["within"] !== "" ? { within: input["within"] } : {};
-        return maybeSaveOut(await evalHelper(`__bc.form(${js(opts)})`, targetId), input);
+        return maybeSaveOut(await evalHelper({ kind: "bc", method: "form", args: [opts] }, targetId), input);
       }
 
       case "query": {
@@ -1300,7 +2224,7 @@ export function createPageHelperHandler(
           ...(Number(input["limit"]) > 0 ? { limit: Number(input["limit"]) } : {}),
           ...(input["all"] === true ? { all: true } : {}),
         };
-        return maybeSaveOut(await evalHelper(`__bc.query(${js(opts)})`, targetId), input);
+        return maybeSaveOut(await evalHelper({ kind: "bc", method: "query", args: [opts] }, targetId), input);
       }
 
       case "read-urls": {
@@ -1311,7 +2235,7 @@ export function createPageHelperHandler(
           ...(Number(input["timeoutMs"]) > 0 ? { timeoutMs: Number(input["timeoutMs"]) } : {}),
           ...(Number(input["maxChars"]) > 0 ? { maxChars: Number(input["maxChars"]) } : {}),
         };
-        return maybeSaveOut(await evalHelper(`await __bc.readUrls(${js(opts)})`, targetId, 75_000), input);
+        return maybeSaveOut(await evalHelper({ kind: "bc", method: "readUrls", args: [opts] }, targetId, 75_000), input);
       }
 
       case "click":
@@ -1323,17 +2247,32 @@ export function createPageHelperHandler(
       case "key":
         return act(action, input, targetId, quiet, browseTab);
 
+      case "hover":
+        return runHover(input, targetId, quiet, browseTab);
+
+      case "dialog":
+        return runDialog(input, targetId, browseTab);
+
+      case "emulate":
+        return runEmulate(input, targetId, browseTab, cdpTarget);
+
+      case "handoff":
+        return runHandoff(input, targetId, resolved);
+
       case "do": {
         const steps = parseSteps(input);
         if (typeof steps === "string") return failure("INPUT_VALIDATION_FAILED", `INPUT_INVALID: ${steps}`);
         if (steps.length === 0) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: no steps given");
         const start = browseTab === undefined
-          ? await evalHelper("__bc.baseline()", targetId)
-          : await invoke("evaluate", { expression: "location.href", ...(targetId ? { targetId } : {}) });
+          ? await evalHelper({ kind: "bc", method: "baseline" }, targetId)
+          : await readProperty("href", targetId);
         if (browseTab === undefined && start && !start.ok) return start;
         const startUrl = start?.ok ? valueOf(start) : "";
+        let prevUrl = startUrl;
         const out: string[] = [];
         let stopped: string | undefined;
+        let challengeReport: string | undefined;
+        const challengeBackend = challengeBackendOf(targetId);
         for (const [i, step] of steps.entries()) {
           const res = await act(step.action, { ...step.input, quiet: true }, targetId, true, browseTab, true);
           if (!res.ok) {
@@ -1352,25 +2291,73 @@ export function createPageHelperHandler(
             stopped = `step ${i + 1} was not read back as typed`;
             break;
           }
-          if (i === steps.length - 1) continue;
+          const isLastStep = i === steps.length - 1;
+          if (isLastStep && browseTab !== undefined) continue;
           const state = await evalHelper(
-            '(await __bc.settle(), [location.href, __bc.wall() || ""].join("\\n"))',
+            {
+              steps: [
+                { kind: "bc", method: "settle", discard: true },
+                { kind: "href" },
+                { kind: "bc", method: "wall", fallback: "" },
+                VENDOR_MARKER_STEP,
+              ],
+              join: "\n",
+            },
             targetId,
             8_000,
           );
           let url = "";
           let wall = "";
-          if (state.ok) [url = "", wall = ""] = valueOf(state).split("\n");
+          let rest: string[] = [];
+          if (state.ok) [url = "", wall = "", ...rest] = valueOf(state).split("\n");
           else {
             await waitParsed(targetId);
-            const again = await evalHelper('[location.href, __bc.wall() || ""].join("\\n")', targetId, 8_000);
-            if (again.ok) [url = "", wall = ""] = valueOf(again).split("\n");
+            const again = await evalHelper(
+              { steps: [{ kind: "href" }, { kind: "bc", method: "wall", fallback: "" }, VENDOR_MARKER_STEP], join: "\n" },
+              targetId,
+              8_000,
+            );
+            if (again.ok) [url = "", wall = "", ...rest] = valueOf(again).split("\n");
           }
-          if (wall) stopped = `the page is a ${wall} wall after step ${i + 1}`;
-          else if (url && startUrl && hostOf(url) !== hostOf(startUrl)) {
-            stopped = `step ${i + 1} left ${hostOf(startUrl)} for ${hostOf(url)}`;
+          const markerRows = rest.join("\n");
+          const navigated = Boolean(url && prevUrl && stripHash(url) !== stripHash(prevUrl));
+          const challengeWall = wall === "captcha" || wall === "rate-limit" || /^# [1-9]\d* row/.test(markerRows);
+          if (browseTab === undefined && (navigated || challengeWall)) {
+            const challenge = await checkChallenge(targetId, { wallHint: wall, knownUrl: url });
+            if (challenge.status === "block") {
+              challengeReport = formatChallengeOutput(challenge.detection, challenge.url || url, {
+                backend: challengeBackend,
+                untrustedBoundary: true,
+              });
+              stopped = `blocked by ${challenge.detection.vendor} after step ${i + 1}`;
+              break;
+            }
+            if (challenge.status === "interactive" || challenge.status === "non-interactive-timeout") {
+              challengeReport = formatChallengeOutput(challenge.detection, challenge.url || url, {
+                backend: challengeBackend,
+                untrustedBoundary: true,
+              });
+              stopped = `${challenge.detection.vendor} challenge after step ${i + 1}`;
+              break;
+            }
+            if (challenge.waited) {
+              const afterWait = await evalHelper(
+                { steps: [{ kind: "href" }, { kind: "bc", method: "wall", fallback: "" }], join: "\n" },
+                targetId,
+                4_000,
+              );
+              if (afterWait.ok) [url = "", wall = ""] = valueOf(afterWait).split("\n");
+              else if (challenge.url) url = challenge.url;
+            }
           }
-          if (stopped) break;
+          if (url) prevUrl = url;
+          if (!isLastStep) {
+            if (wall) stopped = `the page is a ${wall} wall after step ${i + 1}`;
+            else if (url && startUrl && hostOf(url) !== hostOf(startUrl)) {
+              stopped = `step ${i + 1} left ${hostOf(startUrl)} for ${hostOf(url)}`;
+            }
+            if (stopped) break;
+          }
         }
         if (stopped) out.push(`# STOPPED: ${stopped}. ${steps.length - out.length} step(s) not run.`);
         if (!quiet) {
@@ -1380,10 +2367,11 @@ export function createPageHelperHandler(
               cacheBrowseSnapshot(browseTab, valueOf(delta));
               out.push(valueOf(delta));
             }
-          } else {
+          } else if (!challengeReport) {
             out.push(await changes(startUrl, targetId));
           }
         }
+        if (challengeReport) out.unshift(challengeReport);
         return stopped ? failure("EXECUTION_FAILED", out.join("\n")) : success(out.join("\n"));
       }
 
@@ -1399,11 +2387,11 @@ export function createPageHelperHandler(
         if (found.loc.kind === "ax") {
           return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: value needs a DOM ref (e12 or f2:e5), not an accessibility ref");
         }
-        const where = found.loc.kind === "frame" ? frameTarget(found.loc.frame, targetId) : targetId;
+        const where = found.loc.kind === "frame" ? (found.loc.target ?? frameTarget(found.loc.frame, targetId)) : targetId;
         if (found.loc.kind === "frame" && !where) {
           return failure("EXECUTION_FAILED", `STALE_REF: iframe f${found.loc.frame} is not known for this tab. Run snap again.`);
         }
-        return evalHelper(`__bc.value(${js(found.loc.ref)})`, where);
+        return evalHelper({ kind: "bc", method: "value", args: [found.loc.ref] }, where);
       }
 
       case "text": {
@@ -1415,13 +2403,13 @@ export function createPageHelperHandler(
             ...(Number(input["limit"]) > 0 ? { limit: Number(input["limit"]) } : {}),
             ...(Number(input["timeoutMs"]) > 0 ? { timeoutMs: Number(input["timeoutMs"]) } : {}),
           };
-          return maybeSaveOut(await evalHelper(`await __bc.scrollRead(${js(opts)})`, targetId, 65_000), input);
+          return maybeSaveOut(await evalHelper({ kind: "bc", method: "scrollRead", args: [opts] }, targetId, 65_000), input);
         }
         const opts: Json = {};
         if (typeof input["within"] === "string" && input["within"] !== "") opts["within"] = input["within"];
         if (input["all"] === true) opts["all"] = true;
         if (Number(input["max"]) > 0) opts["max"] = Number(input["max"]);
-        return maybeSaveOut(await evalHelper(`__bc.text(${js(opts)})`, targetId), input);
+        return maybeSaveOut(await evalHelper({ kind: "bc", method: "text", args: [opts] }, targetId), input);
       }
 
       case "ocr": {
@@ -1461,9 +2449,9 @@ export function createPageHelperHandler(
           const found = await locate(input["ref"], "read", targetId);
           if (!found.ok) return found.res;
           if (found.loc.kind !== "dom") return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: shot --ref needs a page ref like e12");
-          box = await evalHelper(`__bc.rect(${js(found.loc.ref)})`, targetId);
+          box = await evalHelper({ kind: "bc", method: "rect", args: [found.loc.ref] }, targetId);
         } else {
-          box = await evalHelper("__bc.viewport()", targetId);
+          box = await evalHelper({ kind: "bc", method: "viewport" }, targetId);
         }
         if (!box.ok) return box;
         const r = JSON.parse(valueOf(box)) as { x: number; y: number; width: number; height: number; dpr: number };
@@ -1471,7 +2459,7 @@ export function createPageHelperHandler(
         let nativeBoxes: { boxes: MarkBox[]; legend: string } | undefined;
         let domMarksLegend: string | undefined;
         if (wantMarks && !hasRef) {
-          const mb = await evalHelper("__bc.markBoxes()", targetId);
+          const mb = await evalHelper({ kind: "bc", method: "markBoxes" }, targetId);
           if (mb.ok) {
             try {
               const parsed = JSON.parse(valueOf(mb)) as { boxes: MarkBox[]; legend: string };
@@ -1481,7 +2469,7 @@ export function createPageHelperHandler(
         }
         let domMarksActive = false;
         if (wantMarks && !nativeBoxes) {
-          const dm = await evalHelper("__bc.marks(true)", targetId);
+          const dm = await evalHelper({ kind: "bc", method: "marks", args: [true] }, targetId);
           if (!dm.ok) return dm;
           domMarksLegend = valueOf(dm);
           domMarksActive = true;
@@ -1495,7 +2483,7 @@ export function createPageHelperHandler(
         const clearDomMarks = async () => {
           if (domMarksActive) {
             domMarksActive = false;
-            await evalHelper("__bc.marks(false)", targetId);
+            await evalHelper({ kind: "bc", method: "marks", args: [false] }, targetId);
           }
         };
         try {
@@ -1529,7 +2517,7 @@ export function createPageHelperHandler(
             marksLegend = nativeBoxes.legend;
           } else {
             // Non-macOS or swiftc absent: fall back to temporary DOM badges so --marks still works.
-            const dm = await evalHelper("__bc.marks(true)", targetId);
+            const dm = await evalHelper({ kind: "bc", method: "marks", args: [true] }, targetId);
             if (dm.ok) {
               try {
                 await invoke("capture_screenshot", { ...base, path: outPath });
@@ -1537,7 +2525,7 @@ export function createPageHelperHandler(
                 if (got !== undefined && got > width * 1.1) await resizeImage(outPath, width, height);
                 marksLegend = valueOf(dm);
               } finally {
-                await evalHelper("__bc.marks(false)", targetId).catch(() => {});
+                await evalHelper({ kind: "bc", method: "marks", args: [false] }, targetId).catch(() => {});
               }
             }
           }
@@ -1553,27 +2541,117 @@ export function createPageHelperHandler(
       case "nav": {
         const url = typeof input["url"] === "string" ? input["url"] : "";
         const until = input["until"] === "load" ? "load" : "domcontentloaded";
-        const nav = await invoke("navigate", { url, until, ...(targetId ? { targetId } : {}) });
+        const nav = await invoke("navigate", {
+          url,
+          until,
+          ...(targetId ? { targetId } : {}),
+          ...(input["newWindow"] === true ? { newWindow: true } : {}),
+          ...(input["keepOpen"] === true ? { keepOpen: true } : {}),
+        });
         if (!nav.ok) return nav;
         const data = nav.data as Json;
         const tab = typeof data["targetId"] === "string" ? (data["targetId"] as string) : targetId;
+        // Only the tab id this nav returned may be cleaned up, never the caller's targetId.
+        const newTab =
+          data["created"] === true && typeof data["targetId"] === "string" && extensionTabOf(data["targetId"]) !== undefined
+            ? (data["targetId"] as string)
+            : undefined;
         const onBrowse = browseTabNumber(tab) !== undefined || (tab === undefined && browseTab !== undefined);
         const lines = [JSON.stringify(data)];
         if (!onBrowse) {
-          const state = await evalHelper('(await __bc.settle(), [location.href, __bc.wall() || ""].join("\\n"))', tab, 8_000);
+          const state = await evalHelper(
+            {
+              steps: [
+                { kind: "bc", method: "settle", discard: true },
+                { kind: "href" },
+                { kind: "bc", method: "wall", fallback: "" },
+              ],
+              join: "\n",
+            },
+            tab,
+            8_000,
+          );
+          let final = "";
+          let wall = "";
           if (state.ok) {
-            const [final = "", wall = ""] = valueOf(state).split("\n");
-            if (final && final !== url) lines.push(`# url: ${final}`);
+            [final = "", wall = ""] = valueOf(state).split("\n");
+          } else if (messageOf(state).startsWith("EXTENSION_ONLY:") || messageOf(state).includes("RESTRICTED_PAGE:")) {
+            if (newTab !== undefined && messageOf(state).includes("RESTRICTED_PAGE:")) {
+              const closed = await invoke("close_target", { targetId: newTab }).catch((e: unknown) =>
+                failure("EXECUTION_FAILED", e instanceof Error ? e.message : String(e)),
+              );
+              const note = !closed.ok
+                ? `may still be open (closing it could not be confirmed): ${messageOf(closed)}`
+                : (closed.data as Json | undefined)?.["closed"] === false
+                  ? "may still be open (closing it could not be confirmed)"
+                  : undefined;
+              if (note !== undefined) {
+                return failure(
+                  state.ok ? "EXECUTION_FAILED" : state.error.code,
+                  `${messageOf(state)}\nThe tab this nav opened (${newTab}) ${note}.`,
+                );
+              }
+            }
+            return state;
+          }
+          const challengeBackend = challengeBackendOf(tab);
+          const challenge = await checkChallenge(tab, { wallHint: wall, knownUrl: final || url });
+          if (challenge.status === "block") {
+            return failure(
+              "EXECUTION_FAILED",
+              formatChallengeOutput(challenge.detection, challenge.url || final || url, {
+                backend: challengeBackend,
+                untrustedBoundary: true,
+              }),
+            );
+          }
+          if (challenge.status === "interactive" || challenge.status === "non-interactive-timeout") {
+            const targetUrl = challenge.url || final || url;
+            // The final URL and redirect host come from the page, so keep them inside the boundary.
+            const navDetails: string[] = [];
+            if (final && final !== url) navDetails.push(`# url: ${final}`);
             if (final && hostOf(final) && hostOf(url) && hostOf(final) !== hostOf(url)) {
-              lines.push(`# REDIRECTED: ${hostOf(url)} -> ${hostOf(final)}`);
+              navDetails.push(`# REDIRECTED: ${hostOf(url)} -> ${hostOf(final)}`);
             }
-            if (wall && input["snap"] !== true) {
-              lines.push(`# WALL: ${wall}. Stop and hand this tab to the user; do not solve or bypass it.`);
+            if (navDetails.length) lines.push(wrapUntrusted(navDetails.join("\n")));
+            return {
+              ok: true,
+              data: {
+                value: `${formatChallengeOutput(challenge.detection, targetUrl, { backend: challengeBackend, untrustedBoundary: true })}\n${lines.join("\n")}`,
+                challenge: challengeDataOf(challenge.detection, challenge.status, targetUrl, challengeBackend),
+              },
+            };
+          }
+          if (challenge.waited) {
+            const afterWait = await evalHelper(
+              {
+                steps: [
+                  { kind: "bc", method: "settle", discard: true },
+                  { kind: "href" },
+                  { kind: "bc", method: "wall", fallback: "" },
+                ],
+                join: "\n",
+              },
+              tab,
+              8_000,
+            );
+            if (afterWait.ok) {
+              [final = "", wall = ""] = valueOf(afterWait).split("\n");
+            } else if (challenge.url) {
+              final = challenge.url;
+              wall = "";
             }
+          }
+          if (final && final !== url) lines.push(`# url: ${final}`);
+          if (final && hostOf(final) && hostOf(url) && hostOf(final) !== hostOf(url)) {
+            lines.push(`# REDIRECTED: ${hostOf(url)} -> ${hostOf(final)}`);
+          }
+          if (wall && input["snap"] !== true) {
+            lines.push(`# WALL: ${wall}. Stop and hand this tab to the user; do not solve or bypass it.`);
           }
         }
         if (input["snap"] === true) {
-          const snap = await handlePage("snap", {}, tab);
+          const snap = await handlePage("snap", { _skipChallengeCheck: !onBrowse }, tab);
           lines.push(snap.ok ? valueOf(snap) : `# snap failed: ${messageOf(snap).slice(0, 200)}`);
         }
         return success(lines.join("\n"));
@@ -1601,10 +2679,10 @@ export function createPageHelperHandler(
         return runScript(input, targetId);
 
       case "verdict":
-        return evalHelper("__bc.verdict()", targetId);
+        return evalHelper({ kind: "bc", method: "verdict" }, targetId);
 
       case "health":
-        return evalHelper("__bc.health()", targetId);
+        return evalHelper({ kind: "bc", method: "health" }, targetId);
 
       default: {
         const hint = didYouMean(action, PAGE_ACTIONS);

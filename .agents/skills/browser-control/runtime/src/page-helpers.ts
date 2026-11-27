@@ -44,7 +44,7 @@ export const KEYS: Record<string, KeySpec> = {
 /** Where a `<ref>` argument points: a page ref, a ref inside iframe n, an accessibility node, or a label. */
 export type Locator =
   | { kind: "dom"; ref: string }
-  | { kind: "frame"; frame: number; ref: string }
+  | { kind: "frame"; frame: number; ref: string; target?: string }
   | { kind: "ax"; node: number }
   | { kind: "label"; label: string };
 
@@ -58,4 +58,101 @@ export function parseLocator(raw: unknown): Locator {
   if (frame) return { kind: "frame", frame: Number(frame[1]), ref: frame[2]! };
   if (/^a[0-9]+$/.test(s)) return { kind: "ax", node: Number(s.slice(1)) };
   return { kind: "label", label: raw.trim() };
+}
+
+const BC_METHOD_IDENT = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+
+/** `__bc` methods in `page-helpers.js.txt` that return a Promise and must be awaited on CDP. */
+const ASYNC_BC_METHODS = new Set(["point", "settle", "readUrls", "scrollRead"]);
+
+/** One structured step for `evalHelper` (rendered to JS on CDP, sent verbatim as `bc_call` on extension tabs). */
+export type HelperStep =
+  | { kind: "bc"; method: string; args?: readonly unknown[]; fallback?: ""; discard?: true }
+  | { kind: "href" | "readyState" | "origin" | "host" | "title"; discard?: true };
+
+export type NormalizedHelperCall = {
+  steps: readonly HelperStep[];
+  join?: string;
+};
+
+export type HelperCall = HelperStep | readonly HelperStep[] | NormalizedHelperCall;
+
+/** Structured element target for `resolveObject` (`upload` and `styles`). */
+export type ElementStep =
+  | { kind: "bc"; method: "el"; args: readonly [string] }
+  | { kind: "querySelector"; selector: string };
+
+export function normalizeHelperCall(call: HelperCall): NormalizedHelperCall {
+  if (Array.isArray(call)) return { steps: call };
+  if ("steps" in call) return call;
+  return { steps: [call as HelperStep] };
+}
+
+function serializeArg(arg: unknown): string {
+  if (arg === undefined) return "undefined";
+  const json = JSON.stringify(arg);
+  if (json === undefined) {
+    throw new Error("INPUT_INVALID: helper step argument is not JSON-serializable");
+  }
+  return json;
+}
+
+function renderStep(step: HelperStep): string {
+  switch (step.kind) {
+    case "href":
+      return "location.href";
+    case "readyState":
+      return "document.readyState";
+    case "origin":
+      return "location.origin";
+    case "host":
+      return "location.host";
+    case "title":
+      return "document.title";
+    case "bc": {
+      if (!BC_METHOD_IDENT.test(step.method)) {
+        throw new Error(`INPUT_INVALID: invalid __bc method "${step.method}"`);
+      }
+      const args = (step.args ?? []).map(serializeArg).join(", ");
+      const prefix = ASYNC_BC_METHODS.has(step.method) ? "await " : "";
+      const expr = `${prefix}__bc.${step.method}(${args})`;
+      return step.fallback === "" ? `${expr} || ""` : expr;
+    }
+  }
+}
+
+/** Render structured helper steps into the exact JavaScript expression executed on direct CDP. */
+export function renderSteps(call: HelperCall): string {
+  const { steps, join } = normalizeHelperCall(call);
+  if (steps.length === 0) {
+    throw new Error("INPUT_INVALID: helper call requires at least one step");
+  }
+  if (join === undefined) {
+    return steps.length === 1 ? renderStep(steps[0]!) : `(${steps.map(renderStep).join(", ")})`;
+  }
+  const discarded: string[] = [];
+  const kept: string[] = [];
+  for (const step of steps) {
+    if (step.discard) {
+      if (kept.length > 0) {
+        throw new Error("INPUT_INVALID: discarded steps must precede joined steps");
+      }
+      discarded.push(renderStep(step));
+    } else {
+      kept.push(renderStep(step));
+    }
+  }
+  if (kept.length === 0) {
+    throw new Error("INPUT_INVALID: join requires at least one non-discarded step");
+  }
+  const joined = `[${kept.join(", ")}].join(${JSON.stringify(join)})`;
+  return discarded.length > 0 ? `(${discarded.join(", ")}, ${joined})` : joined;
+}
+
+/** Render a structured element target (`__bc.el(...)` or `document.querySelector(...)`) for CDP `Runtime.evaluate`. */
+export function renderElementStep(step: ElementStep): string {
+  if (step.kind === "querySelector") {
+    return `document.querySelector(${serializeArg(step.selector)})`;
+  }
+  return renderSteps(step);
 }

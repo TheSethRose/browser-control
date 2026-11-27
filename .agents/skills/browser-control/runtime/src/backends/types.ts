@@ -1,9 +1,10 @@
 /**
  * Backends: other ways to reach the browser besides the built-in DevTools (CDP) connection.
  *
- * The CDP operations in `src/index.ts` are always present and are the fallback. Each extra
- * backend lives in its own file, is listed once in `./registry`, and can be removed by
- * deleting that line and its file. Nothing else in the runtime imports a backend directly.
+ * The CDP operations in `src/index.ts` are always present for v1 users, explicit CDP requests,
+ * and opt-in fallback orders (such as `extension,cdp`). Each extra backend lives in its own
+ * file, is listed once in `./registry`, and can be removed by deleting that line and its file.
+ * Nothing else in the runtime imports a backend directly.
  */
 
 export type OpInput = Record<string, unknown>;
@@ -25,7 +26,7 @@ export interface Backend {
    * current tab. Returning false hands the operation to the next backend in the order.
    */
   handles(op: string, input: OpInput, active: boolean): boolean;
-  /** Run the operation. Throw `BackendUnavailable` to fall through to the next backend. */
+  /** Run the operation. Throw `BackendUnavailable` to pass to the next backend (if one is configured). */
   invoke(op: string, input: OpInput): Promise<unknown>;
   /** Tabs this backend can act on, for `list_targets`. */
   listTargets(): Promise<BackendTarget[]>;
@@ -33,6 +34,10 @@ export interface Backend {
   status(): Promise<Record<string, unknown>>;
   /** Forget the selected tab. */
   clearActive(): void;
+  /** Whether a tab is selected (optional; assumed true when missing). */
+  hasActive?(): boolean;
+  /** Optional startup hook (called when this backend is enabled in backendOrder). */
+  start?(): Promise<void> | void;
   dispose?(): Promise<void> | void;
 }
 
