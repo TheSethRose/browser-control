@@ -59,7 +59,7 @@ import {
 } from "./page-helpers";
 import { createPictureTracker, imageWidth, resizeImage } from "./picture";
 import { buildHumanKeystrokes } from "./typing";
-import { didYouMean, withRemedy } from "./safety";
+import { didYouMean, withRemedy, wrapUntrusted } from "./safety";
 import { createScriptRunner, writeOutputFile } from "./script";
 
 type Json = Record<string, unknown>;
@@ -2383,10 +2383,13 @@ export function createPageHelperHandler(
           }
           if (challenge.status === "interactive" || challenge.status === "non-interactive-timeout") {
             const targetUrl = challenge.url || final || url;
-            if (final && final !== url) lines.push(`# url: ${final}`);
+            // The final URL and redirect host come from the page, so keep them inside the boundary.
+            const navDetails: string[] = [];
+            if (final && final !== url) navDetails.push(`# url: ${final}`);
             if (final && hostOf(final) && hostOf(url) && hostOf(final) !== hostOf(url)) {
-              lines.push(`# REDIRECTED: ${hostOf(url)} -> ${hostOf(final)}`);
+              navDetails.push(`# REDIRECTED: ${hostOf(url)} -> ${hostOf(final)}`);
             }
+            if (navDetails.length) lines.push(wrapUntrusted(navDetails.join("\n")));
             return {
               ok: true,
               data: {
