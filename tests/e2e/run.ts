@@ -296,6 +296,7 @@ async function main(): Promise<number> {
       fetch(req) {
         const path = new URL(req.url).pathname;
         if (path === "/challenge") return new Response(read("challenge.html"), { ...html, status: 403 });
+        if (path === "/challenge-wall") return new Response(read("challenge-wall.html"), html);
         if (path === "/popup") return new Response(read("popup.html"), html);
         return new Response(read("page.html").replaceAll("__FRAME__", frameUrl), html);
       },
@@ -408,6 +409,22 @@ async function main(): Promise<number> {
 
     // Simulated Cloudflare / Turnstile challenge.
     await check("challenge", ["nav", `${base}/challenge`], /CHALLENGE:/);
+
+    // A challenge page stops `do` and `fill` before step 1. The fixture's form is real and counts its own
+    // presses and inputs, so zero clicks and zero typed values are measured, not inferred.
+    const wallState = "JSON.stringify({v:document.getElementById('wall-field').value,pressed:window.__pressed,typed:window.__typed,submitted:window.__submitted})";
+    const untouched = (s: string) => /"v":""/.test(s) && /"pressed":0/.test(s) && /"typed":0/.test(s) && /"submitted":0/.test(s);
+    await check("challenge-wall-nav", ["nav", `${base}/challenge-wall`], /CHALLENGE:|WALL:/);
+    const wallFill = await check("challenge-wall-fill-stops", ["fill", JSON.stringify({ "Wall field": "nope" })], /STOPPED: .*before step 1/);
+    const afterFill = await evalJs(wallState);
+    record("challenge-wall-fill-untouched", /1 step\(s\) not run/.test(wallFill) && untouched(afterFill), `${afterFill} ${wallFill}`);
+    const wallDo = await check(
+      "challenge-wall-do-stops",
+      ["do", JSON.stringify([{ click: "Wall button" }, { type: ["Wall field", "nope"] }])],
+      /STOPPED: .*before step 1/,
+    );
+    const afterDo = await evalJs(wallState);
+    record("challenge-wall-do-untouched", /2 step\(s\) not run/.test(wallDo) && untouched(afterDo), `${afterDo} ${wallDo}`);
 
     // Handoff 1: times out, clears itself, tab restored.
     await bc(["nav", `${base}/`]);
