@@ -189,6 +189,14 @@ async function main(): Promise<number> {
     return 1;
   }
 
+  // Isolated relay port: the daemon binds it and the copied extension probes only it, so this run
+  // can never touch 49222-49229 where the user's live daemon listens.
+  const relayPort = await pickRelayPort();
+  if (relayPort === undefined) {
+    record("e2e-relay-port", false, `no free port in ${E2E_PORT_START}-${E2E_PORT_END} for the isolated test relay`);
+    return 1;
+  }
+
   const tmp = mkdtempSync(join(tmpdir(), "bc-e2e-"));
   const profile = join(tmp, "profile");
   const ext = join(tmp, "ext");
@@ -201,13 +209,6 @@ async function main(): Promise<number> {
   const servers: ReturnType<typeof Bun.serve>[] = [];
   let browser: Subprocess | undefined;
   let cdp: Cdp | undefined;
-  // Isolated relay port: the daemon binds it and the copied extension probes only it, so this run
-  // can never touch 49222-49229 where the user's live daemon listens.
-  const relayPort = await pickRelayPort();
-  if (relayPort === undefined) {
-    record("e2e-relay-port", false, `no free port in ${E2E_PORT_START}-${E2E_PORT_END} for the isolated test relay`);
-    return 1;
-  }
   const env = {
     ...process.env,
     XDG_CONFIG_HOME: xdg,
