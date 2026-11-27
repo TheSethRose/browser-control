@@ -101,8 +101,9 @@ export function createScriptRunner(dispatch: PageDispatch, evalPage: EvalFn) {
     const scriptFast = input["fast"] === true;
     const runAction = async (action: string, params: Json): Promise<string> => {
       const merged: Json = {
-        ...(scriptFast && params["fast"] === undefined ? { fast: true } : {}),
         ...params,
+        ...(scriptFast ? { fast: true } : {}),
+        ...(input["_natural"] !== undefined ? { _natural: input["_natural"] } : {}),
         quiet: params["quiet"] ?? true,
       };
       const res = await dispatch(action, merged, targetId);

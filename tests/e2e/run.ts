@@ -40,13 +40,30 @@ function findChrome(): string | undefined {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const PIXEL = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=",
+  "base64",
+);
 
 type Result = { name: string; ok: boolean; detail: string };
 const results: Result[] = [];
+const REQUIRED = process.env["BC_E2E_REQUIRED"] === "1";
+const skips: { name: string; reason: string }[] = [];
 function record(name: string, ok: boolean, detail: string) {
   results.push({ name, ok, detail });
   const clean = detail.replace(/\s+/g, " ").trim().slice(0, 240);
   console.log(ok ? `PASS ${name}` : `FAIL ${name} :: ${clean}`);
+}
+// A skipped check is never a pass: it prints its own line and is counted apart from passed/failed.
+function recordSkip(name: string, reason: string) {
+  skips.push({ name, reason });
+  console.log(`SKIP ${name} :: ${reason}`);
+}
+function printTotals() {
+  const passed = results.filter((r) => r.ok).length;
+  const failed = results.length - passed;
+  const line = `e2e: ${passed} passed, ${failed} failed`;
+  console.log(skips.length > 0 ? `${line}, ${skips.length} skipped` : line);
 }
 
 // ---- minimal CDP client (only used to press the handoff card's Continue button with a trusted click) ----
@@ -182,11 +199,16 @@ async function interactWithHandoff(
 async function main(): Promise<number> {
   const chrome = findChrome();
   if (!chrome) {
-    console.log("SKIP e2e: Chrome for Testing not found (set BC_E2E_CHROME to its binary).");
+    // A required run (CI gate) must never pass on a missing browser.
+    if (REQUIRED) {
+      record("e2e", false, "BC_E2E_REQUIRED=1 but Chrome for Testing was not found (set BC_E2E_CHROME to its binary)");
+      return 1;
+    }
+    recordSkip("e2e", "Chrome for Testing not found (set BC_E2E_CHROME to its binary)");
     return 0;
   }
   if (!existsSync(WRAPPER)) {
-    console.log(`FAIL setup :: wrapper missing at ${WRAPPER}`);
+    record("setup", false, `wrapper missing at ${WRAPPER}`);
     return 1;
   }
 
@@ -210,10 +232,21 @@ async function main(): Promise<number> {
   const servers: ReturnType<typeof Bun.serve>[] = [];
   let browser: Subprocess | undefined;
   let cdp: Cdp | undefined;
-  // The pacing check sets natural browsing through the per-run config file, so a caller's env must not pin it.
-  const { BROWSER_CONTROL_NATURAL: _natural, ...callerEnv } = process.env;
+  // The caller's agent session must not key these runs; the session cases set their own. The pacing check
+  // switches natural browsing through the per-run config file, and the env would override it, so drop that too.
+  const inherited: Record<string, string | undefined> = { ...process.env };
+  for (const k of [
+    "BROWSER_CONTROL_SESSION",
+    "CLAUDE_CODE_SESSION_ID",
+    "T3CODE_THREAD_ID",
+    "CODEX_THREAD_ID",
+    "CODEX_SESSION_ID",
+    "BROWSER_CONTROL_NATURAL",
+  ]) {
+    delete inherited[k];
+  }
   const env = {
-    ...callerEnv,
+    ...inherited,
     XDG_CONFIG_HOME: xdg,
     BROWSER_CONTROL_BACKENDS: "extension",
     BROWSER_CONTROL_DAEMON_DIR: daemonDir,
@@ -223,8 +256,8 @@ async function main(): Promise<number> {
     [RELAY_PORTS_ENV]: `${relayPort}-${relayPort}`,
   };
 
-  const bc = async (args: string[], timeoutMs = 45_000): Promise<string> => {
-    const proc = spawn([WRAPPER, ...args], { env, stdout: "pipe", stderr: "pipe", cwd: tmp });
+  const bc = async (args: string[], timeoutMs = 45_000, extraEnv: Record<string, string> = {}): Promise<string> => {
+    const proc = spawn([WRAPPER, ...args], { env: { ...env, ...extraEnv }, stdout: "pipe", stderr: "pipe", cwd: tmp });
     const timer = setTimeout(() => proc.kill(), timeoutMs);
     const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
     await proc.exited;
@@ -240,6 +273,13 @@ async function main(): Promise<number> {
   const checkEval = async (name: string, expr: string, expect: RegExp) => {
     const out = await evalJs(expr);
     record(name, expect.test(out), out);
+  };
+  // A page call refused with DIALOG_OPEN means the extension has seen the dialog, so `dialog` can handle it.
+  // A fixed sleep raced that detection on a loaded machine.
+  const waitForDialog = async (ms = 10_000) => {
+    for (const end = Date.now() + ms; Date.now() < end; await sleep(100)) {
+      if (/DIALOG_OPEN/.test(await evalJs("1"))) return;
+    }
   };
 
   let cleaned: Promise<void> | undefined;
@@ -265,7 +305,10 @@ async function main(): Promise<number> {
       console.log(`SUMMARY ${pass} pass, ${fail} fail`);
     })());
   for (const [sig, code] of [["SIGINT", 130], ["SIGTERM", 143]] as const) {
-    process.on(sig, () => void cleanup().finally(() => process.exit(code)));
+    process.on(sig, () => void cleanup().finally(() => {
+      printTotals();
+      process.exit(code);
+    }));
   }
 
   try {
@@ -277,7 +320,13 @@ async function main(): Promise<number> {
     const frameServer = Bun.serve({
       port: 0,
       hostname: "localhost",
-      fetch: (req) => (navLog.push({ path: new URL(req.url).pathname, t: Date.now() }), new Response(read("frame.html"), html)),
+      fetch: (req) => {
+        const path = new URL(req.url).pathname;
+        navLog.push({ path, t: Date.now() });
+        return path === "/next"
+          ? new Response("<!doctype html><title>E2E Next</title><p>next page ready</p>", html)
+          : new Response(read("frame.html"), html);
+      },
     });
     servers.push(frameServer);
     const frameUrl = `http://localhost:${frameServer.port}/frame`;
@@ -287,7 +336,12 @@ async function main(): Promise<number> {
       fetch(req) {
         const path = new URL(req.url).pathname;
         navLog.push({ path, t: Date.now() });
+        if (path === "/form") return new Response(read("form.html"), html);
+        if (path === "/busy") return new Response("<!doctype html><title>E2E Busy</title><p>busy page</p>", html);
+        // Keeps the form page loading for 3 s after DOMContentLoaded, as slow trackers do on real sites.
+        if (path === "/slow.png") return sleep(3000).then(() => new Response(PIXEL, { headers: { "content-type": "image/png" } }));
         if (path === "/challenge") return new Response(read("challenge.html"), { ...html, status: 403 });
+        if (path === "/challenge-wall") return new Response(read("challenge-wall.html"), html);
         if (path === "/popup") return new Response(read("popup.html"), html);
         if (path === "/pacing") return new Response(read("pacing.html"), html);
         if (path === "/pacing-short") return new Response(read("pacing-short.html"), html);
@@ -380,11 +434,11 @@ async function main(): Promise<number> {
 
     // confirm: accept, then dismiss.
     await evalJs("setTimeout(()=>document.getElementById('cf').click(),50);1");
-    await sleep(500);
+    await waitForDialog();
     await check("confirm-accept", ["dialog", "accept"], /^dialog accept: accepted/m);
     await checkEval("confirm-accept-check", "document.getElementById('log').textContent", /confirm true/);
     await evalJs("setTimeout(()=>document.getElementById('cf').click(),50);1");
-    await sleep(500);
+    await waitForDialog();
     await check("confirm-dismiss", ["dialog", "dismiss"], /^dialog dismiss: dismissed/m);
     await checkEval("confirm-dismiss-check", "document.getElementById('log').textContent", /confirm false/);
 
@@ -405,6 +459,22 @@ async function main(): Promise<number> {
 
     // Simulated Cloudflare / Turnstile challenge.
     await check("challenge", ["nav", `${base}/challenge`], /CHALLENGE:/);
+
+    // A challenge page stops `do` and `fill` before step 1. The fixture's form is real and counts its own
+    // presses and inputs, so zero clicks and zero typed values are measured, not inferred.
+    const wallState = "JSON.stringify({v:document.getElementById('wall-field').value,pressed:window.__pressed,typed:window.__typed,submitted:window.__submitted})";
+    const untouched = (s: string) => /"v":""/.test(s) && /"pressed":0/.test(s) && /"typed":0/.test(s) && /"submitted":0/.test(s);
+    await check("challenge-wall-nav", ["nav", `${base}/challenge-wall`], /CHALLENGE:|WALL:/);
+    const wallFill = await check("challenge-wall-fill-stops", ["fill", JSON.stringify({ "Wall field": "nope" })], /STOPPED: .*before step 1/);
+    const afterFill = await evalJs(wallState);
+    record("challenge-wall-fill-untouched", /1 step\(s\) not run/.test(wallFill) && untouched(afterFill), `${afterFill} ${wallFill}`);
+    const wallDo = await check(
+      "challenge-wall-do-stops",
+      ["do", JSON.stringify([{ click: "Wall button" }, { type: ["Wall field", "nope"] }])],
+      /STOPPED: .*before step 1/,
+    );
+    const afterDo = await evalJs(wallState);
+    record("challenge-wall-do-untouched", /2 step\(s\) not run/.test(wallDo) && untouched(afterDo), `${afterDo} ${wallDo}`);
 
     // Handoff 1: times out, clears itself, tab restored.
     await bc(["nav", `${base}/`]);
@@ -470,6 +540,102 @@ async function main(): Promise<number> {
       `before=${tabsBeforeClose} after=${tabsAfterClose} id=${openedId}`,
     );
 
+    // Session reuse: one session's tab-less navs share a tab; another session or --new-tab gets its own.
+    const tabOf = (out: string) => /"targetId":"(extension:[^"]+)"/.exec(out)?.[1] ?? "";
+    const sessA = { BROWSER_CONTROL_SESSION: "e2e-session-a" };
+    const navs = [
+      await bc(["nav", `${base}/`], 45_000, sessA),
+      await bc(["nav", `${base}/form`], 45_000, sessA),
+      await bc(["nav", `${base}/`], 45_000, { BROWSER_CONTROL_SESSION: "e2e-session-b" }),
+      await bc(["nav", `${base}/`, "--new-tab"], 45_000, sessA),
+    ];
+    const [idA1, idA2, idB1, idANew] = navs.map(tabOf);
+    record("session-tab-reused", idA1 !== "" && idA1 === idA2 && /reused this session's tab/.test(navs[1]!), `${navs[0]}\n${navs[1]}`);
+    record("session-tab-separate", idB1 !== "" && idB1 !== idA1, `${idA1} ${idB1}`);
+    record("session-new-tab", idANew !== "" && idANew !== idA1 && idANew !== idB1, `${idA1} ${idANew}`);
+    for (const id of new Set([idA1, idB1, idANew])) if (id) await bc(["close", id]);
+
+    // Fresh tab, nav, then an immediate natural 10-field fill, five times; every field must read back exactly.
+    const steps = JSON.stringify([
+      { type: ["Full name", "Ada Lovelace"] },
+      { type: ["Email address", "ada@example.com"] },
+      { type: ["Phone number", "5550100"] },
+      { type: ["Company", "Analytical Engines"] },
+      { type: ["Website", "https://example.com"] },
+      { type: ["Start date", "2026-11-27"] },
+      { select: ["Country", "Canada"] },
+      { type: ["Notes", "First program"] },
+      { click: "Accept terms" },
+      { click: "Pro plan" },
+    ]);
+    const want = "Ada Lovelace|ada@example.com|5550100|Analytical Engines|https://example.com|2026-11-27|ca|First program|true|pro";
+    const readBack =
+      "['name','email','phone','company','site','date','country','notes'].map((k)=>document.getElementById('f-'+k).value)" +
+      ".concat(String(document.getElementById('f-terms').checked), document.querySelector('[name=plan]:checked')?.value ?? '').join('|')";
+    const fillMs: number[] = [];
+    for (let run = 1; run <= 5; run++) {
+      await bc(["call", "clear_target"]);
+      const navOut = await bc(["nav", `${base}/form`]);
+      const formTab = /"targetId":"(extension:[^"]+)"/.exec(navOut)?.[1] ?? "";
+      const t0 = Date.now();
+      const out = await bc(["do", steps], 120_000);
+      fillMs.push(Date.now() - t0);
+      const got = await evalJs(readBack);
+      record(`natural-fill-fresh-${run}`, formTab !== "" && !/FAILED|STOPPED/.test(out) && got.includes(want), `${got} :: ${out}`);
+      if (formTab) await bc(["close", formTab]);
+    }
+    console.log(`TIMING natural-fill-fresh ms=${fillMs.join(",")}`);
+
+    // A 600-character natural type in one step must not hit a per-call timer, and must read back exactly.
+    const longText = Array.from({ length: 600 }, (_, i) => "abcdefghij klmnopqrst uvwxyz.,"[i % 30]).join("");
+    await bc(["call", "clear_target"]);
+    const longNav = await bc(["nav", `${base}/form`]);
+    const longTab = /"targetId":"(extension:[^"]+)"/.exec(longNav)?.[1] ?? "";
+    const typeT0 = Date.now();
+    const longOut = await bc(["do", JSON.stringify([{ type: ["Notes", longText] }])], 300_000);
+    const typeMs = Date.now() - typeT0;
+    const longGot = await evalJs(`String(document.getElementById('f-notes').value === ${JSON.stringify(longText)})`);
+    record("natural-type-600", !/FAILED|STOPPED/.test(longOut) && /true/.test(longGot), `${longGot} ${typeMs}ms :: ${longOut}`);
+    console.log(`TIMING natural-type-600 ms=${typeMs}`);
+    if (longTab) await bc(["close", longTab]);
+
+    // A browser-side tabs.update commits a new document while a helper call waits on a busy page.
+    // Chrome never answers the old document's executeScript; the call must rerun on the new page.
+    await bc(["call", "clear_target"]);
+    const busyNav = await bc(["nav", `${base}/busy`]);
+    const busyTab = /"targetId":"(extension:[^"]+)"/.exec(busyNav)?.[1] ?? "";
+    await evalJs("setTimeout(()=>{const t=performance.now()+6000;while(performance.now()<t);},300);1");
+    await sleep(450);
+    const replaceT0 = Date.now();
+    const pendingRead = bc(["text"], 60_000);
+    await sleep(1200);
+    const sw = ((await cdp.send("Target.getTargets")).targetInfos as Array<{ type: string; url: string; targetId: string }>).find(
+      (x) => x.type === "service_worker" && x.url.startsWith("chrome-extension://"),
+    );
+    let updated = "no extension service worker";
+    if (sw) {
+      const { sessionId } = await cdp.send("Target.attachToTarget", { targetId: sw.targetId, flatten: true });
+      const res = await cdp.send(
+        "Runtime.evaluate",
+        {
+          expression: `(async()=>{const t=(await chrome.tabs.query({})).find((x)=>(x.url||"").includes("/busy"));if(!t)return "no busy tab";await chrome.tabs.update(t.id,{url:${JSON.stringify(`http://localhost:${frameServer.port}/next`)}});return "updated";})()`,
+          awaitPromise: true,
+          returnByValue: true,
+        },
+        sessionId,
+      );
+      updated = String(res?.result?.value ?? JSON.stringify(res));
+      await cdp.send("Target.detachFromTarget", { sessionId }).catch(() => {});
+    }
+    const replacedOut = await pendingRead;
+    const replaceMs = Date.now() - replaceT0;
+    record(
+      "nav-replace-during-call",
+      updated === "updated" && /next page ready/.test(replacedOut) && replaceMs < 15_000,
+      `${updated} ${replaceMs}ms :: ${replacedOut}`,
+    );
+    if (busyTab) await bc(["close", busyTab]);
+
     // The backends file the wrapper writes steers the shipped daemon and outranks the env var.
     const tid = /extension:[A-Za-z0-9:@-]*[A-Za-z0-9]/.exec(await bc(["tabs"]))?.[0] ?? "";
     record("tab-id", tid !== "", tid);
@@ -481,7 +647,16 @@ async function main(): Promise<number> {
     record("enable-deleted-file", !existsSync(backendsFile), backendsFile);
     await check("enabled-works", ["eval", "document.title", tid], /E2E Fixture/);
     await runPacingCheck(bc, base, record, { navLog, frameUrl });
-    await runStaleExtensionCheck(chrome, record);
+    // The stale-extension check archives the pre-PR #10 build; a shallow clone cannot, so say so out loud.
+    const oldCommit = "b8b976f";
+    const hasOldCommit =
+      (await spawn(["git", "-C", REPO, "rev-parse", "--verify", `${oldCommit}^{commit}`], {
+        stdout: "ignore",
+        stderr: "ignore",
+      }).exited) === 0;
+    if (hasOldCommit) await runStaleExtensionCheck(chrome, record);
+    else if (REQUIRED) record("stale-extension", false, `commit ${oldCommit} not present in this clone (fetch full history)`);
+    else recordSkip("stale-extension", `commit ${oldCommit} not present in this clone (fetch full history)`);
     return results.some((r) => !r.ok) ? 1 : 0;
   } catch (error) {
     record("runner", false, String(error instanceof Error ? error.stack : error));
@@ -491,4 +666,13 @@ async function main(): Promise<number> {
   }
 }
 
-process.exit(await main());
+// One finalizer: totals print for normal completion and for setup/cleanup exceptions alike.
+let code = 1;
+try {
+  code = await main();
+} catch (error) {
+  record("runner", false, String(error instanceof Error ? error.stack : error));
+} finally {
+  printTotals();
+}
+process.exit(code);

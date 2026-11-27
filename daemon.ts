@@ -28,6 +28,7 @@ import {
   extensionDiagnosticsReport,
   extensionStatusReport,
   getRegisteredExtensionBackend,
+  sessionKeyOf,
 } from "./src/backends/extension";
 import { backendOrder, backendOrderSource, setDaemonBackendsFile, withAutoConnect } from "./src/backends/router";
 import { prefixOf } from "./src/backends/types";
@@ -43,7 +44,7 @@ type Json = Record<string, unknown>;
 const UNTRUSTED_PAGE_ACTIONS = new Set([
   "snap", "text", "form", "query", "read-urls", "ocr", "value", "verdict", "health",
   "styles", "issues", "perf", "click", "hover", "dialog", "type", "select", "upload", "drag", "wait", "key", "do",
-  "notes", "flow", "script",
+  "notes", "flow", "script", "solve_captcha",
 ]);
 
 const failure = (code: string, message: string): InvokeResult =>
@@ -234,6 +235,10 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
       targetId = tab.targetId;
     }
     const quiet = url.searchParams.get("q") === "1";
+    // The wrapper resolves its caller's natural switch and sends only on/off, so status and dispatch agree.
+    const natHeader = request.headers.get("x-bc-natural");
+    const callerNatural = natHeader === "on" || natHeader === "off" ? { _natural: natHeader === "on" } : {};
+    const sessionKey = sessionKeyOf(request.headers.get("x-bc-session"));
     const wrap = boundariesDefault && url.searchParams.get("raw") !== "1";
 
     switch (route) {
@@ -263,7 +268,10 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
                 snap: url.searchParams.get("snap") === "1",
                 newWindow: url.searchParams.get("new_window") === "1",
                 keepOpen: url.searchParams.get("keep_open") === "1",
+                ...(url.searchParams.get("new_tab") === "1" ? { newTab: true } : {}),
+                ...(sessionKey ? { sessionKey } : {}),
                 ...(url.searchParams.get("fast") === "1" ? { fast: true } : {}),
+                ...callerNatural,
               },
               targetId,
             ),
@@ -293,7 +301,7 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
         const shouldWrap = wrap && UNTRUSTED_PAGE_ACTIONS.has(operation) && !parsed.value["out"];
         return text(
           await requestBrowser.run(navScope, () =>
-            handlePage(operation, { ...parsed.value, ...(quiet ? { quiet: true } : {}) }, explicitTargetId),
+            handlePage(operation, { ...parsed.value, _natural: undefined, ...callerNatural, ...(quiet ? { quiet: true } : {}) }, explicitTargetId),
           ),
           (data) => data.value,
           shouldWrap,

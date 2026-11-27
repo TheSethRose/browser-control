@@ -3,6 +3,8 @@
 
 export const AGENT_GROUPS_STORAGE_KEY = "bc_agent_group_ids";
 const TAB_GROUP_ID_NONE = -1;
+// The title `syncGroup` writes. Used to re-adopt our group after storage/session loss.
+const AGENT_GROUP_TITLE_RE = /^Agents · \d+$/;
 
 /** Strip `#...` from `about:blank#...` before navigate (avoids Chrome/Vivaldi crash). */
 export function normalizeNavigateUrl(rawUrl) {
@@ -129,6 +131,8 @@ export function createWindowGroups({
   const internalGroupOps = new Set();
   const currentActiveByWindow = new Map();
   const previousActiveByWindow = new Map();
+  // Per-window tails that serialize find-or-create so concurrent calls never make two groups.
+  const groupCreateTailsByWindow = new Map();
 
   let persistTail = Promise.resolve();
   function persistKnownGroups() {
@@ -189,15 +193,63 @@ export function createWindowGroups({
     }
   }
 
+  /**
+   * Run `task` after every earlier task queued for the same window, and keep the chain alive
+   * when a task fails so one error never jams later group creation in that window.
+   */
+  function runPerWindow(windowId, task) {
+    const key = typeof windowId === "number" ? windowId : TAB_GROUP_ID_NONE;
+    const previous = groupCreateTailsByWindow.get(key) || Promise.resolve();
+    const run = previous.then(task, task);
+    const tail = run.catch(() => {});
+    groupCreateTailsByWindow.set(key, tail);
+    tail.then(() => {
+      if (groupCreateTailsByWindow.get(key) === tail) groupCreateTailsByWindow.delete(key);
+    });
+    return run;
+  }
+
+  async function countTabsInGroup(groupId) {
+    try {
+      const tabs = (await chromeApi.tabs.query({ groupId })) || [];
+      return tabs.length;
+    } catch {
+      return 0;
+    }
+  }
+
   async function findAgentGroupInWindow(windowId) {
     await knownGroupsReady;
     if (!chromeApi.tabGroups?.query) return null;
+    let groups;
     try {
-      const groups = (await chromeApi.tabGroups.query({ windowId })) || [];
-      return groups.find((g) => knownGroupIds.has(g.id)) || null;
+      groups = (await chromeApi.tabGroups.query({ windowId })) || [];
     } catch {
       return null;
     }
+
+    const known = groups.find((g) => knownGroupIds.has(g.id));
+    if (known) return known;
+
+    // chrome.storage.session is wiped by an extension reload or browser restart, and group ids
+    // change, so known ids alone lose our group. Adopt a group still wearing the title
+    // `syncGroup` writes; a group the user renamed away from it stays theirs.
+    const titled = groups.filter((g) => AGENT_GROUP_TITLE_RE.test(String(g.title ?? "")));
+    let best = null;
+    let bestCount = -1;
+    for (const candidate of titled) {
+      const count = await countTabsInGroup(candidate.id);
+      const better = count > bestCount || (count === bestCount && (best === null || candidate.id < best.id));
+      if (better) {
+        best = candidate;
+        bestCount = count;
+      }
+    }
+    if (!best) return null;
+
+    knownGroupIds.add(best.id);
+    await persistKnownGroups();
+    return best;
   }
 
   async function syncGroup(groupId, { allowCollapse = false } = {}) {
@@ -273,31 +325,36 @@ export function createWindowGroups({
 
     beginInternalGroupOp(tabId);
     try {
-      let targetGroupId = null;
-      if (
-        typeof preferredGroupId === "number" &&
-        preferredGroupId !== TAB_GROUP_ID_NONE &&
-        knownGroupIds.has(preferredGroupId)
-      ) {
-        const winGroups = (await chromeApi.tabGroups.query?.({ windowId: tab.windowId }).catch(() => [])) || [];
-        if (winGroups.some((g) => g.id === preferredGroupId)) {
-          targetGroupId = preferredGroupId;
+      // Queue find-or-create per window: a second call waits, finds the group the first made,
+      // and joins it instead of creating a duplicate.
+      const groupId = await runPerWindow(tab.windowId, async () => {
+        let targetGroupId = null;
+        if (
+          typeof preferredGroupId === "number" &&
+          preferredGroupId !== TAB_GROUP_ID_NONE &&
+          knownGroupIds.has(preferredGroupId)
+        ) {
+          const winGroups = (await chromeApi.tabGroups.query?.({ windowId: tab.windowId }).catch(() => [])) || [];
+          if (winGroups.some((g) => g.id === preferredGroupId)) {
+            targetGroupId = preferredGroupId;
+          }
         }
-      }
-      if (targetGroupId === null) {
-        const existing = await findAgentGroupInWindow(tab.windowId);
-        if (existing) targetGroupId = existing.id;
-      }
+        if (targetGroupId === null) {
+          const existing = await findAgentGroupInWindow(tab.windowId);
+          if (existing) targetGroupId = existing.id;
+        }
 
-      const groupId =
-        targetGroupId !== null
-          ? await chromeApi.tabs.group({ groupId: targetGroupId, tabIds: [tabId] })
-          : await chromeApi.tabs.group({ createProperties: { windowId: tab.windowId }, tabIds: [tabId] });
+        const created =
+          targetGroupId !== null
+            ? await chromeApi.tabs.group({ groupId: targetGroupId, tabIds: [tabId] })
+            : await chromeApi.tabs.group({ createProperties: { windowId: tab.windowId }, tabIds: [tabId] });
 
-      if (!knownGroupIds.has(groupId)) {
-        knownGroupIds.add(groupId);
-        await persistKnownGroups();
-      }
+        if (!knownGroupIds.has(created)) {
+          knownGroupIds.add(created);
+          await persistKnownGroups();
+        }
+        return created;
+      });
       groupedAgentTabs.add(tabId);
 
       // Position the agent group right after pinned tabs in this window.

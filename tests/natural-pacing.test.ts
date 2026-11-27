@@ -24,6 +24,8 @@ type MockOptions = {
   locate?: Record<string, string>;
   /** Runs inside the mocked `navigate`, so a test can advance its fake clock over a slow load. */
   onNavigate?: () => void;
+  /** Tab a session nav lands on, as the backend picks it (#45 session tab reuse). */
+  sessionTab?: string;
 };
 
 /**
@@ -45,6 +47,8 @@ function makeMock(options: MockOptions = {}) {
       const ref = options.locate?.[label];
       return ref ? ok(ref) : { ok: false, error: { code: "EXECUTION_FAILED", message: `NO_MATCH: ${label}` } };
     }
+    // A normal page: the bot-challenge probe answers its complete `{skip,url}` readback.
+    if (expr.includes("responseStatus") && expr.includes("visibleSelectors")) return ok(JSON.stringify({ skip: true, url }));
     if (expr.includes("location.href, __bc.chars()")) return ok(`${url}\n${options.chars ?? 0}\n`);
     if (expr.includes("location.href, __bc.wall()")) return ok(`${url}\n`);
     if (expr.includes("__bc.chars()")) return ok(options.chars ?? 0);
@@ -90,7 +94,8 @@ function makeMock(options: MockOptions = {}) {
     if (op === "navigate") {
       url = String(input["url"] ?? url);
       options.onNavigate?.();
-      return { ok: true, data: { loaded: true, url, ...(input["targetId"] ? { targetId: input["targetId"] } : {}) } };
+      const tab = input["targetId"] ?? (input["sessionKey"] ? options.sessionTab : undefined);
+      return { ok: true, data: { loaded: true, url, ...(tab ? { targetId: tab } : {}) } };
     }
     if (op === "execute_cdp") return { ok: true, data: { result: {} } };
     return { ok: true, data: {} };
@@ -233,7 +238,9 @@ describe("do/fill think pauses", () => {
     const { clock, handle } = pane({ readback: "v", locate: { Email: "e3", Name: "e4" } });
     const res = await handle("do", { fill: { Email: "v", Name: "v" }, quiet: true });
     expect(res.ok).toBe(true);
-    expect(clock.thinkPauses()).toEqual([290]);
+    // One think pause between the fields; typing v2's own 160 ms first-key settle stays inside each type.
+    expect(clock.sleeps.filter((ms) => ms === 290)).toEqual([290]);
+    expect(clock.sleeps.filter((ms) => ms === 160)).toHaveLength(2);
   });
 
   test("--fast and natural off add no pauses anywhere", async () => {
@@ -310,6 +317,18 @@ describe("post-nav dwell and pagination gap", () => {
     clock.advance(4_500);
     expect((await handle("nav", { url: "https://b.test/2" })).ok).toBe(true);
     expect(clock.sleeps).toHaveLength(0);
+  });
+
+  test("a session nav keeps its pagination clock though the backend picks its tab; --new-tab owes no gap", async () => {
+    const { clock, handle } = pane({ sessionTab: "T-session" });
+    const sessionKey = "abcdef12";
+    expect((await handle("nav", { url: "https://a.test/1", sessionKey })).ok).toBe(true);
+    clock.advance(500);
+    expect((await handle("nav", { url: "https://a.test/2", sessionKey })).ok).toBe(true);
+    expect(clock.sleeps).toEqual([1_700]);
+    clock.sleeps.length = 0;
+    expect((await handle("nav", { url: "https://a.test/3", newTab: true })).ok).toBe(true);
+    expect(clock.sleeps).toEqual([]);
   });
 
   test("nav --fast and a per-step fast skip the dwell, and natural off records nothing", async () => {
@@ -450,8 +469,8 @@ describe("text --scroll pace", () => {
     expect(source).toContain("Number.isFinite(factor) ? Math.round(height * factor) : Math.max(200");
   });
 
-  test("helpers v11 ship the attach-free chars reader, stay plain JavaScript, and match the extension copy", () => {
-    expect(PAGE_HELPERS_VERSION).toBe(11);
+  test("helpers v12 ship the attach-free chars reader, stay plain JavaScript, and match the extension copy", () => {
+    expect(PAGE_HELPERS_VERSION).toBe(12);
     expect(PAGE_HELPERS_SOURCE).toContain("scrollRead, text, chars,");
     expect(PAGE_HELPERS_SOURCE).toContain("opts.scrollPace");
     expect(PAGE_HELPERS_SOURCE).toContain("scrollPace.factors");

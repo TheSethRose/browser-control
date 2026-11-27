@@ -8,13 +8,17 @@
 #                                     --browser <slug> opens it in that browser
 #                                     extension tabs only: --new-window opens it in a new
 #                                     window; --keep-open keeps the tab past idle cleanup
+#                                     Without a targetId it reuses this agent session's last tab;
+#                                     --new-tab opens a new one. BROWSER_CONTROL_SESSION names the session
 #   close [targetId]                  close an agent-opened extension tab (active tab if omitted)
 #   eval '<js>'                       run JavaScript, print its value ('-' reads stdin)
 #   call <op> ['<json>']              any operation, JSON in and out
 #   start [browser]                   switch browser by name (chrome, beta, brave, ardia); opens it
 #                                     if needed. Never pass a port.
 #   default [browser]                 show or set the default browser
-#   natural [on|off|status]           show or set global natural browsing (default on; --fast opts out per call)
+#   natural [on|off|status]           show or set global natural browsing (default on; --fast opts out per call).
+#                                     Each call resolves it here (env, then file) and sends on/off, so status
+#                                     matches what runs
 #   ops | status | check-update [--force]
 #
 # Chrome extension (no remote-debugging prompt):
@@ -40,6 +44,8 @@
 #   shot [--ref <ref>] [--marks] [--full] [--png] [--to <path>]
 #   verdict | health | styles <ref|css> [--properties a,b] | issues [--kind <k>] [--clear]
 #   perf [--reload] [--duration <ms>]
+#   solve_captcha [--verify]           report a challenge on the page (agent-native; never solves)
+#                                      --verify re-checks after a solve: still present | clear
 #
 # Act on it (each prints what changed; --quiet leaves that out; --no-boundaries omits markers):
 #   click <ref|label> | click --xy <x,y>
@@ -52,7 +58,7 @@
 #           [--reduced-motion] [--offline] [--ua <str>] [--reset]
 #   handoff <message> [--timeout <s>]            overlay for the user, wait, then continue
 #   type [--fast] [--keys] <ref|label> <text> | type --focused [--fast] <text>
-#   select <ref|label> <option>       native <select> or ARIA combobox
+#   select [--fast] <ref|label> <option> native <select> or ARIA combobox
 #   upload <ref|label> <path>         <input type="file"> (never opens OS picker)
 #   drag <from> <to> [--side before|after]        HTML5 drag-and-drop or mouse drag
 #   wait [--text <t>] [--selector <css>] [--url <u>] [--timeout <ms>]
@@ -89,6 +95,23 @@ write_natural() {
   if mkdir -p "$d" && chmod 700 "$d" && [[ ! -d "$f" ]] && printf '%s\n' "$1" >"$t" && mv -f "$t" "$f"; then return 0; fi
   rm -f "$t" 2>/dev/null || true
   fail EXECUTION_FAILED "could not write $f"
+}
+# Resolve natural browsing like src/natural.ts: env, then the config file, then on. Sets nat_val and nat_src.
+natural_word() {
+  local v="$1" r=""
+  v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+  shopt -s nocasematch
+  case "$v" in 0 | false | off | no) r=off ;; 1 | true | on | yes) r=on ;; esac
+  shopt -u nocasematch
+  printf '%s' "$r"
+}
+resolve_natural() {
+  local f="${XDG_CONFIG_HOME:-$HOME/.config}/browser-control/natural" w
+  nat_val=on; nat_src=default
+  w="$(natural_word "${BROWSER_CONTROL_NATURAL:-}")"
+  if [[ -n "$w" ]]; then nat_val="$w"; nat_src=env; return; fi
+  [[ -f "$f" ]] && w="$(natural_word "$(cat "$f" 2>/dev/null)")"
+  if [[ -n "$w" ]]; then nat_val="$w"; nat_src=file; fi
 }
 
 # True when `$1` has the shape of a targetId: extension:<n>, extension:<slug>:<n>, browse:<n>,
@@ -179,11 +202,22 @@ check_update() {
   fi
 }
 
+# Agent session key: a short sha256 prefix, so raw session ids never leave this script.
+session_key() {
+  local id="${BROWSER_CONTROL_SESSION:-${CLAUDE_CODE_SESSION_ID:-${T3CODE_THREAD_ID:-${CODEX_THREAD_ID:-${CODEX_SESSION_ID:-}}}}}"
+  [[ -n "$id" ]] || return 0
+  if command -v shasum >/dev/null 2>&1; then printf '%s' "$id" | shasum -a 256 | cut -c1-16
+  elif command -v sha256sum >/dev/null 2>&1; then printf '%s' "$id" | sha256sum | cut -c1-16
+  fi
+}
+
 req() {
   local rc=0 mt=""
   # A long-running call (handoff) sets max_time so curl gives up just after the server would.
   [[ -z "${max_time:-}" ]] || mt="--max-time $max_time"
-  printf '%s' "${3:-}" | curl -sS --fail-with-body ${mt} --unix-socket "$sock" -X "$1" \
+  resolve_natural
+  [[ -n "${sess_key+x}" ]] || sess_key="$(session_key)"
+  printf '%s' "${3:-}" | curl -sS --fail-with-body ${mt} -H "x-bc-natural: $nat_val" -H "x-bc-session: $sess_key" --unix-socket "$sock" -X "$1" \
     --data-binary @- "http://daemon/$2" 2>/dev/null || rc=$?
   case $rc in 0) ;; 22) return 1 ;; 7) return 7 ;; *) return 9 ;; esac
 }
@@ -195,7 +229,8 @@ ensure() {
   mkdir -p "$dir"; chmod 700 "$dir"
   find "$lock" -maxdepth 0 -mmin +1 -exec rmdir {} \; 2>/dev/null || true
   if mkdir "$lock" 2>/dev/null; then
-    up || { rm -f "$sock" "$build_file"; nohup bun "$here/../runtime/cli.js" --serve "$sock" >"$log" 2>&1 & }
+    # The daemon serves every caller, so it must not inherit one caller's raw session ids.
+    up || { rm -f "$sock" "$build_file"; nohup env -u BROWSER_CONTROL_SESSION -u CLAUDE_CODE_SESSION_ID -u T3CODE_THREAD_ID -u CODEX_THREAD_ID -u CODEX_SESSION_ID bun "$here/../runtime/cli.js" --serve "$sock" >"$log" 2>&1 & }
   fi
   for _ in $(seq 100); do up && break; sleep 0.05; done
   rmdir "$lock" 2>/dev/null || true
@@ -242,15 +277,16 @@ cmd="${1:-}"; [[ $# -gt 0 ]] && shift
 
 # Flags may sit anywhere after the command; unknown --flags are rejected immediately.
 match=""; quiet=""; raw=""; all=false; ax=false; keys=false; fast=false; focused=false; marks=false; full=false; png=false; snap=""
+verify=false
 scroll=false; reload=false; clear_flag=false
 find=""; within=""; max=""; until=""; xy=""; ref_flag=""; to=""; out_path=""
 wait_text=""; wait_selector=""; wait_url=""; timeout=""
 filter=""; limit=""; fields=""; concurrency=""; side=""; duration=""; kind=""; properties=""; site=""
 browser=""; viewport=""; color_scheme=""; ua=""; mobile=false; reduced_motion=false; offline=false; reset_flag=false
-max_time=""; new_window=""; keep_open=""
+max_time=""; new_window=""; keep_open=""; new_tab=""
 params_list=(); where_list=()
 args=()
-case "$cmd" in snap | text | form | query | read-urls | ocr | click | hover | type | select | upload | drag | wait | key | value | shot | nav | eval | close | fill | do | verdict | health | styles | issues | perf | dialog | emulate | handoff | notes | flow | script)
+case "$cmd" in snap | text | form | query | read-urls | ocr | click | hover | type | select | upload | drag | wait | key | value | shot | nav | eval | close | fill | do | verdict | health | styles | issues | perf | dialog | emulate | handoff | solve_captcha | notes | flow | script)
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --match) match="${2:?--match needs text from the tab url or title}"; shift 2 ;;
@@ -268,6 +304,7 @@ case "$cmd" in snap | text | form | query | read-urls | ocr | click | hover | ty
       --scroll) scroll=true; shift ;;
       --reload) reload=true; shift ;;
       --clear) clear_flag=true; shift ;;
+      --verify) verify=true; shift ;;
       --find) find="${2:?--find needs text}"; shift 2 ;;
       --within) within="${2:?--within needs a ref or CSS selector}"; shift 2 ;;
       --max) max="${2:?--max needs a number}"; shift 2 ;;
@@ -297,9 +334,9 @@ case "$cmd" in snap | text | form | query | read-urls | ocr | click | hover | ty
       --reduced-motion) reduced_motion=true; shift ;;
       --offline) offline=true; shift ;;
       --reset) reset_flag=true; shift ;;
-      --new-window | --keep-open)
+      --new-window | --keep-open | --new-tab)
         [[ "$cmd" == nav ]] || fail INPUT_INVALID "unknown flag: $1 ($1 works only with nav)"
-        if [[ "$1" == --new-window ]]; then new_window=1; else keep_open=1; fi
+        case "$1" in --new-window) new_window=1 ;; --new-tab) new_tab=1 ;; *) keep_open=1 ;; esac
         shift ;;
       --param) params_list+=("${2:?--param needs key=value}"); shift 2 ;;
       --where) where_list+=("${2:?--where needs field=value}"); shift 2 ;;
@@ -357,11 +394,12 @@ case "$cmd" in
     run POST "eval$(query "$(arg 1)")" "$(body "$(arg 0)")"
     ;;
   nav)
-    [[ -n "$(arg 0)" ]] || fail INPUT_INVALID "usage: browser-control-daemon nav <url> [targetId] [--snap] [--until load] [--new-window] [--keep-open] [--fast]"
+    [[ -n "$(arg 0)" ]] || fail INPUT_INVALID "usage: browser-control-daemon nav <url> [targetId] [--snap] [--until load] [--new-window] [--new-tab] [--keep-open] [--fast]"
     extra=""; [[ -z "$snap" ]] || extra="snap=1"
     [[ "$until" != "load" ]] || extra="${extra:+$extra&}until=load"
     [[ -z "$new_window" ]] || extra="${extra:+$extra&}new_window=1"
     [[ -z "$keep_open" ]] || extra="${extra:+$extra&}keep_open=1"
+    [[ -z "$new_tab" ]] || extra="${extra:+$extra&}new_tab=1"
     [[ "$fast" != true ]] || extra="${extra:+$extra&}fast=1"
     run POST "nav$(query "$(arg 1)" "$extra")" "$(arg 0)"
     ;;
@@ -496,6 +534,11 @@ case "$cmd" in
     input='{'; [[ -z "$find" ]] || input+='"find":'"$(json_str "$find")"
     run POST "page/ocr$(query "$(arg 0)")" "$input}"
     ;;
+  solve_captcha)
+    input='{}'
+    [[ "$verify" != true ]] || input='{"verify":true}'
+    run POST "page/solve_captcha$(query "$(arg 0)")" "$input"
+    ;;
   type)
     if [[ "$focused" == true ]]; then
       [[ ${#args[@]} -ge 1 ]] || fail INPUT_INVALID "usage: browser-control-daemon type --focused [--fast] [--keys] <text> [targetId]"
@@ -506,8 +549,10 @@ case "$cmd" in
     run POST "page/type$(query "$(arg 2)")" '{"ref":'"$(json_str "$(arg 0)")"',"text":'"$(json_str "$(arg 1)")"',"fast":'"$fast"',"keys":'"$keys"'}'
     ;;
   select)
-    [[ ${#args[@]} -ge 2 ]] || fail INPUT_INVALID "usage: browser-control-daemon select <ref|label> <option> [targetId]"
-    run POST "page/select$(query "$(arg 2)")" '{"ref":'"$(json_str "$(arg 0)")"',"option":'"$(json_str "$(arg 1)")"'}'
+    [[ ${#args[@]} -ge 2 ]] || fail INPUT_INVALID "usage: browser-control-daemon select [--fast] <ref|label> <option> [targetId]"
+    input='{"ref":'"$(json_str "$(arg 0)")"',"option":'"$(json_str "$(arg 1)")"
+    [[ "$fast" != true ]] || input+=',"fast":true'
+    run POST "page/select$(query "$(arg 2)")" "$input}"
     ;;
   upload)
     [[ ${#args[@]} -ge 2 ]] || fail INPUT_INVALID "usage: browser-control-daemon upload <ref|label> <path> [targetId]"
@@ -629,12 +674,8 @@ case "$cmd" in
         printf '%s\n' '{"ok":true,"data":{"natural":'"$(json_str "$sub")"',"file":'"$(json_str "$file")"'}}'
         ;;
       "" | status)
-        env_raw="$(printf '%s' "${BROWSER_CONTROL_NATURAL:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
-        file_raw="$(tr -d '[:space:]' <"$file" 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
-        val="on"; src="default"
-        case "$file_raw" in 0|false|off|no) val="off"; src="file" ;; 1|true|on|yes) val="on"; src="file" ;; esac
-        case "$env_raw" in 0|false|off|no) val="off"; src="env" ;; 1|true|on|yes) val="on"; src="env" ;; esac
-        printf '%s\n' '{"ok":true,"data":{"natural":'"$(json_str "$val")"',"source":'"$(json_str "$src")"',"file":'"$(json_str "$file")"'}}'
+        resolve_natural
+        printf '%s\n' '{"ok":true,"data":{"natural":'"$(json_str "$nat_val")"',"source":'"$(json_str "$nat_src")"',"file":'"$(json_str "$file")"'}}'
         ;;
       *) fail INPUT_INVALID "usage: browser-control-daemon natural [on|off|status]" ;;
     esac

@@ -43,6 +43,8 @@ function makeCdpHarness(options: {
   locate?: Record<string, string>;
   /** Rows the cheap vendor-marker query returns in `do` state reads (e.g. `# 1 row(s) for ...`). */
   markerRows?: string;
+  /** Successive `wall()` values, one per href+wall read (`do` reads once before step 1 and once per step). */
+  wallSequence?: string[];
   /** Called for each probe instead of `probeSequence`. */
   probeFn?: () => string;
   sleep?: (ms: number) => Promise<void>;
@@ -55,7 +57,15 @@ function makeCdpHarness(options: {
   let snapIdx = 0;
   let diffIdx = 0;
   let stepUrlIdx = 0;
+  let wallIdx = 0;
   let waitedOnce = false;
+
+  /** `do` reads the wall once before step 1 and after every step; a wall that appears later uses wallSequence. */
+  const nextWall = () => {
+    const seq = options.wallSequence;
+    if (!seq || seq.length === 0) return options.wall ?? "";
+    return seq[Math.min(wallIdx++, seq.length - 1)]!;
+  };
 
   const invoke = async (op: string, input: Record<string, unknown> = {}): Promise<InvokeResult> => {
     calls.push({ op, input });
@@ -86,7 +96,7 @@ function makeCdpHarness(options: {
             : options.stepUrls
               ? options.stepUrls[Math.min(stepUrlIdx++, options.stepUrls.length - 1)]!
               : (options.finalUrl ?? "https://app.test/page");
-        const w = waitedOnce && options.postWaitUrl ? "" : (options.wall ?? "");
+        const w = waitedOnce && options.postWaitUrl ? "" : nextWall();
         const m = expr.includes("__bc.query(") && options.markerRows ? `\n${options.markerRows}` : "";
         // The nav probe also carries the body length, between the URL and the wall.
         return { ok: true, data: { value: `${u}${expr.includes("__bc.chars()") ? "\n0" : ""}\n${w}${m}` } };
@@ -144,7 +154,7 @@ type FakeExtPage = {
  * Fake extension harness: serves `bcCall` silently and records any `invoke("evaluate")` calls
  * so tests can prove normal pages never attach the debugger on extension tabs.
  */
-function makeExtensionHarness(pages: FakeExtPage[], targetId = "extension:42") {
+function makeExtensionHarness(pages: FakeExtPage[], targetId = "extension:42", harnessOpts: { failMarkers?: boolean } = {}) {
   const bcCalls: BcCallInput[] = [];
   const evalCalls: Call[] = [];
   const sleeps: number[] = [];
@@ -177,6 +187,7 @@ function makeExtensionHarness(pages: FakeExtPage[], targetId = "extension:42") {
           const opts = (step.args?.[0] ?? {}) as { selector?: string; all?: boolean };
           const sel = String(opts.selector ?? "");
           if (sel === "iframe[src]") {
+            if (harnessOpts.failMarkers === true) throw new Error("RELAY: marker read failed");
             return formatRows(sel, (p.frames ?? []).map((src) => ({ src })));
           }
           if (sel === "script[src]") {
@@ -433,7 +444,7 @@ describe("bot-challenge wiring: snap and do (CDP)", () => {
     expect(hBlock.sleeps).toHaveLength(0);
   });
 
-  test("do steps that do NOT navigate do ZERO challenge probes", async () => {
+  test("do probes once before step 1 and never per step that does NOT navigate", async () => {
     const h = makeCdpHarness({
       finalUrl: "https://app.test/form",
       stepUrls: ["https://app.test/form", "https://app.test/form"],
@@ -442,16 +453,20 @@ describe("bot-challenge wiring: snap and do (CDP)", () => {
     });
     const res = await h.handle("do", { steps: [{ click: "Save" }, { click: "Close" }] });
     expect(res.ok).toBe(true);
-    expect(h.probeCalls).toHaveLength(0);
+    // One pre-step probe (the batch must not act on a challenge page), then no probe per non-navigating step.
+    expect(h.probeCalls).toHaveLength(1);
     expect(h.sleeps).toHaveLength(0);
   });
 
   test("do step that navigates into a non-interactive interstitial waits, clears, and finishes remaining steps", async () => {
     const h = makeCdpHarness({
       finalUrl: "https://app.test/step1",
-      stepUrls: ["https://app.test/step2"],
+      // First read is the pre-step check (still step1); the state read after the click sees the interstitial.
+      stepUrls: ["https://app.test/step1", "https://app.test/step2"],
       postWaitUrl: "https://app.test/step2",
       probeSequence: [
+        // The page is normal before step 1; the interstitial appears only after the click.
+        cdpSkipPayload("https://app.test/step1"),
         cdpProbePayload({
           url: "https://app.test/step2",
           title: "Just a moment...",
@@ -473,8 +488,11 @@ describe("bot-challenge wiring: snap and do (CDP)", () => {
   test("do step that navigates into an interactive challenge or block stops immediately and skips remaining steps", async () => {
     const hChallenge = makeCdpHarness({
       finalUrl: "https://app.test/step1",
-      stepUrls: ["https://app.test/verify"],
+      // First read is the pre-step check (still step1); the state read after the click lands on the challenge.
+      stepUrls: ["https://app.test/step1", "https://app.test/verify"],
       probeSequence: [
+        // Normal before step 1; the challenge appears after the click.
+        cdpSkipPayload("https://app.test/step1"),
         cdpProbePayload({
           url: "https://app.test/verify",
           title: "Just a moment...",
@@ -496,8 +514,9 @@ describe("bot-challenge wiring: snap and do (CDP)", () => {
 
     const hBlock = makeCdpHarness({
       finalUrl: "https://app.test/step1",
-      stepUrls: ["https://app.test/denied"],
+      stepUrls: ["https://app.test/step1", "https://app.test/denied"],
       probeSequence: [
+        cdpSkipPayload("https://app.test/step1"),
         cdpProbePayload({
           url: "https://app.test/denied",
           status: 403,
@@ -512,6 +531,44 @@ describe("bot-challenge wiring: snap and do (CDP)", () => {
     expect(textOf(r2)).toStartWith("BLOCKED: generic ");
     expect(textOf(r2)).toContain("1 step(s) not run");
     expect(hBlock.sleeps).toHaveLength(0);
+  });
+
+  test("do and fill on a challenge page stop before step 1 and dispatch no input", async () => {
+    const turnstile: ChallengeProbe = {
+      url: "https://app.test/gate",
+      title: "Just a moment...",
+      text: "Verify you are human by completing the action below.",
+      selectors: [".cf-turnstile"],
+      visibleSelectors: [".cf-turnstile"],
+    };
+    const challengePage = () =>
+      makeCdpHarness({
+        finalUrl: "https://app.test/gate",
+        wall: "captcha",
+        probeSequence: [cdpProbePayload(turnstile)],
+        locate: { Submit: "e1", "Wall field": "e2" },
+      });
+    const inputEvents = (h: ReturnType<typeof makeCdpHarness>) =>
+      h.calls.filter((c) => c.op === "execute_cdp" && String(c.input["method"] ?? "").startsWith("Input.")).length;
+
+    const hDo = challengePage();
+    const rDo = await hDo.handle("do", { steps: [{ click: "Submit" }, { key: "Tab" }], quiet: true });
+    expect(rDo.ok).toBe(false);
+    expect(textOf(rDo)).toStartWith("CHALLENGE: cloudflare interactive");
+    expect(textOf(rDo)).toContain("# STOPPED: cloudflare challenge before step 1");
+    expect(textOf(rDo)).toContain("2 step(s) not run");
+    expect(textOf(rDo)).not.toContain("1. click");
+    expect(inputEvents(hDo)).toBe(0);
+
+    // `fill` is a batch of type steps through the same path, so it must not type on the challenge page either.
+    const hFill = challengePage();
+    const rFill = await hFill.handle("do", { fill: { "Wall field": "nope" }, quiet: true });
+    expect(rFill.ok).toBe(false);
+    expect(textOf(rFill)).toStartWith("CHALLENGE: cloudflare interactive");
+    expect(textOf(rFill)).toContain("# STOPPED: cloudflare challenge before step 1");
+    expect(textOf(rFill)).toContain("1 step(s) not run");
+    expect(textOf(rFill)).not.toContain("1. type");
+    expect(inputEvents(hFill)).toBe(0);
   });
 });
 
@@ -607,6 +664,21 @@ describe("bot-challenge wiring: extension tabs (silent bc_call tier)", () => {
     expect(extBlock.sleeps).toHaveLength(0);
     expect(extBlock.evalCalls).toHaveLength(0);
     expect(textOf(rBlock)).toStartWith("BLOCKED: cloudflare ");
+  });
+
+  test("an extension marker read that comes back incomplete is unknown before step 1, not clear", async () => {
+    // A short page is suspicious, so the probe reads its markers; a truncated marker readback used to
+    // leave every marker list empty, which classifies as a clear page.
+    const ext = makeExtensionHarness(
+      [{ url: "https://a.test/next", title: "Next", bodyText: "Next" }],
+      "extension:42",
+      { failMarkers: true },
+    );
+    const res = await ext.handle("do", { steps: [{ key: "Tab" }], quiet: true }, "extension:42");
+    expect(res.ok).toBe(false);
+    expect(textOf(res)).toContain("# STOPPED: page state unknown before step 1");
+    expect(textOf(res)).toContain("1 step(s) not run");
+    expect(ext.evalCalls).toHaveLength(0); // the strict read never attaches the debugger
   });
 });
 
@@ -868,8 +940,9 @@ describe("PR #9 review fixes (S1-S7)", () => {
     const h = makeCdpHarness({
       finalUrl: "https://app.test/form",
       stepUrls: ["https://app.test/form"],
-      wall: "captcha",
-      probeSequence: [cdpProbePayload(recaptcha)],
+      // The page is clean before step 1; the CAPTCHA shows up after the click with the URL unchanged.
+      wallSequence: ["", "captcha"],
+      probeSequence: [cdpSkipPayload("https://app.test/form"), cdpProbePayload(recaptcha)],
       locate: { Submit: "e1" },
     });
 
@@ -877,7 +950,8 @@ describe("PR #9 review fixes (S1-S7)", () => {
     expect(res.ok).toBe(false);
     expect(textOf(res)).toStartWith("CHALLENGE: recaptcha interactive");
     expect(textOf(res)).toContain("# STOPPED: recaptcha challenge after step 1");
-    expect(h.probeCalls).toHaveLength(1);
+    // One pre-step probe on the clean page, one after the step that saw the CAPTCHA.
+    expect(h.probeCalls).toHaveLength(2);
   });
 
   test("S3: one deadline bounds sleeps, probes, and fallback calls and shrinks probe timeoutMs", async () => {
@@ -1057,7 +1131,8 @@ describe("PR #9 review fixes, round 2", () => {
       finalUrl: "https://app.test/form",
       stepUrls: ["https://app.test/form"],
       markerRows: '# 1 row(s) for #px-captcha\n{"id":"px-captcha"}',
-      probeSequence: [cdpProbePayload(px)],
+      // Normal before step 1; the marker is the only signal, and it appears after the click.
+      probeSequence: [cdpSkipPayload("https://app.test/form"), cdpProbePayload(px)],
       locate: { Submit: "e1", Next: "e2" },
     });
     const res = await h.handle("do", { steps: [{ click: "Submit" }, { click: "Next" }], quiet: true });
@@ -1065,7 +1140,8 @@ describe("PR #9 review fixes, round 2", () => {
     expect(textOf(res)).toStartWith("CHALLENGE: perimeterx");
     expect(textOf(res)).toContain("# STOPPED: perimeterx challenge after step 1");
     expect(textOf(res)).not.toContain("2. ");
-    expect(h.probeCalls).toHaveLength(1);
+    // One pre-step probe on the clean page, one after the step that saw the marker.
+    expect(h.probeCalls).toHaveLength(2);
   });
 
   test("S3: with real sleeps, a page that clears near the deadline is reported as cleared", async () => {

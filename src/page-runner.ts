@@ -16,7 +16,7 @@ import {
   isBackendUnavailable,
   isExtensionOnlyOrder,
 } from "./backends/router";
-import { extensionFrameTarget, extensionTabOf, getRegisteredExtensionBcCall, type BcCallFn } from "./backends/extension";
+import { extensionFrameTarget, extensionTabOf, getRegisteredExtensionBackend, getRegisteredExtensionBcCall, parseExtensionTargetId, sessionKeyOf, type BcCallFn } from "./backends/extension";
 import {
   SHORT_PAGE_CHARS,
   buildChallengeProbeExpression,
@@ -80,8 +80,9 @@ import {
   type Locator,
 } from "./page-helpers";
 import { createPictureTracker, imageWidth, resizeImage } from "./picture";
-import { buildHumanKeystrokes } from "./typing";
+import { classifyFieldKind, planTyping, type CharKeySpec, type FieldKind } from "./typing";
 import { didYouMean, withRemedy, wrapUntrusted } from "./safety";
+import { formatCaptchaReport, type CaptchaStatus } from "./captcha";
 import { createScriptRunner, writeOutputFile } from "./script";
 
 type Json = Record<string, unknown>;
@@ -90,21 +91,40 @@ export type Invoker = (operation: string, input?: Json) => Promise<InvokeResult>
 const NEED_INSTALL = "__BC_NEED_INSTALL__";
 /** Input events never return while a JavaScript dialog is open, so don't wait the full CDP timeout. */
 const INPUT_TIMEOUT_MS = 10_000;
+/** Natural typing: a dispatch this far behind its schedule is a stall, not round-trip latency. */
+const STALL_MS = 60;
+/**
+ * Chrome acks a mouse move or wheel event only once the page has handled it, which for these events waits on the
+ * next painted frame. A page that is not painting (headless CI, a throttled renderer) acks about once a second, so a
+ * 20-40 step natural path took 20-45 s. One ack slower than this, or a path past its budget, ends the human motion.
+ */
+const SLOW_INPUT_ACK_MS = 250;
+const NATURAL_MOTION_BUDGET_MS = 2_500;
 const MAX_VIEWPORT_DIM = 10_000_000;
 const DIALOG_HINT = "the page stopped responding; a JavaScript dialog is probably open (references/dom-and-input.md)";
 
 const PAGE_ACTIONS = [
   "snap", "text", "form", "query", "read-urls", "ocr", "shot", "click", "hover", "type", "select",
   "upload", "drag", "wait", "key", "fill", "do", "value", "nav", "verdict", "health",
-  "styles", "issues", "perf", "dialog", "emulate", "handoff", "notes", "flow", "script",
+  "styles", "issues", "perf", "dialog", "emulate", "handoff", "notes", "flow", "script", "solve_captcha",
 ] as const;
 
 const DEFAULT_HANDOFF_TIMEOUT_MS = 10 * 60 * 1000;
 const CHALLENGE_WAIT_MAX_MS = 8_000;
 const CHALLENGE_POLL_MS = 500;
 const CHALLENGE_PROBE_RESERVE_MS = 250;
+/** Before step 1: at most two probe tries inside this budget; past it the page state stays unknown. */
+const PRE_STEP_PROBE_TRIES = 2;
+const PRE_STEP_PROBE_BUDGET_MS = 1_500;
+/**
+ * Each try gets its own share of the budget, so a first try that times out cannot eat the retry: the
+ * probe's own timeout is wall-clock, so the whole budget on try one left nothing for try two.
+ */
+const PRE_STEP_PROBE_ATTEMPT_MS = 700;
 const CHALLENGE_PROBE_SEP = "\n__BC_CHALLENGE_SEP__\n";
 const CHALLENGE_PROBE_EXPR = buildChallengeProbeExpression(false);
+/** Same probe for verify mode: never trust a fast-path skip. */
+const CHALLENGE_PROBE_EXPR_FULL = buildChallengeProbeExpression(true);
 const FAST_VENDOR_CSS = fastVendorSelectors.join(",");
 /** One cheap querySelector-style check for known challenge markers (`# N row(s)` header). */
 const VENDOR_MARKER_STEP = {
@@ -141,8 +161,35 @@ type ProbeReadResult =
   | { kind: "probe"; probe: ChallengeProbe }
   | { kind: "error" };
 
+/**
+ * Parse a readback of {@link CHALLENGE_PROBE_EXPR}: `{skip,url}` or `{skip:false,probe}`, else "skip".
+ * `strict` is for the pre-step guard: there a readback that cannot be parsed, or that arrives without the
+ * URL the classifier and the host boundary both need, is incomplete, so it reads as "error" (unknown) and
+ * never as "skip" (clear).
+ */
+function parseProbeReadback(raw: string, strict = false): ProbeReadResult {
+  const bad = (): ProbeReadResult => (strict ? { kind: "error" } : { kind: "skip" });
+  if (!raw || !raw.startsWith("{")) return bad();
+  try {
+    const parsed = JSON.parse(raw) as { skip?: boolean; url?: string; probe?: ChallengeProbe };
+    if (parsed.skip === true) {
+      return typeof parsed.url === "string" && parsed.url !== "" ? { kind: "skip", url: parsed.url } : bad();
+    }
+    if (parsed.probe && typeof parsed.probe === "object") {
+      if (strict && !(typeof parsed.probe.url === "string" && parsed.probe.url !== "")) return { kind: "error" };
+      return { kind: "probe", probe: parsed.probe };
+    }
+    return bad();
+  } catch {
+    return bad();
+  }
+}
+
 type ChallengeCheckResult =
   | { status: "clear"; waited: boolean; url?: string }
+  // Only `checkChallenge(..., { unknownOnError: true })` produces this: the probe failed, so the page
+  // state is not known to be clear. Callers that guard an action treat it as "do not act".
+  | { status: "unknown"; waited: false; url?: string }
   | {
       status: "interactive" | "block" | "non-interactive-timeout";
       detection: ChallengeDetection;
@@ -288,7 +335,7 @@ type PointDetail = {
   stickyBottom: number;
   scroller?: ScrollerDetail;
 };
-type Step = { action: string; input: Json; label: string; fast?: boolean };
+type Step = { action: string; input: Json; label: string };
 
 export function createPageHelperHandler(
   invoke: Invoker,
@@ -304,17 +351,27 @@ export function createPageHelperHandler(
     naturalDefault?: boolean;
     bcCall?: BcCallFn;
     extensionRequest?: ExtensionRequestFn;
+    /** Qualify a short extension tab id with its browser; defaults to the registered extension backend. */
+    extensionResolveKey?: (targetId: string) => string | undefined;
     challengeWaitMaxMs?: number;
   } = {},
 ) {
   const daemonSessionId = options.sessionId ?? randomUUID().slice(0, 12);
   const pause = options.sleep ?? sleep;
   const rng = options.rng ?? Math.random;
+  /** Natural typing speed for this daemon session, drawn once (0.85-1.15) on the first use. */
+  let typingSpeed: number | undefined;
+  const typingSpeedFactor = (): number => (typingSpeed ??= 0.85 + rng() * 0.3);
   const now = options.now ?? (() => Date.now());
-  const isNatural = (input: Json): boolean => isNaturalEnabled(input, { defaultEnabled: options.naturalDefault });
-  /** Per-tab pointer state keyed by tab id without frame suffix. */
+  /** `_natural` is the wrapper caller's resolved on/off switch, so status and dispatch agree. */
+  const isNatural = (input: Json): boolean =>
+    input["fast"] !== true && typeof input["_natural"] === "boolean"
+      ? (input["_natural"] as boolean)
+      : isNaturalEnabled(input, { defaultEnabled: options.naturalDefault });
+  /** Per-tab pointer state keyed by resolved top-level target id (without frame suffix). */
   const motionByTab = new Map<string, { pointer?: Point2D; viewport?: Viewport }>();
-  const tabKeyOf = (targetId?: string): string => (targetId ?? "").replace(/@frame:\d+$/, "");
+  let implicitCdpTarget: string | undefined;
+  const tabKeyOf = (targetId?: string): string => (targetId ?? implicitCdpTarget ?? "").replace(/@(?:frame:)?\d+$/, "");
   const motionOf = (targetId?: string): { pointer?: Point2D; viewport?: Viewport } => {
     const key = tabKeyOf(targetId);
     let st = motionByTab.get(key);
@@ -324,8 +381,49 @@ export function createPageHelperHandler(
     }
     return st;
   };
+  /** What the page still has down because its release never reached it: one record per browser, tab and kind. */
+  type HeldInput = { kind: "key" | "mouse"; label: string };
+  const heldByTab = new Map<string, HeldInput>();
+  /** Held state is keyed by browser (profile) and tab, never by a bare tab number two browsers can share. */
+  const heldKeyOf = (targetId?: string): string => {
+    const raw = targetId ?? implicitCdpTarget;
+    if (raw === undefined) return "";
+    const plain = raw.replace(/@(?:frame:)?\d+$/, "");
+    if (!parseExtensionTargetId(raw)) return plain;
+    // The backend binds a short tab id to its browser and qualifies both forms the same way.
+    const resolve = options.extensionResolveKey ?? ((id: string) => getRegisteredExtensionBackend()?.resolveTargetKey(id));
+    try {
+      return resolve(raw) ?? plain;
+    } catch {
+      return plain;
+    }
+  };
+  const heldLine = (held: HeldInput): string =>
+    `# HELD: ${held.label}. It was not sent again; the caller decides what to do next.`;
+  /** Attach the held-input line to the result of a release this command could not deliver. */
+  const withHeld = (res: InvokeResult, held?: HeldInput): InvokeResult =>
+    !held
+      ? res
+      : res.ok
+        ? success(`${valueOf(res)}\n${heldLine(held)}`)
+        : failure(res.error.code, `${messageOf(res)}\n${heldLine(held)}`);
+  const HELD_KINDS = ["key", "mouse"] as const;
+  /** A held key and a held mouse button on one tab are separate records. */
+  const heldSlot = (targetId: string | undefined, kind: HeldInput["kind"]): string => `${heldKeyOf(targetId)}#${kind}`;
+  /**
+   * A press the extension refused because a dialog was open may never have gone out, so it records the input as
+   * possibly down and the command stops there: nothing more is sent into the open dialog. A later dialog accept or
+   * dismiss reports the record and the caller decides.
+   */
+  const refusedPress = (res: InvokeResult, targetId: string | undefined, held: HeldInput): InvokeResult => {
+    const uncertain: HeldInput = { kind: held.kind, label: held.label.replace(/ still down$/, " may still be down") };
+    heldByTab.set(heldSlot(targetId, held.kind), uncertain);
+    return withHeld(res, uncertain);
+  };
+  /** Navigation starts a new document, so pointer and held-input state for the old one are dropped. */
   const resetMotion = (targetId?: string): void => {
     motionByTab.delete(tabKeyOf(targetId));
+    for (const kind of HELD_KINDS) heldByTab.delete(heldSlot(targetId, kind));
   };
   /** Last completed nav per tab, for same-host pagination gaps. */
   const lastNavByTab = new Map<string, { at: number; host: string }>();
@@ -349,9 +447,10 @@ export function createPageHelperHandler(
    * Record a finished nav for this tab: `dispatchAt` (the nav dispatch) starts the pagination clock,
    * while the reading dwell runs from now. `chars` comes from the attach-free nav probe.
    */
-  function recordNavPace(tab: string | undefined, url: string, dispatchAt: number, chars: number): void {
+  function recordNavPace(tab: string | undefined, url: string, dispatchAt: number, chars: number, paceKey?: string): void {
     const key = tabKeyOf(tab);
     lastNavByTab.set(key, { at: dispatchAt, host: hostOf(url) });
+    if (paceKey?.startsWith("session:")) lastNavByTab.set(paceKey, { at: dispatchAt, host: hostOf(url) });
     pendingNavPaceByTab.set(key, { navAt: now(), chars });
   }
 
@@ -378,7 +477,7 @@ export function createPageHelperHandler(
   /** Active human handoff id per extension tab id (at most one active handoff per tab). */
   const activeHandoffs = new Map<number, string>();
 
-  async function runBcCall(call: ReturnType<typeof normalizeHelperCall>, targetId: string, timeoutMs?: number): Promise<InvokeResult> {
+  async function runBcCall(call: ReturnType<typeof normalizeHelperCall>, targetId: string, timeoutMs?: number, noAttach = false): Promise<InvokeResult> {
     const order = backendOrder();
     const fn = options.bcCall ?? (order.includes("extension") ? getRegisteredExtensionBcCall() : undefined);
     if (!fn) {
@@ -393,6 +492,7 @@ export function createPageHelperHandler(
         steps: call.steps,
         join: call.join,
         ...(timeoutMs ? { timeoutMs } : {}),
+        ...(noAttach ? { noAttach } : {}),
       });
       return { ok: true, data };
     } catch (error) {
@@ -403,10 +503,10 @@ export function createPageHelperHandler(
     }
   }
 
-  async function evalHelper(call: HelperCall, targetId?: string, timeoutMs?: number): Promise<InvokeResult> {
+  async function evalHelper(call: HelperCall, targetId?: string, timeoutMs?: number, noAttach = false): Promise<InvokeResult> {
     const normalized = normalizeHelperCall(call);
     if (extensionTabOf(targetId) !== undefined) {
-      return runBcCall(normalized, targetId!, timeoutMs);
+      return runBcCall(normalized, targetId!, timeoutMs, noAttach);
     }
     const callExpr = renderSteps(normalized);
     const extra = { isolated: true, ...(targetId ? { targetId } : {}), ...(timeoutMs ? { timeoutMs } : {}) };
@@ -559,12 +659,15 @@ export function createPageHelperHandler(
   }
 
   async function cdp(method: string, params: Json, targetId?: string, timeoutMs?: number): Promise<InvokeResult> {
-    return invoke("execute_cdp", {
-      method,
-      params,
-      ...(targetId ? { targetId } : {}),
-      ...(timeoutMs ? { timeoutMs } : {}),
-    });
+    // Resolve the pointer-state slot before awaiting, so a concurrent request that switches the
+    // implicit target cannot make this event land under another tab.
+    const st = method === "Input.dispatchMouseEvent" ? motionOf(targetId) : undefined;
+    const res = await invoke("execute_cdp", { method, params, ...(targetId ? { targetId } : {}), ...(timeoutMs ? { timeoutMs } : {}) });
+    if (st) {
+      if (!res.ok) delete st.pointer;
+      else if (params["type"] === "mouseMoved" && typeof params["x"] === "number" && typeof params["y"] === "number") st.pointer = { x: params["x"], y: params["y"] };
+    }
+    return res;
   }
 
   /** Resolve a structured element target into a CDP RemoteObjectId in the same world where `__bc` lives. */
@@ -668,25 +771,51 @@ export function createPageHelperHandler(
       overshootProb: opts.overshootProb,
       rng,
     });
+    return dispatchPath(plan.steps, {
+      ...(opts.button !== undefined ? { button: opts.button } : {}),
+      ...(opts.buttons !== undefined ? { buttons: opts.buttons } : {}),
+    }, targetId);
+  }
+
+  /**
+   * Send a planned pointer path as trusted mouseMoved events. Once a step acks slowly or the path runs past its
+   * budget, the remaining steps collapse into one move to the end point, so the pointer still lands where planned.
+   */
+  async function dispatchPath(
+    steps: ReadonlyArray<{ x: number; y: number; delayMs: number }>,
+    extra: Json,
+    targetId: string | undefined,
+    onMoved?: (at: Point2D) => void,
+  ): Promise<InvokeResult> {
     const pace = createPacer();
-    for (const step of plan.steps) {
+    const start = now();
+    for (let i = 0; i < steps.length; i++) {
+      const step = steps[i]!;
       await pace(step.delayMs);
-      const res = await cdp(
-        "Input.dispatchMouseEvent",
-        {
-          type: "mouseMoved",
-          x: step.x,
-          y: step.y,
-          ...(opts.button !== undefined ? { button: opts.button } : {}),
-          ...(opts.buttons !== undefined ? { buttons: opts.buttons } : {}),
-        },
-        targetId,
-        INPUT_TIMEOUT_MS,
-      );
+      const sent = now();
+      const res = await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: step.x, y: step.y, ...extra }, targetId, INPUT_TIMEOUT_MS);
       if (!res.ok) return res;
-      state.pointer = { x: step.x, y: step.y };
+      onMoved?.({ x: step.x, y: step.y });
+      const done = now();
+      if (i < steps.length - 2 && (done - sent > SLOW_INPUT_ACK_MS || done - start > NATURAL_MOTION_BUDGET_MS)) {
+        i = steps.length - 2; // the next pass sends the end point
+      }
     }
     return success("ok");
+  }
+
+  const notActionable = (ref: string, why = "covered after hover") => failure("EXECUTION_FAILED", `NOT_ACTIONABLE: ${ref} ${why}`);
+
+  /** `res` is a helper error (stale ref, bad output) that must fail the click; `blocked` means another element is on top. */
+  async function verifyHit(ref: string, pt: Point2D, where: string | undefined) {
+    const hc = await evalHelper({ kind: "bc", method: "hitCheck", args: [ref, pt.x, pt.y] }, where, 2_000);
+    if (!hc.ok) return { ok: false as const, res: hc };
+    try {
+      const p = JSON.parse(valueOf(hc)) as { ok?: boolean; reason?: string };
+      if (p.ok === true) return { ok: true as const };
+      if (p.ok === false) return { ok: false as const, blocked: p.reason };
+    } catch { /* fall through */ }
+    return { ok: false as const, res: notActionable(ref, "invalid hitCheck output") };
   }
 
   async function clickCoords(
@@ -696,63 +825,54 @@ export function createPageHelperHandler(
     clickCount = 1,
     opts: { natural?: boolean; box?: Box2D; viewport?: Viewport; domRef?: string } = {},
   ): Promise<InvokeResult> {
+    let at: Point2D = { x, y };
+    let timing: ReturnType<typeof planClickTiming> | undefined;
     if (!opts.natural) {
       const m1 = await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x, y }, targetId, INPUT_TIMEOUT_MS);
       if (!m1.ok) return m1;
-      for (let c = 1; c <= clickCount; c++) {
-        const m2 = await cdp(
-          "Input.dispatchMouseEvent",
-          { type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: c },
-          targetId,
-          INPUT_TIMEOUT_MS,
-        );
-        if (!m2.ok) return m2;
-        const m3 = await cdp(
-          "Input.dispatchMouseEvent",
-          { type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: c },
-          targetId,
-          INPUT_TIMEOUT_MS,
-        );
-        if (!m3.ok) return m3;
-      }
-      return success("ok");
-    }
-    const targetSize = opts.box ? Math.min(opts.box.width, opts.box.height) : undefined;
-    const moved = await movePointer({ x, y }, targetId, { viewport: opts.viewport, targetSize });
-    if (!moved.ok) return moved;
-    const timing = planClickTiming(clickCount, rng);
-    await pause(timing.dwellMs);
-    if (opts.domRef) {
-      const hc = await evalHelper({ kind: "bc", method: "hitCheck", args: [opts.domRef, x, y] }, targetId, 2_000);
-      if (hc.ok) {
-        const raw = valueOf(hc);
-        if (raw.startsWith("{")) {
-          try {
-            const parsed = JSON.parse(raw) as { ok?: boolean; reason?: string };
-            if (parsed.ok === false) {
-              return failure("EXECUTION_FAILED", `NOT_ACTIONABLE: ${opts.domRef} ${parsed.reason ?? "covered after hover"}`);
-            }
-          } catch { /* ignore */ }
+    } else {
+      const moveOpts = { viewport: opts.viewport, targetSize: opts.box ? Math.min(opts.box.width, opts.box.height) : undefined };
+      const moved = await movePointer(at, targetId, moveOpts);
+      if (!moved.ok) return moved;
+      timing = planClickTiming(clickCount, rng);
+      await pause(timing.dwellMs);
+      if (opts.domRef) {
+        // Hover can open menus over the target: never press without a passing hit check.
+        let chk = await verifyHit(opts.domRef, at, targetId);
+        if (!chk.ok && !chk.res && opts.box) {
+          const { left, top, width, height } = opts.box;
+          const alt = await pickVerifiedPoint(opts.domRef, opts.box, { x: Math.round(left + width / 2), y: Math.round(top + height / 2) }, targetId);
+          if (!alt.ok) return alt.res;
+          const rep = await movePointer(alt.pt, targetId, { ...moveOpts, overshootProb: 0 });
+          if (!rep.ok) return rep;
+          at = alt.pt;
+          chk = await verifyHit(opts.domRef, at, targetId);
         }
+        if (!chk.ok) return chk.res ?? notActionable(opts.domRef, chk.blocked);
       }
     }
+    const HELD_MOUSE: HeldInput = { kind: "mouse", label: "mouse left button still down" };
     for (let c = 1; c <= clickCount; c++) {
       const m2 = await cdp(
         "Input.dispatchMouseEvent",
-        { type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: c },
+        { type: "mousePressed", ...at, button: "left", buttons: 1, clickCount: c },
         targetId,
         INPUT_TIMEOUT_MS,
       );
-      if (!m2.ok) return m2;
-      await pause(timing.holdsMs[c - 1]!);
-      const m3 = await cdp(
+      // A dialog refusal means the press may never have gone out: report it and send nothing into the dialog.
+      if (!m2.ok) return refusedByDialog(m2) ? refusedPress(m2, targetId, HELD_MOUSE) : m2;
+      if (timing) await pause(timing.holdsMs[c - 1]!);
+      const rel = await sendRelease(
         "Input.dispatchMouseEvent",
-        { type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: c },
+        { type: "mouseReleased", ...at, button: "left", buttons: 0, clickCount: c },
         targetId,
+        HELD_MOUSE,
         INPUT_TIMEOUT_MS,
       );
-      if (!m3.ok) return m3;
-      if (c < clickCount) await pause(timing.gapsMs[c - 1]!);
+      // A release nobody can vouch for comes back non-ok: report it, send nothing more, and read nothing behind it.
+      if (rel.held) return withHeld(rel.res, rel.held);
+      if (!rel.res.ok) return rel.res;
+      if (timing && c < clickCount) await pause(timing.gapsMs[c - 1]!);
     }
     return success("ok");
   }
@@ -825,29 +945,17 @@ export function createPageHelperHandler(
     return undefined;
   }
 
-  async function sampleHitCheckedPoint(
-    ref: string,
-    detail: PointDetail,
-    where: string | undefined,
-  ): Promise<Point2D> {
-    if (detail.box.width < 2 || detail.box.height < 2) return { x: detail.x, y: detail.y };
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const cand = pickClickPoint(detail.box, rng);
-      const hc = await evalHelper({ kind: "bc", method: "hitCheck", args: [ref, cand.x, cand.y] }, where, 2_000);
-      if (!hc.ok) break;
-      const raw = valueOf(hc);
-      if (raw.startsWith("{")) {
-        try {
-          const parsed = JSON.parse(raw) as { ok?: boolean };
-          if (parsed.ok) return cand;
-          continue;
-        } catch {
-          return cand;
-        }
-      }
-      return cand;
+  async function pickVerifiedPoint(ref: string, box: Box2D | undefined, center: Point2D, where: string | undefined) {
+    const canSample = Boolean(box && box.width >= 2 && box.height >= 2);
+    let blocked: string | undefined;
+    for (let i = canSample ? 0 : 3; i < 4; i++) {
+      const pt = i < 3 ? pickClickPoint(box!, rng) : center;
+      const chk = await verifyHit(ref, pt, where);
+      if (chk.ok) return { ok: true as const, pt };
+      if (chk.res) return { ok: false as const, res: chk.res };
+      blocked = chk.blocked;
     }
-    return { x: detail.x, y: detail.y };
+    return { ok: false as const, res: notActionable(ref, blocked) };
   }
 
   async function wheelScrollIntoView(
@@ -887,16 +995,17 @@ export function createPageHelperHandler(
             ? pickClickPoint({ left: cl, top: ct, width: cr - cl, height: cb - ct }, rng)
             : { x: Math.round(vw * 0.5), y: Math.round(vh * 0.5) };
         }
-      } else if (ptr && ptr.x >= 0 && ptr.x < vw && ptr.y >= 0 && ptr.y < vh) {
-        anchor = ptr;
-        inScrollArea = true;
-      } else if (scroller?.point) {
-        anchor = scroller.point;
       } else {
-        anchor = {
-          x: Math.round(vw * (0.35 + rng() * 0.3)),
-          y: Math.round(vh * (0.35 + rng() * 0.3)),
-        };
+        // Reuse the resting pointer only when the page confirms it is over the document, not a nested scroller.
+        const ptrIn = ptr !== undefined && ptr.x >= 0 && ptr.x < vw && ptr.y >= 0 && ptr.y < vh;
+        let docPt = scroller?.point;
+        if (ptrIn || !docPt) {
+          const sp = await evalHelper({ kind: "bc", method: "pageScrollPoint", ...(ptrIn ? { args: [ptr.x, ptr.y] } : {}) }, targetId, 2_000);
+          try { docPt = (sp.ok ? (JSON.parse(valueOf(sp)) as Point2D | null) : null) ?? docPt; } catch { /* keep docPt */ }
+        }
+        const ok = docPt != null && typeof docPt.x === "number" && typeof docPt.y === "number";
+        inScrollArea = ok && ptrIn && docPt!.x === ptr.x && docPt!.y === ptr.y;
+        anchor = ok ? docPt! : { x: Math.round(vw * (0.35 + rng() * 0.3)), y: Math.round(vh * (0.35 + rng() * 0.3)) };
       }
 
       if (!inScrollArea) {
@@ -906,11 +1015,14 @@ export function createPageHelperHandler(
 
       const plan = planWheelScroll(neededDeltaY, rng);
       const pace = createPacer();
-      for (let fi = 0; fi < plan.flicks.length; fi++) {
+      const start = now();
+      let slow = false;
+      for (let fi = 0; fi < plan.flicks.length && !slow; fi++) {
         const flick = plan.flicks[fi]!;
         const prevTop = cur.rect.top;
         for (const ev of flick.events) {
           await pace(ev.delayMs);
+          const sent = now();
           const wres = await cdp(
             "Input.dispatchMouseEvent",
             { type: "mouseWheel", x: anchor.x, y: anchor.y, deltaX: 0, deltaY: ev.deltaY },
@@ -918,7 +1030,14 @@ export function createPageHelperHandler(
             INPUT_TIMEOUT_MS,
           );
           if (!wres.ok) return { ok: false, res: wres };
+          const done = now();
+          // A page acking wheel events this slowly scrolls instantly below instead.
+          if (done - sent > SLOW_INPUT_ACK_MS || done - start > NATURAL_MOTION_BUDGET_MS) {
+            slow = true;
+            break;
+          }
         }
+        if (slow) break;
         const probe = await evalHelper(
           { kind: "bc", method: "point", args: [ref, { noScroll: true, detail: true }] },
           targetId,
@@ -992,7 +1111,7 @@ export function createPageHelperHandler(
       return bad(failure("EXECUTION_FAILED", `STALE_REF: iframe f${loc.frame} is not known for this tab. Run snap again.`));
     }
     const before = baseline && loc.kind === "frame" ? await evalHelper({ kind: "bc", method: "baseline" }, targetId) : undefined;
-    if (!natural) {
+    if (!natural || loc.kind === "frame") {
       const call: HelperCall = baseline && loc.kind === "dom"
         ? { steps: [{ kind: "bc", method: "baseline" }, { kind: "bc", method: "point", args: [loc.ref] }], join: " " }
         : { kind: "bc", method: "point", args: [loc.ref] };
@@ -1020,17 +1139,17 @@ export function createPageHelperHandler(
       return { ok: true, pt: { x, y, hidden: parts[2] === "hidden", before: href } };
     }
 
-    // Natural mode: inspect visibility without scrolling on main-frame DOM refs so off-screen targets wheel-scroll.
-    const pointOpts = loc.kind === "dom" ? { noScroll: true, detail: true } : { detail: true };
-    const call: HelperCall = baseline && loc.kind === "dom"
+    // Natural mode (main-frame DOM ref): inspect visibility without scrolling so off-screen targets wheel-scroll.
+    const pointOpts = { noScroll: true, detail: true };
+    const call: HelperCall = baseline
       ? { steps: [{ kind: "bc", method: "baseline" }, { kind: "bc", method: "point", args: [loc.ref, pointOpts] }], join: "\n" }
       : { kind: "bc", method: "point", args: [loc.ref, pointOpts] };
-    const res = await evalHelper(call, where);
+    const res = await evalHelper(call, targetId);
     if (!res.ok) return bad(res);
     const raw = valueOf(res);
-    let href: string | undefined = before?.ok ? valueOf(before) : undefined;
+    let href: string | undefined;
     let ptRaw = raw;
-    if (baseline && loc.kind === "dom") {
+    if (baseline) {
       const nl = raw.indexOf("\n");
       if (nl >= 0) {
         href = raw.slice(0, nl);
@@ -1047,55 +1166,31 @@ export function createPageHelperHandler(
     if (!detail) {
       // Fallback for mocks returning legacy "x y visible" format.
       const parts = ptRaw.split(" ");
-      let x = Number(parts[0]);
-      let y = Number(parts[1]);
+      const x = Number(parts[0]);
+      const y = Number(parts[1]);
       if (!Number.isFinite(x) || !Number.isFinite(y)) {
         return bad(failure("EXECUTION_FAILED", `unexpected point output: ${raw}`));
-      }
-      if (loc.kind === "frame") {
-        const slot = (await crossFrames(targetId)).find((f) => f.target === where)?.i;
-        if (slot === undefined) {
-          return bad(failure("EXECUTION_FAILED", `STALE_REF: iframe f${loc.frame} is gone. Run snap again.`));
-        }
-        const off = await evalHelper({ kind: "bc", method: "frameOffset", args: [slot] }, targetId);
-        if (!off.ok) return bad(off);
-        const [ox, oy] = valueOf(off).split(" ").map(Number);
-        x = Math.round(x + (ox ?? 0));
-        y = Math.round(y + (oy ?? 0));
       }
       return { ok: true, pt: { x, y, hidden: parts[2] === "hidden", before: href } };
     }
 
-    if (loc.kind === "dom" && !detail.inView) {
+    if (!detail.inView) {
       const scrolled = await wheelScrollIntoView(loc.ref, detail, targetId);
       if (!scrolled.ok) return bad(scrolled.res);
       detail = scrolled.detail;
     }
 
     motionOf(targetId).viewport = detail.viewport;
-    let picked = await sampleHitCheckedPoint(loc.ref, detail, where);
-    let box = detail.box;
-    if (loc.kind === "frame") {
-      const slot = (await crossFrames(targetId)).find((f) => f.target === where)?.i;
-      if (slot === undefined) {
-        return bad(failure("EXECUTION_FAILED", `STALE_REF: iframe f${loc.frame} is gone. Run snap again.`));
-      }
-      const off = await evalHelper({ kind: "bc", method: "frameOffset", args: [slot] }, targetId);
-      if (!off.ok) return bad(off);
-      const [ox, oy] = valueOf(off).split(" ").map(Number);
-      const dx = ox ?? 0;
-      const dy = oy ?? 0;
-      picked = { x: Math.round((picked.x + dx) * 10) / 10, y: Math.round((picked.y + dy) * 10) / 10 };
-      box = { left: box.left + dx, top: box.top + dy, width: box.width, height: box.height };
-    }
+    const sampled = await pickVerifiedPoint(loc.ref, detail.box, { x: detail.x, y: detail.y }, targetId);
+    if (!sampled.ok) return bad(sampled.res);
     return {
       ok: true,
       pt: {
-        x: picked.x,
-        y: picked.y,
+        x: sampled.pt.x,
+        y: sampled.pt.y,
         hidden: detail.hidden,
         before: href,
-        box,
+        box: detail.box,
         viewport: detail.viewport,
       },
     };
@@ -1120,16 +1215,50 @@ export function createPageHelperHandler(
     });
   }
 
+  /** Why a page read was refused because a dialog blocks the page, or undefined when the page answered. */
+  const DIALOG_READ_BLOCKED = "a dialog opened; accept or dismiss it before reading the page";
+  const dialogRefusedRead = (res: InvokeResult): string | undefined =>
+    refusedByDialog(res) ? DIALOG_READ_BLOCKED : undefined;
+  /** Why a page read could not happen: a dialog, or a page that never answered (every read behind one times out). */
+  const dialogBlockedBy = (res: InvokeResult): string | undefined =>
+    dialogRefusedRead(res) ?? (messageOf(res).startsWith("CDP_TIMEOUT") ? DIALOG_HINT : undefined);
+
   /** Arm isolated-world event probe and read back trusted event counts after input. */
-  async function readProbe(targetId?: string): Promise<Record<string, number> | undefined> {
+  async function readProbe(targetId?: string): Promise<{ counts?: Record<string, number>; blocked?: string }> {
     const res = await evalHelper({ kind: "bc", method: "readInputProbe" }, targetId, 2_000);
-    if (!res.ok) return undefined;
+    // Only a dialog refusal blocks the probe: a slow page that merely timed out still owes the click its diff.
+    if (!res.ok) return { blocked: dialogRefusedRead(res) };
     try {
       const parsed = JSON.parse(valueOf(res)) as Record<string, number>;
-      return typeof parsed === "object" && parsed !== null && "mousedown" in parsed ? parsed : undefined;
+      return { counts: typeof parsed === "object" && parsed !== null && "mousedown" in parsed ? parsed : undefined };
     } catch {
-      return undefined;
+      return {};
     }
+  }
+
+  /**
+   * One key press and its release under the held-input rules: a refused press records the key and sends nothing more,
+   * and a release nobody can vouch for comes back non-ok so typing stops instead of writing into an open dialog.
+   */
+  async function sendKeyStroke(
+    down: Json,
+    up: Json,
+    targetId: string | undefined,
+    held: HeldInput,
+    holdMs = 0,
+  ): Promise<InvokeResult> {
+    // Pin the tab once: a tab switch during the hold cannot move the release to another page.
+    const gestureTarget = targetId ?? implicitCdpTarget;
+    const press = await cdp("Input.dispatchKeyEvent", down, gestureTarget, INPUT_TIMEOUT_MS);
+    if (!press.ok) {
+      // A dialog refusal may mean the press never went out: send nothing more into the open dialog.
+      if (refusedByDialog(press)) return refusedPress(press, gestureTarget, held);
+      const out = await sendRelease("Input.dispatchKeyEvent", up, gestureTarget, held, INPUT_TIMEOUT_MS, true);
+      return out.held ? withHeld(press, out.held) : press;
+    }
+    if (holdMs > 0) await pause(holdMs);
+    const out = await sendRelease("Input.dispatchKeyEvent", up, gestureTarget, held, INPUT_TIMEOUT_MS);
+    return out.held ? withHeld(out.res, out.held) : out.res;
   }
 
   async function pressKey(name: string, targetId?: string, holdMs = 0): Promise<InvokeResult> {
@@ -1138,19 +1267,17 @@ export function createPageHelperHandler(
       return failure("INPUT_VALIDATION_FAILED", `INPUT_INVALID: key must be ${Object.keys(KEYS).join(", ")}`);
     }
     const base: Json = { key: spec.key, code: spec.code, windowsVirtualKeyCode: spec.windowsVirtualKeyCode };
-    const down = spec.text !== undefined
-      ? await cdp("Input.dispatchKeyEvent", { type: "keyDown", ...base, text: spec.text }, targetId, INPUT_TIMEOUT_MS)
-      : await cdp("Input.dispatchKeyEvent", { type: "rawKeyDown", ...base }, targetId, INPUT_TIMEOUT_MS);
-    if (!down.ok) return down;
-    if (holdMs > 0) await pause(holdMs);
-    return cdp("Input.dispatchKeyEvent", { type: "keyUp", ...base }, targetId, INPUT_TIMEOUT_MS);
+    const down: Json = spec.text !== undefined
+      ? { type: "keyDown", ...base, text: spec.text }
+      : { type: "rawKeyDown", ...base };
+    return sendKeyStroke(down, { type: "keyUp", ...base }, targetId, { kind: "key", label: `key ${name} still down` }, holdMs);
   }
 
   async function dispatchText(
     text: string,
     mode: "human" | "fast" | "keys",
     targetId?: string,
-    opts: { focused?: boolean } = {},
+    opts: { focused?: boolean; fieldKind?: FieldKind } = {},
   ): Promise<InvokeResult> {
     if (text === "") {
       return pressKey("Backspace", targetId);
@@ -1161,48 +1288,107 @@ export function createPageHelperHandler(
         const ins = await cdp("Input.insertText", { text: text.slice(0, -1) }, targetId, INPUT_TIMEOUT_MS);
         if (!ins.ok) return ins;
         const last = text.slice(-1);
-        const kd = await cdp("Input.dispatchKeyEvent", { type: "keyDown", key: last, text: last }, targetId, INPUT_TIMEOUT_MS);
-        if (!kd.ok) return kd;
-        return cdp("Input.dispatchKeyEvent", { type: "keyUp", key: last }, targetId, INPUT_TIMEOUT_MS);
+        return sendKeyStroke(
+          { type: "keyDown", key: last, text: last },
+          { type: "keyUp", key: last },
+          targetId,
+          { kind: "key", label: `key ${last} still down` },
+        );
       }
       return cdp("Input.insertText", { text }, targetId, INPUT_TIMEOUT_MS);
     }
     if (mode === "keys") {
       for (const ch of text) {
-        const kd = await cdp("Input.dispatchKeyEvent", { type: "keyDown", key: ch, text: ch }, targetId, INPUT_TIMEOUT_MS);
-        if (!kd.ok) return kd;
-        const ku = await cdp("Input.dispatchKeyEvent", { type: "keyUp", key: ch }, targetId, INPUT_TIMEOUT_MS);
-        if (!ku.ok) return ku;
+        const sent = await sendKeyStroke(
+          { type: "keyDown", key: ch, text: ch },
+          { type: "keyUp", key: ch },
+          targetId,
+          { kind: "key", label: `key ${ch} still down` },
+        );
+        if (!sent.ok) return sent;
       }
       return success("ok");
     }
-    // Default: human/natural typing with realistic hold times, variable cadence, and occasional self-corrected typos.
-    const plan = buildHumanKeystrokes(text, { rng });
-    for (const step of plan) {
-      if (step.kind === "backspace") {
-        const bs = await pressKey("Backspace", targetId, step.holdMs);
-        if (!bs.ok) return bs;
-      } else if (step.kind === "insert") {
-        const ins = await cdp("Input.insertText", { text: step.text }, targetId, INPUT_TIMEOUT_MS);
-        if (!ins.ok) return ins;
-      } else {
-        const base: Json = {
-          key: step.spec.key,
-          code: step.spec.code,
-          windowsVirtualKeyCode: step.spec.windowsVirtualKeyCode,
-          ...(step.spec.modifiers ? { modifiers: step.spec.modifiers } : {}),
-        };
-        const down = step.spec.text !== undefined
-          ? await cdp("Input.dispatchKeyEvent", { type: "keyDown", ...base, text: step.spec.text }, targetId, INPUT_TIMEOUT_MS)
-          : await cdp("Input.dispatchKeyEvent", { type: "rawKeyDown", ...base }, targetId, INPUT_TIMEOUT_MS);
-        if (!down.ok) return down;
-        if (step.holdMs > 0) await pause(step.holdMs);
-        const up = await cdp("Input.dispatchKeyEvent", { type: "keyUp", ...base }, targetId, INPUT_TIMEOUT_MS);
-        if (!up.ok) return up;
+    // Default: natural typing — human cadence, rollover, real Shift, and self-corrected typos.
+    const plan = planTyping(text, { rng, speedFactor: typingSpeedFactor(), fieldKind: opts.fieldKind });
+    // A key is recorded as down before its keyDown goes out, so one that reached the page but timed out is
+    // still released. Events run on elapsed time, absorbing round trips; a stall past STALL_MS shifts the rest.
+    // Each keyUp goes out once: one that never reached the page is reported as held, never re-sent.
+    const down = new Map<string, CharKeySpec>();
+    /** Keys whose keyDown a dialog refused: they may never have gone out, so they read as possibly down. */
+    const refusedDown = new Set<string>();
+    const stuck: string[] = [];
+    let result: InvokeResult = success("ok");
+    let blocked = false;
+    let mayBeDown = false;
+    const keyUp = async (spec: CharKeySpec, pressRefused = false): Promise<InvokeResult> => {
+      down.delete(spec.key);
+      if (pressRefused) mayBeDown = true;
+      // After a timeout or a dialog refusal nothing more goes out: the rest are reported held, never sent.
+      if (blocked) return (stuck.push(spec.key), failure("EXECUTION_FAILED", "CDP_TIMEOUT"));
+      const up = await sendKey("keyUp", spec, targetId).catch((err: unknown) => failure("EXECUTION_FAILED", String(err)));
+      if (!up.ok) {
+        if (messageOf(up).startsWith("CDP_TIMEOUT")) blocked = true;
+        // A dialog refusal may have landed: unverified, never "still down".
+        else if (refusedByDialog(up)) {
+          blocked = true;
+          return releaseUnverified(`key ${spec.key} release: delivery unverified (a dialog opened)`);
+        } else stuck.push(spec.key);
       }
-      if (step.pauseAfterMs > 0) await pause(step.pauseAfterMs);
+      return up;
+    };
+    let start = now();
+    let plannedAt = 0;
+    try {
+      for (const step of plan.events) {
+        plannedAt += step.delayMs;
+        const wait = start + plannedAt - now();
+        if (wait > 0) await pause(wait);
+        // Measure lateness after waking: a sleep that oversleeps past STALL_MS would otherwise leave the next
+        // step no hold at all, so the rest of the schedule shifts by the overshoot.
+        const late = now() - (start + plannedAt);
+        if (late > STALL_MS) start += late;
+        // Emoji and other unmapped characters go as key text: keyDown with text, then keyUp.
+        const spec: CharKeySpec =
+          step.kind === "insert" ? { key: step.text, code: "", windowsVirtualKeyCode: 0, text: step.text } : step.spec;
+        if (step.kind !== "keyUp") {
+          down.set(spec.key, spec);
+          result = await sendKey(spec.text !== undefined ? "keyDown" : "rawKeyDown", spec, targetId);
+          // The press may never have gone out: send nothing more into the open dialog.
+          if (refusedByDialog(result)) (refusedDown.add(spec.key), (blocked = true));
+        }
+        if (result.ok && step.kind !== "keyDown") result = await keyUp(spec);
+        if (!result.ok) break;
+      }
+    } finally {
+      for (const spec of [...down.values()].reverse()) await keyUp(spec, refusedDown.has(spec.key));
     }
-    return success("ok");
+    if (stuck.length === 0) return result;
+    const held: HeldInput = {
+      kind: "key",
+      label: `key${stuck.length > 1 ? "s" : ""} ${stuck.join(", ")} ${mayBeDown ? "may still be down" : "still down"}`,
+    };
+    heldByTab.set(heldSlot(targetId, "key"), held);
+    return withHeld(result, held);
+  }
+
+  function sendKey(type: string, spec: CharKeySpec, targetId?: string, timeoutMs = INPUT_TIMEOUT_MS): Promise<InvokeResult> {
+    const { key, code, windowsVirtualKeyCode, modifiers, text } = spec;
+    const extra = { ...(modifiers ? { modifiers } : {}), ...(type === "keyDown" && text !== undefined ? { text } : {}) };
+    return cdp("Input.dispatchKeyEvent", { type, key, code, windowsVirtualKeyCode, ...extra }, targetId, timeoutMs);
+  }
+
+  /** Typo policy from the focused field's live type and flags (attach-free read); any doubt means none. */
+  async function fieldKindOf(text: string, targetId?: string): Promise<FieldKind> {
+    const probe = await evalHelper({ kind: "bc", method: "typingField" }, targetId, 2_000, true);
+    let f: { type?: unknown; flags?: unknown; hint?: unknown } = {};
+    try {
+      f = (probe.ok && JSON.parse(valueOf(probe))) || {};
+    } catch {}
+    if (typeof f.type !== "string" || !Array.isArray(f.flags)) return "none";
+    if (/^(number|password)$/.test(f.type) || f.flags.some((x) => /^(secure|trap|payment|cc)$/.test(String(x)))) return "none";
+    if (/^(email|tel|url|date|time|datetime-local|month|week)$/.test(f.type)) return "structured";
+    return classifyFieldKind(text, String(f.hint ?? ""));
   }
 
   async function waitParsed(targetId?: string): Promise<void> {
@@ -1218,7 +1404,8 @@ export function createPageHelperHandler(
       steps: [{ kind: "bc", method: "settle" }, { kind: "bc", method: "diff", args: [{ from: before ?? "" }] }],
     };
     let res = await evalHelper(call, targetId, 8_000);
-    if (!res.ok && messageOf(res).startsWith("CDP_TIMEOUT")) return `# ${DIALOG_HINT}`;
+    // A dialog makes every read wait out its timeout, so report it instead of retrying on a blocked page.
+    if (!res.ok && dialogBlockedBy(res)) return `# ${dialogBlockedBy(res)}`;
     if (!res.ok) {
       await waitParsed(targetId);
       res = await evalHelper(call, targetId, 8_000);
@@ -1229,8 +1416,67 @@ export function createPageHelperHandler(
   const withChanges = async (line: string, before: string | undefined, quiet: boolean, targetId?: string): Promise<InvokeResult> =>
     success(quiet ? line : `${line}\n${await changes(before, targetId)}`);
 
-  const inputFailed = (res: InvokeResult, what: string): InvokeResult =>
-    messageOf(res).startsWith("CDP_TIMEOUT") ? success(`${what}: delivered_unverified (${DIALOG_HINT})`) : res;
+  /**
+   * An input command the extension refused because a dialog blocked it. It is ambiguous: the dialog may have been
+   * open already (nothing was sent) or the event itself opened it (it was delivered), so the event may have landed.
+   */
+  const refusedByDialog = (res: InvokeResult): boolean => /^DIALOG_OPEN:/.test(messageOf(res));
+  /**
+   * Word a failed input as delivered_unverified, keeping any held-input lines it already carries. A marked release is
+   * unverified rather than failed: the press landed, so the command reports what it could not confirm and stops.
+   */
+  const inputFailed = (res: InvokeResult, what: string): InvokeResult => {
+    const held = messageOf(res).split("\n").filter((l) => l.startsWith("# HELD:"));
+    if (isUnverifiedRelease(res)) {
+      const note = messageOf(res).split("\n")[0]!.slice(UNVERIFIED_RELEASE.length).trim();
+      // The note already names the input when it is a key release ("key Tab release: …"): don't name it twice.
+      return success([note.startsWith(what) ? note : `${what}: ${note}`, ...held].join("\n"));
+    }
+    return messageOf(res).startsWith("CDP_TIMEOUT")
+      ? success([`${what}: delivered_unverified (${DIALOG_HINT})`, ...held].join("\n"))
+      : res;
+  };
+
+  /** Marks a release nobody can vouch for, so no caller can read it as delivered; the command boundary words it. */
+  const UNVERIFIED_RELEASE = "UNVERIFIED_RELEASE:";
+  const releaseUnverified = (note: string): InvokeResult => failure("EXECUTION_FAILED", `${UNVERIFIED_RELEASE} ${note}`);
+  const isUnverifiedRelease = (res: InvokeResult): boolean => messageOf(res).startsWith(UNVERIFIED_RELEASE);
+
+  type ReleaseOutcome = { res: InvokeResult; held?: HeldInput };
+  /**
+   * Send a release to its pinned tab; it is never retried. A timeout may have reached the page, so it returns a
+   * marked non-ok result that reads as delivered_unverified, not held. A dialog refusal is ambiguous too, so it is
+   * unverified as well — unless the press it releases was itself refused, which leaves the input possibly still down.
+   */
+  async function sendRelease(
+    method: string,
+    params: Json,
+    target: string | undefined,
+    held: HeldInput,
+    timeoutMs = 2_000,
+    pressRefused = false,
+  ): Promise<ReleaseOutcome> {
+    const res = await cdp(method, params, target, timeoutMs).catch((err: unknown) => failure("EXECUTION_FAILED", String(err)));
+    const slot = heldSlot(target, held.kind);
+    if (res.ok) {
+      heldByTab.delete(slot);
+      return { res };
+    }
+    const what = `${held.label.replace(/ still down$/, "")} release`;
+    if (messageOf(res).startsWith("CDP_TIMEOUT")) {
+      heldByTab.delete(slot);
+      return { res: releaseUnverified(`${what}: delivered_unverified (${DIALOG_HINT})`) };
+    }
+    if (refusedByDialog(res) && !pressRefused) {
+      heldByTab.delete(slot);
+      return { res: releaseUnverified(`${what}: delivery unverified (a dialog opened)`) };
+    }
+    const uncertain: HeldInput = refusedByDialog(res)
+      ? { kind: held.kind, label: what.replace(/ release$/, " may still be down") }
+      : held;
+    heldByTab.set(slot, uncertain);
+    return { res, held: uncertain };
+  }
 
   /** Targets that can run helpers inside a child frame: OOPIF targets on CDP, frame ids on extension tabs. */
   async function frameTargetPool(targetId?: string): Promise<Array<{ targetId: string; url: string }>> {
@@ -1403,14 +1649,10 @@ export function createPageHelperHandler(
     }
     if (!Array.isArray(raw)) return 'do takes a JSON array of steps, e.g. [{"type":["Email","a@b.co"]},{"key":"Tab"},{"click":"Next"}]';
     for (const [i, entry] of raw.entries()) {
-      const isStep = typeof entry === "object" && entry !== null;
-      const keys = isStep ? Object.keys(entry as Json) : [];
-      // A step may carry `"fast": true` beside its one verb to skip the think pause for that step.
-      const fastStep = isStep && (entry as Json)["fast"] === true;
-      const verbs = fastStep ? keys.filter((k) => k !== "fast") : keys;
-      const verb = verbs[0];
+      const keys = typeof entry === "object" && entry !== null ? Object.keys(entry as Json).filter((k) => k !== "fast") : [];
+      const verb = keys[0];
       const arg = verb ? (entry as Json)[verb] : undefined;
-      if (verbs.length !== 1 || !verb) return `step ${i + 1}: each step is one verb, e.g. {"click":"Save"}`;
+      if (keys.length !== 1 || !verb) return `step ${i + 1}: each step is one verb, e.g. {"click":"Save"}`;
       if (verb === "click" && typeof arg === "string") {
         steps.push({ action: "click", input: { ref: arg }, label: `click ${js(arg)}` });
       } else if (verb === "key" && typeof arg === "string") {
@@ -1439,7 +1681,8 @@ export function createPageHelperHandler(
       } else {
         return `step ${i + 1}: use {"click":"<ref|label>"}, {"type":["<ref|label>","<text>"]}, {"select":["<ref|label>","<option>"]}, {"upload":["<ref|label>","<abs-path>"]}, {"drag":["<from>","<to>"]}, {"wait":"<text>"}, or {"key":"<name>"}`;
       }
-      if (fastStep) steps[steps.length - 1]!.fast = true;
+      const last = steps[steps.length - 1]!;
+      if ((entry as Json)["fast"] === true) last.input = { ...last.input, fast: true };
     }
     return steps;
   }
@@ -1500,7 +1743,9 @@ export function createPageHelperHandler(
   }
 
   /** Perform HTML5 drag-and-drop (via Input.setInterceptDrags) or plain mouse drag. */
-  async function runDrag(input: Json, targetId: string | undefined, quiet: boolean, healInBatch: boolean): Promise<InvokeResult> {
+  async function runDrag(input: Json, rawTargetId: string | undefined, quiet: boolean, healInBatch: boolean): Promise<InvokeResult> {
+    // Pin the tab once: press, moves, and release must all land on the tab the drag started on.
+    const targetId = rawTargetId ?? implicitCdpTarget;
     const fromLoc = await locate(input["from"], "click", targetId, healInBatch);
     if (!fromLoc.ok) return fromLoc.res;
     const toLoc = await locate(input["to"], "click", targetId, healInBatch);
@@ -1520,33 +1765,70 @@ export function createPageHelperHandler(
     };
 
     const natural = isNatural(input);
+    const held: HeldInput = { kind: "mouse", label: "mouse left button still down" };
     let html5Dropped = false;
     let dragIntercepted: { data?: Json } | undefined;
     let mouseDown = false;
     let dragErr: InvokeResult | undefined;
+    let releaseHeld: HeldInput | undefined;
+    let releaseUnverifiedRes: InvokeResult | undefined;
+    let refusedIntoDialog = false;
+    const releaseParams: Json = { type: "mouseReleased", x: info.dx, y: info.dy, button: "left", buttons: 0, clickCount: 1 };
+    /**
+     * A drag event the dialog refused: the button may never have gone down, so the press is recorded once and nothing
+     * more — no dragCancel, no release — is sent into the open dialog.
+     */
+    const refuseDrag = (res: InvokeResult): InvokeResult => {
+      refusedIntoDialog = true;
+      mouseDown = false;
+      return refusedPress(res, targetId, held);
+    };
+    /** dragEnter, dragOver, then drop; a dialog refusal stops at once so drop never follows it. */
+    const dragToTarget = async (dragData: Json): Promise<InvokeResult | undefined> => {
+      for (const type of ["dragEnter", "dragOver", "drop"]) {
+        const res = await cdp("Input.dispatchDragEvent", { type, x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
+        if (refusedByDialog(res)) return res;
+        if (type === "drop") html5Dropped = res.ok;
+      }
+      return undefined;
+    };
+    /** Release the button before an early return, so a blocked release is reported on this command's result. */
+    const bail = async (res: InvokeResult, what: string): Promise<InvokeResult> => {
+      const failed = inputFailed(res, what);
+      if (!mouseDown) return failed;
+      // A dialog refusal means the button may never have gone down: send nothing into the open dialog.
+      if (refusedByDialog(res)) return refuseDrag(res);
+      mouseDown = false;
+      const out = await sendRelease("Input.dispatchMouseEvent", releaseParams, targetId, held, 2_000, true);
+      return out.held ? withHeld(failed, out.held) : failed;
+    };
     if (info.draggable) {
       await cdp("Input.setInterceptDrags", { enabled: true }, targetId, 4_000);
     }
     try {
       if (!natural) {
         const m0 = await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: info.sx, y: info.sy }, targetId, INPUT_TIMEOUT_MS);
-        if (!m0.ok) { dragErr = m0; return inputFailed(m0, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
-        const mp = await cdp("Input.dispatchMouseEvent", { type: "mousePressed", x: info.sx, y: info.sy, button: "left", buttons: 1, clickCount: 1 }, targetId, INPUT_TIMEOUT_MS);
-        if (!mp.ok) { dragErr = mp; return inputFailed(mp, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
+        if (!m0.ok) { dragErr = m0; return bail(m0, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
         mouseDown = true;
+        const mp = await cdp("Input.dispatchMouseEvent", { type: "mousePressed", x: info.sx, y: info.sy, button: "left", buttons: 1, clickCount: 1 }, targetId, INPUT_TIMEOUT_MS);
+        if (!mp.ok) {
+          dragErr = mp;
+          // A dialog refusal may mean the press never went out: report it and send nothing into the dialog.
+          if (refusedByDialog(mp)) return refuseDrag(mp);
+          return bail(mp, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`);
+        }
         const mx = Math.round((info.sx + info.dx) / 2);
         const my = Math.round((info.sy + info.dy) / 2);
         if (info.draggable) {
           const waitDrag = invoke("wait_for_event", { method: "Input.dragIntercepted", timeoutMs: 1200, ...(targetId ? { targetId } : {}) });
-          await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: mx, y: my, button: "left", buttons: 1 }, targetId, INPUT_TIMEOUT_MS);
+          const mid = await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: mx, y: my, button: "left", buttons: 1 }, targetId, INPUT_TIMEOUT_MS);
+          if (!mid.ok) { dragErr = mid; return refusedByDialog(mid) ? refuseDrag(mid) : bail(mid, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
           const ev = await waitDrag;
           if (ev.ok && (ev.data as Json)["found"] === true) {
             dragIntercepted = (((ev.data as Json)["event"] as Json)?.["params"] as { data?: Json }) ?? {};
             const dragData = dragIntercepted.data ?? { items: [], dragOperationsMask: 1 };
-            await cdp("Input.dispatchDragEvent", { type: "dragEnter", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
-            await cdp("Input.dispatchDragEvent", { type: "dragOver", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
-            const dropRes = await cdp("Input.dispatchDragEvent", { type: "drop", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
-            html5Dropped = dropRes.ok;
+            const refusal = await dragToTarget(dragData);
+            if (refusal) { dragErr = refusal; return refuseDrag(refusal); }
           } else {
             await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: info.dx, y: info.dy, button: "left", buttons: 1 }, targetId, INPUT_TIMEOUT_MS);
           }
@@ -1556,11 +1838,16 @@ export function createPageHelperHandler(
         }
       } else {
         const toSrc = await movePointer({ x: info.sx, y: info.sy }, targetId);
-        if (!toSrc.ok) { dragErr = toSrc; return inputFailed(toSrc, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
+        if (!toSrc.ok) { dragErr = toSrc; return bail(toSrc, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
         await pause(planClickTiming(1, rng).dwellMs);
-        const mp = await cdp("Input.dispatchMouseEvent", { type: "mousePressed", x: info.sx, y: info.sy, button: "left", buttons: 1, clickCount: 1 }, targetId, INPUT_TIMEOUT_MS);
-        if (!mp.ok) { dragErr = mp; return inputFailed(mp, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
         mouseDown = true;
+        const mp = await cdp("Input.dispatchMouseEvent", { type: "mousePressed", x: info.sx, y: info.sy, button: "left", buttons: 1, clickCount: 1 }, targetId, INPUT_TIMEOUT_MS);
+        if (!mp.ok) {
+          dragErr = mp;
+          // A dialog refusal may mean the press never went out: report it and send nothing into the dialog.
+          if (refusedByDialog(mp)) return refuseDrag(mp);
+          return bail(mp, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`);
+        }
         await pause(Math.round(60 + rng() * 50));
 
         const state = motionOf(targetId);
@@ -1572,60 +1859,54 @@ export function createPageHelperHandler(
           overshootProb: 0,
           rng,
         });
-        const dispatchSteps = async (stepsSlice: typeof dragPlan.steps): Promise<InvokeResult> => {
-          const pace = createPacer();
-          for (const step of stepsSlice) {
-            await pace(step.delayMs);
-            const res = await cdp(
-              "Input.dispatchMouseEvent",
-              { type: "mouseMoved", x: step.x, y: step.y, button: "left", buttons: 1 },
-              targetId,
-              INPUT_TIMEOUT_MS,
-            );
-            if (!res.ok) return res;
-            state.pointer = { x: step.x, y: step.y };
-          }
-          return success("ok");
-        };
+        const dispatchSteps = (stepsSlice: typeof dragPlan.steps): Promise<InvokeResult> =>
+          dispatchPath(stepsSlice, { button: "left", buttons: 1 }, targetId, (at) => { state.pointer = at; });
 
         if (info.draggable) {
           const waitDrag = invoke("wait_for_event", { method: "Input.dragIntercepted", timeoutMs: 1200, ...(targetId ? { targetId } : {}) });
           let splitIdx = dragPlan.steps.findIndex((s) => Math.hypot(s.x - info.sx, s.y - info.sy) >= 10);
           if (splitIdx < 0) splitIdx = Math.max(0, Math.floor(dragPlan.steps.length / 2) - 1);
           const nudge = await dispatchSteps(dragPlan.steps.slice(0, splitIdx + 1));
-          if (!nudge.ok) { dragErr = nudge; return inputFailed(nudge, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
+          if (!nudge.ok) { dragErr = nudge; return bail(nudge, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
           const ev = await waitDrag;
           if (ev.ok && (ev.data as Json)["found"] === true) {
             dragIntercepted = (((ev.data as Json)["event"] as Json)?.["params"] as { data?: Json }) ?? {};
             const dragData = dragIntercepted.data ?? { items: [], dragOperationsMask: 1 };
-            await cdp("Input.dispatchDragEvent", { type: "dragEnter", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
-            await cdp("Input.dispatchDragEvent", { type: "dragOver", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
-            const dropRes = await cdp("Input.dispatchDragEvent", { type: "drop", x: info.dx, y: info.dy, data: dragData }, targetId, INPUT_TIMEOUT_MS);
-            html5Dropped = dropRes.ok;
+            const refusal = await dragToTarget(dragData);
+            if (refusal) { dragErr = refusal; return refuseDrag(refusal); }
             state.pointer = { x: info.dx, y: info.dy };
           } else {
             const rest = await dispatchSteps(dragPlan.steps.slice(splitIdx + 1));
-            if (!rest.ok) { dragErr = rest; return inputFailed(rest, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
+            if (!rest.ok) { dragErr = rest; return bail(rest, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
           }
         } else {
           const moved = await dispatchSteps(dragPlan.steps);
-          if (!moved.ok) { dragErr = moved; return inputFailed(moved, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
+          if (!moved.ok) { dragErr = moved; return bail(moved, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`); }
         }
         await pause(Math.round(40 + rng() * 50));
       }
     } finally {
-      if (info.draggable && dragIntercepted && !html5Dropped) {
-        await cdp("Input.dispatchDragEvent", { type: "dragCancel", x: info.dx, y: info.dy, data: dragIntercepted.data ?? { items: [], dragOperationsMask: 1 } }, targetId, 2_000).catch(() => {});
-      }
-      if (mouseDown) {
-        const rel = await cdp("Input.dispatchMouseEvent", { type: "mouseReleased", x: info.dx, y: info.dy, button: "left", buttons: 0, clickCount: 1 }, targetId, 2_000).catch(() => undefined);
-        if (rel?.ok && !dragErr) motionOf(targetId).pointer = { x: info.dx, y: info.dy };
+      // A refusal means nothing more goes out: no dragCancel, no release into the open dialog.
+      if (!refusedIntoDialog) {
+        if (info.draggable && dragIntercepted && !html5Dropped) {
+          await cdp("Input.dispatchDragEvent", { type: "dragCancel", x: info.dx, y: info.dy, data: dragIntercepted.data ?? { items: [], dragOperationsMask: 1 } }, targetId, 2_000).catch(() => {});
+        }
+        if (mouseDown) {
+          const out = await sendRelease("Input.dispatchMouseEvent", releaseParams, targetId, held);
+          if (out.held) {
+            releaseHeld = out.held;
+            if (!dragErr) dragErr = out.res;
+          } else if (isUnverifiedRelease(out.res)) releaseUnverifiedRes = out.res;
+          else if (!dragErr) motionOf(targetId).pointer = { x: info.dx, y: info.dy };
+        }
       }
       if (info.draggable) {
         await cdp("Input.setInterceptDrags", { enabled: false }, targetId, 2_000).catch(() => {});
       }
     }
 
+    if (dragErr) return withHeld(inputFailed(dragErr, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}: release`), releaseHeld);
+    if (releaseUnverifiedRes) return inputFailed(releaseUnverifiedRes, `drag ${fromLoc.loc.ref} -> ${toLoc.loc.ref}`);
     const posRes = info.listMeta
       ? await evalHelper({ kind: "bc", method: "listPosition", args: [info.listMeta] }, targetId)
       : undefined;
@@ -1678,14 +1959,17 @@ export function createPageHelperHandler(
         }
         const found = await locate(input["ref"], "click", targetId, healInBatch);
         if (!found.ok) return found.res;
-        const at = await pointOf(found.loc, targetId, !quiet, natural);
+        const useNatural = natural && found.loc.kind !== "frame";
+        const at = await pointOf(found.loc, targetId, !quiet, useNatural);
         if (!at.ok) return at.res;
         if (found.loc.kind === "dom") await evalHelper({ kind: "bc", method: "armInputProbe" }, targetId, 2_000).catch(() => {});
-        const clicked = await clickAt(at.pt, targetId, 1, natural, found.loc.kind === "dom" ? found.loc.ref : undefined);
+        const clicked = await clickAt(at.pt, targetId, 1, useNatural, found.loc.kind === "dom" ? found.loc.ref : undefined);
         if (!clicked.ok) return inputFailed(clicked, `click ${nameOf(found.loc)}`);
         const probe = found.loc.kind === "dom" ? await readProbe(targetId) : undefined;
         const healPrefix = found.healedFrom ? `↻ ${found.healedFrom}->${nameOf(found.loc)} ` : "";
-        const delivery = probe && probe["mousedown"] === 0 && probe["mouseup"] === 0
+        // The click opened a dialog (or stopped the page): report it now, never wait out every later read.
+        if (probe?.blocked) return success(`${healPrefix}click ${nameOf(found.loc)} at ${at.pt.x},${at.pt.y}: delivered, then ${probe.blocked}`);
+        const delivery = probe?.counts && probe.counts["mousedown"] === 0 && probe.counts["mouseup"] === 0
           ? "delivered_unverified (no mouse events reached page)"
           : "delivered";
         return withChanges(`${healPrefix}click ${nameOf(found.loc)} at ${at.pt.x},${at.pt.y}: ${delivery}`, at.pt.before, quiet, targetId);
@@ -1695,6 +1979,8 @@ export function createPageHelperHandler(
         if (typeof input["text"] !== "string") {
           return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: text is required");
         }
+        // Pin the tab once: a tab switch mid-typing cannot move a later key or its release to another page.
+        targetId = targetId ?? implicitCdpTarget;
         const text = input["text"];
         const natural = isNatural(input);
         const mode: "human" | "fast" | "keys" =
@@ -1752,12 +2038,15 @@ export function createPageHelperHandler(
             if (!editorRef) {
               const pt = await pointOf(loc, targetId, false, natural);
               if (!pt.ok) return pt.res;
-              await clickAt(pt.pt, targetId, 2, natural, loc.kind === "dom" ? loc.ref : undefined);
+              // The double-click opens the editor: a refused release means no editor, so stop before pressing Enter.
+              const opened = await clickAt(pt.pt, targetId, 2, natural, loc.kind === "dom" ? loc.ref : undefined);
+              if (!opened.ok) return inputFailed(opened, `type ${name}`);
               await sleep(150);
               const ed = await evalHelper({ kind: "bc", method: "cellEditor" }, fieldTarget);
               editorRef = ed.ok && /^e\d+$/.test(valueOf(ed)) ? valueOf(ed) : null;
               if (!editorRef) {
-                await pressKey("Enter", targetId, natural ? planKeyHold(rng) : 0);
+                const focused = await pressKey("Enter", targetId, natural ? planKeyHold(rng) : 0);
+                if (!focused.ok) return inputFailed(focused, `type ${name}`);
                 await sleep(150);
                 const ed2 = await evalHelper({ kind: "bc", method: "cellEditor" }, fieldTarget);
                 editorRef = ed2.ok && /^e\d+$/.test(valueOf(ed2)) ? valueOf(ed2) : null;
@@ -1766,9 +2055,11 @@ export function createPageHelperHandler(
             if (editorRef) {
               await evalHelper({ kind: "bc", method: "focusForType", args: [editorRef] }, fieldTarget);
             }
-            const sent = await dispatchText(text, mode, targetId);
+            const cellKind = mode === "human" ? await fieldKindOf(text, fieldTarget) : undefined;
+            const sent = await dispatchText(text, mode, targetId, { fieldKind: cellKind });
             if (!sent.ok) return inputFailed(sent, `type ${name}`);
-            await pressKey("Enter", targetId, natural ? planKeyHold(rng) : 0);
+            const committed = await pressKey("Enter", targetId, natural ? planKeyHold(rng) : 0);
+            if (!committed.ok) return inputFailed(committed, `type ${name}`);
             await sleep(150);
             const afterRes = await evalHelper({ kind: "bc", method: "cellRead", args: [loc.ref, cInfo.before] }, fieldTarget);
             if (afterRes.ok) {
@@ -1805,7 +2096,8 @@ export function createPageHelperHandler(
             return failure("EXECUTION_FAILED", `type ${name}: not_delivered (the click did not focus it; try snap again)`);
           }
         }
-        const sent = await dispatchText(text, mode, targetId);
+        const typeKind = mode === "human" ? await fieldKindOf(text, fieldTarget) : undefined;
+        const sent = await dispatchText(text, mode, targetId, { fieldKind: typeKind });
         if (!sent.ok) return inputFailed(sent, `type ${name}`);
         if (loc.kind === "ax") {
           return withChanges(`${healPrefix}type ${name}: delivered_unverified (accessibility ref, not read back)`, at.pt.before, quiet, targetId);
@@ -1855,7 +2147,7 @@ export function createPageHelperHandler(
             targetId,
           );
         }
-        const natural = isNatural(input);
+        const natural = isNatural(input) && loc.kind !== "frame";
         const at = await pointOf(loc, targetId, false, natural);
         if (!at.ok) return at.res;
         const opened = await clickAt(at.pt, targetId, 1, natural, loc.kind === "dom" ? loc.ref : undefined);
@@ -2111,6 +2403,7 @@ export function createPageHelperHandler(
         ? await movePointer({ x: x!, y: y! }, targetId)
         : await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: x!, y: y! }, targetId, INPUT_TIMEOUT_MS);
       if (!moved.ok) return inputFailed(moved, `hover ${x},${y}`);
+      if (natural) await pause(planClickTiming(1, rng).dwellMs);
       return withChanges(`hover ${x},${y}: delivered. ${what ?? ""}`.trimEnd(), before, quiet, targetId);
     }
     const found = await locate(input["ref"], "click", targetId);
@@ -2128,6 +2421,7 @@ export function createPageHelperHandler(
         })
       : await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: at.pt.x, y: at.pt.y }, targetId, INPUT_TIMEOUT_MS);
     if (!moved.ok) return inputFailed(moved, `hover ${nameOf(found.loc)}`);
+    if (natural) await pause(planClickTiming(1, rng).dwellMs);
     return withChanges(`hover ${nameOf(found.loc)} at ${at.pt.x},${at.pt.y}: delivered`, at.pt.before, quiet, targetId);
   }
 
@@ -2156,8 +2450,12 @@ export function createPageHelperHandler(
       }
       return res;
     }
-    if (accept) return success(typeof params["promptText"] === "string" ? `dialog accept: accepted with prompt text ${js(params["promptText"])}` : "dialog accept: accepted");
-    return success("dialog dismiss: dismissed");
+    // Nothing is re-sent automatically: the release a dialog blocked is reported as still held.
+    const held = HELD_KINDS.flatMap((kind) => heldByTab.get(heldSlot(targetId, kind)) ?? []);
+    const head = accept
+      ? typeof params["promptText"] === "string" ? `dialog accept: accepted with prompt text ${js(params["promptText"])}` : "dialog accept: accepted"
+      : "dialog dismiss: dismissed";
+    return success([head, ...held.map(heldLine)].join("\n"));
   }
 
   const mediaByTarget = new Map<string, Map<string, string>>();
@@ -2458,16 +2756,42 @@ export function createPageHelperHandler(
     }
   }
 
+  /**
+   * Parse a readback of {@link CHALLENGE_PROBE_EXPR}: `{skip,url}` or `{skip:false,probe}`, else "skip".
+   * `strict` is for calls that must not report a page it could not read: a readback that cannot be
+   * parsed, or that arrives without the URL the classifier and the host boundary both need, is
+   * incomplete, so it reads as "error" (unknown) and never as "skip" (clear).
+   */
+  function parseProbeReadback(raw: string, strict = false): ProbeReadResult {
+    const bad = (): ProbeReadResult => (strict ? { kind: "error" } : { kind: "skip" });
+    if (!raw || !raw.startsWith("{")) return bad();
+    try {
+      const parsed = JSON.parse(raw) as { skip?: boolean; url?: string; probe?: ChallengeProbe };
+      if (parsed.skip === true) {
+        return typeof parsed.url === "string" && parsed.url !== "" ? { kind: "skip", url: parsed.url } : bad();
+      }
+      if (parsed.probe && typeof parsed.probe === "object") {
+        if (strict && !(typeof parsed.probe.url === "string" && parsed.probe.url !== "")) return { kind: "error" };
+        return { kind: "probe", probe: parsed.probe };
+      }
+      return bad();
+    } catch {
+      return bad();
+    }
+  }
+
   async function readChallengeProbeCdp(
     targetId: string | undefined,
     timeoutMs = 4_000,
     deadline?: number,
+    strict = false,
+    forceFull = false,
   ): Promise<ProbeReadResult> {
     const budget = deadline !== undefined ? Math.min(timeoutMs, deadline - Date.now()) : timeoutMs;
     if (budget <= 0) return { kind: "error" };
     const res = await raceDeadline(
       invoke("evaluate", {
-        expression: CHALLENGE_PROBE_EXPR,
+        expression: forceFull ? CHALLENGE_PROBE_EXPR_FULL : CHALLENGE_PROBE_EXPR,
         isolated: true,
         ...(targetId ? { targetId } : {}),
         timeoutMs: Math.max(1, Math.floor(budget)),
@@ -2476,16 +2800,29 @@ export function createPageHelperHandler(
       failure("EXECUTION_FAILED", "CHALLENGE_PROBE_TIMEOUT"),
     );
     if (!res.ok) return { kind: "error" };
-    const raw = valueOf(res);
-    if (!raw || !raw.startsWith("{")) return { kind: "skip" };
-    try {
-      const parsed = JSON.parse(raw) as { skip?: boolean; url?: string; probe?: ChallengeProbe };
-      if (parsed.skip) return { kind: "skip", url: typeof parsed.url === "string" ? parsed.url : undefined };
-      if (parsed.probe && typeof parsed.probe === "object") return { kind: "probe", probe: parsed.probe };
-      return { kind: "skip" };
-    } catch {
-      return { kind: "skip" };
-    }
+    return parseProbeReadback(valueOf(res), strict);
+  }
+
+  /**
+   * Read the same probe on a `browse:<n>` tab. browse has no `__bc` helper and no wall probe, but its
+   * `eval` tool is read-only and already the route for `evaluate` on these tabs, so the self-contained
+   * probe expression runs there unchanged and feeds the same classifier.
+   */
+  async function readChallengeProbeBrowse(
+    browseTab: number,
+    timeoutMs = 4_000,
+    deadline?: number,
+    strict = false,
+  ): Promise<ProbeReadResult> {
+    const budget = deadline !== undefined ? Math.min(timeoutMs, deadline - Date.now()) : timeoutMs;
+    if (budget <= 0) return { kind: "error" };
+    const res = await raceDeadline(
+      callBrowse("eval", { tab: browseTab, expression: CHALLENGE_PROBE_EXPR, timeout: Math.max(1, Math.floor(budget)) }, budget),
+      deadline,
+      failure("EXECUTION_FAILED", "CHALLENGE_PROBE_TIMEOUT"),
+    );
+    if (!res.ok) return { kind: "error" };
+    return parseProbeReadback(valueOf(res), strict);
   }
 
   /**
@@ -2497,10 +2834,16 @@ export function createPageHelperHandler(
    */
   async function readChallengeProbe(
     targetId: string | undefined,
-    opts: { wallHint?: string; reprobe?: boolean; deadline?: number } = {},
+    opts: { wallHint?: string; reprobe?: boolean; deadline?: number; strict?: boolean; forceFull?: boolean } = {},
   ): Promise<ProbeReadResult> {
     const remaining = (cap: number): number =>
       opts.deadline !== undefined ? Math.min(cap, opts.deadline - Date.now()) : cap;
+
+    // browse tabs have no `__bc` helper; their read-only `eval` runs the same self-contained probe.
+    const browseTab = browseTabNumber(targetId);
+    if (browseTab !== undefined) {
+      return readChallengeProbeBrowse(browseTab, opts.reprobe ? 1_500 : 4_000, opts.deadline, opts.strict);
+    }
 
     if (extensionTabOf(targetId) !== undefined) {
       const baseTimeout = opts.reprobe ? 1_500 : 4_000;
@@ -2524,14 +2867,18 @@ export function createPageHelperHandler(
         failure("EXECUTION_FAILED", "CHALLENGE_PROBE_TIMEOUT"),
       );
       if (!quick.ok) {
-        return opts.reprobe ? readChallengeProbeCdp(targetId, baseTimeout, opts.deadline) : { kind: "error" };
+        return opts.reprobe ? readChallengeProbeCdp(targetId, baseTimeout, opts.deadline, opts.strict, opts.forceFull) : { kind: "error" };
       }
       const rawQuick = valueOf(quick);
-      if (!rawQuick.includes(CHALLENGE_PROBE_SEP)) return { kind: "skip" };
-      const [url = "", title = "", rawText = "", rawVendor = ""] = rawQuick.split(CHALLENGE_PROBE_SEP);
+      if (!rawQuick.includes(CHALLENGE_PROBE_SEP)) return opts.strict === true ? { kind: "error" } : { kind: "skip" };
+      const quickParts = rawQuick.split(CHALLENGE_PROBE_SEP);
+      // A readback missing one of the four fields is incomplete, not a safe page: in strict mode it is unknown.
+      if (opts.strict === true && quickParts.length !== 4) return { kind: "error" };
+      const [url = "", title = "", rawText = "", rawVendor = ""] = quickParts;
       const { text, textLength } = parseBcTextForProbe(rawText);
       const hasVendor = parseBcQueryRows(rawVendor).length > 0;
       const suspicious =
+        opts.forceFull === true ||
         opts.wallHint === "captcha" ||
         opts.wallHint === "rate-limit" ||
         textLength < SHORT_PAGE_CHARS ||
@@ -2568,9 +2915,11 @@ export function createPageHelperHandler(
         opts.deadline,
         failure("EXECUTION_FAILED", "CHALLENGE_PROBE_TIMEOUT"),
       );
-      const [rawFrames = "", rawScripts = "", rawSel = "", rawVis = "", rawAws = ""] = markers.ok
-        ? valueOf(markers).split(CHALLENGE_PROBE_SEP)
-        : [];
+      const markerParts = markers.ok ? valueOf(markers).split(CHALLENGE_PROBE_SEP) : [];
+      // Five steps join into five fields. A failed or short marker read leaves every marker list empty,
+      // which is exactly what a normal page looks like, so strict mode calls it an error, never a clear.
+      if (opts.strict === true && markerParts.length !== 5) return { kind: "error" };
+      const [rawFrames = "", rawScripts = "", rawSel = "", rawVis = "", rawAws = ""] = markerParts;
       const frameUrls = parseBcQueryRows(rawFrames).map((r) => r["src"]).filter((s): s is string => Boolean(s));
       const scriptSrcs = parseBcQueryRows(rawScripts).map((r) => r["src"]).filter((s): s is string => Boolean(s));
       const hasAws = parseBcQueryRows(rawAws).length > 0;
@@ -2614,19 +2963,25 @@ export function createPageHelperHandler(
       return { kind: "probe", probe };
     }
 
-    return readChallengeProbeCdp(targetId, opts.reprobe ? 1_500 : 4_000, opts.deadline);
+    return readChallengeProbeCdp(targetId, opts.reprobe ? 1_500 : 4_000, opts.deadline, opts.strict, opts.forceFull);
   }
 
   /**
    * Run the challenge classifier; auto-wait boundedly (~8 s) on `non-interactive` interstitials,
    * and immediately report `interactive` or `block` without retrying.
+   * `unknownOnError` makes a failed first probe "unknown" instead of "clear", for guards that must
+   * not act on a page they could not read; `deadline` bounds the probe itself.
    */
   async function checkChallenge(
     targetId: string | undefined,
-    opts: { wallHint?: string; knownUrl?: string } = {},
+    opts: { wallHint?: string; knownUrl?: string; unknownOnError?: boolean; deadline?: number; forceFull?: boolean } = {},
   ): Promise<ChallengeCheckResult> {
-    const first = await readChallengeProbe(targetId, { wallHint: opts.wallHint });
+    const strict = opts.unknownOnError === true;
+    const first = await readChallengeProbe(targetId, { wallHint: opts.wallHint, deadline: opts.deadline, strict, forceFull: opts.forceFull });
     if (first.kind !== "probe") {
+      if (first.kind === "error" && strict) {
+        return { status: "unknown", waited: false, url: opts.knownUrl };
+      }
       return { status: "clear", waited: false, url: first.kind === "skip" ? first.url : opts.knownUrl };
     }
     let lastProbe = first.probe;
@@ -2654,8 +3009,13 @@ export function createPageHelperHandler(
       await pause(step);
       waitedMs += step;
       if (deadline - Date.now() <= 0) break;
-      const next = await readChallengeProbe(targetId, { reprobe: true, deadline });
-      if (next.kind === "error") continue;
+      const next = await readChallengeProbe(targetId, { reprobe: true, deadline, strict, forceFull: opts.forceFull });
+      if (next.kind === "error") {
+        // Strict reads must not poll past a page they cannot read: the deadline would end in
+        // non-interactive-timeout, which reports a challenge that was never seen.
+        if (strict) return { status: "unknown", waited: false, url: opts.knownUrl };
+        continue;
+      }
       if (next.kind === "skip") {
         return { status: "clear", waited: true, url: next.url || opts.knownUrl };
       }
@@ -2682,13 +3042,34 @@ export function createPageHelperHandler(
     };
   }
 
+  /**
+   * The pre-step-1 challenge guard. A probe error there is not "clear": step 1 must not run on a page
+   * whose state could not be read. Two tries inside a short budget, then it stays unknown. The budget is
+   * wall-clock, like the probe's own deadline (the probe reads use `Date.now()` for their timeouts), and
+   * each try is capped to its own share so a timing-out first try always leaves the second one time to run.
+   */
+  async function probeChallengeBeforeStep1(
+    targetId: string | undefined,
+    wallHint: string,
+    knownUrl: string,
+  ): Promise<ChallengeCheckResult> {
+    const deadline = Date.now() + PRE_STEP_PROBE_BUDGET_MS;
+    let result: ChallengeCheckResult = { status: "unknown", waited: false, url: knownUrl };
+    for (let attempt = 0; attempt < PRE_STEP_PROBE_TRIES; attempt++) {
+      const attemptDeadline = Math.min(deadline, Date.now() + PRE_STEP_PROBE_ATTEMPT_MS);
+      result = await checkChallenge(targetId, { wallHint, knownUrl, unknownOnError: true, deadline: attemptDeadline });
+      if (result.status !== "unknown" || Date.now() >= deadline) break;
+    }
+    return result;
+  }
+
   async function handlePage(action: string, input: Json, rawTargetId?: string): Promise<InvokeResult> {
     const resolved = await resolveTargetBackend(rawTargetId);
     const { browseTab, extensionTarget, cdpTarget } = resolved;
-    // Pin the concrete tab so pacing keys, pointer state and frame maps never share an empty key
-    // across tabs when the caller omits a target.
-    const targetId = rawTargetId ?? extensionTarget ?? cdpTarget;
-
+    if (rawTargetId === undefined) implicitCdpTarget = cdpTarget;
+    // A browse batch resolves only a tab number, so pin `browse:<n>`: the guard and every probe route by
+    // target id, and an empty id sent them to the CDP backend instead of the browse tab they act on.
+    const targetId = rawTargetId ?? extensionTarget ?? (browseTab !== undefined ? `browse:${browseTab}` : undefined);
     const quiet = input["quiet"] === true;
 
     switch (action) {
@@ -2812,6 +3193,54 @@ export function createPageHelperHandler(
       case "handoff":
         return runHandoff(input, targetId, resolved);
 
+      case "solve_captcha": {
+        const verify = input["verify"] === true;
+        // Same engine as nav/snap/do: detection is read-only; the agent acts, the tool never solves.
+        // A failed or incomplete read reports "unknown", never "clear": a read that failed did not
+        // read a clean page. The report proves detection evidence — what it does not prove is that
+        // the answer was accepted; that is what --verify is for.
+        if (verify) {
+          // One forced full read, not the fast-path skip: a long page still carrying a widget must
+          // not report clear. No wait loop — verify is a re-check after the agent answered.
+          const probe = await readChallengeProbe(targetId, { reprobe: true, strict: true, forceFull: true });
+          if (probe.kind === "error") {
+            return success(formatCaptchaReport({ status: "unknown", waited: false }, true));
+          }
+          if (probe.kind === "skip") {
+            return success(formatCaptchaReport({ status: "clear", waited: false, url: probe.url }, true));
+          }
+          const p = probe.probe;
+          const detection = classifyChallenge(p);
+          if (!detection) {
+            // The classifier ignores widgets on long pages (walls flag short pages only). A widget
+            // marker in the full probe still means the page is not a clean read: report still present.
+            const widgetSel = (p.selectors ?? [])[0];
+            const widgetFrame = (p.frameUrls ?? []).find((u) => /recaptcha|hcaptcha|turnstile/i.test(u));
+            if (widgetSel !== undefined || widgetFrame !== undefined) {
+              const reason = widgetSel !== undefined ? `widget marker ${widgetSel}` : `widget frame ${widgetFrame}`;
+              return success(
+                formatCaptchaReport(
+                  { status: "interactive", waited: false, url: p.url, detection: { vendor: "generic", kind: "interactive", reason } },
+                  true,
+                ),
+              );
+            }
+            return success(formatCaptchaReport({ status: "clear", waited: false, url: p.url }, true));
+          }
+          const status: "interactive" | "block" | "non-interactive-timeout" =
+            detection.kind === "interactive" ? "interactive" : detection.kind === "block" ? "block" : "non-interactive-timeout";
+          return success(formatCaptchaReport({ status, waited: false, url: p.url, detection }, true));
+        }
+        const res = await checkChallenge(targetId, { unknownOnError: true });
+        const report: CaptchaStatus =
+          res.status === "clear"
+            ? { status: "clear", waited: res.waited, url: res.url }
+            : res.status === "unknown"
+              ? { status: "unknown", waited: res.waited, url: res.url }
+              : { status: res.status, waited: res.waited, url: res.url, detection: res.detection };
+        return success(formatCaptchaReport(report, verify));
+      }
+
       case "do": {
         const steps = parseSteps(input);
         if (typeof steps === "string") return failure("INPUT_VALIDATION_FAILED", `INPUT_INVALID: ${steps}`);
@@ -2826,15 +3255,75 @@ export function createPageHelperHandler(
         let stopped: string | undefined;
         let challengeReport: string | undefined;
         const challengeBackend = challengeBackendOf(targetId);
+        // Nothing looks at the page until a step has run, so a batch would act on a challenge page before the
+        // post-step check could see it. Probe up front on the same terms as that check: a wall, a challenge, a
+        // page that could not be read, or a redirect off the start host stops the batch with every step unrun.
+        // Attach-free on DevTools tabs (one bc_call read plus the silent probe); on browse tabs the href read
+        // and the read-only `eval` probe are the equivalent.
+        const readPreStepState = async (): Promise<{ url: string; wall: string }> => {
+          if (browseTab !== undefined) {
+            const href = await readProperty("href", targetId);
+            return { url: href.ok ? valueOf(href) : "", wall: "" };
+          }
+          const state = await evalHelper(
+            { steps: [{ kind: "href" }, { kind: "bc", method: "wall", fallback: "" }], join: "\n" },
+            targetId,
+            4_000,
+          );
+          if (!state.ok) return { url: "", wall: "" };
+          const [url = "", wall = ""] = valueOf(state).split("\n");
+          return { url: url ?? "", wall: wall ?? "" };
+        };
+        {
+          const pre = await readPreStepState();
+          if (pre.url) prevUrl = pre.url;
+          let preWall = pre.wall;
+          const challenge = await probeChallengeBeforeStep1(targetId, preWall, prevUrl || startUrl);
+          if (challenge.status === "unknown") {
+            stopped = "page state unknown before step 1";
+          } else if (
+            challenge.status === "block" ||
+            challenge.status === "interactive" ||
+            challenge.status === "non-interactive-timeout"
+          ) {
+            challengeReport = formatChallengeOutput(challenge.detection, challenge.url || prevUrl, {
+              backend: challengeBackend,
+              untrustedBoundary: true,
+            });
+            stopped =
+              challenge.status === "block"
+                ? `blocked by ${challenge.detection.vendor} before step 1`
+                : `${challenge.detection.vendor} challenge before step 1`;
+          } else {
+            if (challenge.waited) {
+              const after = await readPreStepState();
+              if (after.url) prevUrl = after.url;
+              else if (challenge.url) prevUrl = challenge.url;
+              preWall = after.wall;
+            } else if (challenge.url) {
+              // Nothing newer was read, so the probe's own URL is the freshest: a redirect during the
+              // first probe would otherwise leave the boundary comparing the URL from before it.
+              prevUrl = challenge.url;
+            }
+            // A captcha or rate-limit wall the probe could not classify still stops the batch unrun.
+            if (preWall === "captcha" || preWall === "rate-limit") {
+              stopped = `the page is a ${preWall} wall before step 1`;
+            } else if (prevUrl && startUrl && hostOf(prevUrl) !== hostOf(startUrl)) {
+              // A cleared challenge can leave the tab on another host, so re-apply the post-step boundary.
+              stopped = `the page left ${hostOf(startUrl)} for ${hostOf(prevUrl)} before step 1`;
+            }
+          }
+        }
         const naturalPacing = isNatural(input);
         // Test-only trace: the e2e compares each planned pause to the dispatch gap it produced. Off unless
         // BC_E2E_PACING_TRACE=1, so no caller's output changes.
         const pacingTrace: Array<{ after: number; planned: number; slept: number }> | undefined =
           process.env["BC_E2E_PACING_TRACE"] === "1" ? [] : undefined;
         for (const [i, step] of steps.entries()) {
+          if (stopped) break;
           const stepInput: Json = {
             ...(input["fast"] === true ? { fast: true } : {}),
-            ...(step.fast ? { fast: true } : {}),
+            ...(input["_natural"] !== undefined ? { _natural: input["_natural"] } : {}),
             ...step.input,
             quiet: true,
           };
@@ -2925,7 +3414,7 @@ export function createPageHelperHandler(
             if (stopped) break;
           }
           // Think pause before the next step: skip after `wait` (already idle) and on a fast step.
-          if (naturalPacing && !isLastStep && !step.fast && step.action !== "wait") {
+          if (naturalPacing && !isLastStep && step.input["fast"] !== true && step.action !== "wait") {
             const { want, sleepMs } = planThinkPauseDetail(rng, now() - settleStartedAt);
             if (sleepMs > 0) await pause(sleepMs);
             pacingTrace?.push({ after: i + 1, planned: want, slept: sleepMs });
@@ -3122,17 +3611,27 @@ export function createPageHelperHandler(
       case "nav": {
         const url = typeof input["url"] === "string" ? input["url"] : "";
         const until = input["until"] === "load" ? "load" : "domcontentloaded";
+        const sessionKey = sessionKeyOf(input["sessionKey"]);
+        const forceNewTab = input["newTab"] === true && rawTargetId === undefined;
+        // The implicit extension tab is the daemon-wide selection; a session or --new-tab picks its own.
+        const implicitExtension = rawTargetId === undefined && (targetId === undefined || extensionTabOf(targetId) !== undefined);
+        const navTarget = implicitExtension && (sessionKey || forceNewTab) ? undefined : targetId;
         const paced = isNatural(input);
+        // A session nav picks its tab inside the backend, so the session keys its own pagination clock;
+        // a forced new tab has no previous page to paginate from.
+        const paceKey = navTarget === undefined && sessionKey ? `session:${sessionKey}` : navTarget;
         // Pagination belongs to nav, so the minimum gap lands between the two navigations.
-        if (paced) await pacePagination(targetId, url);
+        if (paced && !forceNewTab) await pacePagination(paceKey, url);
         // Stamp the clock at dispatch, so a slow load never eats into the pagination gap.
         const navAt = now();
         const nav = await invoke("navigate", {
           url,
           until,
-          ...(targetId ? { targetId } : {}),
+          ...(navTarget ? { targetId: navTarget } : {}),
           ...(input["newWindow"] === true ? { newWindow: true } : {}),
           ...(input["keepOpen"] === true ? { keepOpen: true } : {}),
+          ...(forceNewTab ? { newTab: true } : {}),
+          ...(sessionKey ? { sessionKey } : {}),
         });
         if (!nav.ok) return nav;
         const data = nav.data as Json;
@@ -3145,6 +3644,7 @@ export function createPageHelperHandler(
             : undefined;
         const onBrowse = browseTabNumber(tab) !== undefined || (tab === undefined && browseTab !== undefined);
         const lines = [JSON.stringify(data)];
+        if (data["reused"] === true && tab) lines.push(`# reused this session's tab ${tab}; --new-tab opens another`);
         if (!onBrowse) {
           const state = await evalHelper(
             {
@@ -3244,7 +3744,7 @@ export function createPageHelperHandler(
             lines.push(`# WALL: ${wall}. Stop and hand this tab to the user; do not solve or bypass it.`);
           }
           // Remember the dwell (and any pagination gap) to pay before the next input on this tab.
-          if (!wall && paced) recordNavPace(tab, final || url, navAt, chars);
+          if (!wall && paced) recordNavPace(tab, final || url, navAt, chars, paceKey);
         }
         if (input["snap"] === true) {
           const snap = await handlePage("snap", { _skipChallengeCheck: !onBrowse }, tab);
@@ -3294,9 +3794,10 @@ export function createPageHelperHandler(
     invoke("evaluate", { expression, ...(tid ? { targetId: tid } : {}) }),
   );
 
-  return async function handlePageWithRemedies(action: string, input: Json, targetId?: string): Promise<InvokeResult> {
+  const handlePageWithRemedies = async (action: string, input: Json, targetId?: string): Promise<InvokeResult> => {
     const res = await handlePage(action, input, targetId);
     if (!res.ok) return failure(res.error.code, withRemedy(res.error.message));
     return res;
   };
+  return handlePageWithRemedies;
 }
