@@ -1,5 +1,5 @@
 (() => {
-  const VERSION = 10;
+  const VERSION = 11;
   if (globalThis.__bc && globalThis.__bc.v === VERSION) return;
 
   const INTERACTIVE = [
@@ -1695,12 +1695,16 @@
         if (performance.now() >= deadline) { reason = `timed out after ${timeoutMs}ms`; break; }
         const prevTop = scroller.scrollTop;
         const height = scroller === document.scrollingElement ? innerHeight : scroller.clientHeight;
-        const factor = scrollPace && Number.isFinite(scrollPace.factors?.[scrollIdx]) ? scrollPace.factors[scrollIdx] : null;
-        const pauseMs = scrollPace && Number.isFinite(scrollPace.pauses?.[scrollIdx]) ? scrollPace.pauses[scrollIdx] : null;
+        // Plans are short; cycle them so a long read keeps its paced step and pause past the last entry.
+        const fLen = scrollPace && Array.isArray(scrollPace.factors) ? scrollPace.factors.length : 0;
+        const pLen = scrollPace && Array.isArray(scrollPace.pauses) ? scrollPace.pauses.length : 0;
+        const factor = fLen ? scrollPace.factors[scrollIdx % fLen] : null;
+        const pauseMs = pLen ? scrollPace.pauses[scrollIdx % pLen] : null;
         scrollIdx++;
-        const step = Math.max(200, Math.round(height * (factor === null ? 0.9 : factor)));
+        // Paced steps keep their jittered size in any scroller; the 200 px floor is for the fast path only.
+        const step = Number.isFinite(factor) ? Math.round(height * factor) : Math.max(200, Math.round(height * 0.9));
         scroller.scrollTop = prevTop + step;
-        await new Promise((r) => setTimeout(r, pauseMs === null ? 120 : pauseMs));
+        await new Promise((r) => setTimeout(r, Number.isFinite(pauseMs) ? pauseMs : 120));
         if (scroller.scrollTop === prevTop && seen.size === beforeCount) {
           stagnant++;
           if (stagnant >= 2) break;
@@ -1735,6 +1739,9 @@
     const parts = [range || total, pageOf, hasNext ? 'has Next page link' : ''].filter(Boolean);
     return parts.length ? `# scope: ${parts.join('; ')}` : '';
   };
+
+  // Body text length, used for the post-nav reading dwell (bc_call, so reads stay attach-free).
+  const chars = () => (document.body ? (document.body.textContent || '').length : 0);
 
   // The page's readable content as compact markdown. Folds noisy site navbars/filters unless --all.
   function text(opts = {}) {
@@ -1833,7 +1840,7 @@
       setTypedValue, verifyRef, healRef, armInputProbe, readInputProbe, cellInfo, cellEditor, cellRead,
       dragInfo, listPosition, select, locateOption, locateFile, el: resolve, checkWait, value,
       verdict, health, frames, tagFrames, frameTag, frameOffset, baseline, settle, diff, locate, hit, rect, viewport,
-      markBoxes, marks, form, query, readUrls, scrollRead, text,
+      markBoxes, marks, form, query, readUrls, scrollRead, text, chars,
     },
     configurable: true, enumerable: false,
   });

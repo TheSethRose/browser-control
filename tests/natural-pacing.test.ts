@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { InvokeResult } from "@agent-software/core";
+import { readFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { BcCallFn, BcCallInput } from "../src/backends/extension";
 import {
   createSeededRng,
   planNavDwell,
@@ -10,7 +12,7 @@ import {
   planTextScrollStep,
   planThinkPause,
 } from "../src/natural";
-import { PAGE_HELPERS_SOURCE } from "../src/page-helpers";
+import { PAGE_HELPERS_SOURCE, PAGE_HELPERS_VERSION } from "../src/page-helpers";
 import { createPageHelperHandler } from "../src/page-runner";
 
 type Call = { op: string; input: Record<string, unknown> };
@@ -19,7 +21,16 @@ type Call = { op: string; input: Record<string, unknown> };
  * Minimal page-helper invoker: serves the helper expressions the pacing hooks read and lets the
  * test set the document text length, the current URL, and the typed readback.
  */
-function makeMock(options: { chars?: number; url?: string; readback?: string; locate?: Record<string, string> } = {}) {
+function makeMock(
+  options: {
+    chars?: number;
+    url?: string;
+    readback?: string;
+    locate?: Record<string, string>;
+    /** Runs inside the mocked `navigate`, so a test can advance its fake clock over a slow load. */
+    onNavigate?: () => void;
+  } = {},
+) {
   const calls: Call[] = [];
   let url = options.url ?? "https://a.test/1";
   let installed = false;
@@ -27,7 +38,6 @@ function makeMock(options: { chars?: number; url?: string; readback?: string; lo
 
   const evaluate = (input: Record<string, unknown>): InvokeResult => {
     const expr = String(input["expression"] ?? "");
-    if (expr.includes("document.body ? (document.body.textContent")) return ok(options.chars ?? 0);
     if (expr.includes(PAGE_HELPERS_SOURCE)) installed = true;
     if (!installed && expr.includes("__BC_NEED_INSTALL__")) return ok("__BC_NEED_INSTALL__");
     if (expr.includes("__bc.locate")) {
@@ -35,16 +45,9 @@ function makeMock(options: { chars?: number; url?: string; readback?: string; lo
       const ref = options.locate?.[label];
       return ref ? ok(ref) : { ok: false, error: { code: "EXECUTION_FAILED", message: `NO_MATCH: ${label}` } };
     }
+    if (expr.includes("location.href, __bc.chars()")) return ok(`${url}\n${options.chars ?? 0}\n`);
     if (expr.includes("location.href, __bc.wall()")) return ok(`${url}\n`);
-    if (expr.includes("__bc.baseline")) return ok(url);
-    if (expr.includes("__bc.checkWait")) return ok(JSON.stringify({ matched: true, url, wall: "" }));
-    if (expr.includes("__bc.value")) return ok(options.readback ?? "v");
-    if (expr.includes("__bc.armInputProbe")) return ok("armed");
-    if (expr.includes("__bc.readInputProbe")) return ok(JSON.stringify({ mousedown: 1, mouseup: 1 }));
-    if (expr.includes("__bc.focusForType")) return ok("focused");
-    if (expr.includes("__bc.guard")) return ok("ok");
-    if (expr.includes("__bc.verifyRef")) return ok("e3");
-    if (expr.includes("__bc.hitCheck")) return ok(JSON.stringify({ ok: true }));
+    if (expr.includes("__bc.chars()")) return ok(options.chars ?? 0);
     if (expr.includes("__bc.point")) {
       const detail = JSON.stringify({
         x: 350,
@@ -68,6 +71,15 @@ function makeMock(options: { chars?: number; url?: string; readback?: string; lo
       });
       return ok(expr.includes("__bc.baseline()") ? `${url}\n${detail}` : detail);
     }
+    if (expr.includes("__bc.baseline")) return ok(url);
+    if (expr.includes("__bc.checkWait")) return ok(JSON.stringify({ matched: true, url, wall: "" }));
+    if (expr.includes("__bc.value")) return ok(options.readback ?? "v");
+    if (expr.includes("__bc.armInputProbe")) return ok("armed");
+    if (expr.includes("__bc.readInputProbe")) return ok(JSON.stringify({ mousedown: 1, mouseup: 1 }));
+    if (expr.includes("__bc.focusForType")) return ok("focused");
+    if (expr.includes("__bc.guard")) return ok("ok");
+    if (expr.includes("__bc.verifyRef")) return ok("e3");
+    if (expr.includes("__bc.hitCheck")) return ok(JSON.stringify({ ok: true }));
     if (expr.includes("__bc.text")) return ok(`# Page | ${url}\n\nhello`);
     return ok("ok");
   };
@@ -77,7 +89,8 @@ function makeMock(options: { chars?: number; url?: string; readback?: string; lo
     if (op === "evaluate") return evaluate(input);
     if (op === "navigate") {
       url = String(input["url"] ?? url);
-      return { ok: true, data: { loaded: true, url } };
+      options.onNavigate?.();
+      return { ok: true, data: { loaded: true, url, ...(input["targetId"] ? { targetId: input["targetId"] } : {}) } };
     }
     if (op === "execute_cdp") return { ok: true, data: { result: {} } };
     return { ok: true, data: {} };
@@ -366,6 +379,133 @@ describe("post-nav dwell and pagination gap", () => {
     expect((await handle("key", { key: "Tab", quiet: true })).ok).toBe(true);
     expect(clock.sleeps.every((ms) => ms <= 130)).toBe(true);
   });
+
+  test("nav takes the length from the attach-free probe, never an evaluate on an extension tab", async () => {
+    const bcCalls: BcCallInput[] = [];
+    const mock = makeMock({ chars: 4_000 });
+    const clock = makeClock();
+    const bcCall: BcCallFn = async (input) => {
+      bcCalls.push(input);
+      const values = input.steps.map((step) => {
+        if (step.kind === "href") return "https://a.test/1";
+        if (step.kind === "title") return "Page";
+        if (step.kind !== "bc") return "";
+        if (step.method === "chars") return 4_000;
+        if (step.method === "text") return `# Page | https://a.test/1\n\n${"word ".repeat(600)}`;
+        if (step.method === "query") return "";
+        if (step.method === "settle") return "quiet";
+        return "";
+      });
+      const kept = values.filter((_, i) => !input.steps[i]!.discard);
+      return { value: input.join === undefined ? values.at(-1) : kept.join(input.join) };
+    };
+    const handle = createPageHelperHandler(mock.invoke, undefined, undefined, {
+      bcCall,
+      sleep: clock.sleep,
+      rng: () => 0.5,
+      now: clock.now,
+    });
+
+    expect((await handle("nav", { url: "https://a.test/1" }, "extension:42")).ok).toBe(true);
+    // The char count rides inside the existing bc_call nav probe, so nothing attaches the debugger.
+    expect(bcCalls.some((c) => c.steps.some((s) => s.kind === "bc" && s.method === "chars"))).toBe(true);
+    expect(mock.calls.filter((c) => c.op === "evaluate")).toHaveLength(0);
+
+    expect((await handle("key", { key: "Tab", quiet: true }, "extension:42")).ok).toBe(true);
+    expect(clock.sleeps.at(0)).toBe(548);
+  });
+
+  test("the pagination clock starts at nav dispatch, not after a slow load", async () => {
+    const clock = makeClock();
+    let slowLoad = true;
+    const mock = makeMock({
+      chars: 4_000,
+      onNavigate: () => {
+        if (!slowLoad) return;
+        slowLoad = false;
+        clock.advance(1_000);
+      },
+    });
+    const handle = createPageHelperHandler(mock.invoke, undefined, undefined, {
+      sleep: clock.sleep,
+      rng: () => 0.5,
+      now: clock.now,
+    });
+
+    // Nav 1 dispatches at t=0 and finishes at t=1000; nav 2 dispatches at t=1500.
+    expect((await handle("nav", { url: "https://a.test/1" })).ok).toBe(true);
+    clock.advance(500);
+    expect((await handle("nav", { url: "https://a.test/2" })).ok).toBe(true);
+    // Gap 2200 ms from dispatch (t=0) leaves 700 ms, not 1700 as a post-load clock would.
+    expect(clock.sleeps).toEqual([700]);
+  });
+
+  test("implicit targets on different tabs never share dwell state", async () => {
+    let active = "target-A";
+    const mock = makeMock({ chars: 4_000 });
+    const clock = makeClock();
+    const handle = createPageHelperHandler(
+      async (op, input = {}) => {
+        if (op === "get_browser_status") return { ok: true, data: { activeTargetId: active } };
+        return mock.invoke(op, input);
+      },
+      undefined,
+      undefined,
+      { sleep: clock.sleep, rng: () => 0.5, now: clock.now },
+    );
+
+    // Nav on tab A, then switch tabs: tab B must not pay A's dwell.
+    expect((await handle("nav", { url: "https://a.test/1" })).ok).toBe(true);
+    active = "target-B";
+    expect((await handle("key", { key: "Tab", quiet: true })).ok).toBe(true);
+    expect(clock.sleeps.every((ms) => ms <= 130)).toBe(true);
+
+    // Back on tab A the dwell is still owed, minus the time tab B's input took.
+    active = "target-A";
+    expect((await handle("key", { key: "Tab", quiet: true })).ok).toBe(true);
+    expect(clock.sleeps.at(-2)).toBe(548 - 60);
+  });
+
+  test("hover pays the post-nav dwell before it moves the pointer", async () => {
+    const mock = makeMock({ chars: 4_000 });
+    const clock = makeClock();
+    const handle = createPageHelperHandler(mock.invoke, undefined, undefined, {
+      sleep: clock.sleep,
+      rng: () => 0.5,
+      now: clock.now,
+    });
+
+    expect((await handle("nav", { url: "https://a.test/1" })).ok).toBe(true);
+    clock.sleeps.length = 0;
+    expect((await handle("hover", { ref: "e5" })).ok).toBe(true);
+    expect(clock.sleeps.at(0)).toBe(548);
+  });
+
+  test("a malformed step is INPUT_INVALID, not a thrown TypeError", async () => {
+    const mock = makeMock();
+    const handle = createPageHelperHandler(mock.invoke, undefined, undefined, { now: () => 0 });
+    const res = await handle("do", { steps: [null], quiet: true });
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("expected a failure");
+    expect(res.error.code).toBe("INPUT_VALIDATION_FAILED");
+    expect(res.error.message).toContain("INPUT_INVALID");
+  });
+
+  test("a fast step skips the nav dwell on that step", async () => {
+    const mock = makeMock({ chars: 4_000 });
+    const clock = makeClock();
+    const handle = createPageHelperHandler(mock.invoke, undefined, undefined, {
+      sleep: clock.sleep,
+      rng: () => 0.5,
+      now: clock.now,
+    });
+
+    expect((await handle("nav", { url: "https://a.test/1" })).ok).toBe(true);
+    clock.sleeps.length = 0;
+    // The fast step pays no dwell, and the `wait` after it is skipped by pacing, so nothing is owed.
+    expect((await handle("do", { steps: [{ key: "Tab", fast: true }, { wait: "Ready" }], quiet: true })).ok).toBe(true);
+    expect(clock.sleeps.filter((ms) => ms >= 220)).toEqual([]);
+  });
 });
 
 describe("text --scroll pace", () => {
@@ -413,9 +553,26 @@ describe("text --scroll pace", () => {
 
   test("the in-page reader honors the provided plan and stays plain JavaScript", () => {
     expect(PAGE_HELPERS_SOURCE).toContain("opts.scrollPace");
-    expect(PAGE_HELPERS_SOURCE).toContain("scrollPace.factors?.[scrollIdx]");
+    expect(PAGE_HELPERS_SOURCE).toContain("scrollPace.factors");
     expect(() => new Function(PAGE_HELPERS_SOURCE)).not.toThrow();
     // No debugger attach anywhere in the page helper.
     expect(PAGE_HELPERS_SOURCE).not.toContain("Runtime.enable");
+  });
+
+  test("the plan cycles past its 64 steps and the 200 px floor is fast-path only", () => {
+    const source = PAGE_HELPERS_SOURCE;
+    // Cycling, so a long read keeps its paced size and pause instead of dropping to 0.9x / 120 ms.
+    expect(source).toContain("scrollIdx % fLen");
+    expect(source).toContain("scrollIdx % pLen");
+    // Paced steps use the planned length even in a short scroller; the floor stays in the fast path.
+    expect(source).toContain("Number.isFinite(factor) ? Math.round(height * factor) : Math.max(200");
+  });
+
+  test("helpers v11 ships the attach-free chars reader and the extension copy matches", () => {
+    expect(PAGE_HELPERS_VERSION).toBe(11);
+    expect(PAGE_HELPERS_SOURCE).toContain("scrollRead, text, chars,");
+    expect(() => new Function(PAGE_HELPERS_SOURCE)).not.toThrow();
+    const shipped = readFileSync(new URL("../extension/page-helpers.js", import.meta.url), "utf8");
+    expect(shipped).toBe(PAGE_HELPERS_SOURCE);
   });
 });

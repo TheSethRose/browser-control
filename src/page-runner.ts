@@ -332,23 +332,6 @@ export function createPageHelperHandler(
   /** Dwell still owed after a nav, paid lazily before the next input on that tab. */
   const pendingNavPaceByTab = new Map<string, { navAt: number; chars: number }>();
 
-  /** Text length of the current document: one cheap read that never moves the pointer or attaches. */
-  async function readPageChars(targetId?: string): Promise<number> {
-    let res: InvokeResult | undefined;
-    try {
-      res = await invoke("evaluate", {
-        expression: "document.body ? (document.body.textContent || '').length : 0",
-        isolated: true,
-        ...(targetId ? { targetId } : {}),
-        timeoutMs: 2_000,
-      });
-    } catch {
-      res = undefined;
-    }
-    const value = res?.ok ? Number((res.data as Json | undefined)?.["value"]) : NaN;
-    return Number.isFinite(value) && value > 0 ? value : 0;
-  }
-
   /**
    * Wait out the pagination gap before navigating: a same-host nav within 4 s of the previous one on
    * this tab waits until `previous nav + 1.6–2.8 s`. Different hosts and slower reading add nothing.
@@ -362,13 +345,14 @@ export function createPageHelperHandler(
     if (left > 0) await pause(left);
   }
 
-  /** Record a finished nav for this tab so the next input can pay its reading dwell, and remember it for pagination. */
-  async function recordNavPace(tab: string | undefined, url: string): Promise<void> {
+  /**
+   * Record a finished nav for this tab: `dispatchAt` (the nav dispatch) starts the pagination clock,
+   * while the reading dwell runs from now. `chars` comes from the attach-free nav probe.
+   */
+  function recordNavPace(tab: string | undefined, url: string, dispatchAt: number, chars: number): void {
     const key = tabKeyOf(tab);
-    const navAt = now();
-    const chars = await readPageChars(tab);
-    lastNavByTab.set(key, { at: navAt, host: hostOf(url) });
-    pendingNavPaceByTab.set(key, { navAt, chars });
+    lastNavByTab.set(key, { at: dispatchAt, host: hostOf(url) });
+    pendingNavPaceByTab.set(key, { navAt: now(), chars });
   }
 
   /**
@@ -1419,9 +1403,10 @@ export function createPageHelperHandler(
     }
     if (!Array.isArray(raw)) return 'do takes a JSON array of steps, e.g. [{"type":["Email","a@b.co"]},{"key":"Tab"},{"click":"Next"}]';
     for (const [i, entry] of raw.entries()) {
-      const keys = typeof entry === "object" && entry !== null ? Object.keys(entry as Json) : [];
+      const isStep = typeof entry === "object" && entry !== null;
+      const keys = isStep ? Object.keys(entry as Json) : [];
       // A step may carry `"fast": true` beside its one verb to skip the think pause for that step.
-      const fastStep = (entry as Json)["fast"] === true;
+      const fastStep = isStep && (entry as Json)["fast"] === true;
       const verbs = fastStep ? keys.filter((k) => k !== "fast") : keys;
       const verb = verbs[0];
       const arg = verb ? (entry as Json)[verb] : undefined;
@@ -2109,6 +2094,8 @@ export function createPageHelperHandler(
   ): Promise<InvokeResult> {
     if (browseTab !== undefined) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: hover needs a DevTools tab");
     const natural = isNatural(input);
+    // Hover is pointer input: pay any post-nav dwell before it scrolls or moves.
+    if (natural) await paceBeforeInput(targetId);
     if (Array.isArray(input["xy"])) {
       const [x, y] = (input["xy"] as unknown[]).map(Number);
       if (!Number.isFinite(x) || !Number.isFinite(y)) {
@@ -2698,7 +2685,10 @@ export function createPageHelperHandler(
   async function handlePage(action: string, input: Json, rawTargetId?: string): Promise<InvokeResult> {
     const resolved = await resolveTargetBackend(rawTargetId);
     const { browseTab, extensionTarget, cdpTarget } = resolved;
-    const targetId = rawTargetId ?? extensionTarget;
+    // Pin the concrete tab so pacing keys, pointer state and frame maps never share an empty key
+    // across tabs when the caller omits a target.
+    const targetId = rawTargetId ?? extensionTarget ?? cdpTarget;
+
     const quiet = input["quiet"] === true;
 
     switch (action) {
@@ -2840,6 +2830,7 @@ export function createPageHelperHandler(
         for (const [i, step] of steps.entries()) {
           const stepInput: Json = {
             ...(input["fast"] === true ? { fast: true } : {}),
+            ...(step.fast ? { fast: true } : {}),
             ...step.input,
             quiet: true,
           };
@@ -3127,6 +3118,8 @@ export function createPageHelperHandler(
         const until = input["until"] === "load" ? "load" : "domcontentloaded";
         // Pagination belongs to nav, so the minimum gap lands between the two navigations.
         if (isNatural(input)) await pacePagination(targetId, url);
+        // Stamp the clock at dispatch, so a slow load never eats into the pagination gap.
+        const navAt = now();
         const nav = await invoke("navigate", {
           url,
           until,
@@ -3151,6 +3144,7 @@ export function createPageHelperHandler(
               steps: [
                 { kind: "bc", method: "settle", discard: true },
                 { kind: "href" },
+                { kind: "bc", method: "chars", fallback: "" },
                 { kind: "bc", method: "wall", fallback: "" },
               ],
               join: "\n",
@@ -3159,9 +3153,14 @@ export function createPageHelperHandler(
             8_000,
           );
           let final = "";
+          let chars = 0;
           let wall = "";
           if (state.ok) {
-            [final = "", wall = ""] = valueOf(state).split("\n");
+            // Body length rides in the same attach-free probe, so no read ever asks for a debugger.
+            const [href = "", count = "", wallHint = ""] = valueOf(state).split("\n");
+            final = href;
+            chars = Number(count) > 0 ? Number(count) : 0;
+            wall = wallHint;
           } else if (messageOf(state).startsWith("EXTENSION_ONLY:") || messageOf(state).includes("RESTRICTED_PAGE:")) {
             if (newTab !== undefined && messageOf(state).includes("RESTRICTED_PAGE:")) {
               const closed = await invoke("close_target", { targetId: newTab }).catch((e: unknown) =>
@@ -3237,9 +3236,7 @@ export function createPageHelperHandler(
             lines.push(`# WALL: ${wall}. Stop and hand this tab to the user; do not solve or bypass it.`);
           }
           // Remember the dwell (and any pagination gap) to pay before the next input on this tab.
-          if (!wall && isNatural(input)) {
-            await recordNavPace(tab, final || url).catch(() => {});
-          }
+          if (!wall && isNatural(input)) recordNavPace(tab, final || url, navAt, chars);
         }
         if (input["snap"] === true) {
           const snap = await handlePage("snap", { _skipChallengeCheck: !onBrowse }, tab);

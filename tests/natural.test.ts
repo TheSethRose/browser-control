@@ -695,9 +695,9 @@ describe("page-runner natural motion integration", () => {
   });
 });
 
-describe("page-helpers v10 — point detail/noScroll, hitCheck, pageScrollPoint", () => {
-  test("VERSION is 10 and new helpers work in isolated DOM", async () => {
-    expect(PAGE_HELPERS_VERSION).toBe(10);
+describe("page-helpers v11 — point detail/noScroll, hitCheck, pageScrollPoint", () => {
+  test("VERSION is 11 and new helpers work in isolated DOM", async () => {
+    expect(PAGE_HELPERS_VERSION).toBe(11);
 
     const btn: any = {
       nodeType: 1,
@@ -778,7 +778,7 @@ describe("page-helpers v10 — point detail/noScroll, hitCheck, pageScrollPoint"
 
       new Function(PAGE_HELPERS_SOURCE)();
       const bc = (globalThis as any).__bc;
-      expect(bc.v).toBe(10);
+      expect(bc.v).toBe(11);
       bc.snapshot();
 
       // noScroll reports inView: false without calling scrollIntoView.
