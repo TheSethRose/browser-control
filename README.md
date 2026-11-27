@@ -161,7 +161,8 @@ these commands: `start`, `eval`, `nav`, `close`, `tabs`, `call`, `ops`, `default
 `check-update`, `stop --force` and `extension`. It also exposes page helpers through the
 daemon (`snap`, `text`, `form`, `query`, `read-urls`, `ocr`, `shot`, `click`, `hover`, `type`,
 `select`, `upload`, `drag`, `wait`, `key`, `fill`, `do`, `dialog`, `emulate`, `handoff`,
-`value`, `verdict`, `health`, `styles`, `issues`, `perf`, `notes`, `flow` and `script`). On
+`value`, `verdict`, `health`, `styles`, `issues`, `perf`, `notes`, `flow`, `script` and
+`solve_captcha`). On
 CDP tabs they inject `src/page-helpers.js.txt` once per document. On extension tabs the
 extension runs the same helper. `browse:<n>` tabs go through the `browse` CLI. They add no
 capability operations. `SKILL.md` lists every command and flag.
@@ -277,6 +278,9 @@ On extension tabs:
   `Agents · N` tab group.
 - `handoff <message>` shows a "Your turn" card in the tab and waits for you to click Continue.
   Use it for logins, 2FA, CAPTCHAs and payments.
+- `solve_captcha` reports what a challenge on the page looks like (vendor, widget type hint,
+  suggested action, verify hint) — it never solves. The agent answers with its own tools
+  (click, type, drag, vision), then confirms with `solve_captcha --verify`.
 - `nav --browser <slug>` picks a browser when more than one is connected.
   `extension browsers` lists the slugs.
 - The popup can limit the extension to tabs you share (`Only tabs I share`).

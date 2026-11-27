@@ -77,6 +77,7 @@ import {
 import { createPictureTracker, imageWidth, resizeImage } from "./picture";
 import { buildHumanKeystrokes } from "./typing";
 import { didYouMean, withRemedy, wrapUntrusted } from "./safety";
+import { formatCaptchaReport, type CaptchaStatus } from "./captcha";
 import { createScriptRunner, writeOutputFile } from "./script";
 
 type Json = Record<string, unknown>;
@@ -91,7 +92,7 @@ const DIALOG_HINT = "the page stopped responding; a JavaScript dialog is probabl
 const PAGE_ACTIONS = [
   "snap", "text", "form", "query", "read-urls", "ocr", "shot", "click", "hover", "type", "select",
   "upload", "drag", "wait", "key", "fill", "do", "value", "nav", "verdict", "health",
-  "styles", "issues", "perf", "dialog", "emulate", "handoff", "notes", "flow", "script",
+  "styles", "issues", "perf", "dialog", "emulate", "handoff", "notes", "flow", "script", "solve_captcha",
 ] as const;
 
 const DEFAULT_HANDOFF_TIMEOUT_MS = 10 * 60 * 1000;
@@ -2814,6 +2815,17 @@ export function createPageHelperHandler(
 
       case "handoff":
         return runHandoff(input, targetId, resolved);
+
+      case "solve_captcha": {
+        const verify = input["verify"] === true;
+        // Same engine as nav/snap/do: detection is read-only; the agent acts, the tool never solves.
+        const res = await checkChallenge(targetId, {});
+        const report: CaptchaStatus =
+          res.status === "clear"
+            ? { status: "clear", waited: res.waited, url: res.url }
+            : { status: res.status, waited: res.waited, url: res.url, detection: res.detection };
+        return success(formatCaptchaReport(report, verify));
+      }
 
       case "do": {
         const steps = parseSteps(input);
