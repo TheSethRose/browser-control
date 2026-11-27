@@ -74,7 +74,7 @@ import {
   type Locator,
 } from "./page-helpers";
 import { createPictureTracker, imageWidth, resizeImage } from "./picture";
-import { buildHumanKeystrokes } from "./typing";
+import { classifyFieldKind, planTyping, type CharKeySpec, type FieldKind } from "./typing";
 import { didYouMean, withRemedy, wrapUntrusted } from "./safety";
 import { createScriptRunner, writeOutputFile } from "./script";
 
@@ -298,6 +298,9 @@ export function createPageHelperHandler(
   const daemonSessionId = options.sessionId ?? randomUUID().slice(0, 12);
   const pause = options.sleep ?? sleep;
   const rng = options.rng ?? Math.random;
+  /** Natural typing speed for this daemon session, drawn once (0.85-1.15) on the first use. */
+  let typingSpeed: number | undefined;
+  const typingSpeedFactor = (): number => (typingSpeed ??= 0.85 + rng() * 0.3);
   const now = options.now ?? (() => Date.now());
   const isNatural = (input: Json): boolean => isNaturalEnabled(input, { defaultEnabled: options.naturalDefault });
   /** Per-tab pointer state keyed by resolved top-level target id (without frame suffix). */
@@ -1066,7 +1069,7 @@ export function createPageHelperHandler(
     text: string,
     mode: "human" | "fast" | "keys",
     targetId?: string,
-    opts: { focused?: boolean } = {},
+    opts: { focused?: boolean; fieldKind?: FieldKind } = {},
   ): Promise<InvokeResult> {
     if (text === "") {
       return pressKey("Backspace", targetId);
@@ -1092,33 +1095,59 @@ export function createPageHelperHandler(
       }
       return success("ok");
     }
-    // Default: human/natural typing with realistic hold times, variable cadence, and occasional self-corrected typos.
-    const plan = buildHumanKeystrokes(text, { rng });
-    for (const step of plan) {
-      if (step.kind === "backspace") {
-        const bs = await pressKey("Backspace", targetId, step.holdMs);
-        if (!bs.ok) return bs;
-      } else if (step.kind === "insert") {
-        const ins = await cdp("Input.insertText", { text: step.text }, targetId, INPUT_TIMEOUT_MS);
-        if (!ins.ok) return ins;
-      } else {
+    // Default: natural typing — human cadence, rollover, real Shift, and self-corrected typos.
+    const plan = planTyping(text, {
+      rng,
+      speedFactor: typingSpeedFactor(),
+      fieldKind: opts.fieldKind ?? "prose",
+    });
+    const held = new Map<string, CharKeySpec>();
+    try {
+      for (const step of plan.events) {
+        if (step.delayMs > 0) await pause(step.delayMs);
+        if (step.kind === "insert") {
+          const ins = await cdp("Input.insertText", { text: step.text }, targetId, INPUT_TIMEOUT_MS);
+          if (!ins.ok) return ins;
+          continue;
+        }
         const base: Json = {
           key: step.spec.key,
           code: step.spec.code,
           windowsVirtualKeyCode: step.spec.windowsVirtualKeyCode,
           ...(step.spec.modifiers ? { modifiers: step.spec.modifiers } : {}),
         };
-        const down = step.spec.text !== undefined
-          ? await cdp("Input.dispatchKeyEvent", { type: "keyDown", ...base, text: step.spec.text }, targetId, INPUT_TIMEOUT_MS)
-          : await cdp("Input.dispatchKeyEvent", { type: "rawKeyDown", ...base }, targetId, INPUT_TIMEOUT_MS);
-        if (!down.ok) return down;
-        if (step.holdMs > 0) await pause(step.holdMs);
-        const up = await cdp("Input.dispatchKeyEvent", { type: "keyUp", ...base }, targetId, INPUT_TIMEOUT_MS);
-        if (!up.ok) return up;
+        if (step.kind === "keyDown") {
+          const down = step.spec.text !== undefined
+            ? await cdp("Input.dispatchKeyEvent", { type: "keyDown", ...base, text: step.spec.text }, targetId, INPUT_TIMEOUT_MS)
+            : await cdp("Input.dispatchKeyEvent", { type: "rawKeyDown", ...base }, targetId, INPUT_TIMEOUT_MS);
+          if (!down.ok) return down;
+          held.set(step.spec.key, step.spec);
+        } else {
+          const up = await cdp("Input.dispatchKeyEvent", { type: "keyUp", ...base }, targetId, INPUT_TIMEOUT_MS);
+          if (!up.ok) return up;
+          held.delete(step.spec.key);
+        }
       }
-      if (step.pauseAfterMs > 0) await pause(step.pauseAfterMs);
+      return success("ok");
+    } finally {
+      // Never leave a key down, including when a dispatch fails part-way through.
+      for (const spec of [...held.values()].reverse()) {
+        await cdp(
+          "Input.dispatchKeyEvent",
+          { type: "keyUp", key: spec.key, code: spec.code, windowsVirtualKeyCode: spec.windowsVirtualKeyCode },
+          targetId,
+          INPUT_TIMEOUT_MS,
+        ).catch(() => {});
+      }
     }
-    return success("ok");
+  }
+
+  /** Field kind for typo policy: `none` for a focused field we can't inspect and for secure fields. */
+  async function fieldKindOf(text: string, hint: string, ref?: string, targetId?: string): Promise<FieldKind> {
+    if (!ref) return "none";
+    const probe = await evalHelper({ kind: "bc", method: "value", args: [ref] }, targetId, 2_000);
+    if (probe.ok && valueOf(probe) === "__secure__") return "none";
+    return classifyFieldKind(text, hint);
   }
 
   async function waitParsed(targetId?: string): Promise<void> {
@@ -1561,7 +1590,7 @@ export function createPageHelperHandler(
           const isPic = !quiet && (await picture.isPicture(targetId));
           const beforeHash = isPic ? await picture.canvasHash(targetId) : "";
           const before = quiet || isPic ? undefined : await evalHelper({ kind: "bc", method: "baseline" }, targetId);
-          const sent = await dispatchText(text, mode, targetId, { focused: true });
+          const sent = await dispatchText(text, mode, targetId, { focused: true, fieldKind: "none" });
           if (!sent.ok) return inputFailed(sent, "type --focused");
           const line = "type --focused: sent to whatever has focus (not read back)";
           if (isPic) return success(`${line}\n${await picture.pictureChanges(targetId, beforeHash)}`);
@@ -1611,7 +1640,8 @@ export function createPageHelperHandler(
             if (editorRef) {
               await evalHelper({ kind: "bc", method: "focusForType", args: [editorRef] }, fieldTarget);
             }
-            const sent = await dispatchText(text, mode, targetId);
+            const cellKind = mode === "human" ? await fieldKindOf(text, String(input["ref"] ?? ""), editorRef ?? undefined, fieldTarget) : undefined;
+            const sent = await dispatchText(text, mode, targetId, { fieldKind: cellKind });
             if (!sent.ok) return inputFailed(sent, `type ${name}`);
             await pressKey("Enter", targetId);
             await sleep(150);
@@ -1650,7 +1680,10 @@ export function createPageHelperHandler(
             return failure("EXECUTION_FAILED", `type ${name}: not_delivered (the click did not focus it; try snap again)`);
           }
         }
-        const sent = await dispatchText(text, mode, targetId);
+        const typeKind = mode === "human"
+          ? await fieldKindOf(text, String(input["ref"] ?? ""), loc.kind === "ax" ? undefined : activeRef, fieldTarget)
+          : undefined;
+        const sent = await dispatchText(text, mode, targetId, { fieldKind: typeKind });
         if (!sent.ok) return inputFailed(sent, `type ${name}`);
         if (loc.kind === "ax") {
           return withChanges(`${healPrefix}type ${name}: delivered_unverified (accessibility ref, not read back)`, at.pt.before, quiet, targetId);
