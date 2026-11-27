@@ -1192,7 +1192,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
       rejectedBudget > 0 ? recentRejections.filter((e) => e.seq > minSeq).slice(-rejectedBudget) : [];
     const records = [...rejectedEntries.map((e) => ({ ...e.record })), ...pending];
     const reserved = latestPairedMismatch;
-    if (reserved && reserved.seq > minSeq && !rejectedEntries.includes(reserved)) {
+    if (reserved && reserved.seq > Math.max(minSeq, lastSuccessfulHandshakeSeq) && !rejectedEntries.includes(reserved)) {
       if (records.length >= MAX_TRACKED_HANDSHAKES) records.shift();
       records.unshift({ ...reserved.record });
     }
@@ -2303,6 +2303,7 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
       }
       preAuthSockets.clear();
       recentRejections.length = 0;
+      latestPairedMismatch = undefined;
       for (const link of [...links.values()]) {
         failLinkPending(link, "relay disposed");
         clearHandshakeTimer(link.ws);

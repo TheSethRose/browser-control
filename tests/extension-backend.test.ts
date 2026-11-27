@@ -1948,6 +1948,34 @@ describe("relay handshake tracking, fix lines, and timeout", () => {
     pending.close();
   });
 
+  test("S13: a reserved mismatch from before a successful connect never displaces a newer rejection", async () => {
+    const token = randomBytes(32).toString("hex");
+    const backend = createExtensionBackend({ ...allocPortWindow(), token, helpersVersion: 9, waitConnectMs: 80, listTargetsWaitMs: 80 });
+    disposables.push(backend);
+    await backend.start!();
+    const port = backend.getPort()!;
+
+    const stale = await sendPairedHelpersMismatch(port, token, { profileId: "p-stale", helpersVersion: 8 });
+    expect(stale.code).toBe(CLOSE_VERSION_MISMATCH);
+    const good = await connectMockExtension(port, token, undefined, { profileId: "p-good" });
+    const refused = await sendPairedHelpersMismatch(port, randomBytes(32).toString("hex"), { profileId: "p-other", helpersVersion: 7 });
+    expect(refused.code).toBe(CLOSE_AUTH_REFUSED);
+    const pending: WebSocket[] = [];
+    for (let i = 0; i < MAX_TRACKED_HANDSHAKES - 1; i++) {
+      const ws = openWs(`ws://127.0.0.1:${port}/extension`);
+      await waitOpen(ws);
+      pending.push(ws);
+    }
+    await new Promise((r) => setTimeout(r, 20));
+
+    const records = backend.getHandshakeRecords();
+    expect(records).toHaveLength(MAX_TRACKED_HANDSHAKES);
+    expect(records.some((r) => r.closeCode === CLOSE_AUTH_REFUSED)).toBe(true);
+    expect(records.some((r) => r.closeCode === CLOSE_VERSION_MISMATCH)).toBe(false);
+    for (const ws of pending) ws.close();
+    good.ws.close();
+  });
+
   test("S1: hostile values in every hello field and peer close text never appear in status or diagnostics", async () => {
     const token = randomBytes(32).toString("hex");
     const wrongToken = randomBytes(32).toString("hex");
