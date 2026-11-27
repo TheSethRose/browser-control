@@ -4,7 +4,7 @@
 //
 //   POST /call/<operation>   JSON object body -> InvokeResult JSON (HTTP 400 when ok:false)
 //   POST /eval               JavaScript body  -> the value as text
-//   POST /nav                URL body         -> navigate result as text (?until=load&snap=1)
+//   POST /nav                URL body         -> navigate result as text (?until=load&snap=1&new_window=1&keep_open=1)
 //   POST /page/<action>      JSON body        -> page helper result as text
 //        actions: snap, text, form, query, read-urls, click, hover, dialog, emulate, type,
 //                 select, upload, drag, wait, key, value, ocr, do, shot, verdict, health,
@@ -223,7 +223,13 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
           await requestBrowser.run(navScope, () =>
             handlePage(
               "nav",
-              { url: body, until: url.searchParams.get("until") ?? "", snap: url.searchParams.get("snap") === "1" },
+              {
+                url: body,
+                until: url.searchParams.get("until") ?? "",
+                snap: url.searchParams.get("snap") === "1",
+                newWindow: url.searchParams.get("new_window") === "1",
+                keepOpen: url.searchParams.get("keep_open") === "1",
+              },
               targetId,
             ),
           ),

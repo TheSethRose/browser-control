@@ -920,6 +920,7 @@ async function navigateTab(tabId, rawUrl, until, timeoutMs, opts = {}) {
 
   if (tabId) {
     if (!tabAllowed(tabId)) throw new Error(`REFUSED: tab ${tabId} is not lent`);
+    if (opts.keepOpen === true && agentTabs.has(tabId)) tabCleanup.markKeepOpen(tabId, true);
     const existing = await chrome.tabs.get(tabId).catch(() => null);
     if (existing?.url && url.includes("#") && stripHash(existing.url) === stripHash(url) && existing.url !== url) {
       await chrome.tabs.update(tabId, { url });

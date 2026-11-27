@@ -1612,6 +1612,11 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
             }
           }
 
+          const newWindow = input["newWindow"] === true;
+          const keepOpen = input["keepOpen"] === true;
+          // A new window always means a new tab, so the resolved tab only picks the browser.
+          if (newWindow) tabId = undefined;
+
           const res = (await requestOnLink(
             targetLink,
             "navigate",
@@ -1619,6 +1624,8 @@ export function createExtensionBackend(options: ExtensionBackendOptions = {}): E
               ...(tabId !== undefined ? { tabId } : {}),
               url,
               until,
+              ...(newWindow ? { newWindow: true } : {}),
+              ...(keepOpen ? { keepOpen: true } : {}),
               ...(timeoutMs !== undefined ? { timeoutMs } : {}),
             },
             (timeoutMs ?? 30_000) + 10_000,

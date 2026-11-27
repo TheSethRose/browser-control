@@ -137,6 +137,17 @@ describe("wrapper v2 page commands", () => {
     expect(new URLSearchParams(req.query).get("browser")).toBe("brave");
   });
 
+  test("nav --new-window and --keep-open reach the daemon", async () => {
+    const req = await call("nav", "https://example.test/", "--new-window", "--keep-open");
+    expect(req.path).toBe("/nav");
+    const q = new URLSearchParams(req.query);
+    expect(q.get("new_window")).toBe("1");
+    expect(q.get("keep_open")).toBe("1");
+    const plain = new URLSearchParams((await call("nav", "https://example.test/")).query);
+    expect(plain.get("new_window")).toBeNull();
+    expect(plain.get("keep_open")).toBeNull();
+  });
+
   test("dialog dismiss takes a target, not prompt text", async () => {
     const r = await call("dialog", "dismiss", "extension:42");
     expect(JSON.parse(r.body)).toEqual({ sub: "dismiss" });
