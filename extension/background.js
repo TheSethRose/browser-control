@@ -565,6 +565,10 @@ export { agentTabs, handoffTabs };
 
 const BC_DIALOG_PROBE_DELAY_MS = 1_500;
 const BC_LIVENESS_PROBE_TIMEOUT_MS = 400;
+// Chrome never settles an executeScript whose document a browser-side navigation replaces mid-call
+// (tabs.update, omnibox, history), so bc_call watches for the commit and reruns or fails fast.
+const BC_MAX_NAVIGATION_RETRIES = 2;
+const BC_WRITE_METHODS = new Set(["select", "setTypedValue", "focusForType", "markBoxes", "scrollRead", "tagFrames"]);
 const RESOLVE_MARKER_TTL_MS = 10_000;
 
 function assertTabAllowed(tabId) {
@@ -644,7 +648,14 @@ export async function runBcSilent(tabId, steps, opts = {}) {
   let settled = false;
   let cancelled = false;
   let timedOut = false;
-  const isCancelled = () => cancelled;
+  let livenessStalledSeen = false;
+  let rejectNavigated;
+  const targetFrame = typeof opts.frameId === "number" ? opts.frameId : 0;
+  const onCommitted = (details) => {
+    if (details.tabId !== tabId || (details.frameId !== 0 && details.frameId !== targetFrame)) return;
+    rejectNavigated?.(new Error("__BC_NAVIGATED__"));
+  };
+  chrome.webNavigation?.onCommitted?.addListener(onCommitted);
   const dialogPromise = new Promise((_, reject) => {
     unsubscribe = debuggerHub.subscribeDialogOpening(tabId, (dialog) => {
       cancelled = true;
@@ -700,6 +711,7 @@ export async function runBcSilent(tabId, steps, opts = {}) {
         .then((answered) => {
           clearTimeout(livenessTimer);
           if (answered || !livenessStalled || settled || cancelled || !tabAllowed(tabId)) return;
+          livenessStalledSeen = true;
           return probeOpenDialog(tabId, {
             allowUnconfirmed: false,
             waitMs: Math.min(1_000, Math.max(200, timeoutMs - probeDelayMs - probeWaitMs)),
@@ -711,20 +723,39 @@ export async function runBcSilent(tabId, steps, opts = {}) {
     }, probeDelayMs);
   }
 
-  const stepsPromise = runBcSteps(tabId, steps, opts.frameId, isCancelled);
-  stepsPromise.catch(() => {});
+  let navigations = 0;
   try {
-    return await Promise.race([stepsPromise, dialogPromise, earlyProbePromise, timeoutPromise]);
+    for (;;) {
+      const token = { stale: false, ran: false };
+      const stepsPromise = runBcSteps(tabId, steps, opts.frameId, () => cancelled || token.stale, () => {
+        token.ran = true;
+      });
+      stepsPromise.catch(() => {});
+      const navigated = new Promise((_, reject) => {
+        rejectNavigated = reject;
+      });
+      navigated.catch(() => {});
+      try {
+        return await Promise.race([stepsPromise, navigated, dialogPromise, earlyProbePromise, timeoutPromise]);
+      } catch (err) {
+        if (String(err?.message || "") !== "__BC_NAVIGATED__" || cancelled) throw err;
+        token.stale = true;
+        if (token.ran && steps.some((st) => st?.kind === "bc" && BC_WRITE_METHODS.has(st.method))) {
+          throw new Error(`EXECUTION_FAILED: tab ${tabId} loaded a new page while the step ran; snap, then retry`);
+        }
+        if (++navigations > BC_MAX_NAVIGATION_RETRIES) {
+          throw new Error(`EXECUTION_FAILED: tab ${tabId} kept loading new pages during the call; wait for it to settle, then retry`);
+        }
+      }
+    }
   } catch (err) {
     cancelled = true;
     if (timedOut || String(err?.message || "") === "__BC_TIMEOUT__") {
       const dialogErr = await probeOpenDialog(tabId, { allowUnconfirmed: true, waitMs: 1_000 });
-      throw (
-        dialogErr ||
-        new Error(
-          `EXECUTION_FAILED: tab ${tabId} got no answer in ${timeoutMs} ms (a JavaScript dialog may be blocking the page)`,
-        )
-      );
+      const hint = livenessStalledSeen
+        ? "a JavaScript dialog may be blocking the page"
+        : "no dialog detected; the page may be busy or still loading";
+      throw dialogErr || new Error(`EXECUTION_FAILED: tab ${tabId} got no answer in ${timeoutMs} ms (${hint})`);
     }
     if (String(err?.message || err).startsWith("DIALOG_OPEN:")) {
       throw err instanceof Error ? err : new Error(String(err));
@@ -736,10 +767,11 @@ export async function runBcSilent(tabId, steps, opts = {}) {
     clearTimeout(probeTimer);
     clearTimeout(livenessTimer);
     unsubscribe?.();
+    chrome.webNavigation?.onCommitted?.removeListener(onCommitted);
   }
 }
 
-async function runBcSteps(tabId, steps, frameId, isCancelled = () => false) {
+async function runBcSteps(tabId, steps, frameId, isCancelled = () => false, onRun = () => {}) {
   if (isCancelled() || debuggerHub.getOpenDialog(tabId)) {
     throw new Error("CANCELLED: bc_call aborted");
   }
@@ -763,6 +795,7 @@ async function runBcSteps(tabId, steps, frameId, isCancelled = () => false) {
       throw new Error("CANCELLED: bc_call aborted");
     }
   }
+  onRun();
   const exec = await chrome.scripting.executeScript({
     target,
     world: "ISOLATED",

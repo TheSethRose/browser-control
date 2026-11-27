@@ -39,6 +39,10 @@ function findChrome(): string | undefined {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const PIXEL = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=",
+  "base64",
+);
 
 type Result = { name: string; ok: boolean; detail: string };
 const results: Result[] = [];
@@ -231,6 +235,8 @@ async function main(): Promise<number> {
     ...process.env,
     XDG_CONFIG_HOME: xdg,
     BROWSER_CONTROL_BACKENDS: "extension",
+    // Natural (human-paced) input on explicitly, whatever the caller's shell says.
+    BROWSER_CONTROL_NATURAL: "1",
     BROWSER_CONTROL_DAEMON_DIR: daemonDir,
     [RELAY_PORTS_ENV]: `${relayPort}-${relayPort}`,
   };
@@ -295,6 +301,9 @@ async function main(): Promise<number> {
       hostname: "127.0.0.1",
       fetch(req) {
         const path = new URL(req.url).pathname;
+        if (path === "/form") return new Response(read("form.html"), html);
+        // Keeps the form page loading for 3 s after DOMContentLoaded, as slow trackers do on real sites.
+        if (path === "/slow.png") return sleep(3000).then(() => new Response(PIXEL, { headers: { "content-type": "image/png" } }));
         if (path === "/challenge") return new Response(read("challenge.html"), { ...html, status: 403 });
         if (path === "/popup") return new Response(read("popup.html"), html);
         return new Response(read("page.html").replaceAll("__FRAME__", frameUrl), html);
@@ -472,6 +481,37 @@ async function main(): Promise<number> {
       tabsAfterClose === tabsBeforeClose - 1 && openedId !== "" && !tabsAfterCloseList.includes(openedId),
       `before=${tabsBeforeClose} after=${tabsAfterClose} id=${openedId}`,
     );
+
+    // Fresh tab, nav, then an immediate natural 10-field fill, five times; every field must read back exactly.
+    const steps = JSON.stringify([
+      { type: ["Full name", "Ada Lovelace"] },
+      { type: ["Email address", "ada@example.com"] },
+      { type: ["Phone number", "5550100"] },
+      { type: ["Company", "Analytical Engines"] },
+      { type: ["Website", "https://example.com"] },
+      { type: ["Start date", "2026-11-27"] },
+      { select: ["Country", "Canada"] },
+      { type: ["Notes", "First program"] },
+      { click: "Accept terms" },
+      { click: "Pro plan" },
+    ]);
+    const want = "Ada Lovelace|ada@example.com|5550100|Analytical Engines|https://example.com|2026-11-27|ca|First program|true|pro";
+    const readBack =
+      "['name','email','phone','company','site','date','country','notes'].map((k)=>document.getElementById('f-'+k).value)" +
+      ".concat(String(document.getElementById('f-terms').checked), document.querySelector('[name=plan]:checked')?.value ?? '').join('|')";
+    const fillMs: number[] = [];
+    for (let run = 1; run <= 5; run++) {
+      await bc(["call", "clear_target"]);
+      const navOut = await bc(["nav", `${base}/form`]);
+      const formTab = /"targetId":"(extension:[^"]+)"/.exec(navOut)?.[1] ?? "";
+      const t0 = Date.now();
+      const out = await bc(["do", steps], 120_000);
+      fillMs.push(Date.now() - t0);
+      const got = await evalJs(readBack);
+      record(`natural-fill-fresh-${run}`, formTab !== "" && !/FAILED|STOPPED/.test(out) && got.includes(want), `${got} :: ${out}`);
+      if (formTab) await bc(["close", formTab]);
+    }
+    console.log(`TIMING natural-fill-fresh ms=${fillMs.join(",")}`);
 
     // The backends file the wrapper writes steers the shipped daemon and outranks the env var.
     const tid = /extension:[A-Za-z0-9:@-]*[A-Za-z0-9]/.exec(await bc(["tabs"]))?.[0] ?? "";

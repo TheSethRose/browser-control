@@ -1043,6 +1043,7 @@ function makeBackgroundChrome(opts: {
     tabs: opts.tabs ?? [{ id: 7, windowId: 1, url: "https://app.test", active: true, groupId: -1 }],
   });
   const noopListener = { addListener: () => {}, removeListener: () => {} };
+  const commitListeners = new Set<(d: { tabId: number; frameId: number }) => void>();
   const debuggerEventListeners: Array<(source: { tabId: number }, method: string, params: unknown) => void> = [];
   const messageListeners: Array<
     (msg: Record<string, unknown>, sender: unknown, sendResponse: (res: unknown) => void) => unknown
@@ -1099,11 +1100,20 @@ function makeBackgroundChrome(opts: {
       onReplaced: noopListener,
       sendMessage: async () => ({ ok: true }),
     },
-    webNavigation: { onCreatedNavigationTarget: noopListener },
+    webNavigation: {
+      onCreatedNavigationTarget: noopListener,
+      onCommitted: {
+        addListener: (fn: (d: { tabId: number; frameId: number }) => void) => commitListeners.add(fn),
+        removeListener: (fn: (d: { tabId: number; frameId: number }) => void) => commitListeners.delete(fn),
+      },
+    },
     storage: { ...fake.chrome.storage, onChanged: noopListener },
   };
+  const emitCommitted = (tabId: number, frameId = 0) => {
+    for (const fn of [...commitListeners]) fn({ tabId, frameId });
+  };
 
-  return { fullChrome, calls: fake.calls, cdpCalls, executeScriptCalls, emitDebuggerEvent, sendRuntimeMessage };
+  return { fullChrome, calls: fake.calls, cdpCalls, executeScriptCalls, emitDebuggerEvent, sendRuntimeMessage, emitCommitted, commitListeners };
 }
 
 async function withBackgroundModule<T>(
@@ -1516,6 +1526,95 @@ describe("background.js resolveBcNode & runBcSilent review fixes (S1, S3, S6, S7
       expect(values).toEqual(["https://app.test/slow"]);
       expect(envSlow.calls.some((c) => c.api === "debugger.attach")).toBe(false);
       expect(envSlow.cdpCalls.length).toBe(0);
+    });
+  });
+
+  // Chrome never settles an executeScript whose document a browser-side navigation replaces mid-call
+  // (seen live in Chrome for Testing 1255: no answer after 10 s).
+  const lostOnFirstRun = (onRun: () => void, value: string) => {
+    let runs = 0;
+    return async (details: unknown) => {
+      const d = details as { args?: unknown[] };
+      if (Array.isArray(d.args) && typeof d.args[0] === "number") return [{ result: true }];
+      if (Array.isArray(d.args) && Array.isArray(d.args[0])) {
+        if (++runs === 1) {
+          onRun();
+          return new Promise(() => {});
+        }
+        return [{ result: { ok: true, values: [value] } }];
+      }
+      return [{ result: 1 }];
+    };
+  };
+
+  test("N1: a read lost to a new document commit reruns on the new page instead of waiting out the timeout", async () => {
+    let env!: ReturnType<typeof makeBackgroundChrome>;
+    env = makeBackgroundChrome({
+      executeScript: lostOnFirstRun(() => setTimeout(() => env.emitCommitted(7), 10), "https://app.test/next"),
+    });
+    await withBackgroundModule("n1-nav-rerun", env.fullChrome, async (bg) => {
+      const t0 = Date.now();
+      const values = await bg.runBcSilent(7, [{ kind: "href" }, { kind: "bc", method: "baseline" }], { timeoutMs: 10_000 });
+      expect(values).toEqual(["https://app.test/next"]);
+      expect(Date.now() - t0).toBeLessThan(1_000);
+      expect(env.commitListeners.size).toBe(0);
+    });
+  });
+
+  test("N2: a write lost to a new document fails fast instead of repeating it on the new page", async () => {
+    let env!: ReturnType<typeof makeBackgroundChrome>;
+    env = makeBackgroundChrome({
+      executeScript: lostOnFirstRun(() => setTimeout(() => env.emitCommitted(7), 10), "selected"),
+    });
+    await withBackgroundModule("n2-nav-write", env.fullChrome, async (bg) => {
+      const t0 = Date.now();
+      await expect(
+        bg.runBcSilent(7, [{ kind: "bc", method: "select", args: ["e3", "Canada"] }], { timeoutMs: 10_000 }),
+      ).rejects.toThrow(/loaded a new page while the step ran/);
+      expect(Date.now() - t0).toBeLessThan(1_000);
+      const runs = env.executeScriptCalls.filter((c) => Array.isArray((c as { args?: unknown[] }).args?.[0]));
+      expect(runs.length).toBe(1);
+    });
+  });
+
+  test("N3: other tabs' and child frames' commits do not restart the call", async () => {
+    let env!: ReturnType<typeof makeBackgroundChrome>;
+    env = makeBackgroundChrome({
+      executeScript: async (details) => {
+        const d = details as { args?: unknown[] };
+        if (Array.isArray(d.args) && Array.isArray(d.args[0])) {
+          env.emitCommitted(8);
+          env.emitCommitted(7, 3);
+          await new Promise((r) => setTimeout(r, 20));
+          return [{ result: { ok: true, values: ["same"] } }];
+        }
+        return [{ result: true }];
+      },
+    });
+    await withBackgroundModule("n3-nav-other", env.fullChrome, async (bg) => {
+      expect(await bg.runBcSilent(7, [{ kind: "href" }], { timeoutMs: 5_000 })).toEqual(["same"]);
+      expect(env.executeScriptCalls.filter((c) => Array.isArray((c as { args?: unknown[] }).args?.[0])).length).toBe(1);
+    });
+  });
+
+  test("N4: a timeout on a page that still answers does not blame a dialog", async () => {
+    const env = makeBackgroundChrome({
+      executeScript: async (details) => {
+        const d = details as { args?: unknown[] };
+        if (Array.isArray(d.args) && Array.isArray(d.args[0])) return new Promise(() => {});
+        return [{ result: true }];
+      },
+      sendCommand: async (_t, method) => (method === "Runtime.evaluate" ? { result: { value: 1 } } : {}),
+    });
+    await withBackgroundModule("n4-no-dialog-hint", env.fullChrome, async (bg) => {
+      let msg = "";
+      try {
+        await bg.runBcSilent(7, [{ kind: "href" }], { timeoutMs: 150, dialogProbeDelayMs: 20, livenessProbeTimeoutMs: 30 });
+      } catch (e) {
+        msg = (e as Error).message;
+      }
+      expect(msg).toContain("got no answer in 150 ms (no dialog detected");
+      expect(msg).not.toContain("dialog may be blocking");
     });
   });
 
