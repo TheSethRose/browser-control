@@ -80,9 +80,17 @@ const PAGE_ACTIONS = [
 const DEFAULT_HANDOFF_TIMEOUT_MS = 10 * 60 * 1000;
 const CHALLENGE_WAIT_MAX_MS = 8_000;
 const CHALLENGE_POLL_MS = 500;
+const CHALLENGE_PROBE_RESERVE_MS = 250;
 const CHALLENGE_PROBE_SEP = "\n__BC_CHALLENGE_SEP__\n";
 const CHALLENGE_PROBE_EXPR = buildChallengeProbeExpression(false);
 const FAST_VENDOR_CSS = fastVendorSelectors.join(",");
+/** One cheap querySelector-style check for known challenge markers (`# N row(s)` header). */
+const VENDOR_MARKER_STEP = {
+  kind: "bc",
+  method: "query",
+  args: [{ selector: FAST_VENDOR_CSS, fields: { id: "@id" }, limit: 1, all: true }],
+  fallback: "",
+} as const;
 const PROBE_SELECTORS_CSS = probeSelectors.join(",");
 const EXTENSION_REQUEST_SYMBOL = Symbol.for("browser-control.extension-request");
 type ExtensionRequestFn = (op: string, params?: Json, timeoutMs?: number) => Promise<unknown>;
@@ -1571,7 +1579,9 @@ export function createPageHelperHandler(
     try {
       const digest = await writeOutputFile(outPath, valueOf(res));
       const preview = valueOf(res).split("\n").slice(0, 12).join("\n");
-      return success(`${digest}\n${preview}`);
+      const challenge = (res.data as Json | undefined)?.["challenge"];
+      const value = `${digest}\n${preview}`;
+      return challenge !== undefined ? { ok: true, data: { value, challenge } } : success(value);
     } catch (err) {
       return failure("EXECUTION_FAILED", `ARTIFACT_WRITE_FAILED: ${(err as Error).message}`);
     }
@@ -1891,7 +1901,11 @@ export function createPageHelperHandler(
     let waitedMs = 0;
     const remainingBudget = () => Math.max(0, Math.min(deadline - Date.now(), waitMaxMs - waitedMs));
     while (remainingBudget() > 0) {
-      const step = Math.min(CHALLENGE_POLL_MS, remainingBudget());
+      // Keep part of the budget for one last probe so a page that clears near the deadline is seen.
+      const rem = remainingBudget();
+      const reserve = Math.min(CHALLENGE_PROBE_RESERVE_MS, Math.floor(rem / 2));
+      const last = rem - reserve <= CHALLENGE_POLL_MS;
+      const step = Math.min(CHALLENGE_POLL_MS, rem - reserve);
       if (step <= 0) break;
       await pause(step);
       waitedMs += step;
@@ -1913,6 +1927,7 @@ export function createPageHelperHandler(
       if (detection.kind === "interactive") {
         return { status: "interactive", detection, url: lastProbe.url || opts.knownUrl || "", waited: true };
       }
+      if (last) break;
     }
 
     return {
@@ -1972,7 +1987,10 @@ export function createPageHelperHandler(
           }
           if (challenge.status === "interactive" || challenge.status === "non-interactive-timeout") {
             const targetUrl = challenge.url || snapUrl || "";
-            challengePrefix = formatChallengeOutput(challenge.detection, targetUrl, { backend: challengeBackend });
+            challengePrefix = formatChallengeOutput(challenge.detection, targetUrl, {
+              backend: challengeBackend,
+              untrustedBoundary: true,
+            });
             challengeMeta = challengeDataOf(challenge.detection, challenge.status, targetUrl, challengeBackend);
           } else if (challenge.waited) {
             const refreshed = await evalHelper({ kind: "bc", method: "snapshot", args: [opts] }, targetId);
@@ -2086,6 +2104,7 @@ export function createPageHelperHandler(
                 { kind: "bc", method: "settle", discard: true },
                 { kind: "href" },
                 { kind: "bc", method: "wall", fallback: "" },
+                VENDOR_MARKER_STEP,
               ],
               join: "\n",
             },
@@ -2094,18 +2113,20 @@ export function createPageHelperHandler(
           );
           let url = "";
           let wall = "";
-          if (state.ok) [url = "", wall = ""] = valueOf(state).split("\n");
+          let rest: string[] = [];
+          if (state.ok) [url = "", wall = "", ...rest] = valueOf(state).split("\n");
           else {
             await waitParsed(targetId);
             const again = await evalHelper(
-              { steps: [{ kind: "href" }, { kind: "bc", method: "wall", fallback: "" }], join: "\n" },
+              { steps: [{ kind: "href" }, { kind: "bc", method: "wall", fallback: "" }, VENDOR_MARKER_STEP], join: "\n" },
               targetId,
               8_000,
             );
-            if (again.ok) [url = "", wall = ""] = valueOf(again).split("\n");
+            if (again.ok) [url = "", wall = "", ...rest] = valueOf(again).split("\n");
           }
+          const markerRows = rest.join("\n");
           const navigated = Boolean(url && prevUrl && stripHash(url) !== stripHash(prevUrl));
-          const challengeWall = wall === "captcha" || wall === "rate-limit";
+          const challengeWall = wall === "captcha" || wall === "rate-limit" || /^# [1-9]\d* row/.test(markerRows);
           if (browseTab === undefined && (navigated || challengeWall)) {
             const challenge = await checkChallenge(targetId, { wallHint: wall, knownUrl: url });
             if (challenge.status === "block") {
@@ -2369,7 +2390,7 @@ export function createPageHelperHandler(
             return {
               ok: true,
               data: {
-                value: `${formatChallengeOutput(challenge.detection, targetUrl, { backend: challengeBackend })}\n${lines.join("\n")}`,
+                value: `${formatChallengeOutput(challenge.detection, targetUrl, { backend: challengeBackend, untrustedBoundary: true })}\n${lines.join("\n")}`,
                 challenge: challengeDataOf(challenge.detection, challenge.status, targetUrl, challengeBackend),
               },
             };
