@@ -394,7 +394,8 @@ export async function runPacingCheck(
     const maxJump = Math.max(0, ...ys.slice(1).map((y, i) => Math.abs(y - ys[i]!)));
     const clicked = evs.some((e) => e[0] === "click" && e[7] === "far");
     judged("pacing-wheel-flicks", wheels.length >= 2 && deltas.size >= 2, `wheels=${wheels.length} distinct deltaY=${deltas.size}`);
-    record("pacing-wheel-click", clicked, `clicked=${clicked} last=${JSON.stringify(evs.slice(-6))} :: ${farOut}`);
+    if (!clicked) console.log(`NOTE pacing far click output: ${farOut.replace(/\s+/g, " ")} :: last events ${JSON.stringify(evs.slice(-8))}`);
+    record("pacing-wheel-click", clicked, `clicked=${clicked}`);
     judged("pacing-wheel-no-jump", maxJump <= 680 && ys.length > 1, `max scroll jump=${maxJump}px over ${ys.length - 1} scroll events`);
   }
 
