@@ -12,6 +12,7 @@
 
 import type { ChallengeDetection } from "./challenges";
 import { sanitizeChallengeText } from "./challenges";
+import { wrapUntrusted } from "./safety";
 
 /** What the widget on the page looks like. Best-effort: "unknown" means read the page. */
 export type WidgetType = "checkbox" | "image" | "slider" | "audio" | "video" | "unknown";
@@ -80,6 +81,11 @@ function safeReason(reason: string): string {
   return sanitizeChallengeText(reason, 160) || "security check";
 }
 
+/** The page-derived reason, always inside its own untrusted-content boundary. */
+function reasonBoundary(detection: ChallengeDetection): string {
+  return wrapUntrusted(`reason: ${safeReason(detection.reason)}`);
+}
+
 /**
  * One bounded report block for the agent. Never throws.
  * The first line is the verdict; the next lines say what to do and how to verify.
@@ -98,16 +104,19 @@ export function formatCaptchaReport(status: CaptchaStatus, verify = false): stri
       : `CAPTCHA: unknown — the probe failed to read the page. Is the tab alive? Try snap.`;
   }
 
-  const { vendor, kind, reason } = status.detection;
-  const safe = safeReason(reason);
+  const { vendor, kind } = status.detection;
 
   if (kind === "block") {
-    return `BLOCKED: ${vendor} refused the visit on ${origin} (${safe}). Stop and tell the user; do not retry or reload in a loop.`;
+    return [
+      `BLOCKED: ${vendor} refused the visit on ${origin}. Stop and tell the user; do not retry or reload in a loop.`,
+      reasonBoundary(status.detection),
+    ].join("\n");
   }
 
   if (kind === "interactive") {
     const widget = widgetTypeOf(status.detection);
-    const lines = [`CAPTCHA${verify ? " verify" : ""}: ${vendor} interactive on ${origin} (${safe})`];
+    const lines = [`CAPTCHA${verify ? " verify" : ""}: ${vendor} interactive on ${origin}`];
+    lines.push(reasonBoundary(status.detection));
     lines.push(`widget (hint): ${widget} — ${ACTION_BY_WIDGET[widget]}`);
     lines.push(`verify: solve_captcha --verify`);
     if (verify) lines.push(`status: still present — the page did not clear after the answer`);
@@ -116,7 +125,8 @@ export function formatCaptchaReport(status: CaptchaStatus, verify = false): stri
 
   // non-interactive: report what to do, never claim it is still present without evidence.
   const waited = status.waited ? " (did not auto-clear within the wait budget)" : "";
-  const lines = [`CAPTCHA${verify ? " verify" : ""}: ${vendor} non-interactive on ${origin}${waited} (${safe})`];
+  const lines = [`CAPTCHA${verify ? " verify" : ""}: ${vendor} non-interactive on ${origin}${waited}`];
+  lines.push(reasonBoundary(status.detection));
   lines.push(`next: wait briefly, then re-check with solve_captcha --verify; hand off if stuck`);
   return lines.join("\n");
 }

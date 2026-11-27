@@ -478,9 +478,11 @@ To be upgraded/modularized in Phase 2: mutual HMAC + ECDH pairing (`lib/pairing.
 
 **What shipped (Phase A, opt-in):**
 
-- `solve_captcha` — report-only; `--verify` to re-check. Same `checkChallenge` engine; never solves, never clicks, never calls an API.
-- `src/captcha.ts` — widget-type classification (`checkbox | image | slider | audio | video | unknown`) + report builder. Pure module; zero I/O.
-- `tests/captcha.test.ts` — fixtures for classification, report shape, `--verify`, garbage-input safety, wiring.
+- `solve_captcha` — report-only; `--verify` to re-check with a forced full probe. Same `checkChallenge` engine; never solves, never clicks, never calls an API.
+- `src/captcha.ts` — widget-type classification (`checkbox | image | slider | audio | video | unknown`) + report builder. Pure module; zero I/O. The page-derived reason is always inside its own untrusted-content boundary.
+- `tests/captcha.test.ts` — fixtures for classification, report shape (+ untrusted boundary), `--verify`, garbage-input safety, both-tier wiring (CDP + silent extension tier, attach-free).
+
+**Verify semantics:** `--verify` does not prove the answer was accepted — it re-reads the page with a forced full probe (no fast-path skip) and reports `still present` vs `clear` vs `unknown`. The report proves detection evidence, not ground truth. A failed or incomplete read reports `unknown`, never `clear`.
 
 **Explicitly out of scope:** frame-ref `shot --ref`, crop-aware `ocr --ref`, `CHALLENGE:` remedy-line change, game heading reporting, `drag --xy`, paid opt-in providers. Extension: zero changes. No new permissions, dependencies, or network.
 

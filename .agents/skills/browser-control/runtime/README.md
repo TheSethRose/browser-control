@@ -280,7 +280,11 @@ On extension tabs:
   Use it for logins, 2FA, CAPTCHAs and payments.
 - `solve_captcha` reports what a challenge on the page looks like (vendor, widget type hint,
   suggested action, verify hint) — it never solves. The agent answers with its own tools
-  (click, type, drag, vision), then confirms with `solve_captcha --verify`.
+  (click, type, drag, vision), then confirms with `solve_captcha --verify`. A failed or
+  incomplete read reports `unknown`, never `clear`; the reason text always carries its own
+  untrusted-content boundary. `--verify` re-reads with a forced full probe (not the fast-path
+  skip) and reports `still present` vs `clear` vs `unknown` — it proves a page state, not that
+  the answer was accepted.
 - `nav --browser <slug>` picks a browser when more than one is connected.
   `extension browsers` lists the slugs.
 - The popup can limit the extension to tabs you share (`Only tabs I share`).

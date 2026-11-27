@@ -111,6 +111,28 @@ describe("formatCaptchaReport", () => {
     expect(out).toContain("solve_captcha --verify");
   });
 
+  test("the reason is page content in its own boundary, never mixed with tool guidance", () => {
+    const pageBits = [
+      { kind: "block" as const, vendor: "generic" as const, reason: "status 403, title: Access Denied" },
+      { kind: "interactive" as const, vendor: "recaptcha" as const, reason: "iframe https://www.google.com/recaptcha/api2/anchor#?k=x" },
+      { kind: "non-interactive" as const, vendor: "cloudflare" as const, reason: "title: Just a moment..." },
+    ];
+    for (const detection of pageBits) {
+      const status =
+        detection.kind === "non-interactive" ? ("non-interactive-timeout" as const)
+        : detection.kind === "interactive" ? ("interactive" as const)
+        : ("block" as const);
+      for (const verify of [false, true]) {
+        const out = formatCaptchaReport({ status, waited: false, url: "https://shop.example/", detection }, verify);
+        // The reason is not inline on the first line — it lives in its own boundary.
+        expect(out.split("\n")[0]).not.toContain(detection.reason);
+        expect(out).toContain("<<<UNTRUSTED_PAGE_CONTENT");
+        expect(out).toContain("reason: ");
+        expect(out).toContain("<<<END_UNTRUSTED_PAGE_CONTENT");
+      }
+    }
+  });
+
   test("never throws on garbage input", () => {
     expect(() => formatCaptchaReport({ status: "unknown", waited: false })).not.toThrow();
     expect(() => formatCaptchaReport({ status: "clear", waited: false, url: "not a url" })).not.toThrow();
@@ -204,6 +226,22 @@ describe("solve_captcha (page-runner)", () => {
     expect(res.ok).toBe(true);
     expect(textOf(res)).toBe("CAPTCHA verify: clear — no challenge detected on https://normal.example");
   });
+
+  test("verify mode on a page the probe cannot read reports unknown", async () => {
+    const h = cdpHarness("not-json");
+    const res = await h.handle("solve_captcha", { verify: true });
+    expect(res.ok).toBe(true);
+    expect(textOf(res)).toContain("unknown");
+    expect(textOf(res)).not.toContain("clear");
+  });
+
+  test("an unreadable CDP page reports unknown, never clear", async () => {
+    const h = cdpHarness("not-json");
+    const res = await h.handle("solve_captcha", {});
+    expect(res.ok).toBe(true);
+    expect(textOf(res)).toContain("unknown");
+    expect(textOf(res)).not.toContain("clear");
+  });
 });
 
 /** Extension harness: serves the silent bcCall tier, records which steps ran. */
@@ -216,11 +254,20 @@ function extensionHarness(page: {
   selectorRows?: Array<Record<string, string>>;
   visibleSelectorRows?: Array<Record<string, string>>;
   hasAwsCaptcha?: boolean;
+  /** Fail the quick probe (simulates an unreadable page). */
+  quickError?: boolean;
+  /** Return a quick readback that is missing fields (simulates an incomplete read). */
+  quickShort?: boolean;
 }) {
+  const calls: string[] = [];
   const formatRows = (sel: string, rows: Array<Record<string, string>>) =>
     [`# ${rows.length} row(s) for ${sel}`, ...rows.map((r) => JSON.stringify(r))].join("\n");
 
   const bcCall = async (input: BcCallInput) => {
+    if (page.quickError && input.steps.length <= 4) {
+      // The quick probe is the four-step read (href, title, text, FAST_VENDOR_CSS query).
+      return { ok: false, error: { code: "EXECUTION_FAILED", message: "quick probe unavailable" } } as never;
+    }
     const values = input.steps.map((step) => {
       if (step.kind === "href") return page.url;
       if (step.kind === "title") return page.title;
@@ -249,10 +296,12 @@ function extensionHarness(page: {
       return "ok";
     });
     const kept = values.filter((_, i) => !input.steps[i]?.discard);
+    if (page.quickShort && input.steps.length <= 4) return { value: kept.slice(0, 3).join(input.join ?? "\n") };
     return { value: kept.join(input.join ?? "\n") };
   };
 
-  const invoke = async (op: string): Promise<InvokeResult> => {
+  const invoke = async (op: string, input?: Record<string, unknown>): Promise<InvokeResult> => {
+    calls.push(op);
     if (op === "get_browser_status") {
       return {
         ok: true,
@@ -262,12 +311,13 @@ function extensionHarness(page: {
         },
       };
     }
-    if (op === "evaluate") return { ok: true, data: { value: 200 } };
-    return { ok: true, data: {} };
+    if (op === "evaluate") throw new Error(`unexpected evaluate on extension tier: ${String(input?.["expression"] ?? "")}`);
+    if (op.startsWith("Input.")) throw new Error(`unexpected CDP dispatch: ${op}`);
+    throw new Error(`unexpected invoke op: ${op}`);
   };
 
   const handle = createPageHelperHandler(invoke, undefined, undefined, { bcCall, sleep: async () => {} });
-  return { handle };
+  return { handle, calls };
 }
 
 describe("solve_captcha (extension harness)", () => {
@@ -285,14 +335,60 @@ describe("solve_captcha (extension harness)", () => {
     expect(out).toContain("widget (hint): checkbox");
   });
 
-  test("a normal extension page reports clear without an evaluate attach", async () => {
+  test("a normal extension page reports clear without an attach, an Input dispatch, or any read beyond one status check", async () => {
     const h = extensionHarness({
       url: "https://normal.example/page",
       title: "Catalog",
       bodyText: "Normal article paragraph with real product details and documentation. ".repeat(40),
     });
-    const res = await h.handle("solve_captcha", {}, "extension:42");
+    const res = await h.handle("solve_captcha", {});
     expect(res.ok).toBe(true);
     expect(textOf(res)).toContain("clear");
+    // One status check on the read path, nothing else: no chrome.debugger attach (evaluate),
+    // no CDP Input dispatch (the extension tier never sends gestures).
+    expect(h.calls).toEqual(["get_browser_status"]);
+  });
+
+  test("an unreadable page reports unknown, never clear", async () => {
+    const h = extensionHarness({
+      url: "https://shop.example/",
+      title: "Shop",
+      bodyText: "Verify you are human to continue",
+      quickError: true,
+    });
+    const res = await h.handle("solve_captcha", {});
+    expect(res.ok).toBe(true);
+    expect(textOf(res)).toContain("unknown");
+    expect(textOf(res)).not.toContain("clear");
+    expect(h.calls).toEqual(["get_browser_status"]);
+  });
+
+  test("an incomplete quick read reports unknown, never clear", async () => {
+    const h = extensionHarness({
+      url: "https://shop.example/",
+      title: "Shop",
+      bodyText: "Verify you are human to continue",
+      quickShort: true,
+    });
+    const res = await h.handle("solve_captcha", {}, "extension:42");
+    expect(res.ok).toBe(true);
+    expect(textOf(res)).toContain("unknown");
+  });
+
+  test("verify mode forces a full probe: a long page with a widget is not clear", async () => {
+    const h = extensionHarness({
+      url: "https://shop.example/",
+      title: "Shop",
+      bodyText: "Long landing page with a marketing hero and a widget. ".repeat(60),
+      frames: ["https://www.google.com/recaptcha/api2/anchor#?k=x"],
+      selectorRows: [{ id: "", cls: "g-recaptcha", src: "", title: "" }],
+      visibleSelectorRows: [{ id: "", cls: "g-recaptcha", src: "", title: "" }],
+    });
+    const res = await h.handle("solve_captcha", { verify: true });
+    expect(res.ok).toBe(true);
+    const out = textOf(res);
+    // The full probe found the widget — not a fast-path skip.
+    expect(out).not.toContain("no challenge detected");
+    expect(out).toContain("still present");
   });
 });

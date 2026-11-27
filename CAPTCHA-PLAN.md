@@ -129,15 +129,23 @@ verify: solve_captcha --verify
 - No new npm dependencies.
 - No over-engineering: one new module, one new command, two small extensions (frame-ref `shot`, `--ref` `ocr`).
 
-## 9. Phase plan (after approval)
+## 9. Phase plan
 
-- **Phase A (no extension changes):** `src/captcha.ts` (widgetType + report), `solve_captcha` CLI/daemon/MCP command in no-solve mode, `--verify`, frame-ref `shot`, unit tests, docs. **Done when:** `solve_captcha` reports detection + widgetType + suggested action on a real page; existing tests green.
+- **Phase A (no extension changes) — shipped:** `src/captcha.ts` (widgetType + report), `solve_captcha` command + `--verify` (report-only), unit tests, docs, wrapper route. **Done:** `solve_captcha` reports detection + widgetType + suggested action on a real page; existing tests green.
 - **Phase B (local OCR tier):** `ocr --ref`, crop-aware OCR for static-text challenges, verification loop, fallback to vision. **Done when:** static-text challenges solve with zero network.
 - **Phase C (game-state reporting):** `solve_captcha` reports game/task heading; `--verify` diffs levels. **Done when:** the neal.fun game can be verified at the level boundary without a full re-read.
 - **Phase D (optional paid opt-in):** NopeCHA/2Captcha/CapSolver behind a config flag, off by default. **Done when:** one keyed provider can be selected without changing defaults.
 - **Phase E (hardening):** e2e against official pages, budget/usage reporting, docs (`PLAN.md`, `README.md`). **Done when:** e2e green + acceptance criteria below.
 
-## 10. Acceptance criteria
+## 10. What the report proves (and what it doesn't)
+
+`solve_captcha` (and `--verify`) report **detection evidence**, not ground truth:
+
+- **True:** the page was probed; the probe either found a challenge, found nothing, or could not read the page. `unknown` means the read failed or was incomplete — never "clear".
+- **True:** `--verify` re-reads with a forced full probe (no fast-path skip) and a widget-marker double-check on long pages, so a page that still carries a widget reports still present.
+- **Not true:** that the answer was accepted or the challenge is solved — only the agent (or the user) can confirm that. `--verify` says whether the page still shows a challenge after the agent's answer; it says nothing about the answer's correctness.
+
+## 10b. Acceptance criteria
 
 - Detection rate ≥ 95% on official demo pages (manual, not vendor-claimed).
 - Agent-native solve rate on checkbox/image/slider/text challenges: measured in Phase A/C on the official pages; no vendor claim.
@@ -160,11 +168,12 @@ verify: solve_captcha --verify
 
 ---
 
-## Phase A — implemented (this PR)
+## Phase A — implemented (this PR, review round 1)
 
-- `src/captcha.ts` (new, pure): `widgetTypeOf` + `formatCaptchaReport`. `widgetTypeOf` maps detection to `checkbox | image | slider | audio | video | unknown` (reason text first, then vendor map; `unknown` is honest). Never throws.
-- `src/page-runner.ts`: new opt-in `solve_captcha` action (report-only by default, `--verify` re-checks). Uses the same `checkChallenge` engine as nav/snap/do. `solve_captcha` added to `PAGE_ACTIONS`; no other challenge-path code touched.
+- `src/captcha.ts` (new, pure): `widgetTypeOf` + `formatCaptchaReport`. `widgetTypeOf` maps detection to `checkbox | image | slider | audio | video | unknown` (reason text first, then vendor map; `unknown` is honest). Never throws. The page-derived reason is always inside its own untrusted-content boundary; the report's first line is tool guidance only.
+- `src/page-runner.ts`: new opt-in `solve_captcha` action (report-only by default, `--verify` re-checks with a forced full probe + widget-marker double-check). Uses the same `checkChallenge` engine as nav/snap/do. `solve_captcha` added to `PAGE_ACTIONS`; no other challenge-path code touched.
 - `daemon.ts`: `solve_captcha` joins `UNTRUSTED_PAGE_ACTIONS` (page-derived reason text is escaped/wrapped like all page-derived output).
-- `tests/captcha.test.ts` (new): widgetType fixtures, report shape, `--verify`, garbage-input safety, page-runner wiring via a fake CDP probe.
+- Wrapper script: `solve_captcha [--verify]` routed to `page/solve_captcha`; listed in `help`.
+- `tests/captcha.test.ts` (new): widgetType fixtures, report shape + untrusted boundary, `--verify`, garbage-input safety, fake-CDP-probe wiring, and both-tier harness tests (CDP + silent extension `bcCall` tier: attach-free, one status read, no `evaluate`/`Input.*`).
 - The tool reports; the agent solves. The tool never clicks, never calls an API, never mutates the page.
-- No changes to: `challenges.ts`, `extension/`, page-helpers, `checkChallenge`/`formatChallengeOutput`/`do`/`fill` (Phase 6 surface). No new permissions, dependencies, or network.
+- No changes to: `challenges.ts`, `extension/`, page-helpers, `checkChallenge`/`formatChallengeOutput`/`do`/`fill` (Phase 6 surface). No new permissions, dependencies, or network. No MCP command, no frame-ref screenshots — deliberately out of Phase A.
