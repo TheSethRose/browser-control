@@ -42,10 +42,23 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 type Result = { name: string; ok: boolean; detail: string };
 const results: Result[] = [];
+const REQUIRED = process.env["BC_E2E_REQUIRED"] === "1";
+const skips: { name: string; reason: string }[] = [];
 function record(name: string, ok: boolean, detail: string) {
   results.push({ name, ok, detail });
   const clean = detail.replace(/\s+/g, " ").trim().slice(0, 240);
   console.log(ok ? `PASS ${name}` : `FAIL ${name} :: ${clean}`);
+}
+// A skipped check is never a pass: it prints its own line and is counted apart from passed/failed.
+function recordSkip(name: string, reason: string) {
+  skips.push({ name, reason });
+  console.log(`SKIP ${name} :: ${reason}`);
+}
+function printTotals() {
+  const passed = results.filter((r) => r.ok).length;
+  const failed = results.length - passed;
+  const line = `e2e: ${passed} passed, ${failed} failed`;
+  console.log(skips.length > 0 ? `${line}, ${skips.length} skipped` : line);
 }
 
 // ---- minimal CDP client (only used to press the handoff card's Continue button with a trusted click) ----
@@ -181,11 +194,16 @@ async function interactWithHandoff(
 async function main(): Promise<number> {
   const chrome = findChrome();
   if (!chrome) {
-    console.log("SKIP e2e: Chrome for Testing not found (set BC_E2E_CHROME to its binary).");
+    // A required run (CI gate) must never pass on a missing browser.
+    if (REQUIRED) {
+      record("e2e", false, "BC_E2E_REQUIRED=1 but Chrome for Testing was not found (set BC_E2E_CHROME to its binary)");
+      return 1;
+    }
+    recordSkip("e2e", "Chrome for Testing not found (set BC_E2E_CHROME to its binary)");
     return 0;
   }
   if (!existsSync(WRAPPER)) {
-    console.log(`FAIL setup :: wrapper missing at ${WRAPPER}`);
+    record("setup", false, `wrapper missing at ${WRAPPER}`);
     return 1;
   }
 
@@ -259,7 +277,10 @@ async function main(): Promise<number> {
       console.log(`SUMMARY ${pass} pass, ${fail} fail`);
     })());
   for (const [sig, code] of [["SIGINT", 130], ["SIGTERM", 143]] as const) {
-    process.on(sig, () => void cleanup().finally(() => process.exit(code)));
+    process.on(sig, () => void cleanup().finally(() => {
+      printTotals();
+      process.exit(code);
+    }));
   }
 
   try {
@@ -462,7 +483,16 @@ async function main(): Promise<number> {
     await check("enable", ["extension", "enable"], /"orderFile":"removed"/);
     record("enable-deleted-file", !existsSync(backendsFile), backendsFile);
     await check("enabled-works", ["eval", "document.title", tid], /E2E Fixture/);
-    await runStaleExtensionCheck(chrome, record);
+    // The stale-extension check archives the pre-PR #10 build; a shallow clone cannot, so say so out loud.
+    const oldCommit = "b8b976f";
+    const hasOldCommit =
+      (await spawn(["git", "-C", REPO, "rev-parse", "--verify", `${oldCommit}^{commit}`], {
+        stdout: "ignore",
+        stderr: "ignore",
+      }).exited) === 0;
+    if (hasOldCommit) await runStaleExtensionCheck(chrome, record);
+    else if (REQUIRED) record("stale-extension", false, `commit ${oldCommit} not present in this clone (fetch full history)`);
+    else recordSkip("stale-extension", `commit ${oldCommit} not present in this clone (fetch full history)`);
     return results.some((r) => !r.ok) ? 1 : 0;
   } catch (error) {
     record("runner", false, String(error instanceof Error ? error.stack : error));
@@ -472,4 +502,13 @@ async function main(): Promise<number> {
   }
 }
 
-process.exit(await main());
+// One finalizer: totals print for normal completion and for setup/cleanup exceptions alike.
+let code = 1;
+try {
+  code = await main();
+} catch (error) {
+  record("runner", false, String(error instanceof Error ? error.stack : error));
+} finally {
+  printTotals();
+}
+process.exit(code);
