@@ -96,7 +96,8 @@ const STALL_MS = 60;
 /**
  * Chrome acks a mouse move or wheel event only once the page has handled it, which for these events waits on the
  * next painted frame. A page that is not painting (headless CI, a throttled renderer) acks about once a second, so a
- * 20-40 step natural path took 20-45 s. One ack slower than this, or a path past its budget, ends the human motion.
+ * 20-40 step natural path took 20-45 s. Two acks in a row slower than this, or a path past its budget, ends the
+ * human motion; one slow ack on its own is ordinary jitter.
  */
 const SLOW_INPUT_ACK_MS = 250;
 const NATURAL_MOTION_BUDGET_MS = 2_500;
@@ -409,6 +410,24 @@ export function createPageHelperHandler(
         ? success(`${valueOf(res)}\n${heldLine(held)}`)
         : failure(res.error.code, `${messageOf(res)}\n${heldLine(held)}`);
   const HELD_KINDS = ["key", "mouse"] as const;
+  /**
+   * Mean ack time of the natural path steps this command had to shorten, or undefined when it sent every step.
+   * One receipt per command, however many paths (a hover then a click, a drag) collapsed on the way.
+   */
+  let shortPathAckMs: number | undefined;
+  const shortPathLine = (): string =>
+    shortPathAckMs === undefined ? "" : `# natural path shortened: slow input acks (${shortPathAckMs} ms/step)`;
+  /** Attach the shorten receipt to a command's result, the way held-input lines ride along with their own command. */
+  const withShortPath = (res: InvokeResult): InvokeResult => {
+    const line = shortPathLine();
+    if (line === "") return res;
+    if (!res.ok) return failure(res.error.code, `${res.error.message}\n${line}`);
+    const value = valueOf(res);
+    return {
+      ok: true,
+      data: { ...(res.data as Json), value: value === "" ? line : `${value}\n${line}` },
+    } as InvokeResult;
+  };
   /** A held key and a held mouse button on one tab are separate records. */
   const heldSlot = (targetId: string | undefined, kind: HeldInput["kind"]): string => `${heldKeyOf(targetId)}#${kind}`;
   /**
@@ -779,8 +798,10 @@ export function createPageHelperHandler(
   }
 
   /**
-   * Send a planned pointer path as trusted mouseMoved events. Once a step acks slowly or the path runs past its
-   * budget, the remaining steps collapse into one move to the end point, so the pointer still lands where planned.
+   * Send a planned pointer path as trusted mouseMoved events. Two slow acks in a row, or the path running past its
+   * budget, collapse the remaining steps into one move to the end point, so the pointer still lands where planned.
+   * One slow ack on its own is ordinary jitter and the path carries on. A collapse is recorded for the command's
+   * receipt line; fast mode never reaches here.
    */
   async function dispatchPath(
     steps: ReadonlyArray<{ x: number; y: number; delayMs: number }>,
@@ -790,6 +811,11 @@ export function createPageHelperHandler(
   ): Promise<InvokeResult> {
     const pace = createPacer();
     const start = now();
+    const acks: number[] = [];
+    let slowStreak = 0;
+    const shorten = (): void => {
+      shortPathAckMs ??= Math.round(acks.reduce((sum, ms) => sum + ms, 0) / acks.length);
+    };
     for (let i = 0; i < steps.length; i++) {
       const step = steps[i]!;
       await pace(step.delayMs);
@@ -798,7 +824,10 @@ export function createPageHelperHandler(
       if (!res.ok) return res;
       onMoved?.({ x: step.x, y: step.y });
       const done = now();
-      if (i < steps.length - 2 && (done - sent > SLOW_INPUT_ACK_MS || done - start > NATURAL_MOTION_BUDGET_MS)) {
+      acks.push(done - sent);
+      slowStreak = done - sent > SLOW_INPUT_ACK_MS ? slowStreak + 1 : 0;
+      if (i < steps.length - 2 && (slowStreak >= 2 || done - start > NATURAL_MOTION_BUDGET_MS)) {
+        shorten();
         i = steps.length - 2; // the next pass sends the end point
       }
     }
@@ -3827,9 +3856,10 @@ export function createPageHelperHandler(
   );
 
   const handlePageWithRemedies = async (action: string, input: Json, targetId?: string): Promise<InvokeResult> => {
+    // One receipt per command: a `do` or a hover-then-click may shorten several paths, and the caller hears it once.
+    shortPathAckMs = undefined;
     const res = await handlePage(action, input, targetId);
-    if (!res.ok) return failure(res.error.code, withRemedy(res.error.message));
-    return res;
+    return withShortPath(res.ok ? res : failure(res.error.code, withRemedy(res.error.message)));
   };
   return handlePageWithRemedies;
 }

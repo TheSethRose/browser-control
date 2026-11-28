@@ -531,10 +531,12 @@ describe("page-runner natural motion integration", () => {
       const near = await run(true);
       expect(near.res.ok).toBe(true);
       const moves = near.nat.ofType("mouseMoved");
-      expect(moves).toHaveLength(2);
+      // Two slow acks in a row end the path: the third move is the end point.
+      expect(moves).toHaveLength(3);
       const press = near.nat.ofType("mousePressed")[0]!.params;
       expect([press["x"], press["y"]]).toEqual([moves.at(-1)!.params["x"], moves.at(-1)!.params["y"]]);
-      expect(near.elapsedMs).toBeLessThan(3_000);
+      // One extra ack before the streak trips, still far inside the e2e budget it was stalling.
+      expect(near.elapsedMs).toBeLessThan(4_000);
 
       const far = await run(false);
       expect(far.res.ok).toBe(true);
@@ -546,7 +548,72 @@ describe("page-runner natural motion integration", () => {
       // A refused release may have landed, so it reads as unverified, and the click returns at once.
       const alert = await run(true, true);
       expect(alert.res.ok ? String((alert.res.data as { value?: unknown }).value) : "").toMatch(/release: delivery unverified \(a dialog opened\)/);
-      expect(alert.elapsedMs).toBeLessThan(3_000);
+      expect(alert.elapsedMs).toBeLessThan(4_000);
+    });
+  });
+
+  test("one slow ack keeps the whole path; two in a row collapse it and the command says so once", async () => {
+    await withNaturalOn(async () => {
+      // Ack times for mouseMoved calls in order; a case past the end acks instantly.
+      const run = async (ackPattern: number[], action = "click") => {
+        const nat = makeNaturalMock({ inView: true });
+        let clock = 0;
+        let moveIdx = 0;
+        const timed: Invoke = async (op, input = {}) => {
+          const params = (input["params"] ?? {}) as Record<string, unknown>;
+          const res = await nat.invoke(op, input);
+          if (op === "execute_cdp" && params["type"] === "mouseMoved") clock += ackPattern[moveIdx++] ?? 0;
+          return res;
+        };
+        const handler = createPageHelperHandler(timed, undefined, undefined, {
+          sleep: async (ms) => { clock += ms; }, rng: createSeededRng(77), now: () => clock,
+          bcCall: async () => ({ value: "https://a.test/\nhit: button#ok" }),
+        });
+        const input = action === "do"
+          ? { steps: [{ click: "e1" }, { click: "e1" }], quiet: true }
+          : { ref: "e1", quiet: true };
+        const res = await handler(action, input);
+        const text = res.ok ? String((res.data as { value?: unknown }).value) : res.error.message;
+        return { res, moves: nat.ofType("mouseMoved").length, text };
+      };
+      const receipt = (n: number) => `# natural path shortened: slow input acks (${n} ms/step)`;
+
+      // Baseline: every ack is instant, so the path runs to its end and nothing is reported.
+      const full = await run([]);
+      expect(full.res.ok).toBe(true);
+      expect(full.moves).toBeGreaterThan(8);
+      expect(full.text).not.toContain("# natural path shortened");
+
+      // One slow ack is jitter: the rest of the path still goes out, uncollapsed.
+      const one = await run([600]);
+      expect(one.moves).toBe(full.moves);
+      expect(one.text).not.toContain("# natural path shortened");
+
+      // Slow, fast, slow: the fast ack clears the streak, so the path also survives.
+      const flicker = await run([600, 0, 600]);
+      expect(flicker.moves).toBe(full.moves);
+      expect(flicker.text).not.toContain("# natural path shortened");
+
+      // Two slow acks in a row collapse the rest into one move to the end point, and the mean is reported.
+      const two = await run([600, 600]);
+      expect(two.res.ok).toBe(true);
+      expect(two.moves).toBe(3);
+      expect(two.text.split("\n").filter((l) => l === receipt(600))).toHaveLength(1);
+
+      // Slow acks that never repeat collapse on the 2.5 s budget rule instead, reporting the mean of the steps sent.
+      const budgetPattern = [900, 0, 900, 0, 900, 0];
+      const budget = await run(budgetPattern);
+      expect(budget.res.ok).toBe(true);
+      expect(budget.moves).toBeLessThan(full.moves);
+      const sent = budgetPattern.slice(0, budget.moves - 1);
+      const mean = Math.round(sent.reduce((sum, ms) => sum + ms, 0) / sent.length);
+      expect(mean).toBeGreaterThan(0);
+      expect(budget.text.split("\n").filter((l) => l === receipt(mean))).toHaveLength(1);
+
+      // Two paths that both collapse still report it once for the whole command.
+      const twice = await run([600, 600, 600, 600], "do");
+      expect(twice.res.ok).toBe(true);
+      expect(twice.text.split("\n").filter((l) => l.startsWith("# natural path shortened"))).toHaveLength(1);
     });
   });
 
