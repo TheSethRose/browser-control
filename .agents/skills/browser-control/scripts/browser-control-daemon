@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+if [[ -n "${BC_TRACE:-}" ]]; then exec 9>>"$BC_TRACE"; BASH_XTRACEFD=9; PS4='+ $$ $EPOCHREALTIME ${FUNCNAME[0]:-main}:$LINENO: '; set -x; fi
 # One shared background process holds the browser connections, so Chrome's "Allow remote
 # debugging" prompt appears once per browser, not once per call or per agent session.
 # Every command re-uses that process and starts it only if it is not running.

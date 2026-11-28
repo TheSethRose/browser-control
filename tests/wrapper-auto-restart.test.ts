@@ -93,6 +93,7 @@ async function rig(options: { stale?: boolean; cdp?: boolean; browsers?: number;
   if (options.envOrder !== undefined) env["BROWSER_CONTROL_BACKENDS"] = options.envOrder;
   env["BROWSER_CONTROL_DAEMON_DIR"] = dir;
   env["FAKE_STARTS"] = join(root, "starts");
+  env["BC_TRACE"] = join(root, "trace");
   env["FAKE_REQUESTS"] = join(root, "requests");
   env["FAKE_PID"] = join(root, "pid");
   env["FAKE_STALE_FILE"] = join(root, "stale");
@@ -176,6 +177,9 @@ describe("wrapper stale-daemon restart", () => {
     if (r.starts() !== 2) {
       let log = "";
       try { log = readFileSync(join(r.dir, "daemon.log"), "utf8").slice(-600); } catch {}
+      let trace = "";
+      try { trace = readFileSync(join(r.root, "trace"), "utf8").split("\n").filter((l) => /restart_stale_daemon:|ensure:/.test(l)).map((l) => l.slice(0, 170)).join("\n"); } catch {}
+      console.log("DIAGTRACE\n" + trace + "\nENDTRACE");
       console.log("DIAG", JSON.stringify({ a, b, req: r.requests(), starts: r.starts(), log }));
     }
     expect([a.code, b.code]).toEqual([0, 0]);
