@@ -802,7 +802,7 @@ case "$cmd" in
         bun "$here/../runtime/cli.js" extension-setup "$ext_dir" >/dev/null || fail EXECUTION_FAILED "pairing setup failed; see the error above"
         rm -f "$dir/backends" 2>/dev/null || fail EXECUTION_FAILED "could not remove $dir/backends"
         # A leftover global order file (~/.config/browser-control/backends) outranks the paired
-        # default; if it leaves the extension out, back it up and rewrite it to extension alone.
+        # default; if it leaves the extension out, back it up and rewrite it to the default order (extension,cdp).
         extra=""
         gpath="${XDG_CONFIG_HOME:-$HOME/.config}/browser-control/backends"
         if [[ -f "$gpath" ]]; then
@@ -826,11 +826,11 @@ case "$cmd" in
             gmode="$(stat -c %a "$gpath" 2>/dev/null || true)"
             [[ "$gmode" =~ ^[0-7]{3,4}$ ]] || gmode="$(stat -f %Lp "$gpath" 2>/dev/null || true)"
             [[ "$gmode" =~ ^[0-7]{3,4}$ ]] || gmode=600
-            if ! { cp -p "$gpath" "$gtmp" && chmod "$gmode" "$gbackup" && printf 'extension\n' >"$gtmp" && mv -f "$gtmp" "$gpath"; }; then
+            if ! { cp -p "$gpath" "$gtmp" && chmod "$gmode" "$gbackup" && printf 'extension,cdp\n' >"$gtmp" && mv -f "$gtmp" "$gpath"; }; then
               rm -f "$gtmp" 2>/dev/null || true
               fail EXECUTION_FAILED "could not write $gpath"
             fi
-            extra=',"globalOrder":{"was":'"$(json_str "$gorder")"',"now":"extension","backup":'"$(json_str "$gbackup")"'}'
+            extra=',"globalOrder":{"was":'"$(json_str "$gorder")"',"now":"extension,cdp","backup":'"$(json_str "$gbackup")"'}'
           fi
         fi
         if [[ -n "${BROWSER_CONTROL_BACKENDS:-}" ]] && ! order_has "$BROWSER_CONTROL_BACKENDS" extension; then

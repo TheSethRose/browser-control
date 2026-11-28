@@ -76,15 +76,15 @@ async function extFolder(root: string): Promise<string> {
 }
 
 describe("extension setup and the global order file", () => {
-  test("a global file without extension is backed up and rewritten to extension", async () => {
+  test("a global file without extension is backed up and rewritten to the default order", async () => {
     const { root, daemonDir, globalFile } = await isolate("setup-global");
     const ext = await extFolder(root);
     await writeFile(globalFile, "browse,cdp\n");
     const res = await setup(ext, daemonDir);
     expect(res.code).toBe(0);
     const backup = `${globalFile}.bak-${today()}`;
-    expect(res.data["globalOrder"]).toEqual({ was: "browse,cdp", now: "extension", backup });
-    expect((await readFile(globalFile, "utf8")).trim()).toBe("extension");
+    expect(res.data["globalOrder"]).toEqual({ was: "browse,cdp", now: "extension,cdp", backup });
+    expect((await readFile(globalFile, "utf8")).trim()).toBe("extension,cdp");
     expect((await readFile(backup, "utf8")).trim()).toBe("browse,cdp");
     expect(res.data["overriddenBy"]).toBeUndefined();
     expect(res.stdout).not.toContain("token");
@@ -110,7 +110,7 @@ describe("extension setup and the global order file", () => {
     await writeFile(globalFile, "\ncdp\n");
     const res = await setup(ext, daemonDir);
     expect((res.data["globalOrder"] as Record<string, unknown>)["was"]).toBe("cdp");
-    expect((await readFile(globalFile, "utf8")).trim()).toBe("extension");
+    expect((await readFile(globalFile, "utf8")).trim()).toBe("extension,cdp");
     // cdp then extension on the next line already includes the extension: untouched.
     const second = await isolate("setup-multiline-keep");
     const ext2 = await extFolder(second.root);
