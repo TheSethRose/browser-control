@@ -167,13 +167,22 @@ describe("wrapper stale-daemon restart", () => {
   });
 
   test("two concurrent stale calls restart the daemon once", async () => {
-    const r = await rig({ stale: true });
-    const [a, b] = await Promise.all([r.bc("tabs"), r.bc("tabs")]);
+    let r = await rig({ stale: true });
+    let [a, b] = await Promise.all([r.bc("tabs"), r.bc("tabs")]);
+    for (let i = 0; i < 25 && r.starts() === 2; i++) {
+      r = await rig({ stale: true });
+      [a, b] = await Promise.all([r.bc("tabs"), r.bc("tabs")]);
+    }
+    if (r.starts() !== 2) {
+      let log = "";
+      try { log = readFileSync(join(r.dir, "daemon.log"), "utf8").slice(-600); } catch {}
+      console.log("DIAG", JSON.stringify({ a, b, req: r.requests(), starts: r.starts(), log }));
+    }
     expect([a.code, b.code]).toEqual([0, 0]);
     expect(r.starts()).toBe(2);
     const lines = `${a.stderr}\n${b.stderr}`.split("\n").filter((l) => l.includes("restarted the daemon on the new build"));
     expect(lines).toHaveLength(1);
-  }, 15_000);
+  }, 120_000);
 });
 
 describe("wrapper start", () => {
