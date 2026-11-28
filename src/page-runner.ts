@@ -100,6 +100,7 @@ const STALL_MS = 60;
  */
 const SLOW_INPUT_ACK_MS = 250;
 const NATURAL_MOTION_BUDGET_MS = 2_500;
+const SCROLL_SETTLE_MS = 1_500;
 const MAX_VIEWPORT_DIM = 10_000_000;
 const DIALOG_HINT = "the page stopped responding; a JavaScript dialog is probably open (references/dom-and-input.md)";
 
@@ -840,8 +841,11 @@ export function createPageHelperHandler(
         // Hover can open menus over the target: never press without a passing hit check.
         let chk = await verifyHit(opts.domRef, at, targetId);
         if (!chk.ok && !chk.res && opts.box) {
-          const { left, top, width, height } = opts.box;
-          const alt = await pickVerifiedPoint(opts.domRef, opts.box, { x: Math.round(left + width / 2), y: Math.round(top + height / 2) }, targetId);
+          // A late scroll (a queued wheel landing) can move the target after it was measured: aim at where it is now.
+          const fresh = await measureBox(opts.domRef, targetId);
+          const box = fresh && (fresh.box.top !== opts.box.top || fresh.box.left !== opts.box.left) ? fresh.box : opts.box;
+          const { left, top, width, height } = box;
+          const alt = await pickVerifiedPoint(opts.domRef, box, { x: Math.round(left + width / 2), y: Math.round(top + height / 2) }, targetId);
           if (!alt.ok) return alt.res;
           const rep = await movePointer(alt.pt, targetId, { ...moveOpts, overshootProb: 0 });
           if (!rep.ok) return rep;
@@ -945,6 +949,34 @@ export function createPageHelperHandler(
     return undefined;
   }
 
+  /** The target's current in-view geometry, scrolling it back instantly only when a late scroll pushed it out. */
+  async function measureBox(ref: string, where: string | undefined): Promise<PointDetail | undefined> {
+    for (const opts of [{ noScroll: true, detail: true }, { detail: true }]) {
+      const res = await evalHelper({ kind: "bc", method: "point", args: [ref, opts] }, where, 2_000);
+      const d = res.ok ? parsePointDetail(valueOf(res)) : undefined;
+      if (d?.inView) return d;
+    }
+    return undefined;
+  }
+
+  /**
+   * Wheel deltas can land after their acks (and after the instant fallback): wait until two reads of the target agree
+   * before measuring it. Each read spans page frames, so a queued wheel lands between them. Bounded to ~1.5 s.
+   */
+  async function settleScroll(ref: string, detail: PointDetail, targetId: string | undefined): Promise<PointDetail> {
+    const start = now();
+    let prev: PointDetail | undefined;
+    for (let i = 0; i < 20 && now() - start < SCROLL_SETTLE_MS; i++) {
+      if (prev) await pause(50);
+      const res = await evalHelper({ kind: "bc", method: "point", args: [ref, { noScroll: true, detail: true }] }, targetId, 2_000);
+      const next = res.ok ? parsePointDetail(valueOf(res)) : undefined;
+      if (!next) break;
+      if (prev && next.rect.top === prev.rect.top && next.rect.left === prev.rect.left) return next.inView ? next : detail;
+      prev = next;
+    }
+    return prev?.inView ? prev : detail;
+  }
+
   async function pickVerifiedPoint(ref: string, box: Box2D | undefined, center: Point2D, where: string | undefined) {
     const canSample = Boolean(box && box.width >= 2 && box.height >= 2);
     let blocked: string | undefined;
@@ -1046,7 +1078,7 @@ export function createPageHelperHandler(
         const next = parsePointDetail(valueOf(probe));
         if (!next) break;
         cur = next;
-        if (next.inView) return { ok: true, detail: next };
+        if (next.inView) return { ok: true, detail: await settleScroll(ref, next, targetId) };
         if (Math.abs(next.rect.top - prevTop) < 2) break;
         if (fi < plan.flicks.length - 1 && flick.pauseAfterMs > 0) {
           await pace(flick.pauseAfterMs);
@@ -1064,7 +1096,7 @@ export function createPageHelperHandler(
     if (!detail) {
       return { ok: false, res: failure("EXECUTION_FAILED", `unexpected point output: ${valueOf(settled)}`) };
     }
-    return { ok: true, detail };
+    return { ok: true, detail: Math.abs(neededDeltaY) >= 4 ? await settleScroll(ref, detail, targetId) : detail };
   }
 
   /** Where to click, in the top page's viewport coordinates. `baseline` also records the controls for the later diff. */
