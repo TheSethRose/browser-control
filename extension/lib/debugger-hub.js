@@ -2,7 +2,6 @@
 // Emulation.setFocusEmulationEnabled, child OOPIF sessionId forwarding, MV3 service-worker restart
 // recovery (serial-queued storage + Target.getTargetInfo ownedByUs probe), and foreign extension
 // frame eviction with up to 2 retries (never during a handoff).
-// Patterns adapted from anomalyco/browse (MIT License).
 
 export const DEFAULT_DEBUGGER_IDLE_MS = 30_000;
 export const MAX_HOLD_MS = 600_000;

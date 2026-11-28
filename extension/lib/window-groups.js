@@ -1,5 +1,4 @@
 // Background non-minimized tab placement, collapsed "Agents · N" tab groups, and popup adoption.
-// Patterns adapted from anomalyco/browse (MIT License).
 
 export const AGENT_GROUPS_STORAGE_KEY = "bc_agent_group_ids";
 const TAB_GROUP_ID_NONE = -1;

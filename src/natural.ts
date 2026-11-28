@@ -3,9 +3,6 @@
  *
  * Every planner takes an injectable `rng` (see `createSeededRng`) and returns plain data
  * (points + millisecond delays) with no I/O or timers so tests are deterministic and instant.
- *
- * Cubic Bezier bowing, minimum-jerk easing, tapering tremor, and eased wheel glide are
- * adapted from anomalyco/browse (MIT License).
  */
 import { readFileSync } from "node:fs";
 import { configFilePath } from "./backends/router";
@@ -124,7 +121,7 @@ function triangular(rng: () => number, min: number, max: number): number {
   return min + ((rng() + rng()) / 2) * (max - min);
 }
 
-/** Minimum-jerk easing polynomial: slow start, fast middle, slow arrival (MIT-adapted from anomalyco/browse). */
+/** Minimum-jerk easing polynomial: slow start, fast middle, slow arrival */
 function minimumJerk(u: number): number {
   const t = clamp(u, 0, 1);
   return t * t * t * (10 - 15 * t + 6 * t * t);
@@ -320,7 +317,7 @@ export function planPointerPath(opts: PointerPathOptions): PointerPathPlan {
   const rawDuration = (65 + 75 * Math.log2(distance / wEff + 1)) * randBetween(rng, 0.85, 1.18);
   const durationMs = clamp(Math.round(rawDuration), 90, 460);
 
-  // Perpendicular normal and cubic Bezier control points (MIT-adapted from anomalyco/browse).
+  // Perpendicular normal and cubic Bezier control points.
   const nx = -dy / distance;
   const ny = dx / distance;
   const sign = rng() < 0.5 ? -1 : 1;
@@ -386,7 +383,7 @@ export function planPointerPath(opts: PointerPathOptions): PointerPathPlan {
       3 * inv * inv * s * c1.y +
       3 * inv * s * s * c2.y +
       s * s * s * arcEnd.y;
-    // Tapering Irwin-Hall triangular tremor (MIT-adapted from anomalyco/browse).
+    // Tapering Irwin-Hall triangular tremor.
     const tremorScale = 0.85 * (1 - s);
     const jx = (rng() + rng() + rng() - 1.5) * tremorScale;
     const jy = (rng() + rng() + rng() - 1.5) * tremorScale;
@@ -482,7 +479,7 @@ export function planKeyHold(rng: () => number = Math.random): number {
 
 /**
  * Distribute a single wheel flick's `deltaY` across `eventCount` eased events
- * using cubic ease-out `1 - (1 - t)^3` (MIT-adapted from anomalyco/browse) so the
+ * using cubic ease-out `1 - (1 - t)^3` so the
  * integer event deltas sum to `Math.round(deltaY)` exactly. Zero-delta events are dropped so a
  * short flick never sends a wheel event that moves nothing.
  */

@@ -22,7 +22,6 @@ $BCD verdict                                # confirmed / rejected / unverified
 - **Typing:** `type` defaults to natural human typing (per-character `keyDown`/`keyUp` with realistic hold times, variable cadence, and occasional QWERTY-neighbor typos corrected with `Backspace`). Pass `--fast` for instant `Input.insertText` (+ real last key), or `--keys` for zero-delay raw key events. `fill --fast` and `do` step `{"type":[ref, text, "fast"]}` opt into fast mode in batches.
 - **Batching:** `do '[…]'` runs steps in order (`click`, `type`, `select`, `upload`, `wait`, `key`) and stops on the first failure, read-back mismatch, host change, or `# WALL:`. Keep committing clicks in their own approved call.
 - **Hover:** `hover <ref|label>` or `hover --xy <x,y>` moves the pointer without pressing. It reports what is under the pointer and any new tooltip text. Use it for menus that open on hover.
-- **`browse:<n>` tabs:** `snap`, `click`, `type`, `key`, `wait`, `fill`, and `do` work on `browse:<n>` tabs with label resolution, trap/payment refusal, and wall/host checks. `--xy`, `select`, `upload`, and iframe/AX refs require a DevTools tab.
 
 ## 2. Fill and submit a form
 
@@ -63,7 +62,7 @@ Use the `dialog` command first:
 
 - `$BCD dialog accept` clicks OK. `$BCD dialog accept 'text'` also fills a `prompt`.
 - `$BCD dialog dismiss` clicks Cancel.
-- Both take a targetId last (`dialog accept 'text' extension:42`, `dialog dismiss extension:42`). A trailing token that looks like a targetId (`extension:<n>`, `browse:<n>`, 32-hex) is the target, never prompt text; to send text that looks like one, pass it before an explicit targetId.
+- Both take a targetId last (`dialog accept 'text' extension:42`, `dialog dismiss extension:42`). A trailing token that looks like a targetId (`extension:<n>`, 32-hex) is the target, never prompt text; to send text that looks like one, pass it before an explicit targetId.
 - On extension tabs, a stuck helper call reports the open dialog with `remedy: run dialog accept|dismiss`.
 
 The manual CDP steps still work:
