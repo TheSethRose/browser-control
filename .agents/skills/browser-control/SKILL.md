@@ -42,7 +42,7 @@ Extension tabs open in the background, can sit in a collapsed `Agents · N` tab 
 
 On `cdp`, Chrome shows **Allow remote debugging?** per new connection. Never waste the user's click:
 
-- **Never restart, stop, disconnect, or reset the daemon** (`stop --force` only if the user explicitly asks).
+- **Never restart, stop, disconnect, or reset the daemon** (`stop --force` only if the user explicitly asks). The wrapper restarts it by itself after an update when no remote-debugging connection is open.
 - **Never open a second path:** no second daemon, no `BROWSER_CONTROL_DAEMON_DIR`, no `runtime/cli.js`, no custom CDP script, never pass/guess a port.
 - Timeout connecting? The user hasn't clicked Allow yet — ask them and retry the **same** command.
 - Remote debugging off and no extension? Ask the user to enable `chrome://inspect/#remote-debugging` → **Allow remote debugging for this browser instance**, then stop.
@@ -54,7 +54,7 @@ Page commands take `[targetId]` last, `--match <text>`, `--quiet`, and `--no-bou
 
 | Command | Action |
 | --- | --- |
-| `tabs` / `start <browser>` / `default [browser]` / `natural [on\|off\|status]` | List tabs / switch browser (`chrome`, `beta`, `brave`, `ardia`, …) / get or set default browser / toggle global natural browsing (default on; `BROWSER_CONTROL_NATURAL=on\|off` overrides; `--fast` opts out per call). |
+| `tabs` / `start [browser]` / `default [browser]` / `natural [on\|off\|status]` | List tabs / switch browser (`chrome`, `beta`, `brave`, `ardia`, …); with no browser name it waits for the extension and prints its status — with `BROWSER_CONTROL_BACKENDS=extension` it never uses remote debugging, otherwise it falls back to remote debugging after ~10 s with a note / get or set default browser / toggle global natural browsing (default on; `BROWSER_CONTROL_NATURAL=on\|off` overrides; `--fast` opts out per call). |
 | `extension setup [extensionDir]` / `status` / `browsers` / `diagnostics` / `enable` / `disable` | Pair the extension, clear any old daemon override, and back up then rewrite a global `backends` file that leaves the extension out / relay and pairing state, connected browsers, and which source set the backend order (`orderSource`) / connected browsers and slugs / extension log for bug reports / clear any old daemon override (e.g. `cdp` or an older `extension,cdp`) so the default or env applies / `cdp` only. `extension pair` and `revoke` are not built yet and return an error. |
 | `nav <url> [--snap] [--until load] [--browser <slug>] [--new-window] [--new-tab] [--keep-open]` | Navigate until parsed & quiet (`--until load` waits for all resources. `--browser <slug>` opens the tab in that browser, see `extension browsers`. `--new-window`, `--new-tab` and `--keep-open` work on extension tabs only. With no targetId, nav reuses this agent session's last tab and says `# reused this session's tab …`; `--new-tab` opens another.). Flags `# REDIRECTED:` / `# WALL:` / `CHALLENGE:` / `BLOCKED:`. |
 | `close [targetId]` | Close an agent-opened extension tab (active tab if omitted). Refuses tabs Browser Control did not open. |
@@ -113,7 +113,7 @@ Repo: [github.com/TheSethRose/browser-control](https://github.com/TheSethRose/br
 
 - Once per session, run `$BCD check-update` (cached 24 h, safe offline).
 - If a newer version is published, alert the user in one line with local version, latest version, and repo link.
-- **Never update automatically.** Help them update (`git pull` + `stop --force`) **only if they ask**.
+- **Never update automatically.** Help them update **only if they ask**: `git pull`; the next command restarts the daemon by itself (unless a remote-debugging connection is open, then run `stop --force`).
 
 ## Rules
 
