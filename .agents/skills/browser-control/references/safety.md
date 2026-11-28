@@ -1,6 +1,6 @@
 # Account Safety and Action Rules
 
-This skill drives the user's real, signed-in browser. Actions land on their real accounts, and sites with anti-abuse systems can lock an account that behaves like a bot. These rules apply to extension, DevTools, and `browse:<n>` tabs.
+This skill drives the user's real, signed-in browser. Actions land on their real accounts, and sites with anti-abuse systems can lock an account that behaves like a bot. These rules apply to extension and DevTools tabs.
 
 ## Inspect and pace
 
@@ -13,7 +13,6 @@ This skill drives the user's real, signed-in browser. Actions land on their real
 - **CAPTCHA and account checkpoints:** capture the visible state and hand control back to the user:
   - Run `$BCD handoff '<one sentence: what the user needs to do>'`. On an extension tab it expands the `Agents · N` group, brings the tab forward, and shows a "Your turn" card with your message. Password managers work normally while it waits. The command returns when the user clicks **Continue** (or after `--timeout <s>`, default 10 minutes). Then `snap` again, since the page has changed. In `script`, use `await page.handoff('<message>')`.
   - On a DevTools tab without `handoff`: bring the tab to the front (`Target.activateTarget`), say in one sentence what they need to do, and wait for them to say they're done. Don't read the page or act while they work. Then `snap` again, since the page has changed.
-  - On a `browse:<n>` tab: run `browse handoff '<message>' <n>` and wait for their reply.
   - Never solve or bypass a challenge.
 
 ## Bot challenges and block pages

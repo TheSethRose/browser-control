@@ -18,12 +18,6 @@ export const PAGE_HELPERS_VERSION = Number(versionMatch[1]);
  */
 export const PAGE_HELPERS_SOURCE: string = source;
 
-/** Field-name patterns also checked on `browse:<n>` tabs where `__bc` refs aren't used. */
-export const HONEYPOT_NAME =
-  /honeypot|honey.?pot|bot.?field|leave.?this.?empty|do.?not.?fill|anti.?spam|gotcha|trap.?field/i;
-export const PAYMENT_FIELD =
-  /card.?number|cardnumber|cc-?(number|csc|exp)|ccnumber|cvc|cvv|expir(y|ation)|security.?code|iban|account.?number|routing.?number|payment.?method/i;
-
 export interface KeySpec {
   key: string;
   code: string;

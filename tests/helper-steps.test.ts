@@ -265,7 +265,7 @@ const GOLDEN_CALL_SITES: ReadonlyArray<{ name: string; call: HelperCall; golden:
     golden: "__bc.baseline()",
   },
   {
-    name: "do (browse tab): location.href",
+    name: "href: location.href",
     call: { kind: "href" },
     golden: "location.href",
   },
@@ -653,8 +653,7 @@ describe("page-runner property reads keep their pre-refactor options and context
         }
         return { ok: true, data: {} };
       };
-      const browse = async () => ({ code: 0, stdout: "{}", stderr: "" });
-      const handle = createPageHelperHandler(invoke, browse as never, async () => [], {
+      const handle = createPageHelperHandler(invoke, undefined, async () => [], {
         notesDir: dir,
         flowsDir: dir,
         sleep: async () => {},
@@ -667,8 +666,6 @@ describe("page-runner property reads keep their pre-refactor options and context
       await handle("styles", { ref: "e12" }); // right after origin: still helper context 7
       await handle("notes", { sub: "get" }); // location.host
       await handle("styles", { ref: "e12" }); // right after host: still helper context 7
-      await handle("do", { steps: [{ key: "Tab" }] }, "browse:7"); // browse-tab start URL -> location.href
-      await handle("styles", { ref: "e12" }); // must still use helper context 7, not 99
 
       const opts = (expr: string) =>
         calls.filter((c) => c["expression"] === expr).map(({ expression: _e, ...rest }) => rest);
@@ -678,11 +675,9 @@ describe("page-runner property reads keep their pre-refactor options and context
       for (const o of opts("location.origin")) expect(o).toEqual({ isolated: true });
       expect(opts("location.host").length).toBeGreaterThan(0);
       for (const o of opts("location.host")) expect(o).toEqual({ isolated: true });
-      expect(opts("location.href")).toContainEqual({ targetId: "browse:7" });
-      for (const o of opts("location.href")) expect(o).toEqual({ targetId: "browse:7" });
-      // readyState is followed by a helper retry that legitimately re-caches 7, and href runs on another
-      // target, so cache isolation for those two rests on readProperty never touching contextIds.
-      expect(runtimeContexts).toEqual([7, 7, 7]);
+      // readyState is followed by a helper retry that legitimately re-caches 7, so cache isolation
+      // there rests on readProperty never touching contextIds.
+      expect(runtimeContexts).toEqual([7, 7]);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

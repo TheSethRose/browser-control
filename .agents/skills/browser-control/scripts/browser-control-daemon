@@ -13,7 +13,7 @@
 #   close [targetId]                  close an agent-opened extension tab (active tab if omitted)
 #   eval '<js>'                       run JavaScript, print its value ('-' reads stdin)
 #   call <op> ['<json>']              any operation, JSON in and out
-#   start [browser]                   switch browser by name (chrome, beta, brave, ardia); opens it
+#   start [browser]                   switch browser by name (chrome, beta, brave); opens it
 #                                     if needed. With no name it waits for the extension and prints
 #                                     its status; with BROWSER_CONTROL_BACKENDS=extension it never
 #                                     touches cdp, and the default falls back to cdp with a note.
@@ -119,16 +119,16 @@ resolve_natural() {
   if [[ -n "$w" ]]; then nat_val="$w"; nat_src=file; fi
 }
 
-# True when `$1` has the shape of a targetId: extension:<n>, extension:<slug>:<n>, browse:<n>,
+# True when `$1` has the shape of a targetId: extension:<n>, extension:<slug>:<n>,
 # optionally with @<frameId>, or a 32-hex DevTools id. Used where a trailing token could be either
 # a target or literal text (dialog prompt text).
 is_target_id() {
   local s="${1:-}"
-  [[ "$s" =~ ^(extension:[A-Za-z0-9][A-Za-z0-9-]*:[0-9]+|extension:[0-9]+|browse:[0-9]+)(@[0-9]+)?$ ]] && return 0
+  [[ "$s" =~ ^(extension:[A-Za-z0-9][A-Za-z0-9-]*:[0-9]+|extension:[0-9]+)(@[0-9]+)?$ ]] && return 0
   [[ "$s" =~ ^[0-9A-Fa-f]{32}$ ]]
 }
 
-# True when a one-line backend order value names `$2` (extension, cdp, browse). Stays bash 3.2 clean.
+# True when a one-line backend order value names `$2` (extension, cdp). Stays bash 3.2 clean.
 order_has() {
   local tok
   for tok in ${1//,/ }; do

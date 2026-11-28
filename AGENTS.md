@@ -26,8 +26,7 @@ typecheck, and tests on every PR into `v2` and `main`.
 - Slice branches branch from the latest `v2` and merge back into `v2` by PR (squash) after CI
   and review pass.
 - Remove no v1 feature. The parity checklist in `PLAN.md` section 3 is the contract.
-- Reuse no code from Ardia (GPL-3.0). Code adapted from `anomalyco/browse` (MIT) carries its MIT
-  attribution (file header plus the notice in `LICENSE`).
+- No GPL code. Third-party MIT code keeps its notice in `LICENSE`.
 - Never commit `extension/pairing.json`, tokens, or relay secrets.
 
 ### Worktrees
@@ -70,8 +69,11 @@ typecheck, and tests on every PR into `v2` and `main`.
 
 `browser-control` drives a real, already-running Chromium browser (Chrome, Chromium, Edge,
 Brave, Arc, Vivaldi, Opera, Comet, Canary). v2 reaches it through the Browser Control MV3
-extension (`extension/`) and a loopback relay by default, with the Chrome DevTools Protocol as
-the fallback. It is an
+extension (`extension/`) and a loopback relay by default. When the extension can't do the work,
+the command falls back to the Chrome DevTools Protocol and prints one
+`# used remote debugging: <cause>` line. `BROWSER_CONTROL_BACKENDS=extension` is strict: it
+refuses with `EXTENSION_ONLY` instead of falling back. The skill wrapper starts the daemon on
+the first command and restarts it on a new build when no CDP connection is open. It is an
 **infrastructure capability**: the domain is the browser's own control surface, so the
 operations are deliberately low-level protocol primitives rather than user-story verbs.
 `execute_cdp` is the general operation; `evaluate`, `navigate`, `capture_screenshot`,
@@ -94,10 +96,10 @@ profile.
   target routing, and CDP call plumbing.
 - `src/backends/` — backends beside CDP: `types.ts` (the `Backend` interface),
   `router.ts` (per-call routing and the backend order), `registry.ts` (the list), and one file per
-  backend (`extension.ts` for the relay server and pairing, `browse.ts` for the optional opencode
-  adapter). CDP in `src/index.ts` stays the fallback for every operation.
+  backend (`extension.ts` for the relay server and pairing). CDP in `src/index.ts` stays the
+  fallback for every operation.
 - `src/challenges.ts` — the bot-challenge and block-page classifier behind `CHALLENGE:` and
-  `BLOCKED:` lines (adapted from `anomalyco/browse`, MIT).
+  `BLOCKED:` lines.
 - `extension/` — the MV3 extension: `manifest.json` (fixed `key`), `background.js` (service
   worker), `lib/` (`pairing.js`, `debugger-hub.js`, `window-groups.js`, `tab-cleanup.js`,
   `frames.js`), `content-overlay.js` (the handoff card), `popup.html`/`popup.js`, and
@@ -110,7 +112,7 @@ profile.
   version in `/status` and writes `<socket>.build` for stale-daemon detection.
 - `src/page-runner.ts` — the daemon's `/page/*` runner (`snap`, `click`, `type`, `select`,
   `upload`, `wait`, `key`, `fill`, `do`, `value`, `text`, `ocr`, `shot`, `nav`, `verdict`,
-  `health`), accessibility formatting, tab matching, and `browse:<n>` parity.
+  `health`), accessibility formatting, tab matching, and session tab reuse.
 - `src/picture.ts` — picture-page OCR diffing, canvas redraw hash polling, and image width
   measurement.
 - `mcp.ts` — thin standalone MCP bootstrap (plain tool names: `execute_cdp`, not

@@ -91,7 +91,7 @@ describe("wrapper v2 page commands", () => {
   });
 
   test("dialog accept treats a lone targetId as the target, never prompt text", async () => {
-    for (const target of ["extension:528879684", "browse:7", "A".repeat(32), "extension:chrome-1a2b3c:42", "extension:42@3"]) {
+    for (const target of ["extension:528879684", "A".repeat(32), "extension:chrome-1a2b3c:42", "extension:42@3"]) {
       const req = await call("dialog", "accept", target);
       expect(req.path).toBe("/page/dialog");
       expect(JSON.parse(req.body)).toEqual({ sub: "accept" });
@@ -106,7 +106,7 @@ describe("wrapper v2 page commands", () => {
   });
 
   test("dialog accept keeps text that only looks similar to a targetId", async () => {
-    for (const text of ["extension:", "extension:4x", "browse:", "example.com"]) {
+    for (const text of ["extension:", "extension:4x", "browse:7", "example.com"]) {
       const req = await call("dialog", "accept", text);
       expect(JSON.parse(req.body)).toEqual({ sub: "accept", text });
       expect(req.query).toBe("");

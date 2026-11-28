@@ -3,14 +3,14 @@
  * 1. the daemon's own one-line `backends` file in its daemon dir (written by `extension disable`,
  *    removed by `extension enable`),
  * 2. `BROWSER_CONTROL_BACKENDS`,
- * 3. the one-line file `~/.config/browser-control/backends` (for example `extension,cdp` or `browse,cdp`).
+ * 3. the one-line file `~/.config/browser-control/backends` (for example `extension,cdp`).
  * Files are read on every call so the order can change without a restart. When none is set,
  * a paired extension defaults to `extension,cdp` and falls back to remote debugging (cdp) when the
  * extension can't do the work, with one `# used remote debugging:` line on that command's output;
  * unpaired, the default is `cdp` (v1 behavior).
  *
  * Rules:
- * - A target id with a backend prefix (`extension:12`, `browse:12`) always goes to that backend.
+ * - A target id with a backend prefix (`extension:12`) always goes to that backend.
  * - Explicit CDP requests (`connect_browser` / `start <browser>`, a DevTools targetId without a
  *   backend prefix, or `select_target` of a DevTools target) always run on `cdp`, even when the
  *   order is `extension`. After an explicit start or select, untargeted calls stay on CDP and
@@ -21,6 +21,7 @@
  * - An explicit order is honored exactly. With `extension` alone (env, daemon file or global
  *   file), failures (`RESTRICTED_PAGE`, `BackendUnavailable`), unhandled ops, and browser-level
  *   ops refuse with `EXTENSION_ONLY` and never touch CDP.
+ * - Retired backend names (`browse`) are dropped quietly; an order left empty uses the default.
  * - While a backend tab is selected, tab operations that backend can't run fail with a clear
  *   message instead of silently acting on a different (CDP) tab.
  */
@@ -36,6 +37,8 @@ import { BackendUnavailable, prefixOf, type Backend, type OpInput } from "./type
 export const CDP = "cdp";
 const EXTENSION = "extension";
 const HEX_64_RE = /^[0-9a-f]{64}$/i;
+/** Backends that no longer exist. Old backends files may still name them. */
+const RETIRED_BACKENDS = new Set(["browse"]);
 
 export const EXTENSION_ONLY_HINT =
   "The default order already falls back to remote debugging (cdp). This strict mode comes from an explicit backend order (BROWSER_CONTROL_BACKENDS or the backends file); set extension,cdp there, or run `start <browser>` / pass a DevTools targetId, to allow CDP.";
@@ -182,15 +185,19 @@ export function backendOrderSource(): { source: BackendOrderSource; value: strin
   return { source: "default", value: "" };
 }
 
-export function backendOrder(source: { value: string } = backendOrderSource()): string[] {
-  let raw = source.value;
-  // The default falls back: a paired extension first, then remote debugging when it can't help.
-  if (!raw) raw = "token" in readPrivateTokenSync() ? `${EXTENSION},${CDP}` : CDP;
+function parseOrder(raw: string): string[] {
   const names = raw
     .split(/[\s,]+/)
     .map((s) => s.trim().toLowerCase())
-    .filter(Boolean);
+    .filter((s) => s && !RETIRED_BACKENDS.has(s));
   return [...new Set(names)];
+}
+
+export function backendOrder(source: { value: string } = backendOrderSource()): string[] {
+  const names = parseOrder(source.value);
+  if (names.length > 0) return names;
+  // The default falls back: a paired extension first, then remote debugging when it can't help.
+  return parseOrder("token" in readPrivateTokenSync() ? `${EXTENSION},${CDP}` : CDP);
 }
 
 /** True when `error` is a `BackendUnavailable` (even across bundled module instances). */

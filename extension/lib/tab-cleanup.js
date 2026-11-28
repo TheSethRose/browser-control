@@ -1,6 +1,5 @@
 // Agent tab lifecycle hygiene: autoDiscardable:false, optional mute/unmute, leaveLastWindowOpen,
 // idle cleanup for agent-opened tabs, and onRemoved/onReplaced purging.
-// Patterns adapted from anomalyco/browse (MIT License).
 
 export const TAB_STATE_STORAGE_KEYS = ["lentTabs", "agentTabs", "agentTabLastUsed", "keepOpenTabs"];
 const TAB_GROUP_ID_NONE = -1;

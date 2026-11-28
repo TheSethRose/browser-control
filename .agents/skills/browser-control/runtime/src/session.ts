@@ -145,7 +145,6 @@ export function getBrowserCandidates(
     push("Vivaldi", `${base}/Vivaldi`);
     push("Opera", `${base}/com.operasoftware.Opera`);
     push("Comet", `${base}/Comet`);
-    push("Ardia", `${base}/Ardia`);
     push("Google Chrome Canary", `${base}/Google/Chrome Canary`);
   } else if (platform === "win32") {
     const local = env["LOCALAPPDATA"] ?? `${home}\\AppData\\Local`;
@@ -167,7 +166,6 @@ export function getBrowserCandidates(
     push("Brave", `${cfg}/BraveSoftware/Brave-Browser`);
     push("Vivaldi", `${cfg}/vivaldi`);
     push("Opera", `${cfg}/opera`);
-    push("Ardia", `${cfg}/ardia`);
     push("Google Chrome Canary", `${cfg}/google-chrome-unstable`);
   }
   return list;
@@ -206,7 +204,7 @@ export async function readDevToolsActivePort(
   );
 }
 
-const CHROMIUM_NAME = /chrom|edge|brave|vivaldi|opera|comet|helium|ardia|\barc\b|\bdia\b/i;
+const CHROMIUM_NAME = /chrom|edge|brave|vivaldi|opera|comet|helium|\barc\b|\bdia\b/i;
 
 /** Loopback TCP listeners from `lsof -nP -iTCP -sTCP:LISTEN -Fpn` output. */
 export function parseLsofListeners(text: string): Array<{ pid: number; port: number }> {

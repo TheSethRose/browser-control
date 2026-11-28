@@ -4,21 +4,20 @@ Set up and pick a backend, manage browsers and tabs, call raw CDP operations, an
 
 ## 1. Backends
 
-A backend is the path a command takes to the browser. There are three:
+A backend is the path a command takes to the browser. There are two:
 
 - `extension` is the first backend by default once paired (when `~/.config/browser-control/extension-relay.json` exists and is valid). The Browser Control extension in the user's own Chrome talks to the daemon over a local relay (a WebSocket on `127.0.0.1`, ports `49222`-`49229`). It needs no remote-debugging setting and no "Allow" click. The default order is `extension,cdp`: when the extension can't do the work, the command falls back to `cdp` and prints exactly one `# used remote debugging: <cause> (Chrome may ask you to Allow)` line. Fallback is never silent.
 - `cdp` is direct DevTools, the v1 way. It is the default when the extension is not paired, and it always runs when asked for by name (`start <browser>`, a DevTools targetId). It reaches pages the extension can't run on, such as `chrome://` tabs, the Chrome Web Store, other extensions' pages, and the built-in PDF viewer.
-- `browse` is the optional [opencode browse](https://github.com/anomalyco/browse) adapter (section 7).
 
 The daemon reads the backend order from `<daemon dir>/backends` first (default `$TMPDIR/browser-control-daemon/backends`), then `BROWSER_CONTROL_BACKENDS`, then `~/.config/browser-control/backends`. When none is set, a paired extension defaults to `extension,cdp`; without pairing, the default is `cdp`. `extension disable` writes `cdp` to `<daemon dir>/backends`; `extension enable` clears that file, and `extension setup` clears it too and backs up then rewrites a `~/.config/browser-control/backends` that leaves the extension out — so the default, `BROWSER_CONTROL_BACKENDS`, or the global file applies again. `status` and `extension status` report the effective order, its source, and a label such as `extension,cdp (default)` (`orderLabel`). The daemon reads the order on every call, so a change needs no restart.
 
 Routing rules:
 
-- A target id with a backend prefix always goes to that backend: `extension:<tabId>` (or `extension:<slug>:<tabId>` when more than one browser is connected) and `browse:<n>`.
+- A target id with a backend prefix always goes to that backend: `extension:<tabId>` (or `extension:<slug>:<tabId>` when more than one browser is connected).
 - Explicit CDP requests (`start <browser>`, a DevTools targetId with no backend prefix, or `select_target` of a DevTools target) always run on `cdp`, even when the order is `extension`. After an explicit `start` or `select_target`, untargeted calls stay on that CDP tab and `tabs` includes CDP targets; `clear_target` or `nav --browser <slug>` returns to the extension.
 - Otherwise backends are tried in order. The default (`extension,cdp`) falls back to `cdp` on a disconnected extension, a restricted page (`chrome://`, Chrome Web Store, PDF viewer), an unhandled op, or a browser-level CDP method. Each command that fell back prints one `# used remote debugging: <cause> (Chrome may ask you to Allow)` line, even if several of its operations fell back.
 - An explicit order is honored exactly. With `extension` alone (env, daemon file, or global file), nothing reaches `cdp` implicitly: those same failures refuse with `EXTENSION_ONLY` naming the cause and how to opt into `cdp`. The hint names the explicit setting as the reason for strict mode.
-- Fallback to `cdp` happens only when the effective order lists `cdp` (for example the default, `BROWSER_CONTROL_BACKENDS=extension,cdp`, or `browse,cdp`).
+- Fallback to `cdp` happens only when the effective order lists `cdp` (for example the default, or `BROWSER_CONTROL_BACKENDS=extension,cdp`). An old order that still names `browse` drops that entry quietly.
 - While a backend's tab is selected, a tab operation that backend lacks fails with a clear message. It never runs on a different tab instead.
 
 ## 2. One-time extension setup
@@ -80,17 +79,7 @@ If the extension doesn't connect:
 - **Foreground:** `select_target` does not switch the visible tab. On `cdp`, call `execute_cdp { "method": "Target.activateTarget", "params": { "targetId": "<id>" } }` when the user should see it. On the extension, `handoff` brings the tab forward.
 - **Close:** on the extension, run `$BCD close [targetId]` (closes only tabs Browser Control opened, and never closes the last tab of the last window — it opens a blank tab first). On `cdp`, run `execute_cdp { "method": "Target.closeTarget", "params": { "targetId": "<id>" } }`, then `call clear_target` if it was selected.
 
-## 7. The optional `browse` backend
-
-`browse` ([opencode browse](https://github.com/anomalyco/browse)) runs only when its CLI is installed, its extension is connected, and the backend order lists it, for example `browse,cdp`. Otherwise calls go to the next backend.
-
-- `browse:<n>` target ids always go to `browse`. Plain ids go to DevTools.
-- With `browse,cdp` and no DevTools tab selected, a `nav <url>` with no tab opens a background `browse` tab (no Allow click). `clear_target` resets both backends.
-- Operations `browse` lacks (`execute_cdp` on a tab, `capture_pdf`, `select`, `upload`, `ocr`, `click --xy`) fail with `INPUT_INVALID` instead of hitting a different DevTools tab. Browser-level CDP methods still work.
-- `snap`, `click`, `type`, `key`, `wait`, `fill`, and `do` route to `browse` on `browse:<n>` tabs, with label lookup, trap and payment refusal, and wall and host checks. For a handoff on a `browse:<n>` tab, call `browse handoff '<message>' <n>` directly.
-- Refs go stale when typeaheads or navigations replace elements. Run `snap` again.
-
-## 8. Raw CDP operations and MCP / CLI delivery
+## 7. Raw CDP operations and MCP / CLI delivery
 
 All 15 capability operations. Call them with `$BCD call <op> '<json>'`. Check exact schemas with `$BCD ops` or `runtime/capability.json`.
 

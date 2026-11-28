@@ -197,9 +197,9 @@ describe("extension status orderSource", () => {
 
   test("global file", async () => {
     const iso = await isolate("src-global");
-    await writeFile(iso.globalFile, "browse,cdp\n");
-    const data = await statusOrder(iso, ["browse", "cdp"]);
-    expect(data).toMatchObject({ orderSource: "global file", orderSourceValue: "browse,cdp" });
+    await writeFile(iso.globalFile, "extension,cdp\n");
+    const data = await statusOrder(iso, ["extension", "cdp"]);
+    expect(data).toMatchObject({ orderSource: "global file", orderSourceValue: "extension,cdp" });
   });
 
   test("default reports the effective order", async () => {
