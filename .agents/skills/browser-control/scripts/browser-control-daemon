@@ -203,7 +203,9 @@ restart_stale_daemon() {
     return 0
   fi
   # Re-read under the lock: the call that held it may have restarted the daemon already.
+  # The new daemon answers /status before it writes $build_file, so ask it too.
   running="$(tr -d '[:space:]' <"$build_file" 2>/dev/null || true)"
+  if [[ "$running" != "$want" ]] && probe_daemon && [[ "$d_build" == "$want" ]]; then running="$want"; fi
   if [[ "$running" == "$want" ]]; then rmdir "$lock" 2>/dev/null || true; return 0; fi
   req POST stop >/dev/null 2>&1 || true
   rm -f "$sock" "$build_file" 2>/dev/null || true
