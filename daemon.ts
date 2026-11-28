@@ -31,7 +31,7 @@ import {
   getRegisteredExtensionBackend,
   sessionKeyOf,
 } from "./src/backends/extension";
-import { backendOrder, backendOrderSource, setDaemonBackendsFile, withAutoConnect } from "./src/backends/router";
+import { backendOrder, backendOrderSource, runWithFallbackNotice, setDaemonBackendsFile, withAutoConnect } from "./src/backends/router";
 import { prefixOf } from "./src/backends/types";
 import { disposeOcr } from "./src/ocr";
 import { createPageHelperHandler, formatAxTree, matchTab } from "./src/page-runner";
@@ -169,9 +169,12 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
     return new Response(`${JSON.stringify(out)}\n`, { status: result.ok ? 200 : 400 });
   };
 
-  /** Text reply: `pick(data)` on success, the error JSON on failure. */
-  const text = (result: InvokeResult, pick: (data: any) => unknown, untrusted = false) =>
-    result.ok ? new Response(`${asText(pick(result.data), maxChars, untrusted)}\n`) : json(result);
+  /** Text reply: `pick(data)` on success, the error JSON on failure. A fallback notice rides after it. */
+  const text = (result: InvokeResult, pick: (data: any) => unknown, untrusted = false, notice?: string) => {
+    if (!result.ok) return json(result);
+    const rendered = asText(pick(result.data), maxChars, untrusted);
+    return new Response(`${notice === undefined ? rendered : `${rendered}\n${notice}`}\n`);
+  };
 
   const parseJsonBody = (raw: string): { ok: true; value: Json } | { ok: false; res: Response } => {
     if (raw === "") return { ok: true, value: {} };
@@ -246,16 +249,28 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
       case "call": {
         const parsed = parseJsonBody(body);
         if (!parsed.ok) return parsed.res;
-        return json(await invoke(operation, parsed.value));
+        const { value, notice } = await runWithFallbackNotice(() => invoke(operation, parsed.value));
+        // JSON output stays parseable: the notice rides as a field, not a stray line.
+        if (notice === undefined || !value.ok) return json(value);
+        return json({ ...value, data: { ...(value.data as Json), notice } });
       }
-      case "eval":
-        return text(await invoke("evaluate", { expression: body, targetId }), (data) => data.value, wrap);
-      case "close":
+      case "eval": {
+        const { value, notice } = await runWithFallbackNotice(() =>
+          invoke("evaluate", { expression: body, targetId }),
+        );
+        return text(value, (data) => data.value, wrap, notice);
+      }
+      case "close": {
+        const { value, notice } = await runWithFallbackNotice(() =>
+          invoke("close_target", targetId ? { targetId } : {}),
+        );
         return text(
-          await invoke("close_target", targetId ? { targetId } : {}),
+          value,
           (data) => (data.closed === false ? `not closed ${data.targetId ?? ""}` : `closed ${data.targetId ?? ""}`).trim(),
           false,
+          notice,
         );
+      }
       case "nav": {
         const browser = url.searchParams.get("browser")?.trim() || undefined;
         const navScope = browser ? { browser, explicitTargetId: targetId } : undefined;

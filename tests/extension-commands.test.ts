@@ -145,7 +145,7 @@ describe("daemon backends file and paired default", () => {
     expect(backendOrder()).toEqual(["extension"]);
   });
 
-  test("with no order set, unpaired defaults to cdp and paired defaults to extension", async () => {
+  test("with no order set, unpaired defaults to cdp and paired defaults to extension,cdp", async () => {
     const isoXdg = await mkdtemp(join(tmpdir(), "bc-order-xdg-"));
     try {
       delete process.env["BROWSER_CONTROL_BACKENDS"];
@@ -163,9 +163,9 @@ describe("daemon backends file and paired default", () => {
       await chmod(tokenFile, 0o644);
       expect(backendOrder()).toEqual(["cdp"]);
 
-      // Valid private 0600 token file -> extension alone.
+      // Valid private 0600 token file -> the paired default: extension first, then cdp with a notice.
       await chmod(tokenFile, 0o600);
-      expect(backendOrder()).toEqual(["extension"]);
+      expect(backendOrder()).toEqual(["extension", "cdp"]);
 
       // Explicit config file and env var still override the paired default.
       await writeFile(join(cfgDir, "backends"), "extension,cdp\n");
