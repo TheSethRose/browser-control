@@ -5,7 +5,9 @@
  * 2. `BROWSER_CONTROL_BACKENDS`,
  * 3. the one-line file `~/.config/browser-control/backends` (for example `extension,cdp` or `browse,cdp`).
  * Files are read on every call so the order can change without a restart. When none is set,
- * a paired extension defaults to `extension` alone; otherwise the default is `cdp` (v1 behavior).
+ * a paired extension defaults to `extension,cdp` and falls back to remote debugging (cdp) when the
+ * extension can't do the work, with one `# used remote debugging:` line on that command's output;
+ * unpaired, the default is `cdp` (v1 behavior).
  *
  * Rules:
  * - A target id with a backend prefix (`extension:12`, `browse:12`) always goes to that backend.
@@ -13,9 +15,12 @@
  *   backend prefix, or `select_target` of a DevTools target) always run on `cdp`, even when the
  *   order is `extension`. After an explicit start or select, untargeted calls stay on CDP and
  *   `list_targets` includes CDP targets until `clear_target` or `nav --browser <slug>`.
- * - Otherwise backends are tried in order. Fallback to `cdp` happens only when the effective
- *   order lists `cdp`. With `extension` alone, failures (`RESTRICTED_PAGE`, `BackendUnavailable`),
- *   unhandled ops, and browser-level ops refuse with `EXTENSION_ONLY` and never touch CDP.
+ * - Otherwise backends are tried in order. Fallback to `cdp` happens when the effective order
+ *   lists `cdp`. Every such fallback is reported once per command as
+ *   `# used remote debugging: <cause> (Chrome may ask you to Allow)`; it is never silent.
+ * - An explicit order is honored exactly. With `extension` alone (env, daemon file or global
+ *   file), failures (`RESTRICTED_PAGE`, `BackendUnavailable`), unhandled ops, and browser-level
+ *   ops refuse with `EXTENSION_ONLY` and never touch CDP.
  * - While a backend tab is selected, tab operations that backend can't run fail with a clear
  *   message instead of silently acting on a different (CDP) tab.
  */
@@ -33,7 +38,12 @@ const EXTENSION = "extension";
 const HEX_64_RE = /^[0-9a-f]{64}$/i;
 
 export const EXTENSION_ONLY_HINT =
-  "CDP is used only when asked: run `start <browser>` or pass a DevTools targetId, or set BROWSER_CONTROL_BACKENDS=extension,cdp to allow fallback.";
+  "The default order already falls back to remote debugging (cdp). This strict mode comes from an explicit backend order (BROWSER_CONTROL_BACKENDS or the backends file); set extension,cdp there, or run `start <browser>` / pass a DevTools targetId, to allow CDP.";
+
+/** The one line a command prints when the extension couldn't do the work and cdp did. */
+export function fallbackNoticeLine(cause: string): string {
+  return `# used remote debugging: ${cause} (Chrome may ask you to Allow)`;
+}
 
 /** Operations that act on one tab. */
 const TAB_OPS = new Set([
@@ -51,6 +61,7 @@ const TAB_OPS = new Set([
 // process-wide handles live on global symbols that both copies read.
 const DAEMON_BACKENDS_FILE = Symbol.for("browser-control.daemonBackendsFile");
 const AUTO_CONNECT = Symbol.for("browser-control.autoConnect");
+const FALLBACK_NOTICE = Symbol.for("browser-control.fallbackNotice");
 const shared = globalThis as unknown as Record<symbol, unknown>;
 
 /** The daemon calls this once at startup with `<daemonDir>/backends`. */
@@ -67,6 +78,52 @@ function autoConnectStorage(): AsyncLocalStorage<AutoConnect> {
 /** `explicitTarget`: the failed request named a DevTools targetId, so reconnecting is asked for. */
 export function withAutoConnect<T>(fn: () => T, explicitTarget = false): T {
   return autoConnectStorage().run({ explicitTarget }, fn);
+}
+
+type NoticeState = { cause?: string };
+
+function noticeStorage(): AsyncLocalStorage<NoticeState> {
+  return (shared[FALLBACK_NOTICE] ??= new AsyncLocalStorage<NoticeState>()) as AsyncLocalStorage<NoticeState>;
+}
+
+/** Record the first reason this command fell back from the extension to cdp. Later ones are folded in. */
+function noteFallback(cause: string): void {
+  const state = noticeStorage().getStore();
+  if (state && state.cause === undefined) state.cause = cause;
+}
+
+/**
+ * Run one command and return its value plus the single `# used remote debugging:` line it earned.
+ * Nested runs share the outermost scope, so one command prints the notice exactly once even when
+ * several operations fell back. Without a fallback the notice is undefined.
+ */
+export async function runWithFallbackNotice<T>(fn: () => T | Promise<T>): Promise<{ value: T; notice?: string }> {
+  const storage = noticeStorage();
+  if (storage.getStore()) return { value: await fn() };
+  const state: NoticeState = {};
+  const value = await storage.run(state, fn);
+  return state.cause === undefined ? { value } : { value, notice: fallbackNoticeLine(state.cause) };
+}
+
+/** A short, plain reason the extension couldn't run `op`, for the fallback notice. */
+function fallbackCause(error: Error, op: string): string {
+  const raw = error.message
+    .replace(/^BACKEND_UNAVAILABLE:\s*extension:\s*/i, "")
+    .trim()
+    .replace(/\.+$/, "");
+  if (/^RESTRICTED_PAGE/i.test(raw)) return "restricted page";
+  if (/^extension is not connected/i.test(raw)) return "the extension is not connected";
+  if (/isn't shared with Browser Control/i.test(raw)) return "the tab isn't shared with the extension";
+  return raw ? `the extension can't do it: ${raw.slice(0, 120)}` : `the extension can't run ${op}`;
+}
+
+/** The cause for an operation the extension has no handler for. */
+function unhandledCause(op: string, input: OpInput): string {
+  const method = input["method"];
+  if (op === "execute_cdp" && typeof method === "string" && isBrowserLevelMethod(method)) {
+    return `the extension can't run browser-level CDP (${method})`;
+  }
+  return `the extension can't run ${op}`;
 }
 
 function readOneLine(file: string): string {
@@ -127,7 +184,8 @@ export function backendOrderSource(): { source: BackendOrderSource; value: strin
 
 export function backendOrder(source: { value: string } = backendOrderSource()): string[] {
   let raw = source.value;
-  if (!raw) raw = "token" in readPrivateTokenSync() ? EXTENSION : CDP;
+  // The default falls back: a paired extension first, then remote debugging when it can't help.
+  if (!raw) raw = "token" in readPrivateTokenSync() ? `${EXTENSION},${CDP}` : CDP;
   const names = raw
     .split(/[\s,]+/)
     .map((s) => s.trim().toLowerCase())
@@ -258,6 +316,7 @@ export function route(
     }
 
     const skipped: Error[] = [];
+    let extensionCause: string | undefined;
     for (let i = 0; i < orderNow.length; i++) {
       const name = orderNow[i]!;
       if (name === CDP) {
@@ -271,13 +330,18 @@ export function route(
         }
         const handler = cdpOps[op];
         if (!handler) break;
+        // The extension was tried first and couldn't do it: say so on this command's output.
+        if (extensionCause !== undefined) noteFallback(extensionCause);
         const result = await handler(input);
         cdpUsed = true;
         if (op === "select_target") active = CDP;
         return result;
       }
       const backend = byName.get(name)!;
-      if (!backend.handles(op, input, active === name)) continue;
+      if (!backend.handles(op, input, active === name)) {
+        if (name === EXTENSION) extensionCause ??= unhandledCause(op, input);
+        continue;
+      }
       try {
         const result = await backend.invoke(op, input);
         if (op === "select_target" || op === "navigate") active = name;
@@ -285,6 +349,7 @@ export function route(
       } catch (error) {
         // A named browser that is offline is an error, never a reason to use another tab.
         if (!isBackendUnavailable(error) || input["browser"] !== undefined) throw error;
+        if (name === EXTENSION) extensionCause ??= fallbackCause(error, op);
         skipped.push(error);
         if (active === name && i < orderNow.length - 1) active = undefined;
       }
@@ -352,7 +417,9 @@ export function route(
     for (const name of orderNow) {
       if (name !== CDP) extra[name] = await byName.get(name)!.status();
     }
-    return { ...base, backends: { order: orderNow, active: active ?? null, ...extra } };
+    const source = backendOrderSource();
+    const orderLabel = `${orderNow.join(",")} (${source.source})`;
+    return { ...base, backends: { order: orderNow, orderSource: source.source, orderLabel, active: active ?? null, ...extra } };
   };
 
   return ops;

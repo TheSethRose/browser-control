@@ -1,7 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { OperationHandler } from "@agent-software/core";
 import { createBrowseBackend, type Runner } from "../src/backends/browse";
-import { route, withAutoConnect } from "../src/backends/router";
+import { backendOrder, route, runWithFallbackNotice, setDaemonBackendsFile, withAutoConnect } from "../src/backends/router";
 import { BackendUnavailable, type Backend } from "../src/backends/types";
 import { createPageHelperHandler } from "../src/page-runner";
 
@@ -298,7 +301,7 @@ describe("router with extension only (no implicit cdp fallback)", () => {
     const ops = route(fakeCdp(log), [ext], () => ["extension"]);
     await ops["select_target"]!({ targetId: "extension:5" });
     await expect(ops["evaluate"]!({ expression: "document.title" })).rejects.toThrow(
-      /^EXTENSION_ONLY: RESTRICTED_PAGE:.*chrome:\/\/.*CDP is used only when asked:/,
+      /^EXTENSION_ONLY: RESTRICTED_PAGE:.*chrome:\/\/.*This strict mode comes from an explicit backend order/,
     );
     await expect(ops["evaluate"]!({ expression: "document.title", targetId: "extension:5" })).rejects.toThrow(
       /^EXTENSION_ONLY: RESTRICTED_PAGE:.*chrome:\/\//,
@@ -318,7 +321,7 @@ describe("router with extension only (no implicit cdp fallback)", () => {
     });
     const opsDisconnected = route(fakeCdp(log), [disconnected], () => ["extension"]);
     await expect(opsDisconnected["navigate"]!({ url: "https://example.com" })).rejects.toThrow(
-      /^EXTENSION_ONLY: extension is not connected\. CDP is used only when asked:/,
+      /^EXTENSION_ONLY: extension is not connected\..*This strict mode comes from an explicit backend order/,
     );
     await expect(opsDisconnected["list_targets"]!({})).rejects.toThrow(
       /^EXTENSION_ONLY: extension is not connected\./,
@@ -331,7 +334,7 @@ describe("router with extension only (no implicit cdp fallback)", () => {
     });
     const opsNotShared = route(fakeCdp(log), [notShared], () => ["extension"]);
     await expect(opsNotShared["navigate"]!({ url: "https://example.com" })).rejects.toThrow(
-      /^EXTENSION_ONLY: tab 5 isn't shared with Browser Control\. CDP is used only when asked:/,
+      /^EXTENSION_ONLY: tab 5 isn't shared with Browser Control\..*This strict mode comes from an explicit backend order/,
     );
     expect(log).toEqual([]);
   });
@@ -343,7 +346,7 @@ describe("router with extension only (no implicit cdp fallback)", () => {
     await ops["select_target"]!({ targetId: "extension:5" });
 
     await expect(ops["capture_pdf"]!({})).rejects.toThrow(
-      /^EXTENSION_ONLY: capture_pdf isn't handled by the extension\. CDP is used only when asked:/,
+      /^EXTENSION_ONLY: capture_pdf isn't handled by the extension\..*This strict mode comes from an explicit backend order/,
     );
     await expect(ops["list_browsers"]!({})).rejects.toThrow(
       /^EXTENSION_ONLY: list_browsers isn't handled by the extension\./,
@@ -556,7 +559,7 @@ describe("router with extension only (no implicit cdp fallback)", () => {
 
     const res = await handlePage("emulate", { colorScheme: "dark" });
     expect(res.ok).toBe(false);
-    if (!res.ok) expect(res.error.message).toMatch(/^EXTENSION_ONLY:.*CDP is used only when asked:/);
+    if (!res.ok) expect(res.error.message).toMatch(/^EXTENSION_ONLY:.*This strict mode comes from an explicit backend order/);
     expect(log.filter((entry) => entry.startsWith("execute_cdp:"))).toEqual([]);
   });
 
@@ -642,14 +645,14 @@ describe("router with extension only (no implicit cdp fallback)", () => {
     const noTab = await handlePage("handoff", { message: "Sign in" });
     expect(noTab.ok).toBe(false);
     if (!noTab.ok) {
-      expect(noTab.error.message).toMatch(/^EXTENSION_ONLY: no extension tab is selected\. CDP is used only when asked:/);
+      expect(noTab.error.message).toMatch(/^EXTENSION_ONLY: no extension tab is selected\..*This strict mode comes from an explicit backend order/);
     }
 
     available = false;
     const disconnected = await handlePage("handoff", { message: "Sign in" });
     expect(disconnected.ok).toBe(false);
     if (!disconnected.ok) {
-      expect(disconnected.error.message).toMatch(/^EXTENSION_ONLY: extension is not connected\. CDP is used only when asked:/);
+      expect(disconnected.error.message).toMatch(/^EXTENSION_ONLY: extension is not connected\..*This strict mode comes from an explicit backend order/);
     }
 
     // Explicit CDP targetId still rejects with INPUT_INVALID.
@@ -667,5 +670,140 @@ describe("router with extension only (no implicit cdp fallback)", () => {
     });
     await ops["get_browser_status"]!({});
     expect(calls).toBe(1);
+  });
+});
+
+describe("default order: extension first, then cdp with one notice", () => {
+  const saved = process.env["BROWSER_CONTROL_BACKENDS"];
+  const savedXdg = process.env["XDG_CONFIG_HOME"];
+  const TOKEN = "ef".repeat(32);
+  afterEach(() => {
+    setDaemonBackendsFile(undefined);
+    if (saved === undefined) delete process.env["BROWSER_CONTROL_BACKENDS"];
+    else process.env["BROWSER_CONTROL_BACKENDS"] = saved;
+    if (savedXdg === undefined) delete process.env["XDG_CONFIG_HOME"];
+    else process.env["XDG_CONFIG_HOME"] = savedXdg;
+  });
+
+  async function isolatePaired(paired: boolean): Promise<string> {
+    const xdg = await mkdtemp(join(tmpdir(), "bc-default-order-"));
+    delete process.env["BROWSER_CONTROL_BACKENDS"];
+    process.env["XDG_CONFIG_HOME"] = xdg;
+    setDaemonBackendsFile(join(xdg, "missing-backends"));
+    if (paired) {
+      const cfg = join(xdg, "browser-control");
+      await mkdir(cfg, { recursive: true, mode: 0o700 });
+      const tokenFile = join(cfg, "extension-relay.json");
+      await writeFile(tokenFile, JSON.stringify({ token: TOKEN }), { mode: 0o600 });
+      await chmod(tokenFile, 0o600);
+    }
+    return xdg;
+  }
+
+  test("a paired default is extension,cdp; unpaired stays cdp", async () => {
+    const unpaired = await isolatePaired(false);
+    try {
+      expect(backendOrder()).toEqual(["cdp"]);
+    } finally {
+      await rm(unpaired, { recursive: true, force: true });
+    }
+    const paired = await isolatePaired(true);
+    try {
+      expect(backendOrder()).toEqual(["extension", "cdp"]);
+    } finally {
+      await rm(paired, { recursive: true, force: true });
+    }
+  });
+
+  test("the paired default falls back to cdp on a disconnected extension and says so once", async () => {
+    const xdg = await isolatePaired(true);
+    try {
+      const log: string[] = [];
+      const ext = fakeExtension({
+        invoke: async () => {
+          throw new BackendUnavailable("extension", "extension is not connected");
+        },
+      });
+      const ops = route(fakeCdp(log), [ext], backendOrder);
+      const status = (await ops["get_browser_status"]!({})) as { backends: { order: string[]; orderSource: string; orderLabel: string } };
+      expect(status.backends.order).toEqual(["extension", "cdp"]);
+      expect(status.backends.orderSource).toBe("default");
+      expect(status.backends.orderLabel).toBe("extension,cdp (default)");
+      log.length = 0;
+      const { value, notice } = await runWithFallbackNotice(async () => {
+        await ops["navigate"]!({ url: "https://x" });
+        await ops["evaluate"]!({ expression: "1" });
+        return "done";
+      });
+      expect(value).toBe("done");
+      expect(log).toEqual(["navigate:", "evaluate:"]);
+      expect(notice).toBe("# used remote debugging: the extension is not connected (Chrome may ask you to Allow)");
+    } finally {
+      await rm(xdg, { recursive: true, force: true });
+    }
+  });
+
+  test("a restricted page and an unhandled op each name their cause on an explicit extension,cdp order", async () => {
+    const log: string[] = [];
+    const ext = fakeExtension({
+      invoke: async () => {
+        throw new BackendUnavailable("extension", "RESTRICTED_PAGE: cannot access chrome://version");
+      },
+    });
+    const ops = route(fakeCdp(log), [ext], () => ["extension", "cdp"]);
+    const restricted = await runWithFallbackNotice(() => ops["navigate"]!({ url: "https://x" }));
+    expect(restricted.notice).toBe("# used remote debugging: restricted page (Chrome may ask you to Allow)");
+    const unhandled = await runWithFallbackNotice(() => ops["capture_pdf"]!({}));
+    expect(unhandled.notice).toBe("# used remote debugging: the extension can't run capture_pdf (Chrome may ask you to Allow)");
+  });
+
+  test("an explicit extension order still refuses with EXTENSION_ONLY and reports no fallback", async () => {
+    const log: string[] = [];
+    const ext = fakeExtension({
+      invoke: async () => {
+        throw new BackendUnavailable("extension", "extension is not connected");
+      },
+    });
+    const ops = route(fakeCdp(log), [ext], () => ["extension"]);
+    const { notice } = await runWithFallbackNotice(async () => {
+      await expect(ops["navigate"]!({ url: "https://x" })).rejects.toThrow(/^EXTENSION_ONLY: extension is not connected\./);
+      return "done";
+    });
+    expect(notice).toBeUndefined();
+    expect(log).toEqual([]);
+  });
+
+  test("cdp alone never reports a fallback", async () => {
+    const log: string[] = [];
+    const ops = route(fakeCdp(log), [fakeExtension()], () => ["cdp"]);
+    const { notice } = await runWithFallbackNotice(() => ops["navigate"]!({ url: "https://x" }));
+    expect(notice).toBeUndefined();
+    expect(log).toEqual(["navigate:"]);
+  });
+
+  test("a page command carries the notice once, after its output", async () => {
+    const log: string[] = [];
+    const ext = fakeExtension({
+      invoke: async (op) => {
+        if (op === "navigate") throw new BackendUnavailable("extension", "extension is not connected");
+        throw new BackendUnavailable("extension", "RESTRICTED_PAGE: cannot access chrome://version");
+      },
+    });
+    const ops = route(fakeCdp(log), [ext], () => ["extension", "cdp"]);
+    const invoke = async (op: string, input: Record<string, unknown> = {}) => {
+      try {
+        return { ok: true as const, data: (await ops[op]!(input)) as Record<string, unknown> };
+      } catch (err) {
+        return { ok: false as const, error: { code: "EXECUTION_FAILED" as const, message: (err as Error).message } };
+      }
+    };
+    const handlePage = createPageHelperHandler(invoke);
+    const res = await handlePage("nav", { url: "https://x" });
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      const value = String((res.data as Record<string, unknown>)["value"]);
+      const lines = value.split("\n").filter((l) => l.startsWith("# used remote debugging:"));
+      expect(lines).toEqual(["# used remote debugging: the extension is not connected (Chrome may ask you to Allow)"]);
+    }
   });
 });

@@ -15,6 +15,7 @@ import {
   extensionOnlyMessage,
   isBackendUnavailable,
   isExtensionOnlyOrder,
+  runWithFallbackNotice,
 } from "./backends/router";
 import { extensionFrameTarget, extensionTabOf, getRegisteredExtensionBackend, getRegisteredExtensionBcCall, parseExtensionTargetId, sessionKeyOf, type BcCallFn } from "./backends/extension";
 import {
@@ -426,6 +427,16 @@ export function createPageHelperHandler(
     return {
       ok: true,
       data: { ...(res.data as Json), value: value === "" ? line : `${value}\n${line}` },
+    } as InvokeResult;
+  };
+  /** Attach the one fallback receipt to a command's result, the same way. */
+  const withFallback = (res: InvokeResult, notice: string | undefined): InvokeResult => {
+    if (notice === undefined) return res;
+    if (!res.ok) return failure(res.error.code, `${res.error.message}\n${notice}`);
+    const value = valueOf(res);
+    return {
+      ok: true,
+      data: { ...(res.data as Json), value: value === "" ? notice : `${value}\n${notice}` },
     } as InvokeResult;
   };
   /** A held key and a held mouse button on one tab are separate records. */
@@ -3858,8 +3869,10 @@ export function createPageHelperHandler(
   const handlePageWithRemedies = async (action: string, input: Json, targetId?: string): Promise<InvokeResult> => {
     // One receipt per command: a `do` or a hover-then-click may shorten several paths, and the caller hears it once.
     shortPathAckMs = undefined;
-    const res = await handlePage(action, input, targetId);
-    return withShortPath(res.ok ? res : failure(res.error.code, withRemedy(res.error.message)));
+    // One command, one fallback notice, however many of its operations fell back to remote debugging.
+    const { value, notice } = await runWithFallbackNotice(() => handlePage(action, input, targetId));
+    const res = value.ok ? value : failure(value.error.code, withRemedy(value.error.message));
+    return withFallback(withShortPath(res), notice);
   };
   return handlePageWithRemedies;
 }
