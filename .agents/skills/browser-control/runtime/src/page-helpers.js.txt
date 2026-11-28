@@ -1,5 +1,5 @@
 (() => {
-  const VERSION = 13;
+  const VERSION = 14;
   if (globalThis.__bc && globalThis.__bc.v === VERSION) return;
 
   const INTERACTIVE = [
@@ -809,28 +809,35 @@
     return { stickyTop, stickyBottom };
   };
 
-  // pageScrollPoint adapted from anomalyco/browse (MIT License).
-  /** With (px, py), that point wins when it is over the document scroller; otherwise search the usual grid. */
+  // Where a page-level wheel can start: a viewport point whose topmost element sits in no nested
+  // scroller, so the wheel moves the document. A caller's point is kept when it qualifies.
+  const SCROLL_SPOTS = [[0.5, 0.5], [0.5, 0.3], [0.5, 0.7], [0.3, 0.5], [0.7, 0.5], [0.3, 0.3], [0.7, 0.3],
+    [0.3, 0.7], [0.7, 0.7], [0.12, 0.5], [0.88, 0.5], [0.5, 0.12], [0.5, 0.88]];
+  const scrollsByItself = (el) => {
+    let st;
+    try { st = getComputedStyle(el); } catch { return false; }
+    const ys = /(auto|scroll|overlay)/.test(st?.overflowY || '') && el.scrollHeight > el.clientHeight + 1;
+    const xs = /(auto|scroll|overlay)/.test(st?.overflowX || '') && el.scrollWidth > el.clientWidth + 1;
+    return ys || xs;
+  };
+  const overDocument = (x, y) => {
+    const top = [document.body, document.documentElement, document.scrollingElement];
+    let cur = deepHitIn(document, x, y);
+    if (!cur) return false;
+    for (let depth = 0; cur && !top.includes(cur) && depth < 500; cur = parentOf(cur), depth++) {
+      if (scrollsByItself(cur)) return false;
+    }
+    return true;
+  };
   function pageScrollPointRaw(px, py) {
-    if (typeof document.elementFromPoint !== 'function') return null;
-    const root = document.scrollingElement || document.documentElement;
-    const nested = (element) => {
-      for (let e = element; e && e !== root && e !== document.body && e !== document.documentElement; e = parentOf(e)) {
-        const style = getComputedStyle(e);
-        const scrollsY = /(auto|scroll|overlay)/.test(style.overflowY) && e.scrollHeight > e.clientHeight + 1;
-        const scrollsX = /(auto|scroll|overlay)/.test(style.overflowX) && e.scrollWidth > e.clientWidth + 1;
-        if (scrollsY || scrollsX) return true;
-      }
-      return false;
-    };
-    const width = innerWidth, height = innerHeight;
-    const points = [[0.5, 0.5]];
-    for (const fy of [0.3, 0.7, 0.15, 0.85]) for (const fx of [0.5, 0.25, 0.75, 0.1, 0.9]) points.push([fx, fy]);
-    const cands = Number.isFinite(px) && Number.isFinite(py) ? [[px, py]] : [];
-    for (const [fx, fy] of points) cands.push([Math.round(width * fx), Math.round(height * fy)]);
-    for (const [x, y] of cands) {
-      const element = deepHitIn(document, x, y);
-      if (element && element.localName !== 'iframe' && !nested(element)) return { x, y };
+    const vw = innerWidth || document.documentElement?.clientWidth || 0;
+    const vh = innerHeight || document.documentElement?.clientHeight || 0;
+    if (vw < 1 || vh < 1) return null;
+    const x0 = Number(px), y0 = Number(py);
+    if (px != null && py != null && x0 >= 0 && x0 < vw && y0 >= 0 && y0 < vh && overDocument(x0, y0)) return { x: x0, y: y0 };
+    for (const [fx, fy] of SCROLL_SPOTS) {
+      const x = Math.round(vw * fx), y = Math.round(vh * fy);
+      if (overDocument(x, y)) return { x, y };
     }
     return null;
   }

@@ -470,7 +470,7 @@ describe("text --scroll pace", () => {
   });
 
   test("helpers v13 ship the attach-free chars reader, stay plain JavaScript, and match the extension copy", () => {
-    expect(PAGE_HELPERS_VERSION).toBe(13);
+    expect(PAGE_HELPERS_VERSION).toBe(14);
     expect(PAGE_HELPERS_SOURCE).toContain("scrollRead, text, chars,");
     expect(PAGE_HELPERS_SOURCE).toContain("opts.scrollPace");
     expect(PAGE_HELPERS_SOURCE).toContain("scrollPace.factors");

@@ -1,26 +1,12 @@
-// Adapted from anomalyco/browse (MIT), cli/src/execute/challenge-detection.ts @ ce5578e. Copyright (c) 2025 opencode. See LICENSE.
 /**
- * Bot-challenge and block-page classification.
+ * Bot-challenge and block-page detection.
  *
- * After a navigation settles, a caller reads a few cheap signals from the page and classifies it:
- *
- * - `non-interactive`: an interstitial the browser clears by itself (Cloudflare's "Just a moment...", Akamai's and
- *   AWS WAF's silent challenges, a DataDome device check, an Imperva resource wait). The caller may auto-wait on it.
- * - `interactive`: a challenge only a person should answer (Turnstile or reCAPTCHA/hCaptcha checkboxes, PerimeterX
- *   "Press & Hold", a DataDome or AWS WAF captcha). The caller recommends `handoff`; it never solves it.
- * - `block`: the site refused the visit outright (Cloudflare "Sorry, you have been blocked", Akamai or Imperva
- *   "Access Denied"). Retrying makes it worse: stop or ask the user.
- *
- * The signals are vendor markers (challenge frames and scripts, element ids the vendors' pages use) and title/text
- * phrases. Generic phrases ("access denied", "verify you are human") only count on short pages, so an article that
- * mentions them is not a challenge. Detection is deliberately conservative: a miss costs a turn, a false positive
- * costs a wait or a needless handoff.
- *
- * Pure module: input to output, no browser, no network, no I/O. The page-side collection that fills a
- * `ChallengeProbe` lives in the caller.
+ * Reads what a page shows (title, a text sample, frame and script URLs, marker elements, the HTTP
+ * status) and names what is in the way: a vendor challenge that clears by itself, one a person has
+ * to answer, or a hard refusal. Detection only: nothing here solves, clicks, or bypasses anything.
  */
 
-import { scrubPromptTokens, wrapUntrusted } from "./safety";
+import { escapeControls, scrubPromptTokens, wrapUntrusted } from "./safety";
 
 export type ChallengeVendor =
   | "cloudflare"
@@ -38,524 +24,544 @@ export type ChallengeKind = "non-interactive" | "interactive" | "block";
 export type ChallengeDetection = {
   readonly vendor: ChallengeVendor;
   readonly kind: ChallengeKind;
-  /** The marker that matched, for logs and the agent ("title: Just a moment...", "iframe challenges.cloudflare.com"). */
+  /** The evidence that decided it, for logs and the agent ("title: Just a moment...", "frame https://..."). */
   readonly reason: string;
 };
 
-/** What the caller reads from the page. Every field is bounded by the reader. */
+/** Page facts the caller collects. The caller bounds every field. */
 export type ChallengeProbe = {
   readonly url: string;
-  /** `document.title`, already trimmed by the reader. */
+  /** `document.title`, trimmed. */
   readonly title: string;
-  /** The navigation's HTTP status when known. */
+  /** HTTP status of the navigation, when known. */
   readonly status?: number;
-  /** `document.body.innerText`, first 3000 characters. */
+  /** The first 3000 characters of `document.body.innerText`. */
   readonly text: string;
-  /** Full `innerText` length, to tell short interstitials from long pages. Defaults to `text.length`. */
+  /** Length of the whole `innerText`; tells a short interstitial from a long page. Falls back to `text.length`. */
   readonly textLength?: number;
-  /** Frame URLs from the page's frame tree. */
+  /** URLs of the page's frames. */
   readonly frameUrls?: readonly string[];
-  /** Script `src` values, first 50. */
+  /** Up to 50 script `src` values. */
   readonly scriptSrcs?: readonly string[];
-  /** Which of `probeSelectors` matched an element. */
+  /** Entries of `probeSelectors` that matched at least one element. */
   readonly selectors?: readonly string[];
-  /** Which of the matched selectors are visible (non-zero size). */
+  /** The matched entries with at least one element of non-zero size. */
   readonly visibleSelectors?: readonly string[];
 };
 
-/** Element markers the probe checks. Keep in sync with `classifyChallenge`. */
-export const probeSelectors = [
-  // Cloudflare
-  "#challenge-form",
-  "#challenge-running",
-  "#challenge-stage",
-  "#cf-challenge-running",
-  ".cf-turnstile",
-  "#cf-error-details",
-  // Akamai Bot Manager
-  "#sec-if-cpt-container",
-  "#sec-cpt-if",
-  "#sec-text-if",
-  // DataDome
-  "#ddv1-captcha-container",
-  // PerimeterX / HUMAN
-  "#px-captcha",
-  "#px-captcha-wrapper",
-  "[id^='px-captcha']",
-  // Imperva / Incapsula
-  "#main-iframe[src*='_Incapsula_Resource']",
-  // AWS WAF
-  "#captcha-container awswaf-captcha",
-  "awswaf-captcha",
-  "#challenge-container",
-  // reCAPTCHA / hCaptcha
-  ".g-recaptcha",
-  "iframe[src*='/recaptcha/'][title*='challenge']",
-  ".h-captcha",
-] as const;
-
-/** A short page is an interstitial or a wall, not an article. */
+/** Pages whose full text is shorter than this count as interstitial-sized. */
 export const SHORT_PAGE_CHARS = 1_500;
+const TEXT_SAMPLE_CHARS = 3_000;
 
-/** High-confidence vendor markers that warrant probing even on a longer page. */
-export const fastVendorSelectors = [
-  "#challenge-form",
-  "#challenge-running",
-  "#challenge-stage",
-  "#cf-challenge-running",
-  "#cf-error-details",
-  "#sec-if-cpt-container",
-  "#sec-cpt-if",
-  "#sec-text-if",
-  "#ddv1-captcha-container",
-  "#px-captcha",
-  "#px-captcha-wrapper",
-  "[id^='px-captcha']",
-  "#main-iframe[src*='_Incapsula_Resource']",
-  "awswaf-captcha",
-] as const;
+type Row = Record<string, string | null>;
 
-const DENIAL_TITLE_RE =
-  /^(?:(?:403|451)\s+)?(?:access denied|forbidden|blocked|request blocked|you have been blocked)$/i;
-const SUSPICIOUS_TITLE_RE =
-  /^(?:(?:(?:403|451)\s+)?(?:access denied|forbidden|blocked|request blocked|you have been blocked)|just a moment\b|attention required! \| cloudflare|checking your browser|un instant|einen moment|pardon our interruption|security check|one more step|please wait\b)|\b(?:captcha|security check|human verification|verify (?:that )?you(?:'re| are) (?:a )?human|are you a robot)\b/i;
-const SUSPICIOUS_URL_RE = /^https?:\/\/www\.google\.[^/]+\/sorry\//i;
-const CONTROL_OR_LINEBREAK = /[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g;
-const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+/**
+ * One marker element. `css` is what the page is queried with. `id`, `idPrefix`, `cls` and `src` say
+ * how a `bc.query` row (id, class, src) is matched back to it; a marker with none of them is only
+ * found by a dedicated query.
+ */
+type Marker = {
+  readonly css: string;
+  /** Cheap enough and specific enough for the first-pass check on every suspicious page. */
+  readonly fast?: boolean;
+  readonly id?: string;
+  readonly idPrefix?: string;
+  readonly cls?: string;
+  readonly src?: string;
+};
 
-/** Strip line breaks, control chars, lone surrogates, and prompt tokens so page text stays on one bounded line. */
+const MARKERS: readonly Marker[] = [
+  // Cloudflare interstitial, widget, and error page.
+  { css: "#challenge-running", fast: true, id: "challenge-running" },
+  { css: "#challenge-form", fast: true, id: "challenge-form" },
+  { css: "#challenge-stage", fast: true, id: "challenge-stage" },
+  { css: "#cf-challenge-running", fast: true, id: "cf-challenge-running" },
+  { css: "#cf-please-wait", fast: true, id: "cf-please-wait" },
+  { css: "#cf-error-details", fast: true, id: "cf-error-details" },
+  { css: ".cf-turnstile", cls: "cf-turnstile" },
+  { css: "iframe[src*='challenges.cloudflare.com']", src: "challenges.cloudflare.com" },
+  // Akamai Bot Manager.
+  { css: "#sec-if-cpt-container", fast: true, id: "sec-if-cpt-container" },
+  { css: "#sec-cpt-if", fast: true, id: "sec-cpt-if" },
+  // DataDome.
+  { css: "#ddv1-captcha-container", fast: true, id: "ddv1-captcha-container" },
+  { css: "iframe[src*='captcha-delivery.com']", fast: true, src: "captcha-delivery.com" },
+  // PerimeterX / HUMAN.
+  { css: "#px-captcha", fast: true, id: "px-captcha" },
+  { css: "[id^='px-captcha']", idPrefix: "px-captcha" },
+  // Imperva / Incapsula.
+  { css: "#main-iframe[src*='_Incapsula_Resource']", fast: true, id: "main-iframe", src: "_Incapsula_Resource" },
+  { css: "iframe[src*='_Incapsula_Resource']", src: "_Incapsula_Resource" },
+  // AWS WAF CAPTCHA element.
+  { css: "awswaf-captcha", fast: true },
+  // reCAPTCHA and hCaptcha widgets.
+  { css: ".g-recaptcha", cls: "g-recaptcha" },
+  { css: "iframe[src*='/recaptcha/']", src: "/recaptcha/" },
+  { css: ".h-captcha", cls: "h-captcha" },
+  { css: "iframe[src*='hcaptcha.com']", src: "hcaptcha.com" },
+];
+
+/** Every marker the full probe checks. `classifyChallenge` reads matches by these exact strings. */
+export const probeSelectors: readonly string[] = MARKERS.map((m) => m.css);
+
+/** The interstitial and block markers for the cheap first-pass check (no plain widgets). */
+export const fastVendorSelectors: readonly string[] = MARKERS.filter((m) => m.fast).map((m) => m.css);
+
+const CF_INTERSTITIAL_MARKERS = ["#challenge-running", "#challenge-form", "#challenge-stage", "#cf-challenge-running", "#cf-please-wait"];
+
+/** Cloudflare's interstitial title in the languages it ships. */
+const CF_TITLE =
+  /^(?:just a moment|un instant|einen moment|un momento|um momento|een moment|één moment|chwileczk|bir dakika|подождите|одну минуту|しばらくお待ちください|请稍候|請稍候|잠시만 기다리십시오)/i;
+const CF_BLOCK_TITLE = /attention required!?\s*\|\s*cloudflare|used cloudflare to restrict access/i;
+const CF_BLOCK_TEXT = /you have been blocked|cloudflare ray id/i;
+
+const DENIAL_TITLE =
+  /^(?:(?:error\s*)?(?:403|451)(?:\s*[-:|–]?\s*(?:forbidden|access denied|unavailable for legal reasons))?|access denied|access forbidden|forbidden|access to this page has been denied\.?|request (?:blocked|rejected)|(?:sorry, )?you have been blocked)$/i;
+const DENIAL_TEXT =
+  /^\s*(?:access denied|forbidden|access to this page has been denied|request (?:blocked|rejected)|sorry, you have been blocked)|you don'?t have permission to access/i;
+
+/** Titles a verification page uses, as the whole title or before a " | site" suffix. */
+const CHALLENGE_TITLE =
+  /^(?:security check|one more step|pardon our interruption|are you a (?:robot|human)\??|human verification|verify(?:ing)? (?:that )?you are (?:a )?human|bot (?:check|verification)|captcha|security verification|access verification|ddos protection)(?:[\s.!?…]*$|\s+[|–—-]\s)/i;
+
+/** Wording that asks the visitor to prove they are a person. */
+const HUMAN_CUE =
+  /\b(?:(?:verify|confirm|prove)(?:ing)? (?:that )?you(?: are|'re) (?:a )?human|are you a (?:robot|human)|i'?m not a robot|unusual traffic|(?:solve|complete) the (?:captcha|security check|challenge)|human verification)\b/i;
+/** PerimeterX's "Press & Hold" prompt, not a device manual's "press and hold the power button". */
+const PX_HOLD = /press\s*(?:&|&amp;|and)\s*hold\b[^.!?]{0,60}?\b(?:human|robot|not a bot)/i;
+const AKAMAI_REFERENCE = /reference\s*#\s*\d+\.[0-9a-z]+\.\d+/i;
+const IMPERVA_INCIDENT = /incapsula incident id/i;
+const CAPTCHA_WORD = /captcha/i;
+
+const SUSPICIOUS_TITLE =
+  /just a moment|checking your browser|please wait|attention required|security check|one more step|pardon our interruption|captcha|are you a (?:robot|human)|verify(?:ing)? you are (?:a )?human|human verification|access denied|forbidden|you have been blocked|request blocked|has been denied/i;
+const SUSPICIOUS_URL =
+  /\/cdn-cgi\/challenge-platform\/|[?&]__cf_chl_|google\.[a-z.]+\/sorry\/|captcha|_incapsula_resource|\/challenge(?:[/?#]|$)|perfdrive\.com|\/blocked(?:[/?#]|$)/i;
+
+/** Flatten page-derived text to one safe line: no controls, no boundary or chat-template tokens. */
 export function sanitizeChallengeText(value: string, maxLen = 160): string {
-  return scrubPromptTokens(value)
-    .replace(LONE_SURROGATE, "")
-    .replace(CONTROL_OR_LINEBREAK, " ")
+  const flat = scrubPromptTokens(String(value ?? ""))
+    .replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ")
     .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, maxLen);
+    .trim();
+  const cut = flat.length > maxLen ? `${flat.slice(0, Math.max(0, maxLen - 1))}…` : flat;
+  return escapeControls(cut);
 }
 
-function safeOrigin(url: string): string {
-  try {
-    const parsed = new URL(url);
-    if ((parsed.protocol === "http:" || parsed.protocol === "https:") && parsed.origin && parsed.origin !== "null") {
-      return sanitizeChallengeText(parsed.origin, 120);
-    }
-  } catch {
-    /* fall through */
+export const isDenialTitle = (title: string): boolean => DENIAL_TITLE.test(title.trim());
+export const isSuspiciousTitle = (title: string): boolean => {
+  const t = title.trim();
+  return CF_TITLE.test(t) || CHALLENGE_TITLE.test(t) || DENIAL_TITLE.test(t) || SUSPICIOUS_TITLE.test(t);
+};
+export const isSuspiciousUrl = (url: string): boolean => SUSPICIOUS_URL.test(url.trim());
+
+type Page = {
+  url: string;
+  title: string;
+  text: string;
+  short: boolean;
+  status: number | undefined;
+  frames: string[];
+  scripts: string[];
+  found: Set<string>;
+  shown: Set<string>;
+};
+
+function readPage(probe: ChallengeProbe): Page {
+  const text = probe.text ?? "";
+  const length = probe.textLength ?? text.length;
+  return {
+    url: probe.url ?? "",
+    title: (probe.title ?? "").trim(),
+    text,
+    short: length < SHORT_PAGE_CHARS,
+    status: typeof probe.status === "number" && probe.status > 0 ? probe.status : undefined,
+    frames: [...(probe.frameUrls ?? [])],
+    scripts: [...(probe.scriptSrcs ?? [])],
+    found: new Set(probe.selectors ?? []),
+    shown: new Set(probe.visibleSelectors ?? []),
+  };
+}
+
+const ev = {
+  title: (p: Page) => `title: ${sanitizeChallengeText(p.title, 80)}`,
+  text: (s: string) => `text: ${sanitizeChallengeText(s, 80)}`,
+  frame: (u: string) => `frame ${sanitizeChallengeText(u, 120)}`,
+  script: (u: string) => `script ${sanitizeChallengeText(u, 120)}`,
+  element: (css: string) => `element ${css}`,
+  status: (n: number) => `status ${n}`,
+  url: (u: string) => `url ${sanitizeChallengeText(u, 120)}`,
+};
+
+function hit(vendor: ChallengeVendor, kind: ChallengeKind, evidence: Array<string | undefined | false>): ChallengeDetection {
+  const reason = evidence.filter((e): e is string => typeof e === "string" && e !== "").join(", ");
+  return { vendor, kind, reason: sanitizeChallengeText(reason, 240) || vendor };
+}
+
+const firstMatch = (text: string, re: RegExp): string | undefined => re.exec(text)?.[0];
+const anyFound = (p: Page, list: readonly string[]) => list.find((css) => p.found.has(css));
+const lower = (s: string) => s.toLowerCase();
+
+// Vendor block pages: the vendor's own refusal wording or reference format.
+
+function cloudflareBlock(p: Page): ChallengeDetection | undefined {
+  const blockedText = firstMatch(p.text, CF_BLOCK_TEXT);
+  const titled = CF_BLOCK_TITLE.test(p.title);
+  const details = p.found.has("#cf-error-details");
+  if (!blockedText || !(titled || details || /cloudflare ray id/i.test(p.text))) return undefined;
+  return hit("cloudflare", "block", [titled && ev.title(p), details && ev.element("#cf-error-details"), ev.text(blockedText)]);
+}
+
+function akamaiBlock(p: Page): ChallengeDetection | undefined {
+  const ref = firstMatch(p.text, AKAMAI_REFERENCE);
+  if (!ref || !(isDenialTitle(p.title) || /permission to access/i.test(p.text))) return undefined;
+  return hit("akamai", "block", [p.status !== undefined && ev.status(p.status), p.title !== "" && ev.title(p), ev.text(ref)]);
+}
+
+function impervaBlock(p: Page): ChallengeDetection | undefined {
+  const incident = p.short ? firstMatch(p.text, IMPERVA_INCIDENT) : undefined;
+  return incident ? hit("imperva", "block", [ev.text(incident)]) : undefined;
+}
+
+// Vendor challenges: interstitials that clear by themselves, or prompts a person must answer.
+
+function cloudflareChallenge(p: Page): ChallengeDetection | undefined {
+  const titled = p.short && CF_TITLE.test(p.title);
+  const marker = anyFound(p, CF_INTERSTITIAL_MARKERS);
+  const cfFrames = p.frames.filter((u) => /\/\/challenges\.cloudflare\.com\//i.test(u));
+  // A Turnstile frame alone is a form widget, not an interstitial.
+  const pageFrame = cfFrames.find((u) => !/\/turnstile\//i.test(u));
+  const cfUrl = /\/cdn-cgi\/challenge-platform\/|[?&]__cf_chl_/i.test(p.url);
+  if (!titled && !marker && !pageFrame && !cfUrl) return undefined;
+  const widget = p.shown.has(".cf-turnstile") ? ".cf-turnstile" : undefined;
+  const cue = firstMatch(p.text, HUMAN_CUE);
+  const evidence = [titled && ev.title(p), marker && ev.element(marker), pageFrame && ev.frame(pageFrame), cfUrl && ev.url(p.url)];
+  if (widget || cue) {
+    return hit("cloudflare", "interactive", [...evidence, widget && ev.element(widget), !widget && cue && ev.text(cue)]);
   }
-  return "this page";
+  return hit("cloudflare", "non-interactive", evidence);
 }
 
-export const isDenialTitle = (title: string): boolean => DENIAL_TITLE_RE.test(title.trim());
-export const isSuspiciousTitle = (title: string): boolean => SUSPICIOUS_TITLE_RE.test(title.trim());
-export const isSuspiciousUrl = (url: string): boolean => SUSPICIOUS_URL_RE.test(url.trim());
+function akamaiChallenge(p: Page): ChallengeDetection | undefined {
+  if (p.shown.has("#sec-cpt-if")) return hit("akamai", "interactive", [ev.element("#sec-cpt-if")]);
+  const marker = anyFound(p, ["#sec-if-cpt-container", "#sec-cpt-if"]);
+  return marker ? hit("akamai", "non-interactive", [ev.element(marker)]) : undefined;
+}
 
-const textLengthOf = (probe: ChallengeProbe): number => probe.textLength ?? probe.text.length;
-
-const shortPage = (probe: ChallengeProbe): boolean => textLengthOf(probe) < SHORT_PAGE_CHARS;
-
-function hostOf(url: string): string {
-  try {
-    return new URL(url).hostname.toLowerCase();
-  } catch {
-    return "";
+function dataDomeChallenge(p: Page): ChallengeDetection | undefined {
+  const frame = p.frames.find((u) => /\/\/[^/]*captcha-delivery\.com\//i.test(u));
+  if (frame) {
+    const kind: ChallengeKind = /\/interstitial\//i.test(frame) ? "non-interactive" : "interactive";
+    return hit("datadome", kind, [ev.frame(frame)]);
   }
+  const marker = anyFound(p, ["#ddv1-captcha-container", "iframe[src*='captcha-delivery.com']"]);
+  return marker ? hit("datadome", "interactive", [ev.element(marker)]) : undefined;
 }
 
-function hasFrame(probe: ChallengeProbe, pattern: RegExp): string | undefined {
-  return (probe.frameUrls ?? []).find((url) => pattern.test(url));
+function perimeterXChallenge(p: Page): ChallengeDetection | undefined {
+  const marker = anyFound(p, ["#px-captcha", "[id^='px-captcha']"]);
+  const hold = p.short ? firstMatch(p.text, PX_HOLD) : undefined;
+  if (!marker && !hold) return undefined;
+  return hit("perimeterx", "interactive", [marker && ev.element(marker), hold && ev.text(hold)]);
 }
 
-function hasScript(probe: ChallengeProbe, pattern: RegExp): string | undefined {
-  return (probe.scriptSrcs ?? []).find((src) => pattern.test(src));
+function impervaChallenge(p: Page): ChallengeDetection | undefined {
+  if (!p.short) return undefined;
+  const isResource = (u: string) => lower(u).includes("_incapsula_resource");
+  const frame = p.frames.find(isResource);
+  const script = frame ? undefined : p.scripts.find(isResource);
+  const marker = frame || script ? undefined : anyFound(p, ["#main-iframe[src*='_Incapsula_Resource']", "iframe[src*='_Incapsula_Resource']"]);
+  if (!frame && !script && !marker) return undefined;
+  const evidence = [frame && ev.frame(frame), script && ev.script(script), marker && ev.element(marker)];
+  const captcha = firstMatch(p.text, CAPTCHA_WORD) ?? firstMatch(p.text, HUMAN_CUE);
+  const widgetFrame = p.frames.find((u) => /\/recaptcha\/|hcaptcha\.com\//i.test(u));
+  if (captcha || widgetFrame) {
+    return hit("imperva", "interactive", [...evidence, captcha && ev.text(captcha), widgetFrame && ev.frame(widgetFrame)]);
+  }
+  return hit("imperva", "non-interactive", evidence);
 }
 
-const has = (probe: ChallengeProbe, selector: string): boolean => (probe.selectors ?? []).includes(selector);
-const visible = (probe: ChallengeProbe, selector: string): boolean =>
-  (probe.visibleSelectors ?? []).includes(selector);
+/** A refusal with no vendor wording: a 403/451, or a short page titled or worded as a denial. */
+function denial(p: Page): ChallengeDetection | undefined {
+  const refused = p.status === 403 || p.status === 451;
+  const titled = isDenialTitle(p.title);
+  const worded = p.short ? firstMatch(p.text, DENIAL_TEXT) : undefined;
+  if (!(refused && (p.short || titled)) && !(p.short && (titled || worded))) return undefined;
+  return hit("generic", "block", [refused && ev.status(p.status!), titled && ev.title(p), !titled && worded && ev.text(worded)]);
+}
 
-/** Classify a probed page, or `undefined` when it does not look like a challenge or block page. */
+/** The visitor-facing wall cue: a challenge title or prove-you-are-human wording, on a short page. */
+function wallCue(p: Page): string | undefined {
+  if (!p.short) return undefined;
+  if (CHALLENGE_TITLE.test(p.title)) return ev.title(p);
+  const cue = firstMatch(p.text, HUMAN_CUE);
+  return cue ? ev.text(cue) : undefined;
+}
+
+function awsWafChallenge(p: Page): ChallengeDetection | undefined {
+  if (!p.short) return undefined;
+  const element = [...p.found].find((css) => css.includes("awswaf-captcha"));
+  if (element) return hit("aws-waf", "interactive", [ev.element(element)]);
+  // The silent challenge answers 202 while its script runs; the same SDK loads on normal pages.
+  const sdk = p.scripts.find((u) => /\.awswaf\.com\//i.test(u));
+  return sdk && p.status === 202 ? hit("aws-waf", "non-interactive", [ev.status(202), ev.script(sdk)]) : undefined;
+}
+
+function widgetWall(
+  p: Page,
+  vendor: "recaptcha" | "hcaptcha",
+  frameRe: RegExp,
+  widgetCss: string,
+): ChallengeDetection | undefined {
+  const frame = p.frames.find((u) => frameRe.test(u));
+  const widget = p.found.has(widgetCss) ? widgetCss : undefined;
+  if (!frame && !widget) return undefined;
+  // A widget inside a sign-in or contact form is not a wall; a wall says so in its title or text.
+  const cue = wallCue(p);
+  return cue ? hit(vendor, "interactive", [cue, frame ? ev.frame(frame) : ev.element(widget!)]) : undefined;
+}
+
+function recaptchaChallenge(p: Page): ChallengeDetection | undefined {
+  if (/^https?:\/\/(?:www\.)?google\.[a-z.]+\/sorry\//i.test(p.url)) {
+    return hit("recaptcha", "interactive", [ev.url(p.url)]);
+  }
+  return widgetWall(p, "recaptcha", /\/recaptcha\/(?:api2|enterprise)\/|recaptcha\.net\/recaptcha\//i, ".g-recaptcha");
+}
+
+const hcaptchaChallenge = (p: Page) => widgetWall(p, "hcaptcha", /\/\/(?:[^/]+\.)?hcaptcha\.com\//i, ".h-captcha");
+
+function genericChallenge(p: Page): ChallengeDetection | undefined {
+  const cue = wallCue(p);
+  return cue ? hit("generic", "interactive", [cue]) : undefined;
+}
+
+/**
+ * Classify a page. Order matters: a vendor's own block page first, then vendor challenges (a
+ * Cloudflare interstitial is served with 403, so it must win over a bare status), then a plain
+ * refusal, then embedded CAPTCHA walls, then generic verification pages. `undefined` means no
+ * challenge was found.
+ */
 export function classifyChallenge(probe: ChallengeProbe): ChallengeDetection | undefined {
-  const title = probe.title.trim().toLowerCase();
-  const text = probe.text.toLowerCase();
-  const host = hostOf(probe.url);
-  const reason = (value: string) => sanitizeChallengeText(value, 160);
-  const refused = probe.status === 403 || probe.status === 451;
-  const denialTitle = isDenialTitle(title);
-
-  // An HTTP refusal with an explicit denial title is a block at any length, even if it offers a CAPTCHA form.
-  if (refused && denialTitle) {
-    const akamai = title === "access denied" && /you don't have permission to access/.test(text) && /reference #?\d/.test(text);
-    if (akamai) return { vendor: "akamai", kind: "block", reason: "title: Access Denied (Akamai reference)" };
-    return { vendor: "generic", kind: "block", reason: reason(`status ${probe.status}, title: ${probe.title.trim()}`) };
-  }
-
-  // Cloudflare
-  if (/sorry, you have been blocked/.test(text) && (has(probe, "#cf-error-details") || /cloudflare/.test(text))) {
-    return { vendor: "cloudflare", kind: "block", reason: "text: Sorry, you have been blocked" };
-  }
-  const cloudflareInterstitial =
-    /^just a moment\b|^attention required! \| cloudflare|^checking your browser|^un instant|^einen moment/.test(title) ||
-    has(probe, "#challenge-form") ||
-    has(probe, "#challenge-running") ||
-    has(probe, "#cf-challenge-running") ||
-    has(probe, "#challenge-stage");
-  // The managed-challenge orchestrator frame marks an interstitial; a Turnstile widget frame alone is
-  // often a site's own form widget, so it never flags a page by itself.
-  const orchestrator = hasFrame(probe, /^https:\/\/challenges\.cloudflare\.com\/cdn-cgi\/challenge-platform\/.*\/orchestrate\//);
-  if (cloudflareInterstitial || (orchestrator !== undefined && shortPage(probe))) {
-    // The managed challenge shows Turnstile's checkbox only when it wants a click; until then it clears itself.
-    const widget =
-      visible(probe, ".cf-turnstile") ||
-      /verify you are human by completing|click to verify|confirm you are human/.test(text);
-    return {
-      vendor: "cloudflare",
-      kind: widget ? "interactive" : "non-interactive",
-      reason: reason(
-        cloudflareInterstitial ? (probe.title.trim() ? `title: ${probe.title.trim()}` : "element #challenge-*") : `iframe ${orchestrator}`,
-      ),
-    };
-  }
-
-  // PerimeterX / HUMAN
-  if (
-    has(probe, "#px-captcha") ||
-    has(probe, "#px-captcha-wrapper") ||
-    has(probe, "[id^='px-captcha']") ||
-    (shortPage(probe) && /press (?:&|and) hold[^.\n]{0,40}\b(?:(?:you are|you're) (?:a )?human|not a (?:ro)?bot)/.test(text))
-  ) {
-    return {
-      vendor: "perimeterx",
-      kind: "interactive",
-      reason: has(probe, "#px-captcha") ? "element #px-captcha" : "text: Press & Hold",
-    };
-  }
-
-  // DataDome
-  const dataDomeFrame = hasFrame(probe, /captcha-delivery\.com/);
-  if (dataDomeFrame !== undefined || has(probe, "#ddv1-captcha-container")) {
-    const interstitial = dataDomeFrame !== undefined && /\/interstitial\//.test(dataDomeFrame);
-    return {
-      vendor: "datadome",
-      kind: interstitial ? "non-interactive" : "interactive",
-      reason: reason(dataDomeFrame ? `iframe ${dataDomeFrame}` : "element #ddv1-captcha-container"),
-    };
-  }
-
-  // Akamai Bot Manager
-  if (has(probe, "#sec-if-cpt-container") || has(probe, "#sec-cpt-if") || has(probe, "#sec-text-if")) {
-    const interactive = visible(probe, "#sec-cpt-if") && /verify|press|slide|captcha/.test(text);
-    return {
-      vendor: "akamai",
-      kind: interactive ? "interactive" : "non-interactive",
-      reason: "element #sec-if-cpt-container",
-    };
-  }
-  if (title === "access denied" && /you don't have permission to access/.test(text) && /reference #?\d/.test(text)) {
-    return { vendor: "akamai", kind: "block", reason: "title: Access Denied (Akamai reference)" };
-  }
-
-  // Imperva / Incapsula
-  const incapsula = hasFrame(probe, /_Incapsula_Resource/) ?? hasScript(probe, /_Incapsula_Resource/);
-  if (incapsula !== undefined || has(probe, "#main-iframe[src*='_Incapsula_Resource']")) {
-    const captcha = /captcha|verify you are human|i am human/.test(text) || hasFrame(probe, /hcaptcha|recaptcha/) !== undefined;
-    if (/request unsuccessful|incapsula incident id/.test(text) && !captcha) {
-      return { vendor: "imperva", kind: "block", reason: "text: Request unsuccessful (Incapsula)" };
-    }
-    return {
-      vendor: "imperva",
-      kind: captcha ? "interactive" : "non-interactive",
-      reason: reason(`resource ${incapsula ?? "_Incapsula_Resource"}`),
-    };
-  }
-  if (/incapsula incident id/.test(text) && shortPage(probe)) {
-    return { vendor: "imperva", kind: "block", reason: "text: Incapsula incident ID" };
-  }
-
-  // AWS WAF
-  const awsCaptcha = has(probe, "awswaf-captcha") || has(probe, "#captcha-container awswaf-captcha");
-  const awsScript = hasScript(probe, /\.awswaf\.com\//);
-  if (awsCaptcha) return { vendor: "aws-waf", kind: "interactive", reason: "element awswaf-captcha" };
-  if (awsScript !== undefined && !refused && shortPage(probe) && (has(probe, "#challenge-container") || probe.status === 202)) {
-    return { vendor: "aws-waf", kind: "non-interactive", reason: reason(`script ${awsScript}`) };
-  }
-
-  // Captcha walls: a page that is mostly a reCAPTCHA or hCaptcha widget.
-  if (shortPage(probe)) {
-    const recaptcha = hasFrame(
-      probe,
-      /^https:\/\/www\.(?:google|recaptcha)\.(?:com|net)\/recaptcha\/(?:api2|enterprise)\/anchor/,
-    );
-    const hcaptcha = hasFrame(probe, /^https:\/\/(?:newassets\.|assets\.)?hcaptcha\.com\/captcha\//);
-    const wallText =
-      /verify you are (?:a )?human|are you a robot|not a robot|unusual traffic|security check|(?:solve|complete) the captcha|captcha to continue/.test(
-        text,
-      ) || /\b(?:captcha|security check|human verification|verify (?:that )?you(?:'re| are) (?:a )?human|are you a robot)\b/.test(title);
-    if (hcaptcha !== undefined && wallText) {
-      return { vendor: "hcaptcha", kind: "interactive", reason: reason(`iframe ${hcaptcha}`) };
-    }
-    if (recaptcha !== undefined && wallText) {
-      return { vendor: "recaptcha", kind: "interactive", reason: reason(`iframe ${recaptcha}`) };
-    }
-    // Google's own "unusual traffic" interstitial.
-    if (/^www\.google\./.test(host) && /\/sorry\//.test(probe.url)) {
-      return { vendor: "recaptcha", kind: "interactive", reason: "url: google.com/sorry" };
-    }
-  }
-
-  // Generic block and verification pages, short pages only.
-  if (shortPage(probe)) {
-    if (
-      denialTitle ||
-      /^(?:access to this page has been denied|access denied)\b/.test(text.trim())
-    ) {
-      return {
-        vendor: "generic",
-        kind: "block",
-        reason: reason(`title: ${probe.title.trim() || text.trim().slice(0, 60)}`),
-      };
-    }
-    if (
-      /verify (?:that )?you are (?:a )?human|confirm you are (?:a )?human|are you a robot\?|pardon our interruption|please verify you are a human/.test(
-        `${title}\n${text}`,
-      )
-    ) {
-      const phrase = /verify[^.\n]*human|confirm[^.\n]*human|are you a robot|pardon our interruption/.exec(
-        `${title}\n${text}`,
-      )?.[0];
-      return { vendor: "generic", kind: "interactive", reason: reason(`text: ${phrase ?? "verification"}`) };
-    }
-    // A bare refusal with no body: nothing to wait on and nothing to solve.
-    if ((probe.status === 403 || probe.status === 451) && text.trim().length < 300) {
-      return { vendor: "generic", kind: "block", reason: `status ${probe.status}` };
-    }
+  const p = readPage(probe);
+  const checks = [
+    cloudflareBlock,
+    akamaiBlock,
+    impervaBlock,
+    cloudflareChallenge,
+    akamaiChallenge,
+    dataDomeChallenge,
+    perimeterXChallenge,
+    impervaChallenge,
+    denial,
+    awsWafChallenge,
+    recaptchaChallenge,
+    hcaptchaChallenge,
+    genericChallenge,
+  ];
+  for (const check of checks) {
+    const found = check(p);
+    if (found) return found;
   }
   return undefined;
 }
 
-/** One line for the agent: a `CHALLENGE:`/`BLOCKED:` verdict with the recommended next step. */
-export function describeChallenge(detection: ChallengeDetection, url: string): string {
-  const where = (() => {
-    try {
-      return sanitizeChallengeText(new URL(url).origin, 120);
-    } catch {
-      return sanitizeChallengeText(url, 120);
-    }
-  })();
-  const safeReason = sanitizeChallengeText(detection.reason, 160) || "security check";
-  const label = `${detection.vendor} ${detection.kind} challenge on ${where} (${safeReason})`;
-  if (detection.kind === "block") {
-    return `BLOCKED: ${detection.vendor} refused the visit on ${where} (${safeReason}). Do not retry or reload in a loop: it makes the block worse for the user's IP. Stop and tell the user.`;
+/** `https://host` for a web URL; anything else is kept as given (sanitized). */
+function originOf(url: string): string {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol === "http:" || parsed.protocol === "https:") return sanitizeChallengeText(parsed.origin, 120);
+  } catch {
+    /* not a URL */
   }
-  if (detection.kind === "interactive") {
-    return `CHALLENGE: ${label}. A person has to answer it: call handoff("Solve the security check on ${where}, then continue"). Do not retry or reload in a loop.`;
-  }
-  return `CHALLENGE: ${label}. It should clear by itself: wait briefly, then re-read the page.`;
+  return sanitizeChallengeText(url, 120) || "this page";
 }
 
-const REMEDY_EXTENSION_INTERACTIVE = 'remedy: run handoff "Solve the security check, then continue"';
-const REMEDY_EXTENSION_WAIT_TIMEOUT = 'remedy: run handoff "Complete the security check, then continue"';
-const REMEDY_CDP_MANUAL = "remedy: ask the user to complete the security check in the browser, then continue";
+function headline(detection: ChallengeDetection, origin: string): string {
+  const { vendor } = detection;
+  switch (detection.kind) {
+    case "block":
+      return `BLOCKED: ${vendor} refused the visit on ${origin}. Do not retry; tell the user the site blocked this browser.`;
+    case "interactive":
+      return `CHALLENGE: ${vendor} interactive challenge on ${origin}. A person has to complete it; this tool does not solve CAPTCHAs.`;
+    default:
+      return `CHALLENGE: ${vendor} non-interactive check on ${origin}. It should clear by itself; re-check before acting.`;
+  }
+}
+
+/** One-paragraph description with the next step for each kind. */
+export function describeChallenge(detection: ChallengeDetection, url: string): string {
+  const origin = originOf(url);
+  const next =
+    detection.kind === "interactive" ? ` Next: handoff("Solve the security check on ${origin}"), then continue.` : "";
+  const reason = sanitizeChallengeText(detection.reason);
+  return `${headline(detection, origin)}${next}${reason ? ` (${reason})` : ""}`;
+}
 
 export type FormatChallengeOptions = {
-  /** Target backend: `extension` supports `handoff`; `cdp` does not. Defaults to `"cdp"`. */
+  /** Where the tab lives: `extension` can run `handoff`, `cdp` cannot. Defaults to `"cdp"`. */
   backend?: "extension" | "cdp";
   /**
-   * Wrap page-derived reason text in `wrapUntrusted` markers. Enable on error paths that the
-   * daemon serializes directly outside its untrusted-content wrapper.
+   * Put the page-derived reason and URL inside `wrapUntrusted` markers. Use it on error paths the
+   * daemon returns without its own untrusted-content wrapper.
    */
   untrustedBoundary?: boolean;
 };
 
+const REMEDY_EXTENSION = 'remedy: run handoff "Solve the security check, then continue"';
+const REMEDY_CDP = "remedy: ask the user to complete the security check in the browser, then continue";
+
 /**
- * Format a `CHALLENGE:` / `BLOCKED:` output block with a fixed actionable `remedy:` line when
- * human action is needed.
+ * The `CHALLENGE:` / `BLOCKED:` block: a verdict line, a fixed `remedy:` line when a person can
+ * help, then the page-derived evidence.
  */
 export function formatChallengeOutput(
   detection: ChallengeDetection,
   url: string,
-  opts: FormatChallengeOptions = {},
+  options: FormatChallengeOptions = {},
 ): string {
-  const where = safeOrigin(url);
-  const safeReason = sanitizeChallengeText(detection.reason, 160) || "security check";
-  const isExtension = opts.backend === "extension";
-  if (detection.kind === "block") {
-    if (opts.untrustedBoundary) {
-      return [
-        `BLOCKED: ${detection.vendor} refused the visit on ${where}. Do not retry or reload in a loop: it makes the block worse for the user's IP. Stop and tell the user.`,
-        wrapUntrusted(`reason: ${safeReason}`),
-      ].join("\n");
-    }
-    return `BLOCKED: ${detection.vendor} refused the visit on ${where} (${safeReason}). Do not retry or reload in a loop: it makes the block worse for the user's IP. Stop and tell the user.`;
-  }
-  if (detection.kind === "interactive") {
-    const remedy = isExtension ? REMEDY_EXTENSION_INTERACTIVE : REMEDY_CDP_MANUAL;
-    if (opts.untrustedBoundary) {
-      return [
-        `CHALLENGE: ${detection.vendor} interactive challenge on ${where}. A person has to answer it; do not retry or reload in a loop.`,
-        wrapUntrusted(`reason: ${safeReason}`),
-        remedy,
-      ].join("\n");
-    }
-    return `CHALLENGE: ${detection.vendor} interactive challenge on ${where} (${safeReason}). A person has to answer it; do not retry or reload in a loop.\n${remedy}`;
-  }
-  const remedy = isExtension ? REMEDY_EXTENSION_WAIT_TIMEOUT : REMEDY_CDP_MANUAL;
-  if (opts.untrustedBoundary) {
-    return [
-      `CHALLENGE: ${detection.vendor} non-interactive challenge on ${where}. It did not clear automatically; re-read the page or hand off to the user.`,
-      wrapUntrusted(`reason: ${safeReason}`),
-      remedy,
-    ].join("\n");
-  }
-  return `CHALLENGE: ${detection.vendor} non-interactive challenge on ${where} (${safeReason}). It did not clear automatically; re-read the page or hand off to the user.\n${remedy}`;
+  const lines = [headline(detection, originOf(url))];
+  if (detection.kind !== "block") lines.push(options.backend === "extension" ? REMEDY_EXTENSION : REMEDY_CDP);
+  const evidence = `reason: ${sanitizeChallengeText(detection.reason) || detection.vendor}\nurl: ${sanitizeChallengeText(url, 300)}`;
+  lines.push(options.untrustedBoundary === true ? wrapUntrusted(evidence) : evidence);
+  return lines.join("\n");
 }
 
-/** True when a `snap` output looks like it might be a bot challenge or block page. */
+/** Whether a `bc.snapshot` output looks like it could be a challenge page, so a probe is worth running. */
 export function isSuspiciousSnapshot(snapText: string): boolean {
-  if (!snapText) return false;
-  if (snapText.includes("# snap diff") || snapText.includes("# PICTURE PAGE:")) return false;
-  if (snapText.includes("# WALL: captcha") || snapText.includes("# WALL: rate-limit")) return true;
-  const header = /^# ([^\n]*?) \| ([^\s\n]+)/.exec(snapText);
-  if (header) {
-    if (isSuspiciousTitle(header[1] ?? "")) return true;
-    if (isSuspiciousUrl(header[2] ?? "")) return true;
-  }
-  // No interactive DOM controls at all (e.g. blank interstitial or iframe-only challenge wall).
-  if (!snapText.includes("\n- ")) return true;
-  return false;
+  if (/^# WALL: /m.test(snapText)) return true;
+  const header = /^# (.*) \| (\S+)\s*$/.exec(snapText.split("\n", 1)[0] ?? "");
+  if (!header) return false;
+  return isSuspiciousTitle(header[1] ?? "") || isSuspiciousUrl(header[2] ?? "");
 }
 
 /**
- * Self-contained page expression (no `__bc` references) that returns `{ skip: true, url }` on
- * normal long pages without scanning all selectors/frames/scripts, or `{ skip: false, probe }`
- * on short/suspicious pages.
+ * A self-contained, read-only page expression that returns JSON: `{skip:true,url}` for a page that
+ * is plainly normal (long, no suspicious title or URL, no fast marker), else `{skip:false,probe}`
+ * with a full `ChallengeProbe`. It only reads the DOM and the navigation timing entry. `forceFull`
+ * never takes the skip.
  */
 export function buildChallengeProbeExpression(forceFull = false): string {
-  const selectorsJson = JSON.stringify(probeSelectors);
-  const fastJson = JSON.stringify(fastVendorSelectors.join(","));
-  const titleRe = SUSPICIOUS_TITLE_RE.source;
-  const urlRe = SUSPICIOUS_URL_RE.source;
+  const config = JSON.stringify({
+    full: forceFull,
+    short: SHORT_PAGE_CHARS,
+    sample: TEXT_SAMPLE_CHARS,
+    fast: fastVendorSelectors.join(","),
+    markers: probeSelectors,
+  });
   return `(() => {
-    const title = String(document.title || "").trim();
-    const rawText = (document.body && document.body.innerText) || "";
-    const textLength = rawText.length;
-    const url = String(location.href || "");
-    let status;
-    try {
-      const nav = performance.getEntriesByType && performance.getEntriesByType("navigation")[0];
-      if (nav && typeof nav.responseStatus === "number" && nav.responseStatus > 0) status = nav.responseStatus;
-    } catch {}
-    const fastHit = (() => { try { return Boolean(document.querySelector(${fastJson})); } catch { return false; } })();
-    const suspicious = ${forceFull ? "true" : "false"} || textLength < ${SHORT_PAGE_CHARS} || status === 403 || status === 451 || status === 202 || fastHit || new RegExp(${JSON.stringify(titleRe)}, "i").test(title) || new RegExp(${JSON.stringify(urlRe)}, "i").test(url);
-    if (!suspicious) return JSON.stringify({ skip: true, url });
-    const selectors = [];
-    const visibleSelectors = [];
-    const isShown = (el) => {
-      try {
-        const r = el.getBoundingClientRect();
-        if (r.width <= 0 || r.height <= 0) return false;
-        const st = getComputedStyle(el);
-        return st.display !== "none" && st.visibility !== "hidden" && st.visibility !== "collapse";
-      } catch { return false; }
-    };
-    for (const sel of ${selectorsJson}) {
-      try {
-        const list = document.querySelectorAll(sel);
-        if (list.length > 0) {
-          selectors.push(sel);
-          for (const el of list) { if (isShown(el)) { visibleSelectors.push(sel); break; } }
-        }
-      } catch {}
-    }
-    const frameUrls = [];
-    try {
-      for (const f of document.querySelectorAll("iframe[src]")) {
-        if (f.src) frameUrls.push(String(f.src));
-        if (frameUrls.length >= 20) break;
-      }
-    } catch {}
-    const scriptSrcs = [];
-    try {
-      for (const s of document.querySelectorAll("script[src]")) {
-        if (s.src) scriptSrcs.push(String(s.src));
-        if (scriptSrcs.length >= 50) break;
-      }
-    } catch {}
-    const probe = { url, title, text: rawText.slice(0, 3000), textLength, frameUrls, scriptSrcs, selectors, visibleSelectors };
-    if (status !== undefined) probe.status = status;
-    return JSON.stringify({ skip: false, probe });
-  })()`;
-}
-
-/** Parse `__bc.text({ all: true, max: 3000 })` output into `{ text, textLength }`. */
-export function parseBcTextForProbe(raw: string): { text: string; textLength: number } {
-  const sep = raw.indexOf("\n\n");
-  let body = sep >= 0 ? raw.slice(sep + 2) : raw;
-  let textLength = body.length;
-  const trunc = /\n# \[truncated \d+ of (\d+) chars;[^\]]*\]$/.exec(body);
-  if (trunc) {
-    textLength = Number(trunc[1]);
-    body = body.slice(0, trunc.index);
+  const cfg = ${config};
+  const titleRe = [${CF_TITLE}, ${CHALLENGE_TITLE}, ${DENIAL_TITLE}, ${SUSPICIOUS_TITLE}];
+  const urlRe = ${SUSPICIOUS_URL};
+  const url = String(location.href || "");
+  const title = String(document.title || "").trim();
+  const all = document.body ? String(document.body.innerText || "") : "";
+  if (!cfg.full && all.length >= cfg.short && !titleRe.some((re) => re.test(title)) && !urlRe.test(url)) {
+    let marked = false;
+    try { marked = Boolean(document.querySelector(cfg.fast)); } catch (_) {}
+    if (!marked) return JSON.stringify({ skip: true, url });
   }
-  return { text: body.slice(0, 3000), textLength };
+  const list = (css) => { try { return Array.from(document.querySelectorAll(css)); } catch (_) { return []; } };
+  const srcOf = (el) => String((el.getAttribute && el.getAttribute("src")) || el.src || "");
+  const srcs = (css, cap) => list(css).map(srcOf).filter(Boolean).slice(0, cap);
+  const shown = (el) => {
+    try {
+      const r = el.getBoundingClientRect();
+      if (!r || r.width <= 0 || r.height <= 0) return false;
+      const st = typeof getComputedStyle === "function" ? getComputedStyle(el) : null;
+      return !st || (st.display !== "none" && st.visibility !== "hidden");
+    } catch (_) { return false; }
+  };
+  const selectors = [];
+  const visibleSelectors = [];
+  for (const css of cfg.markers) {
+    const els = list(css);
+    if (els.length === 0) continue;
+    selectors.push(css);
+    if (els.slice(0, 5).some(shown)) visibleSelectors.push(css);
+  }
+  let responseStatus = 0;
+  try {
+    const nav = performance.getEntriesByType("navigation")[0];
+    if (nav && typeof nav.responseStatus === "number") responseStatus = nav.responseStatus;
+  } catch (_) {}
+  const probe = {
+    url,
+    title,
+    text: all.slice(0, cfg.sample),
+    textLength: all.length,
+    frameUrls: srcs("iframe[src]", 20),
+    scriptSrcs: srcs("script[src]", 50),
+    selectors,
+    visibleSelectors,
+  };
+  if (responseStatus > 0) probe.status = responseStatus;
+  return JSON.stringify({ skip: false, probe });
+})()`;
 }
 
-/** Parse `__bc.query(...)` JSONL output into plain row objects. */
+/**
+ * Split a `bc.text` readback (`# title | url`, a blank line, the body, and an optional
+ * `# [truncated N of M chars ...]` trailer) into the text sample and the full length.
+ */
+export function parseBcTextForProbe(raw: string): { text: string; textLength: number } {
+  const lines = String(raw ?? "").split("\n");
+  if (lines[0]?.startsWith("# ")) lines.splice(0, lines[1] === "" ? 2 : 1);
+  let total = 0;
+  const trailer = /^# \[truncated \d+ of (\d+) chars/.exec(lines[lines.length - 1] ?? "");
+  if (trailer) {
+    total = Number(trailer[1]);
+    lines.pop();
+  }
+  const text = lines.join("\n").slice(0, TEXT_SAMPLE_CHARS);
+  return { text, textLength: Math.max(total, text.length) };
+}
+
+/** Parse a `bc.query` readback (`# N row(s) for ...`, then one JSON object per line). */
 export function parseBcQueryRows(raw: string): Array<Record<string, string | null>> {
-  const rows: Array<Record<string, string | null>> = [];
-  for (const line of raw.split("\n")) {
+  const rows: Row[] = [];
+  for (const line of String(raw ?? "").split("\n")) {
     if (!line.startsWith("{")) continue;
     try {
-      const parsed = JSON.parse(line) as Record<string, unknown>;
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        const clean: Record<string, string | null> = {};
-        for (const [k, v] of Object.entries(parsed)) {
-          clean[k] = typeof v === "string" ? v : v === null ? null : String(v);
-        }
-        rows.push(clean);
+      const parsed = JSON.parse(line) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+      const row: Row = {};
+      for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+        row[key] = value === null || value === undefined ? null : String(value);
       }
+      rows.push(row);
     } catch {
-      /* skip non-JSON lines */
+      /* skip a malformed line */
     }
   }
   return rows;
 }
 
-/** Reconstruct which `probeSelectors` matched from silent `__bc.query` attribute rows. */
+function rowMatches(marker: Marker, row: Row): boolean {
+  if (marker.id === undefined && marker.idPrefix === undefined && marker.cls === undefined && marker.src === undefined) {
+    return false;
+  }
+  const id = row["id"] ?? "";
+  if (marker.id !== undefined && id !== marker.id) return false;
+  if (marker.idPrefix !== undefined && !id.startsWith(marker.idPrefix)) return false;
+  if (marker.cls !== undefined && !(row["cls"] ?? "").split(/\s+/).includes(marker.cls)) return false;
+  if (marker.src !== undefined && !(row["src"] ?? "").includes(marker.src)) return false;
+  return true;
+}
+
+/**
+ * Map `bc.query` rows from the `probeSelectors` query back to the markers they match, in
+ * `probeSelectors` order. `hasAwsWafCaptcha` comes from a separate `awswaf-captcha` query, since a
+ * row cannot show its tag name.
+ */
 export function matchProbeSelectorsFromRows(
   rows: ReadonlyArray<Record<string, string | null>>,
   hasAwsWafCaptcha = false,
 ): string[] {
-  const matched = new Set<string>();
-  for (const row of rows) {
-    const id = String(row["id"] ?? "").trim();
-    const classes = new Set(String(row["cls"] ?? "").trim().split(/\s+/).filter(Boolean));
-    const src = String(row["src"] ?? "");
-    const title = String(row["title"] ?? "");
-    if (id === "challenge-form") matched.add("#challenge-form");
-    if (id === "challenge-running") matched.add("#challenge-running");
-    if (id === "challenge-stage") matched.add("#challenge-stage");
-    if (id === "cf-challenge-running") matched.add("#cf-challenge-running");
-    if (classes.has("cf-turnstile")) matched.add(".cf-turnstile");
-    if (id === "cf-error-details") matched.add("#cf-error-details");
-    if (id === "sec-if-cpt-container") matched.add("#sec-if-cpt-container");
-    if (id === "sec-cpt-if") matched.add("#sec-cpt-if");
-    if (id === "sec-text-if") matched.add("#sec-text-if");
-    if (id === "ddv1-captcha-container") matched.add("#ddv1-captcha-container");
-    if (id === "px-captcha") matched.add("#px-captcha");
-    if (id === "px-captcha-wrapper") matched.add("#px-captcha-wrapper");
-    if (id.startsWith("px-captcha")) matched.add("[id^='px-captcha']");
-    if (id === "main-iframe" && src.includes("_Incapsula_Resource")) {
-      matched.add("#main-iframe[src*='_Incapsula_Resource']");
+  const out: string[] = [];
+  for (const marker of MARKERS) {
+    if (marker.css === "awswaf-captcha" ? hasAwsWafCaptcha : rows.some((row) => rowMatches(marker, row))) {
+      out.push(marker.css);
     }
-    if (id === "challenge-container") matched.add("#challenge-container");
-    if (classes.has("g-recaptcha")) matched.add(".g-recaptcha");
-    if (src.includes("/recaptcha/") && title.includes("challenge")) {
-      matched.add("iframe[src*='/recaptcha/'][title*='challenge']");
-    }
-    if (classes.has("h-captcha")) matched.add(".h-captcha");
   }
-  if (hasAwsWafCaptcha) {
-    matched.add("awswaf-captcha");
-  }
-  return [...matched];
+  return out;
 }
