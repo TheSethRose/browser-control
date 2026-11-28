@@ -1,10 +1,10 @@
 # AGENTS.md
 
-## v2 rebuild (read first)
+## Workflow (read first)
 
-This branch (`v2`) is the browser-control v2 rebuild. The spec is [`PLAN.md`](PLAN.md); treat it
-as the contract. Section 3 is the parity checklist: no v1 feature is removed. Section 9 lists the
-phases and their "Done when" gates; a phase ends at its gate.
+`main` is the only long-lived branch. The spec is [`PLAN.md`](PLAN.md); treat it as the contract.
+Section 3 is the parity checklist: no feature is removed. Section 9 lists the phases and their
+"Done when" gates; a phase ends at its gate.
 
 ### Commands
 
@@ -12,30 +12,30 @@ phases and their "Done when" gates; a phase ends at its gate.
 - `bun run typecheck`
 - `bun test`
 - `bun run build:skill` (rebuilds `.agents/skills/browser-control/runtime/`; commit the result)
-- `bun run test:e2e` (the `tests/e2e/` suite, which needs Chrome for Testing as described below. CI skips it.)
+- `bun run test:e2e` (the `tests/e2e/` suite, which needs Chrome for Testing as described below. CI runs it too.)
 
 Run typecheck and tests before every commit. CI (`.github/workflows/ci.yml`) runs install,
-typecheck, and tests on every PR into `v2` and `main`.
+typecheck, and tests on every PR into `main` and on every push to `main`.
 
 ### Hard rules
 
-- Never edit, check out, reset, stash, or rename anything in the v1 `main` checkout
+- Never edit, check out a branch in, reset, stash, or rename anything in the live `main` checkout
   (`~/Developer/tools/browser-control`). Agents use it live: the skill symlinks and running
-  daemons load `runtime/cli.js` from it. Work only in git worktrees.
-- Never commit, merge, or push to `main`. Never tag. Never publish a release.
-- Slice branches branch from the latest `v2` and merge back into `v2` by PR (squash) after CI
-  and review pass.
-- Remove no v1 feature. The parity checklist in `PLAN.md` section 3 is the contract.
+  daemons load `runtime/cli.js` from it. Work only in git worktrees; update the live checkout
+  with a fast-forward pull.
+- Never commit or push straight to `main`. Never tag. Never publish a release.
+- Slice branches branch from the latest `main` and merge back by PR (squash) after CI and review
+  pass. Delete the branch after the merge.
+- Remove no feature. The parity checklist in `PLAN.md` section 3 is the contract.
 - No GPL code. Third-party MIT code keeps its notice in `LICENSE`.
 - Never commit `extension/pairing.json`, tokens, or relay secrets.
 
 ### Worktrees
 
 - `@agent-software/core` resolves as `file:../agent-software/core`, so every worktree needs an
-  `agent-software` folder or symlink beside it. Create slice worktrees as siblings under
-  `~/Developer/tools/browser-control-v2/` (it holds the symlink
-  `agent-software -> ~/Developer/tools/agent-software`), or add the same symlink next to the
-  worktree: `ln -s ~/Developer/tools/agent-software ../agent-software`.
+  `agent-software` folder or symlink beside it. Create slice worktrees as siblings of the live
+  checkout under `~/Developer/tools/`, or add a symlink next to the worktree:
+  `ln -s ~/Developer/tools/agent-software ../agent-software`.
 - Check `bun install` succeeds in a new worktree before writing code.
 
 ### Launching browsers (tests, E2E, probes)
@@ -51,24 +51,24 @@ typecheck, and tests on every PR into `v2` and `main`.
 - `tests/e2e/` runs Chrome for Testing with the unpacked `extension/` loaded
   (`--load-extension` plus `--disable-extensions-except`) against a local fixture page. Install
   it with `bunx @puppeteer/browsers install chrome@stable`. Run it with `bun run test:e2e`.
-  `bun test` and CI skip it.
+  `bun test` skips it; CI runs it as its own job.
 
 ### File ownership for parallel slices
 
 - Each slice owns an explicit list of files, named in its brief and its PR description.
 - A slice edits only the files it owns. Two open slices never own the same file.
-- Slices that need the same file run in order: the second starts from `v2` after the first merges.
+- Slices that need the same file run in order: the second starts from `main` after the first merges.
 - Shared files (`package.json`, `bun.lock`, `capability.json`, `PLAN.md`, `AGENTS.md`,
   `.agents/skills/browser-control/runtime/`) belong to one slice at a time. If you need a change
   in a file you don't own, say so in the PR instead of editing it.
-- After a merge into `v2`, rebase open slice branches onto the new `v2`.
+- After a merge into `main`, merge the new `main` into open slice branches (never force-push).
 
 ## Project overview
 
 **Agent** means any compatible reasoning/coding agent working in this repository.
 
 `browser-control` drives a real, already-running Chromium browser (Chrome, Chromium, Edge,
-Brave, Arc, Vivaldi, Opera, Comet, Canary). v2 reaches it through the Browser Control MV3
+Brave, Arc, Vivaldi, Opera, Comet, Canary). It reaches it through the Browser Control MV3
 extension (`extension/`) and a loopback relay by default. When the extension can't do the work,
 the command falls back to the Chrome DevTools Protocol and prints one
 `# used remote debugging: <cause>` line. `BROWSER_CONTROL_BACKENDS=extension` is strict: it
