@@ -6,6 +6,7 @@ import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Glob } from "bun";
 import { E2E_PORT_END, E2E_PORT_START, patchExtensionPorts, pickRelayPort, RELAY_PORTS_ENV } from "./relay-port";
+import { runPacingCheck, type NavEntry } from "./pacing";
 import { runStaleExtensionCheck } from "./stale-extension";
 
 const REPO = resolve(import.meta.dir, "../..");
@@ -231,18 +232,27 @@ async function main(): Promise<number> {
   const servers: ReturnType<typeof Bun.serve>[] = [];
   let browser: Subprocess | undefined;
   let cdp: Cdp | undefined;
-  // The caller's agent session must not key these runs; the session cases set their own.
+  // The caller's agent session must not key these runs; the session cases set their own. The pacing check
+  // switches natural browsing through the per-run config file, and the env would override it, so drop that too.
   const inherited: Record<string, string | undefined> = { ...process.env };
-  for (const k of ["BROWSER_CONTROL_SESSION", "CLAUDE_CODE_SESSION_ID", "T3CODE_THREAD_ID", "CODEX_THREAD_ID", "CODEX_SESSION_ID"]) {
+  for (const k of [
+    "BROWSER_CONTROL_SESSION",
+    "CLAUDE_CODE_SESSION_ID",
+    "T3CODE_THREAD_ID",
+    "CODEX_THREAD_ID",
+    "CODEX_SESSION_ID",
+    "BROWSER_CONTROL_NATURAL",
+  ]) {
     delete inherited[k];
   }
   const env = {
     ...inherited,
     XDG_CONFIG_HOME: xdg,
     BROWSER_CONTROL_BACKENDS: "extension",
-    // Natural (human-paced) input on explicitly, whatever the caller's shell says.
-    BROWSER_CONTROL_NATURAL: "1",
     BROWSER_CONTROL_DAEMON_DIR: daemonDir,
+    // The pacing check reads each planned think pause from the `do` output; without this the daemon adds no
+    // trace line, so callers see the same output as always.
+    BC_E2E_PACING_TRACE: "1",
     [RELAY_PORTS_ENV]: `${relayPort}-${relayPort}`,
   };
 
@@ -303,15 +313,20 @@ async function main(): Promise<number> {
 
   try {
     // Fixture servers: two origins (different ports and hostnames) so the iframes are cross-origin.
+    // Every request is stamped so the pacing check can measure nav dispatch gaps at the server.
+    const navLog: NavEntry[] = [];
     const read = (f: string) => readFileSync(join(FIXTURES, f), "utf8");
     const html = { headers: { "content-type": "text/html; charset=utf-8" } };
     const frameServer = Bun.serve({
       port: 0,
       hostname: "localhost",
-      fetch: (req) =>
-        new URL(req.url).pathname === "/next"
+      fetch: (req) => {
+        const path = new URL(req.url).pathname;
+        navLog.push({ path, t: Date.now() });
+        return path === "/next"
           ? new Response("<!doctype html><title>E2E Next</title><p>next page ready</p>", html)
-          : new Response(read("frame.html"), html),
+          : new Response(read("frame.html"), html);
+      },
     });
     servers.push(frameServer);
     const frameUrl = `http://localhost:${frameServer.port}/frame`;
@@ -320,6 +335,7 @@ async function main(): Promise<number> {
       hostname: "127.0.0.1",
       fetch(req) {
         const path = new URL(req.url).pathname;
+        navLog.push({ path, t: Date.now() });
         if (path === "/form") return new Response(read("form.html"), html);
         if (path === "/busy") return new Response("<!doctype html><title>E2E Busy</title><p>busy page</p>", html);
         // Keeps the form page loading for 3 s after DOMContentLoaded, as slow trackers do on real sites.
@@ -327,6 +343,11 @@ async function main(): Promise<number> {
         if (path === "/challenge") return new Response(read("challenge.html"), { ...html, status: 403 });
         if (path === "/challenge-wall") return new Response(read("challenge-wall.html"), html);
         if (path === "/popup") return new Response(read("popup.html"), html);
+        if (path === "/pacing") return new Response(read("pacing.html"), html);
+        if (path === "/pacing-short") return new Response(read("pacing-short.html"), html);
+        if (path === "/pacing-long") return new Response(read("pacing-long.html"), html);
+        if (path.startsWith("/paging-")) return new Response(read("pacing-short.html"), html);
+        if (path === "/pacing-wall") return new Response(read("pacing-wall.html"), html);
         return new Response(read("page.html").replaceAll("__FRAME__", frameUrl), html);
       },
     });
@@ -625,6 +646,7 @@ async function main(): Promise<number> {
     await check("enable", ["extension", "enable"], /"orderFile":"removed"/);
     record("enable-deleted-file", !existsSync(backendsFile), backendsFile);
     await check("enabled-works", ["eval", "document.title", tid], /E2E Fixture/);
+    await runPacingCheck(bc, base, record, { navLog, frameUrl, skip: recordSkip });
     // The stale-extension check archives the pre-PR #10 build; a shallow clone cannot, so say so out loud.
     const oldCommit = "b8b976f";
     const hasOldCommit =

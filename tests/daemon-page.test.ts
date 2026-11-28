@@ -641,7 +641,7 @@ describe("picture pages and daemon script flags", () => {
     expect(out).toContain("unknown flag: --tpye");
   });
 
-  test("page-helpers diff fast-path detects JS input.value mutations and passive JS errors without MutationObserver", () => {
+  test("page-helpers diff fast-path detects JS input.value mutations and passive JS errors without MutationObserver", async () => {
     const inputEl: any = {
       nodeType: 1,
       tagName: "INPUT",
@@ -699,6 +699,21 @@ describe("picture pages and daemon script flags", () => {
       };
       new Function(PAGE_HELPERS_SOURCE)();
       const bc = (globalThis as any).__bc;
+
+      // A background tab under focus emulation: visible, frames at full rate, timers throttled to 1 s.
+      const realSetTimeout = globalThis.setTimeout;
+      const g = globalThis as any;
+      const prevTimers = { setTimeout: g.setTimeout, requestAnimationFrame: g.requestAnimationFrame, cancelAnimationFrame: g.cancelAnimationFrame };
+      try {
+        g.setTimeout = (fn: () => void, ms?: number) => realSetTimeout(fn, Math.max(ms ?? 0, 1_000));
+        g.requestAnimationFrame = (fn: () => void) => realSetTimeout(fn, 16);
+        g.cancelAnimationFrame = (id: ReturnType<typeof setTimeout>) => clearTimeout(id);
+        const t0 = performance.now();
+        expect(await bc.settle()).toBe("quiet");
+        expect(performance.now() - t0).toBeLessThan(400);
+      } finally {
+        Object.assign(g, prevTimers);
+      }
 
       expect(bc.snapshot()).toContain('- textbox "Email" [e1] value="a@b.co"');
       bc.baseline();

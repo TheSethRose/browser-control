@@ -619,9 +619,20 @@ export function planWheelScroll(deltaY: number, rng: () => number = Math.random)
  * the last step, and on `--fast` or a `"fast": true` step.
  */
 export function planThinkPause(rng: () => number = Math.random, settledMs = 0): number {
+  return planThinkPauseDetail(rng, settledMs).sleepMs;
+}
+
+/**
+ * The same plan, split into the pause it wanted (always 160–420 ms) and what it still has to sleep
+ * after crediting the settle. Tests read `want` to prove each boundary was paced on plan.
+ */
+export function planThinkPauseDetail(
+  rng: () => number = Math.random,
+  settledMs = 0,
+): { want: number; sleepMs: number } {
   const want = clamp(Math.round(triangular(rng, 160, 420)), 160, 420);
   const spent = Number.isFinite(settledMs) ? Math.max(0, Math.round(settledMs)) : 0;
-  return Math.max(0, want - spent);
+  return { want, sleepMs: Math.max(0, want - spent) };
 }
 
 /**

@@ -25,7 +25,7 @@ $BCD click "Next"                          # ref or exact label; prints diff + H
 - **Bind tabs inline:** pass `targetId` last or `--match <url|title text>`. Skip `select_target` unless routing must persist.
 - **Read text first:** `snap` (auto-scopes to open modals; `--within body` widens), `text`, or `snap --find <t>`. Use `shot` only for layout or `# PICTURE PAGE` canvases.
 - **Trust action receipts:** `click`, `type`, `select`, `upload`, `key`, `fill`, `do` print DOM diffs (`+`, `-`, `~`, `# url:`) plus passive 4xx/5xx HTTP and uncaught JS errors. Refs on `+` lines work immediately.
-- **Batch safely:** use `fill` or `do` (`click`, `type`, `select`, `upload`, `wait`, `key`); keep committing clicks (Submit, Send, Publish) as separate approved calls.
+- **Batch safely:** prefer one `fill`/`do` over many single calls. Use `fill` or `do` (`click`, `type`, `select`, `upload`, `wait`, `key`); keep committing clicks (Submit, Send, Publish) as separate approved calls.
 - **Labels are exact:** `AMBIGUOUS` lists candidate refs — pick the ref instead of rewording. For bulk reads, call the site's JSON API from `eval` (`references/network-and-apis.md`).
 
 ### First run: set up the extension

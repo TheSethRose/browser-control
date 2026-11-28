@@ -469,8 +469,8 @@ describe("text --scroll pace", () => {
     expect(source).toContain("Number.isFinite(factor) ? Math.round(height * factor) : Math.max(200");
   });
 
-  test("helpers v12 ship the attach-free chars reader, stay plain JavaScript, and match the extension copy", () => {
-    expect(PAGE_HELPERS_VERSION).toBe(12);
+  test("helpers v13 ship the attach-free chars reader, stay plain JavaScript, and match the extension copy", () => {
+    expect(PAGE_HELPERS_VERSION).toBe(13);
     expect(PAGE_HELPERS_SOURCE).toContain("scrollRead, text, chars,");
     expect(PAGE_HELPERS_SOURCE).toContain("opts.scrollPace");
     expect(PAGE_HELPERS_SOURCE).toContain("scrollPace.factors");

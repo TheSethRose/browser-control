@@ -566,6 +566,47 @@ describe("page-runner natural motion integration", () => {
     });
   });
 
+  test("a wheel delta that lands after the instant fallback re-measures the moved target and still clicks it", async () => {
+    await withNaturalOn(async () => {
+      // CI: wheels acked ~1 s late, the fallback scrolled instantly, then the queued 82 px wheel moved the page again.
+      const m = makeNaturalMock({ inView: false });
+      let clock = 0, top = 1200, pending = 0, fellBack = false;
+      const detail = () => JSON.stringify({
+        x: 350, y: top + 20, hidden: false, inView: top >= 16 && top + 40 <= 784,
+        box: { left: 250, top, width: 200, height: 40 }, rect: { left: 250, top, width: 200, height: 40 },
+        viewport: { width: 1280, height: 800 }, stickyTop: 0, stickyBottom: 0,
+        scroller: { kind: "document", box: { left: 0, top: 0, width: 1280, height: 800 }, point: { x: 640, y: 400 } },
+      });
+      const lagging: Invoke = async (op, inp = {}) => {
+        const expr = String(inp["expression"] ?? "");
+        const type = (inp["params"] as Record<string, unknown> | undefined)?.["type"];
+        if (op === "evaluate" && expr.includes("__bc.point")) {
+          if (!expr.includes('"noScroll":true')) { top = 380; fellBack = true; }
+          m.evalExprs.push(expr);
+          return val(expr.includes("__bc.baseline()") ? `https://a.test/\n${detail()}` : detail());
+        }
+        const hc = /__bc\.hitCheck\("e1", ([\d.]+), ([\d.]+)\)/.exec(expr);
+        if (op === "evaluate" && hc) {
+          const [x, y] = [Number(hc[1]), Number(hc[2])];
+          return val(x >= 250 && x < 450 && y >= top && y < top + 40 ? '{"ok":true}' : '{"ok":false,"reason":"covered by body [e18]"}');
+        }
+        if (type === "mouseWheel") { clock += 1_000; pending += 82; }
+        if (type === "mouseMoved" && fellBack && pending) { top -= pending; pending = 0; }
+        return m.invoke(op, inp);
+      };
+      const h = createPageHelperHandler(lagging, undefined, undefined, {
+        sleep: async (ms) => { clock += ms; }, rng: createSeededRng(5), now: () => clock,
+        bcCall: async () => ({ value: "https://a.test/\nhit: button#ok" }),
+      });
+      const res = await h("click", { ref: "e1", quiet: true });
+      expect(res.ok).toBe(true);
+      expect(top).toBe(298);
+      const press = m.ofType("mousePressed")[0]!.params;
+      expect(Number(press["y"])).toBeGreaterThanOrEqual(298);
+      expect(Number(press["y"])).toBeLessThan(338);
+    });
+  });
+
   test("S1: never presses without a passing post-hover hitCheck; a covered point retries before pressing", async () => {
     await withNaturalOn(async () => {
       const hitAfter = (n: number, res: InvokeResult) => (next: Invoke): Invoke => {
@@ -1086,8 +1127,8 @@ describe("page-runner natural motion integration", () => {
 });
 
 describe("page-helpers v10 — point detail/noScroll, hitCheck, pageScrollPoint", () => {
-  test("VERSION is 12 and new helpers work in isolated DOM", async () => {
-    expect(PAGE_HELPERS_VERSION).toBe(12);
+  test("VERSION is 13 and new helpers work in isolated DOM", async () => {
+    expect(PAGE_HELPERS_VERSION).toBe(13);
 
     const btn: any = {
       nodeType: 1,
@@ -1168,7 +1209,7 @@ describe("page-helpers v10 — point detail/noScroll, hitCheck, pageScrollPoint"
 
       new Function(PAGE_HELPERS_SOURCE)();
       const bc = (globalThis as any).__bc;
-      expect(bc.v).toBe(12);
+      expect(bc.v).toBe(13);
       bc.snapshot();
 
       // noScroll reports inView: false without calling scrollIntoView.
