@@ -14,6 +14,7 @@
 //   GET  /ops                one operation per line with its input names
 //   GET  /status             daemon pid, version, build hash + get_browser_status
 //   GET  /extension/<sub>    status | diagnostics (JSON), browsers (one per line); no secrets
+//                            status takes ?wait=<ms> (max 60 s) to wait for a first connection
 //   POST /stop               dispose and exit
 //
 // /eval, /nav and /page/* take ?t=<targetId> or ?m=<text in the tab's url or title>,
@@ -373,6 +374,15 @@ export async function serveDaemon(capabilityDir: string, socketPath: string): Pr
 
 const EXTENSION_ROUTE_RE = /^\/extension\/(status|browsers|diagnostics)$/;
 
+/** `?wait=<ms>` on `/extension/status`: how long the relay waits for a first connection (max 60 s). */
+export function extensionWaitMs(url: URL): number | undefined {
+  const raw = url.searchParams.get("wait");
+  if (raw === null || raw.trim() === "") return undefined;
+  const ms = Number(raw);
+  if (!Number.isFinite(ms)) return undefined;
+  return Math.min(Math.max(0, Math.trunc(ms)), 60_000);
+}
+
 /** Match `GET /extension/(status|browsers|diagnostics)` before shared page parsing. */
 export async function dispatchExtensionRequest(
   request: Request,
@@ -396,7 +406,7 @@ export async function dispatchExtensionRequest(
       { status: 405, headers: { allow: "GET" } },
     );
   }
-  return handleExtensionRoute(matched[1]!, backend, order, tokenFile, orderSource);
+  return handleExtensionRoute(matched[1]!, backend, order, tokenFile, orderSource, extensionWaitMs(url));
 }
 
 /** `GET /extension/<sub>`: the wrapper's `extension status|browsers|diagnostics`. */
@@ -406,13 +416,14 @@ export async function handleExtensionRoute(
   order: string[],
   tokenFile?: string,
   orderInfo?: Parameters<typeof extensionStatusReport>[4],
+  waitMs = 2000,
 ): Promise<Response> {
   const reply = (result: InvokeResult) =>
     new Response(`${JSON.stringify(result)}\n`, { status: result.ok ? 200 : 400 });
   try {
     switch (sub) {
       case "status":
-        return reply({ ok: true, data: await extensionStatusReport(backend, order, tokenFile, 2000, orderInfo) } as InvokeResult);
+        return reply({ ok: true, data: await extensionStatusReport(backend, order, tokenFile, waitMs, orderInfo) } as InvokeResult);
       case "diagnostics":
         return reply({ ok: true, data: await extensionDiagnosticsReport(backend, order, { tokenFile }) } as InvokeResult);
       case "browsers": {

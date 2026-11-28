@@ -14,7 +14,10 @@
 #   eval '<js>'                       run JavaScript, print its value ('-' reads stdin)
 #   call <op> ['<json>']              any operation, JSON in and out
 #   start [browser]                   switch browser by name (chrome, beta, brave, ardia); opens it
-#                                     if needed. Never pass a port.
+#                                     if needed. With no name it waits for the extension and prints
+#                                     its status; with BROWSER_CONTROL_BACKENDS=extension it never
+#                                     touches cdp, and the default falls back to cdp with a note.
+#                                     Never pass a port.
 #   default [browser]                 show or set the default browser
 #   natural [on|off|status]           show or set global natural browsing (default on; --fast opts out per call).
 #                                     Each call resolves it here (env, then file) and sends on/off, so status
@@ -31,7 +34,9 @@
 #   extension pair | revoke           not available yet (Web Store build)
 #   stop --force                      ONLY when the user asks: drops every approved connection,
 #                                     so remote debugging (cdp) asks the user to Allow again;
-#                                     the extension reconnects on its own
+#                                     the extension reconnects on its own. After an update the
+#                                     next command restarts the daemon by itself unless a cdp
+#                                     connection is open (then only stop --force updates it)
 #
 # Read the page:
 #   snap [--all] [--full] [--find <t>] [--within <r|css>] [--ax] [--out <p>]
@@ -123,12 +128,12 @@ is_target_id() {
   [[ "$s" =~ ^[0-9A-Fa-f]{32}$ ]]
 }
 
-# True when a one-line backend order value names the extension. Stays bash 3.2 clean.
-order_has_extension() {
+# True when a one-line backend order value names `$2` (extension, cdp, browse). Stays bash 3.2 clean.
+order_has() {
   local tok
   for tok in ${1//,/ }; do
     tok="$(printf '%s' "$tok" | tr '[:upper:]' '[:lower:]')"
-    [[ "$tok" == extension ]] && return 0
+    [[ "$tok" == "$2" ]] && return 0
   done
   return 1
 }
@@ -151,6 +156,63 @@ warn_if_stale() {
   if [[ "$running" != "$want" ]]; then
     echo "browser-control-daemon: running daemon is an older build than runtime/cli.js. Ask the user to run: browser-control-daemon stop --force (remote debugging connections will need Allow again; the extension reconnects on its own)." >&2
   fi
+}
+
+# Read one flat "key":"value" from one-line JSON (our own replies; those values hold no quotes).
+json_str_field() { sed -n 's/.*"'"$1"'":"\([^"]*\)".*/\1/p' | head -n1; }
+# Read one flat "key":true|false from one-line JSON (no sed alternation: macOS sed has no \|).
+json_bool_field() { sed -n 's/.*"'"$1"'":\(true\).*/\1/p; s/.*"'"$1"'":\(false\).*/\1/p' | head -n1; }
+# Read one flat "key":<number> from one-line JSON.
+json_num_field() { sed -n 's/.*"'"$1"'":\([0-9][0-9]*\).*/\1/p' | head -n1; }
+
+# One /status read: d_build is the daemon's build hash, d_cdp its live remote-debugging (cdp)
+# connection (true, false, or "" when the daemon can't say).
+probe_daemon() {
+  local st
+  st="$(req GET status)" || return 1
+  d_build="$(json_str_field build <<<"$st")"
+  d_cdp="$(json_bool_field connected <<<"$st")"
+}
+
+# Restart a daemon that runs an older build than runtime/cli.js, but only when the restart costs the
+# user nothing: the extension reconnects on its own, while a live remote-debugging (cdp) connection
+# drops and makes Chrome ask the user to Allow again. /status "connected" is that cdp state, and a
+# missing or unreadable status counts as live. The daemon cannot count requests in flight, so the
+# few milliseconds between this probe and the stop are an accepted risk.
+restart_stale_daemon() {
+  local want running
+  want="$(cli_build)"
+  [[ -n "$want" && -S "$sock" ]] || return 0
+  running="$(tr -d '[:space:]' <"$build_file" 2>/dev/null || true)"
+  [[ -z "$running" || "$running" != "$want" ]] || return 0
+  probe_daemon || return 0
+  if [[ -n "$d_build" && "$d_build" != unknown ]]; then running="$d_build"; fi
+  [[ -n "$running" && "$running" != "$want" ]] || return 0
+  [[ "$d_cdp" == false ]] || return 0
+  command -v bun >/dev/null 2>&1 || return 0
+  mkdir -p "$dir"; chmod 700 "$dir"
+  find "$lock" -maxdepth 0 -mmin +1 -exec rmdir {} \; 2>/dev/null || true
+  if ! mkdir "$lock" 2>/dev/null; then
+    # Another wrapper holds the lock (a start or a restart). Wait for the build it leaves behind.
+    for _ in $(seq 100); do
+      up || { sleep 0.05; continue; }
+      running="$(tr -d '[:space:]' <"$build_file" 2>/dev/null || true)"
+      [[ "$running" == "$want" ]] && return 0
+      sleep 0.05
+    done
+    return 0
+  fi
+  # Re-read under the lock: the call that held it may have restarted the daemon already.
+  running="$(tr -d '[:space:]' <"$build_file" 2>/dev/null || true)"
+  if [[ "$running" == "$want" ]]; then rmdir "$lock" 2>/dev/null || true; return 0; fi
+  req POST stop >/dev/null 2>&1 || true
+  rm -f "$sock" "$build_file" 2>/dev/null || true
+  # The daemon serves every caller, so it must not inherit one caller's raw session ids.
+  nohup env -u BROWSER_CONTROL_SESSION -u CLAUDE_CODE_SESSION_ID -u T3CODE_THREAD_ID -u CODEX_THREAD_ID -u CODEX_SESSION_ID bun "$here/../runtime/cli.js" --serve "$sock" >"$log" 2>&1 &
+  for _ in $(seq 100); do up && break; sleep 0.05; done
+  rmdir "$lock" 2>/dev/null || true
+  up || fail DAEMON_START_FAILED "daemon did not start; see $log. Tell the user; do not work around it."
+  echo "browser-control-daemon: restarted the daemon on the new build (the extension reconnects on its own)." >&2
 }
 
 local_version() {
@@ -239,6 +301,7 @@ ensure() {
 
 run() {
   local rc=0 out started=0
+  restart_stale_daemon
   out="$(req "$@")" || rc=$?
   if [[ $rc -eq 7 ]]; then ensure; started=1; rc=0; out="$(req "$@")" || rc=$?; fi
   [[ $started -eq 1 ]] || warn_if_stale
@@ -272,6 +335,32 @@ urlencode() {
 }
 body() { if [[ "$1" == "-" ]]; then cat; else printf '%s' "$1"; fi; }
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; }
+
+# `start` with no browser means "get a browser ready". Returns 0 after printing a status, or 1 so
+# `start` falls back to its old connect_browser path.
+# - BROWSER_CONTROL_BACKENDS=extension (exactly): the caller asked for the extension alone. Start the
+#   daemon, wait for the extension (to start's timeout), print its status, and never use remote
+#   debugging, which would make Chrome ask the user to Allow.
+# - No explicit order: wait about 10 s for the extension (the default backend), print its status when
+#   it connects, and otherwise leave a note and fall back to remote debugging.
+start_extension_only() {
+  local env_order="${BROWSER_CONTROL_BACKENDS:-}" st enabled browsers
+  ensure
+  st="$(req GET "extension/status?wait=0")" || return 1
+  enabled="$(json_bool_field enabled <<<"$st")"
+  if [[ -n "$env_order" ]]; then
+    order_has "$env_order" extension && ! order_has "$env_order" cdp || return 1
+    if [[ "$enabled" != true ]]; then printf '%s\n' "$st"; return 0; fi
+    st="$(req GET "extension/status?wait=60000")" || return 1
+    printf '%s\n' "$st"
+    return 0
+  fi
+  [[ "$enabled" == true ]] || return 1
+  st="$(req GET "extension/status?wait=10000")" || return 1
+  browsers="$(json_num_field browsers <<<"$st")"
+  [[ "${browsers:-0}" -gt 0 ]] || { start_note="browser-control-daemon: the extension is not connected, so this uses remote debugging (Chrome may ask you to Allow)."; return 1; }
+  printf '%s\n' "$st"
+}
 
 cmd="${1:-}"; [[ $# -gt 0 ]] && shift
 
@@ -383,7 +472,9 @@ csv_json_arr() {
 case "$cmd" in
   start)
     case "$(arg 0)" in
-      "") input='{"timeoutMs":60000}' ;;
+      "") start_extension_only && exit 0
+          [[ -z "${start_note:-}" ]] || echo "$start_note" >&2
+          input='{"timeoutMs":60000}' ;;
       *[!0-9]*) b="$(arg 0)"; input='{"browser":"'"${b//[\"\\]/}"'","timeoutMs":60000}' ;;
       *) input='{"port":'"$(arg 0)"',"timeoutMs":60000}' ;;
     esac
@@ -684,6 +775,7 @@ case "$cmd" in
     check_update "$(arg 0)"
     ;;
   status)
+    restart_stale_daemon
     if out="$(req GET status)"; then
       warn_if_stale
       printf '%s\n' "$out"
@@ -741,7 +833,7 @@ case "$cmd" in
             extra=',"globalOrder":{"was":'"$(json_str "$gorder")"',"now":"extension","backup":'"$(json_str "$gbackup")"'}'
           fi
         fi
-        if [[ -n "${BROWSER_CONTROL_BACKENDS:-}" ]] && ! order_has_extension "$BROWSER_CONTROL_BACKENDS"; then
+        if [[ -n "${BROWSER_CONTROL_BACKENDS:-}" ]] && ! order_has "$BROWSER_CONTROL_BACKENDS" extension; then
           extra+=',"overriddenBy":'"$(json_str "env BROWSER_CONTROL_BACKENDS=$BROWSER_CONTROL_BACKENDS")"
         fi
         printf '%s\n' '{"ok":true,"data":{"paired":true,"orderFile":"removed","extensionDir":'"$(json_str "$ext_dir")$extra"',"next":"In Chrome open chrome://extensions, turn on Developer mode, click Load unpacked, and pick extensionDir. Then run: browser-control-daemon extension browsers"}}'
