@@ -40,8 +40,6 @@ import {
 import { toCsv } from "../src/script";
 import {
   CdpConnection,
-  browserNameFromCommand,
-  getBrowserCandidates,
   isBlockedCdpMethod,
   type WebSocketLike,
 } from "../src/session";
@@ -74,7 +72,7 @@ class FakeSocket implements WebSocketLike {
   receive(m: unknown): void { this.emit("message", { data: JSON.stringify(m) }); }
 }
 
-describe("CDP session hardening and Ardia discovery", () => {
+describe("CDP session hardening", () => {
   test("blocks Browser.close and any *.crash* CDP method", async () => {
     expect(isBlockedCdpMethod("Browser.close")).toBe(true);
     expect(isBlockedCdpMethod("Browser.crash")).toBe(true);
@@ -150,12 +148,6 @@ describe("CDP session hardening and Ardia discovery", () => {
     sock.auto["Page.createIsolatedWorld"] = { executionContextId: 99 };
     expect(await conn.getIsolatedContextId("t1")).toBe(99);
     conn.close();
-  });
-
-  test("discovers Ardia browser on macOS and Linux", () => {
-    expect(getBrowserCandidates("darwin", "/Users/x", {}).some((c) => c.name === "Ardia")).toBe(true);
-    expect(getBrowserCandidates("linux", "/home/x", {}).some((c) => c.name === "Ardia")).toBe(true);
-    expect(browserNameFromCommand("/Applications/Ardia.app/Contents/MacOS/Ardia")).toBe("Ardia");
   });
 });
 

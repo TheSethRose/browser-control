@@ -2,13 +2,13 @@
 
 > **Where v2 lives:** the `v2` branch of `github.com/TheSethRose/browser-control` (branched from `main` at `7ee11c9`). Work happens in git worktrees; the v1 `main` checkout at `/Users/sethrose/Developer/tools/browser-control` is never edited.
 > v1 (`main`) stays untouched until Seth approves the cutover. Agents are using it.
-> **Status:** plan final, updated 2026-11-26 after auditing **both** Ardia (`ardia-browser/ardia`) and OpenCode Browse (`anomalyco/browse`, MIT) against v1 `HEAD` `7ee11c9`. The extension is scaffolded and syntax-checked, not yet run in a browser. Phase 0 done 2026-11-26 (results in section 9). Next step is Phase 1.
+> **Status:** plan final, updated 2026-11-26 after auditing two other browser-agent projects against v1 `HEAD` `7ee11c9`. The extension is scaffolded and syntax-checked, not yet run in a browser. Phase 0 done 2026-11-26 (results in section 9). Next step is Phase 1.
 
 ---
 
 ## 1. What v2 is
 
-v2 is a first-principles rebuild of `browser-control` that keeps **every v1 feature** and ships its own MV3 Chrome extension companion, replacing the need for both **Ardia** (already folded into v1 as the v7 upgrades) and **OpenCode Browse** (whose MIT-licensed extension/relay patterns we audited and folded into this plan).
+v2 is a first-principles rebuild of `browser-control` that keeps **every v1 feature** and ships its own MV3 Chrome extension companion, so it needs no other browser tool or extension.
 
 The extension removes everything that makes direct CDP awkward:
 
@@ -16,16 +16,16 @@ The extension removes everything that makes direct CDP awkward:
 - Clicking "Allow remote debugging?" after every browser restart.
 - Focus-stealing tabs, background-tab throttling, password-manager debugger crashes, and clumsy login/2FA stops.
 
-Direct CDP (the v1 way) stays unchanged when no extension is paired and is used whenever asked for by name (for example for pages extensions cannot touch). The optional `browse` adapter also stays, because nothing is removed.
+Direct CDP (the v1 way) stays unchanged when no extension is paired and is used whenever asked for by name (for example for pages extensions cannot touch). The third-party `browse` CLI adapter was removed later; the extension covers everything it did.
 
 ### Targets
 
 1. **Install in one prompt and three clicks.** The agent installs the skill and runs `browser-control-daemon extension setup`. The user opens `chrome://extensions`, turns on Developer mode, and clicks Load unpacked. Pairing is automatic via a local gitignored `pairing.json` (plus a one-time 8-char pairing code flow for remote browsers or a future Store build).
 2. **No yellow debugging banner for reads.** `tabs`, `nav`, `snap`, `text`, `form`, `query`, `read-urls`, `value`, `verdict`, `health`, `wait`, native `select`, and typed inputs run silently in Chrome's extension `ISOLATED` world without attaching `chrome.debugger`.
 3. **Every built-in command works on extension tabs.** Commands needing trusted input or DevTools attach `chrome.debugger` on demand and detach after 30 seconds idle. Raw `call` is bounded only by the CDP domains Chrome exposes to extensions (section 10).
-4. **Daily-driver browser polish (OpenCode Browse parity).** Agent tabs open in the background without stealing focus, stay out of Memory Saver (`autoDiscardable: false`), adopt `target="_blank"` / `window.open` popups without yanking focus, optionally group into a collapsed `"Agents · N"` tab group, recover automatically from password-manager foreign frames, and support clean human-in-the-loop `handoff` for logins, 2FA, and CAPTCHAs.
-5. **Works across Chromium 125+ and multiple browsers/profiles at once:** Chrome (stable, Beta, Dev, Canary), Brave, Edge, Arc, Vivaldi, Opera, Comet, Ardia — each identified by a stable browser slug (`chrome-macbook`, `brave-macbook`) with collision-free tab IDs.
-6. **Small footprint, MIT clean.** No new npm dependencies beyond `@agent-software/core`. Bundled `runtime/cli.js` under 500 KB. MIT licensed: **no** code copied from Ardia (GPL-3.0); battle-tested MV3/relay patterns adapted from `anomalyco/browse` (MIT) with attribution.
+4. **Daily-driver browser polish.** Agent tabs open in the background without stealing focus, stay out of Memory Saver (`autoDiscardable: false`), adopt `target="_blank"` / `window.open` popups without yanking focus, optionally group into a collapsed `"Agents · N"` tab group, recover automatically from password-manager foreign frames, and support clean human-in-the-loop `handoff` for logins, 2FA, and CAPTCHAs.
+5. **Works across Chromium 125+ and multiple browsers/profiles at once:** Chrome (stable, Beta, Dev, Canary), Brave, Edge, Arc, Vivaldi, Opera, Comet — each identified by a stable browser slug (`chrome-macbook`, `brave-macbook`) with collision-free tab IDs.
+6. **Small footprint, MIT clean.** No new npm dependencies beyond `@agent-software/core`. Bundled `runtime/cli.js` under 500 KB. MIT licensed: **no** GPL code; third-party MIT code keeps its notice in `LICENSE`.
 
 ---
 
@@ -36,17 +36,17 @@ One-way doors (hard to undo, so each has a safeguard):
 - **No v1 feature is removed.** Agents depend on every command, flag, MCP tool, and safety guard. Safeguard: the parity checklist in section 3, diffed against v1 `HEAD` before cutover, and all v1 tests ported.
 - **The extension-to-daemon link is a security boundary.** It controls signed-in tabs. Safeguard: mutual challenge-response HMAC auth bound to port + nonces, strict `Origin` check against a fixed manifest `key`, unauthenticated `/version` identity probe before sending credentials, and pre-auth size/time limits (section 5).
 - **`capability.json` stays stable.** MCP clients validate it strictly. Only optional fields may be added (`isolated` and `contextId` on `evaluate` already exist in v1).
-- **Licensing is strictly MIT.** Zero code from Ardia (GPL-3.0 engine). Clean adaptation with MIT notice for patterns derived from `anomalyco/browse` (MIT).
+- **Licensing is strictly MIT.** No GPL code. Third-party MIT code keeps its notice in `LICENSE`.
 
 Two-way doors (cheap to change later): module layout, CLI wording, port numbers, tab-group colors, idle timeouts.
 
 Settled in review:
 
-- **Several daemons at once:** port range `49222–49229` with unauthenticated `/version` probing before auth (section 5). If Phase 0 shows sandboxes block port binding, switch to a single host relay hub (`browse`-style).
+- **Several daemons at once:** port range `49222–49229` with unauthenticated `/version` probing before auth (section 5). If Phase 0 shows sandboxes block port binding, switch to a single host relay hub.
 - **Helper calls:** structured steps (`bc_call`), never parsed strings (section 6).
 - **One script world on extension tabs:** enforced by a `__bc` tripwire (section 6).
-- **Cold start:** Chrome's 30-second alarm floor is a hard MV3 limit (confirmed in `anomalyco/browse`). The daemon waits up to 35 seconds on the first call with a clear message; once connected, 20-second `ping` calls `chrome.runtime.getPlatformInfo()` to reset Chromium's 30-second worker idle timer so the link stays instant.
-- **Explicitly deferred from OpenCode Browse (to avoid bloat):** `demonstrate` flow recorder, `recording` (CDP screencast + `ffmpeg` muxing), `screenshot_diff`, and `webmcp`. None are needed for core agent browsing, and keeping them out keeps the bundle lean and dependency-free. Users who want them can still keep the optional `browse` adapter enabled.
+- **Cold start:** Chrome's 30-second alarm floor is a hard MV3 limit. The daemon waits up to 35 seconds on the first call with a clear message; once connected, 20-second `ping` calls `chrome.runtime.getPlatformInfo()` to reset Chromium's 30-second worker idle timer so the link stays instant.
+- **Explicitly deferred (to avoid bloat):** `demonstrate` flow recorder, `recording` (CDP screencast + `ffmpeg` muxing), `screenshot_diff`, and `webmcp`. None are needed for core agent browsing, and keeping them out keeps the bundle lean and dependency-free.
 - **Cutover:** v2 is built on the `v2` branch; cutover is a PR from `v2` into `main` on Seth's go-ahead. The `browser-control` folder is never renamed (Phase 5).
 - **Version:** `2.0.0` for the repo and the extension.
 
@@ -58,7 +58,7 @@ Port from v1 `HEAD` at build time, not from memory. v1 keeps changing while agen
 
 **Delivery:** shared Unix-socket daemon, standalone MCP server (`mcp.ts`), standalone CLI (`cli.ts`), self-contained skill (`runtime/` + `extension/`).
 
-**Backends:** `extension` (new, default when paired), `cdp` (auto-discovery through `DevToolsActivePort`, `lsof`, `ps`), `browse` (optional OpenCode adapter, kept).
+**Backends:** `extension` (new, default when paired), `cdp` (auto-discovery through `DevToolsActivePort`, `lsof`, `ps`).
 
 **Capability operations (14):** `connect_browser`, `disconnect_browser`, `list_browsers`, `get_browser_status`, `list_targets`, `select_target`, `clear_target`, `navigate`, `evaluate`, `execute_cdp`, `capture_screenshot`, `capture_pdf`, `read_events`, `wait_for_event`.
 
@@ -83,7 +83,7 @@ Port from v1 `HEAD` at build time, not from memory. v1 keeps changing while agen
 
 **Safety & walls:** nonce `<<<UNTRUSTED_PAGE_CONTENT>>>` boundaries, fake-marker and chat-token scrubbing, control-character escaping, trap, payment and `# WALL:` guards, sticky secret tracking, Luhn card masking, `Browser.close` and `*.crash*` blocked, fast failure on `Inspector.targetCrashed`, `remedy:` hints, typo suggestions. **New in v2:**
 - Per-tab lending (`All tabs` vs `Lent only`) in the extension popup + one-click toolbar lend/revoke.
-- Bot-challenge / block-page classifier (`src/challenges.ts`, MIT-adapted from `anomalyco/browse`): detects Cloudflare, Akamai, DataDome, PerimeterX, Imperva, AWS WAF, reCAPTCHA, hCaptcha, and generic blocks; auto-waits briefly on `non-interactive` interstitials, reports `CHALLENGE:` + recommends `handoff` on `interactive`, and hard-stops on `block` so agents never burn the user's IP with retry loops.
+- Bot-challenge / block-page classifier (`src/challenges.ts`): detects Cloudflare, Akamai, DataDome, PerimeterX, Imperva, AWS WAF, reCAPTCHA, hCaptcha, and generic blocks; auto-waits briefly on `non-interactive` interstitials, reports `CHALLENGE:` + recommends `handoff` on `interactive`, and hard-stops on `block` so agents never burn the user's IP with retry loops.
 
 ---
 
@@ -104,7 +104,7 @@ Which tier each command uses:
 ```text
 browser-control/   (v2 branch)
 ├── PLAN.md
-├── AGENTS.md, README.md, LICENSE (MIT + anomalyco/browse MIT notice)
+├── AGENTS.md, README.md, LICENSE (MIT + third-party MIT notice)
 ├── package.json, tsconfig.json, bunfig.toml, bun.lock
 ├── capability.json
 ├── cli.ts                        # CLI and --serve entry
@@ -139,10 +139,9 @@ browser-control/   (v2 branch)
 │   └── backends/
 │       ├── types.ts, registry.ts, router.ts
 │       ├── extension.ts          # NEW: loopback relay server, mutual HMAC/ECDH pairing, BrowserLinks, tab routing
-│       └── browse.ts             # Optional OpenCode adapter (kept)
 ├── tests/
 │   ├── setup.ts
-│   ├── manifest, session, operations, backends, daemon-page, ardia-upgrades, standalone (ported)
+│   ├── manifest, session, operations, backends, daemon-page, cdp-hardening, standalone (ported)
 │   ├── helper-steps.test.ts      # NEW: golden strings for every structured helper step
 │   ├── challenges.test.ts        # NEW: challenge/block classification fixtures
 │   ├── extension-backend.test.ts # NEW: mutual auth, ECDH pairing, multi-browser IDs, routing, events, failures
@@ -176,7 +175,6 @@ Tested on macOS with Bun 1.4.4, a listener on `127.0.0.1:49222–49225` and a `0
 | Codex seatbelt, `workspace-write` + `network_access=true` (Seth's config) | yes | yes | yes / yes | yes |
 | Claude Code `srt`, defaults | **no** (bind fails) | n/a | **no** / **no** | yes |
 | Claude Code `srt`, `allowLocalBinding: true` + `allowUnixSockets` | yes | yes | yes / yes | yes |
-| OpenCode 2.4.2 | no bash sandbox found (no flag or config) | | | |
 
 - A first run reported Codex blocking inbound connections. That was a test bug: `codex sandbox` strips environment variables, so the probe's hold time was unset and it exited before the client connected. Re-run with arguments instead of env: inbound works.
 - Claude Code's sandbox with default settings already blocks v1 (its Unix-socket daemon). The same two settings (`allowLocalBinding`, `allowUnixSockets` for the daemon socket dir) make v2 work. Seth's Claude Code does not enable the sandbox today. `SKILL.md` must document both settings.
@@ -194,7 +192,7 @@ Tested on macOS with Bun 1.4.4, a listener on `127.0.0.1:49222–49225` and a `0
 - The daemon derives each connected browser's slug statelessly as `<brand>-<first 6 hex of sha256(profileId)>` (e.g. `chrome-3a00d5`). No slug file is stored, so every daemon computes the same slug for the same browser. Short target IDs (`extension:<tabId>`) are bound to the browser that issued them; once that browser disconnects they fail with `NO_ACTIVE_TARGET` instead of silently hitting another browser.
 - **Collision-free tab IDs:** Chrome numbers tabs per browser, so Chrome and Brave can both have tab `42`. The relay maps `(profileId, tabId)` cleanly to target IDs (`extension:<tabId>` when one browser is connected; `extension:<browserSlug>:<tabId>` or relay-mapped IDs when multiple browsers are connected), and `--browser <slug>` picks which connected browser opens new tabs.
 
-### Mutual authentication & pairing (MIT-adapted from `anomalyco/browse`)
+### Mutual authentication & pairing
 
 - **Origin check:** reject any WebSocket upgrade whose `Origin` does not match the extension's fixed ID (`403`), derived from the pinned `key` in `manifest.json`.
 - **Pre-auth guards:** cap pre-auth messages at **64 KB** and close sockets that do not complete the handshake within **10 seconds**.
@@ -237,7 +235,7 @@ Tested on macOS with Bun 1.4.4, a listener on `127.0.0.1:49222–49225` and a `0
 
 ---
 
-## 6. Hard-won Chrome MV3 behaviors (from `anomalyco/browse` audit)
+## 6. Hard-won Chrome MV3 behaviors
 
 These real-world Chromium edge cases must be built into the extension from day one, not discovered after cutover:
 
@@ -346,7 +344,7 @@ Done when: all 6 results are recorded and sections 5–7 are adjusted for any su
 
 - The `v2` branch already holds v1 `HEAD` (configs, `capability.json`, `cli.ts`, `mcp.ts`, `daemon.ts`, `src/`, `tests/`, `.agents/skills/browser-control/`); no copy step.
 - Convert `evalHelper` and all call sites in `page-runner.ts` to structured steps; add `tests/helper-steps.test.ts`.
-- Add `src/challenges.ts` + `tests/challenges.test.ts` (MIT-adapted from `anomalyco/browse`).
+- Add `src/challenges.ts` + `tests/challenges.test.ts`.
 - Add first-class `hover`, `dialog`, and `emulate` (with double-clear race fix) in `page-runner.ts` (working on CDP immediately).
 - No extension relay wired yet.
 
@@ -372,7 +370,7 @@ Done when: every command in section 3 runs cleanly on an extension tab against t
 ### Phase 4 — Wrapper, docs, automated E2E, and live verification
 
 - Add `extension setup|pair|status|browsers|revoke|diagnostics|enable|disable`, `handoff`, `dialog`, `hover`, `emulate`, and `--browser` to `scripts/browser-control-daemon`.
-- Update `SKILL.md`, the reference guides, `README.md`, `AGENTS.md`, and `LICENSE` (including MIT attribution notice for `anomalyco/browse`).
+- Update `SKILL.md`, the reference guides, `README.md`, `AGENTS.md`, and `LICENSE` (including the third-party MIT notice).
 - Add `tests/e2e/`: Chrome for Testing run against a local fixture page with shadow DOM, two duplicate-URL cross-origin iframes, a file input, a `target="_blank"` popup, an `alert`/`confirm`, a hash link, a simulated Cloudflare/Turnstile challenge page, and a `handoff` flow.
 - **UI pass (its own slice and PR; starts only after the Phase 3 gate passes; needs a delegate that can load skills, not pi-inkling):**
   - Redesign `popup.html`/`popup.js`, `onboarding.html`, and the `handoff` card with the `studio` skill (ui-ux job), then run `ui-ux-audit` on the result and fix its findings.
@@ -404,8 +402,8 @@ Done when: `bun run build:skill`, `typecheck`, `bun test`, `tests/e2e/`, and all
 **Goal:** agent input in Seth's real browser should look like a person using it, so sites don't flag his accounts. Natural typing already exists (`src/typing.ts`, default on, `--fast` opts out). Phase 6 adds the same for the pointer, clicks, scrolling and pacing.
 
 **Research (2026-11-27).**
-- `anomalyco/browse` (MIT): curved, minimum-jerk mouse paths from a tracked pointer position, elapsed-time-compensated frame pacing, eased wheel scrolling that stops when the page stops moving, and a page scroll point that avoids nested scrollers. Adapted code carries attribution.
-- `ardia-browser/ardia` (GPL-3.0, ideas only, no code): it doesn't humanize motion. Ideas we use: aim inside the element's *visible* box, and re-check what sits under the pointer after moving and before pressing, since hover can open menus that cover the target.
+- An MIT-licensed browser agent: curved, minimum-jerk mouse paths from a tracked pointer position, elapsed-time-compensated frame pacing, eased wheel scrolling that stops when the page stops moving, and a page scroll point that avoids nested scrollers.
+- A GPL-3.0 browser agent (ideas only, no code): it doesn't humanize motion. Ideas we use: aim inside the element's *visible* box, and re-check what sits under the pointer after moving and before pressing, since hover can open menus that cover the target.
 - browser-control today: clicks teleport to the exact center with zero-delay press and release. `point()` always runs an instant `scrollIntoView`. The pointer position isn't tracked. `do`/`fill` steps have no pause between them. `nav` has no reading dwell. `--fast` reaches only `type` and `fill`.
 
 **Spec.** All planners live in a pure module, `src/natural.ts`, and take an injected `rng` (seedable Mulberry32), so tests are deterministic.

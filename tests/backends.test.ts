@@ -3,22 +3,9 @@ import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { OperationHandler } from "@agent-software/core";
-import { createBrowseBackend, type Runner } from "../src/backends/browse";
 import { backendOrder, route, runWithFallbackNotice, setDaemonBackendsFile, withAutoConnect } from "../src/backends/router";
 import { BackendUnavailable, type Backend } from "../src/backends/types";
 import { createPageHelperHandler } from "../src/page-runner";
-
-/** A fake `browse` CLI: records calls and answers from a table keyed by tool name. */
-function fakeBrowse(answers: Record<string, { code?: number; out: string }>) {
-  const calls: Array<{ tool: string; args: Record<string, unknown> }> = [];
-  const run: Runner = async (argv) => {
-    const tool = argv[0]!;
-    calls.push({ tool, args: JSON.parse(argv[2] ?? "{}") });
-    const a = answers[tool] ?? { code: 1, out: `no answer for ${tool}` };
-    return { code: a.code ?? 0, stdout: a.out, stderr: "" };
-  };
-  return { run, calls };
-}
 
 /** Fake CDP operations that report which ran. */
 function fakeCdp(log: string[]): Record<string, OperationHandler> {
@@ -43,128 +30,14 @@ function fakeCdp(log: string[]): Record<string, OperationHandler> {
   };
 }
 
-const browseFirst = () => ["browse", "cdp"];
-
 describe("router with cdp only (default)", () => {
   test("every operation goes to CDP", async () => {
     const log: string[] = [];
-    const { run, calls } = fakeBrowse({});
-    const ops = route(fakeCdp(log), [createBrowseBackend(run)], () => ["cdp"]);
+    const ops = route(fakeCdp(log), [], () => ["cdp"]);
     await ops["navigate"]!({ url: "https://x" });
     await ops["evaluate"]!({ expression: "1" });
     expect(log).toEqual(["navigate:", "evaluate:"]);
-    expect(calls.length).toBe(0);
     expect(await ops["get_browser_status"]!({})).toEqual({ connected: true });
-  });
-});
-
-describe("router with browse first", () => {
-  test("navigate opens a browse tab, then tab operations stay on it", async () => {
-    const log: string[] = [];
-    const { run, calls } = fakeBrowse({
-      navigate: { out: JSON.stringify({ tab: 7, url: "https://x/", title: "X", navigated: true }) },
-      eval: { out: '"X"' },
-    });
-    const ops = route(fakeCdp(log), [createBrowseBackend(run)], browseFirst);
-    const nav = (await ops["navigate"]!({ url: "https://x" })) as Record<string, unknown>;
-    expect(nav["targetId"]).toBe("browse:7");
-    expect(nav["loaded"]).toBe(true);
-    expect(await ops["evaluate"]!({ expression: "document.title" })).toEqual({ value: "X" });
-    expect(calls.map((c) => c.tool)).toEqual(["navigate", "eval"]);
-    expect(calls[1]!.args).toEqual({ tab: 7, expression: "document.title", world: "main" });
-    expect(log).toEqual([]);
-  });
-
-  test("dropping browse from the order sends untargeted calls back to CDP", async () => {
-    const log: string[] = [];
-    const { run } = fakeBrowse({ navigate: { out: JSON.stringify({ tab: 7 }) } });
-    let order = ["browse", "cdp"];
-    const ops = route(fakeCdp(log), [createBrowseBackend(run)], () => order);
-    await ops["navigate"]!({ url: "https://x" });
-    order = ["cdp"];
-    await ops["capture_pdf"]!({});
-    expect(log).toEqual(["capture_pdf:"]);
-  });
-
-  test("an operation browse lacks fails clearly on a browse tab instead of using another tab", async () => {
-    const log: string[] = [];
-    const { run } = fakeBrowse({ navigate: { out: JSON.stringify({ tab: 7 }) } });
-    const ops = route(fakeCdp(log), [createBrowseBackend(run)], browseFirst);
-    await ops["navigate"]!({ url: "https://x" });
-    await expect(ops["capture_pdf"]!({})).rejects.toThrow(/isn't available on browse tabs/);
-    // Browser-level CDP still works.
-    await ops["execute_cdp"]!({ method: "Target.getTargets" });
-    expect(log).toEqual(["execute_cdp:"]);
-  });
-
-  test("a CDP target id always goes to CDP", async () => {
-    const log: string[] = [];
-    const { run, calls } = fakeBrowse({});
-    const ops = route(fakeCdp(log), [createBrowseBackend(run)], browseFirst);
-    await ops["evaluate"]!({ expression: "1", targetId: "ABC" });
-    expect(log).toEqual(["evaluate:ABC"]);
-    expect(calls.length).toBe(0);
-  });
-
-  test("after selecting a CDP tab, an untargeted navigate stays on it", async () => {
-    const log: string[] = [];
-    const { run, calls } = fakeBrowse({ navigate: { out: JSON.stringify({ tab: 7 }) } });
-    const ops = route(fakeCdp(log), [createBrowseBackend(run)], browseFirst);
-    await ops["select_target"]!({ targetId: "ABC" });
-    await ops["navigate"]!({ url: "https://x" });
-    expect(log).toEqual(["select_target:ABC", "navigate:"]);
-    expect(calls.length).toBe(0);
-    // clear_target hands untargeted navigate back to browse.
-    await ops["clear_target"]!({});
-    await ops["navigate"]!({ url: "https://y" });
-    expect(calls.map((c) => c.tool)).toEqual(["navigate"]);
-  });
-
-  test("when browse is not installed, operations fall back to CDP", async () => {
-    const log: string[] = [];
-    const run: Runner = async () => ({ code: 127, stdout: "", stderr: "browse not found" });
-    const ops = route(fakeCdp(log), [createBrowseBackend(run)], browseFirst);
-    expect(await ops["navigate"]!({ url: "https://x" })).toEqual({ via: "cdp" });
-    expect(log).toEqual(["navigate:"]);
-  });
-
-  test("a page exception becomes JS_EXCEPTION and does not fall back", async () => {
-    const log: string[] = [];
-    const { run } = fakeBrowse({
-      navigate: { out: JSON.stringify({ tab: 3 }) },
-      eval: { code: 1, out: "Error: boom (at line 1:7 of the eval code)" },
-    });
-    const ops = route(fakeCdp(log), [createBrowseBackend(run)], browseFirst);
-    await ops["navigate"]!({ url: "https://x" });
-    await expect(ops["evaluate"]!({ expression: "throw 1" })).rejects.toThrow(/^JS_EXCEPTION: Error: boom/);
-    expect(log).toEqual([]);
-  });
-
-  test("list_targets merges both backends; select_target and clear_target switch tabs", async () => {
-    const log: string[] = [];
-    const { run } = fakeBrowse({
-      tabs: { out: JSON.stringify({ tabs: [{ tab: 9, url: "https://b/", title: "B" }] }) },
-      eval: { out: "2" },
-    });
-    const ops = route(fakeCdp(log), [createBrowseBackend(run)], browseFirst);
-    const { targets } = (await ops["list_targets"]!({})) as { targets: Array<{ targetId: string }> };
-    expect(targets.map((t) => t.targetId)).toEqual(["browse:9", "ABC"]);
-
-    await ops["select_target"]!({ targetId: "browse:9" });
-    expect(await ops["evaluate"]!({ expression: "1+1" })).toEqual({ value: 2 });
-
-    await ops["select_target"]!({ targetId: "ABC" });
-    await ops["evaluate"]!({ expression: "1" });
-    await ops["clear_target"]!({});
-    expect(log).toEqual(["list_targets:", "select_target:ABC", "evaluate:", "clear_target:"]);
-  });
-
-  test("status reports the backend order and browse state", async () => {
-    const { run } = fakeBrowse({ tabs: { out: JSON.stringify({ tabs: [] }) } });
-    const ops = route(fakeCdp([]), [createBrowseBackend(run)], browseFirst);
-    const status = (await ops["get_browser_status"]!({})) as { backends: Record<string, unknown> };
-    expect(status.backends["order"]).toEqual(["browse", "cdp"]);
-    expect(status.backends["browse"]).toEqual({ available: true, tabs: 0, activeTargetId: null });
   });
 });
 
@@ -210,9 +83,8 @@ describe("router with extension first", () => {
     expect(log).toEqual([]);
   });
 
-  test("a browser-named navigate skips browse and fails when the extension is disabled", async () => {
+  test("a browser-named navigate fails when the extension is disabled", async () => {
     const log: string[] = [];
-    const { run, calls } = fakeBrowse({ navigate: { out: JSON.stringify({ tab: 7 }) } });
     const extCalls: string[] = [];
     const ext = {
       name: "extension",
@@ -225,11 +97,10 @@ describe("router with extension first", () => {
       clearActive: () => {},
       status: async () => ({}),
     };
-    const ops = route(fakeCdp(log), [createBrowseBackend(run), ext as never], () => ["cdp", "browse", "extension"]);
-    await ops["navigate"]!({ url: "https://x", browser: "chrome-abc123", targetId: "browse:7" });
+    const ops = route(fakeCdp(log), [ext as never], () => ["cdp", "extension"]);
+    await ops["navigate"]!({ url: "https://x", browser: "chrome-abc123" });
     expect(extCalls).toEqual(["navigate"]);
-    expect(calls.length).toBe(0);
-    const noExt = route(fakeCdp(log), [createBrowseBackend(run), ext as never], () => ["cdp", "browse"]);
+    const noExt = route(fakeCdp(log), [ext as never], () => ["cdp"]);
     await expect(noExt["navigate"]!({ url: "https://x", browser: "chrome-abc123" })).rejects.toThrow(
       /needs the extension backend/,
     );
@@ -712,6 +583,23 @@ describe("default order: extension first, then cdp with one notice", () => {
       expect(backendOrder()).toEqual(["extension", "cdp"]);
     } finally {
       await rm(paired, { recursive: true, force: true });
+    }
+  });
+
+  test("a retired browse entry is dropped quietly from env and backends files", async () => {
+    const xdg = await isolatePaired(true);
+    try {
+      process.env["BROWSER_CONTROL_BACKENDS"] = "browse,extension";
+      expect(backendOrder()).toEqual(["extension"]);
+      process.env["BROWSER_CONTROL_BACKENDS"] = "browse";
+      expect(backendOrder()).toEqual(["extension", "cdp"]);
+      delete process.env["BROWSER_CONTROL_BACKENDS"];
+      const file = join(xdg, "daemon-backends");
+      await writeFile(file, "browse,cdp\n");
+      setDaemonBackendsFile(file);
+      expect(backendOrder()).toEqual(["cdp"]);
+    } finally {
+      await rm(xdg, { recursive: true, force: true });
     }
   });
 

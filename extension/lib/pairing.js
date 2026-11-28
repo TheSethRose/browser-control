@@ -1,5 +1,4 @@
 // Mutual HMAC-SHA256 pairing helpers for Browser Control Companion (MV3 Web Crypto).
-// Mutual challenge-response handshake pattern adapted from anomalyco/browse (MIT License).
 
 export const PROTOCOL_VERSION = 1;
 

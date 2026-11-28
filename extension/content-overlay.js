@@ -1,7 +1,6 @@
 // On-demand content overlay for Browser Control Companion.
 // Injected ONLY when an agent starts a handoff or needs foreign extension frame eviction.
 // Adds ZERO DOM until `bc:handoff-start` arrives.
-// Patterns adapted from anomalyco/browse (MIT License).
 
 (() => {
   if (globalThis.__bcOverlayInstalled) return;

@@ -167,13 +167,16 @@ describe("wrapper stale-daemon restart", () => {
   });
 
   test("two concurrent stale calls restart the daemon once", async () => {
-    const r = await rig({ stale: true });
-    const [a, b] = await Promise.all([r.bc("tabs"), r.bc("tabs")]);
-    expect([a.code, b.code]).toEqual([0, 0]);
-    expect(r.starts()).toBe(2);
-    const lines = `${a.stderr}\n${b.stderr}`.split("\n").filter((l) => l.includes("restarted the daemon on the new build"));
-    expect(lines).toHaveLength(1);
-  }, 15_000);
+    // The lock race needs a tie of a few microseconds, so one round rarely shows it.
+    for (let round = 0; round < 10; round++) {
+      const r = await rig({ stale: true });
+      const [a, b] = await Promise.all([r.bc("tabs"), r.bc("tabs")]);
+      expect([a.code, b.code]).toEqual([0, 0]);
+      expect(r.starts()).toBe(2);
+      const lines = `${a.stderr}\n${b.stderr}`.split("\n").filter((l) => l.includes("restarted the daemon on the new build"));
+      expect(lines).toHaveLength(1);
+    }
+  }, 60_000);
 });
 
 describe("wrapper start", () => {

@@ -5,9 +5,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { buildHash, createPageHelperHandler, formatAxTree, matchTab } from "../daemon";
 import { PAGE_HELPERS_SOURCE, PAGE_HELPERS_VERSION, parseLocator } from "../src/page-helpers";
-import { parseBrowseSnapshot } from "../src/page-runner";
 import { createSeededRng } from "../src/natural";
-import type { Runner } from "../src/backends/browse";
 import { parseBoxes } from "../src/ocr";
 
 type Call = { op: string; input: Record<string, unknown> };
@@ -20,7 +18,6 @@ afterEach(async () => {
 });
 
 function makeFakeInvoker(options: {
-  browseActive?: string;
   hidden?: boolean;
   readback?: string;
   locate?: Record<string, string>;
@@ -43,19 +40,7 @@ function makeFakeInvoker(options: {
   const invoke = async (op: string, input: Record<string, unknown> = {}): Promise<InvokeResult> => {
     calls.push({ op, input });
     if (op === "get_browser_status") {
-      return {
-        ok: true,
-        data: options.browseActive
-          ? {
-              connected: false,
-              backends: {
-                order: ["browse", "cdp"],
-                active: "browse",
-                browse: { available: true, activeTargetId: options.browseActive },
-              },
-            }
-          : { connected: true },
-      };
+      return { ok: true, data: { connected: true } };
     }
     if (op === "evaluate") {
       const expr = String(input["expression"] ?? "");
@@ -162,17 +147,6 @@ describe("page helper source", () => {
     expect(parseLocator("Save changes")).toEqual({ kind: "label", label: "Save changes" });
     expect(() => parseLocator("")).toThrow("INPUT_INVALID");
     expect(() => parseLocator(undefined)).toThrow("INPUT_INVALID");
-  });
-
-  test("parseBrowseSnapshot extracts refs, roles, names, and disabled state", () => {
-    const parsed = parseBrowseSnapshot(
-      '- button "Next" [e12]\n- textbox "Email" [ref=e4]\n- textbox "Card Number" @e9 [disabled]\n',
-    );
-    expect(parsed.map((e) => ({ ref: e.ref, role: e.role, name: e.name, disabled: e.disabled }))).toEqual([
-      { ref: "e12", role: "button", name: "Next", disabled: false },
-      { ref: "e4", role: "textbox", name: "Email", disabled: false },
-      { ref: "e9", role: "textbox", name: "Card Number", disabled: true },
-    ]);
   });
 });
 
@@ -485,63 +459,6 @@ describe("daemon page helpers", () => {
     expect(text(snapped)).toContain('- button "Save" [e1]');
   });
 
-  test("routes snap, click, type, and key to browse CLI with label lookup, guards, and wall checks", async () => {
-    const { invoke } = makeFakeInvoker({ browseActive: "browse:7" });
-    const browseCalls: string[][] = [];
-    const fakeBrowse: Runner = async (args) => {
-      browseCalls.push(args);
-      if (args[0] === "snapshot") {
-        return {
-          code: 0,
-          stdout: '- button "Next" [e12]\n- textbox "Email" [e5]\n- textbox "Card Number" [e8]\n- textbox "honeypot" [e9]',
-          stderr: "",
-        };
-      }
-      // The browse guard reads the page with the same probe; a normal page answers a complete skip.
-      if (args[0] === "eval") {
-        return { code: 0, stdout: JSON.stringify({ skip: true, url: "https://a.test/x" }), stderr: "" };
-      }
-      return { code: 0, stdout: `ok:${args[0]}`, stderr: "" };
-    };
-    const handle = createPageHelperHandler(invoke, fakeBrowse);
-
-    expect((await handle("snap", { all: false })).ok).toBe(true);
-    expect((await handle("snap", { all: true, find: "save" }, "browse:9")).ok).toBe(true);
-    expect((await handle("click", { ref: "e12", quiet: true })).ok).toBe(true);
-    // Label lookup resolves "Next" -> e12 instead of sending ref:"Next"
-    expect((await handle("click", { ref: "Next", quiet: true })).ok).toBe(true);
-    expect((await handle("type", { ref: "e5", text: "hi", quiet: true })).ok).toBe(true);
-    // Guard blocks payment & trap fields on browse tabs
-    expect(text(await handle("type", { ref: "e8", text: "4111", quiet: true }))).toContain("REFUSED");
-    expect(text(await handle("type", { ref: "honeypot", text: "bot", quiet: true }))).toContain("REFUSED");
-    expect(text(await handle("key", { key: "Enter" }))).toStartWith("ok:press\n- button");
-
-    expect(browseCalls).toEqual([
-      ["snapshot", "--json", JSON.stringify({ tab: 7, interactive: true })],
-      ["snapshot", "--json", JSON.stringify({ tab: 9, find: "save" })],
-      ["click", "--json", JSON.stringify({ tab: 7, ref: "e12" })],
-      ["snapshot", "--json", JSON.stringify({ tab: 7, interactive: true })],
-      ["click", "--json", JSON.stringify({ tab: 7, ref: "e12" })],
-      ["fill", "--json", JSON.stringify({ tab: 7, ref: "e5", value: "hi" })],
-      ["snapshot", "--json", JSON.stringify({ tab: 7, interactive: true })],
-      ["press", "--json", JSON.stringify({ tab: 7, key: "Enter" })],
-      ["snapshot", "--json", JSON.stringify({ tab: 7, interactive: true, delta: true })],
-    ]);
-
-    // do stops on a wall on browse tabs too
-    const walled = makeFakeInvoker({ browseActive: "browse:7", wall: "captcha" });
-    const walledHandle = createPageHelperHandler(walled.invoke, fakeBrowse);
-    const stopped = await walledHandle("do", { steps: [{ click: "e12" }, { key: "Tab" }], quiet: true });
-    expect(stopped.ok).toBe(false);
-    expect(text(stopped)).toContain("# STOPPED: the page is a captcha wall after step 1");
-    // The guard read the browse tab itself, not the CDP backend a bare target id would have reached.
-    expect(browseCalls.filter((c) => c[0] === "eval")).toHaveLength(1);
-    expect(
-      walled.calls.some((c) => c.op === "evaluate" && String(c.input["expression"] ?? "").includes("const fastHit")),
-    ).toBe(false);
-
-    expect((await handle("value", { ref: "e5" })).ok).toBe(false);
-  });
 });
 
 describe("tab matching, build hash, and accessibility formatting", () => {

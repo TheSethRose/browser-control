@@ -13,7 +13,7 @@
 #   close [targetId]                  close an agent-opened extension tab (active tab if omitted)
 #   eval '<js>'                       run JavaScript, print its value ('-' reads stdin)
 #   call <op> ['<json>']              any operation, JSON in and out
-#   start [browser]                   switch browser by name (chrome, beta, brave, ardia); opens it
+#   start [browser]                   switch browser by name (chrome, beta, brave); opens it
 #                                     if needed. With no name it waits for the extension and prints
 #                                     its status; with BROWSER_CONTROL_BACKENDS=extension it never
 #                                     touches cdp, and the default falls back to cdp with a note.
@@ -119,16 +119,16 @@ resolve_natural() {
   if [[ -n "$w" ]]; then nat_val="$w"; nat_src=file; fi
 }
 
-# True when `$1` has the shape of a targetId: extension:<n>, extension:<slug>:<n>, browse:<n>,
+# True when `$1` has the shape of a targetId: extension:<n>, extension:<slug>:<n>,
 # optionally with @<frameId>, or a 32-hex DevTools id. Used where a trailing token could be either
 # a target or literal text (dialog prompt text).
 is_target_id() {
   local s="${1:-}"
-  [[ "$s" =~ ^(extension:[A-Za-z0-9][A-Za-z0-9-]*:[0-9]+|extension:[0-9]+|browse:[0-9]+)(@[0-9]+)?$ ]] && return 0
+  [[ "$s" =~ ^(extension:[A-Za-z0-9][A-Za-z0-9-]*:[0-9]+|extension:[0-9]+)(@[0-9]+)?$ ]] && return 0
   [[ "$s" =~ ^[0-9A-Fa-f]{32}$ ]]
 }
 
-# True when a one-line backend order value names `$2` (extension, cdp, browse). Stays bash 3.2 clean.
+# True when a one-line backend order value names `$2` (extension, cdp). Stays bash 3.2 clean.
 order_has() {
   local tok
   for tok in ${1//,/ }; do
@@ -174,6 +174,15 @@ probe_daemon() {
   d_cdp="$(json_bool_field connected <<<"$st")"
 }
 
+# The start lock is a file made by bash's own exclusive create (noclobber opens with O_EXCL).
+# An external mkdir is not a safe lock: on GitHub's Linux runners two calls a few microseconds
+# apart both reported success. A lock older than a minute is a leftover and is removed.
+lock_take() {
+  find "$lock" -maxdepth 0 -mmin +1 -exec rm -rf {} \; 2>/dev/null || true
+  ( set -o noclobber; printf '%s\n' "$$" >"$lock" ) 2>/dev/null
+}
+lock_drop() { rm -f "$lock" 2>/dev/null || true; }
+
 # Restart a daemon that runs an older build than runtime/cli.js, but only when the restart costs the
 # user nothing: the extension reconnects on its own, while a live remote-debugging (cdp) connection
 # drops and makes Chrome ask the user to Allow again. /status "connected" is that cdp state, and a
@@ -191,8 +200,7 @@ restart_stale_daemon() {
   [[ "$d_cdp" == false ]] || return 0
   command -v bun >/dev/null 2>&1 || return 0
   mkdir -p "$dir"; chmod 700 "$dir"
-  find "$lock" -maxdepth 0 -mmin +1 -exec rmdir {} \; 2>/dev/null || true
-  if ! mkdir "$lock" 2>/dev/null; then
+  if ! lock_take; then
     # Another wrapper holds the lock (a start or a restart). Wait for the build it leaves behind.
     for _ in $(seq 100); do
       up || { sleep 0.05; continue; }
@@ -206,13 +214,13 @@ restart_stale_daemon() {
   # The new daemon answers /status before it writes $build_file, so ask it too.
   running="$(tr -d '[:space:]' <"$build_file" 2>/dev/null || true)"
   if [[ "$running" != "$want" ]] && probe_daemon && [[ "$d_build" == "$want" ]]; then running="$want"; fi
-  if [[ "$running" == "$want" ]]; then rmdir "$lock" 2>/dev/null || true; return 0; fi
+  if [[ "$running" == "$want" ]]; then lock_drop; return 0; fi
   req POST stop >/dev/null 2>&1 || true
   rm -f "$sock" "$build_file" 2>/dev/null || true
   # The daemon serves every caller, so it must not inherit one caller's raw session ids.
   nohup env -u BROWSER_CONTROL_SESSION -u CLAUDE_CODE_SESSION_ID -u T3CODE_THREAD_ID -u CODEX_THREAD_ID -u CODEX_SESSION_ID bun "$here/../runtime/cli.js" --serve "$sock" >"$log" 2>&1 &
   for _ in $(seq 100); do up && break; sleep 0.05; done
-  rmdir "$lock" 2>/dev/null || true
+  lock_drop
   up || fail DAEMON_START_FAILED "daemon did not start; see $log. Tell the user; do not work around it."
   echo "browser-control-daemon: restarted the daemon on the new build (the extension reconnects on its own)." >&2
 }
@@ -291,13 +299,15 @@ ensure() {
   up && return 0
   command -v bun >/dev/null 2>&1 || { echo "browser-control-daemon: bun is required (https://bun.sh)" >&2; exit 127; }
   mkdir -p "$dir"; chmod 700 "$dir"
-  find "$lock" -maxdepth 0 -mmin +1 -exec rmdir {} \; 2>/dev/null || true
-  if mkdir "$lock" 2>/dev/null; then
+  local mine=0
+  if lock_take; then
+    mine=1
     # The daemon serves every caller, so it must not inherit one caller's raw session ids.
     up || { rm -f "$sock" "$build_file"; nohup env -u BROWSER_CONTROL_SESSION -u CLAUDE_CODE_SESSION_ID -u T3CODE_THREAD_ID -u CODEX_THREAD_ID -u CODEX_SESSION_ID bun "$here/../runtime/cli.js" --serve "$sock" >"$log" 2>&1 & }
   fi
   for _ in $(seq 100); do up && break; sleep 0.05; done
-  rmdir "$lock" 2>/dev/null || true
+  # Only the holder releases: dropping another caller's lock would let a third start a second daemon.
+  [[ $mine -eq 0 ]] || lock_drop
   up || fail DAEMON_START_FAILED "daemon did not start; see $log. Tell the user; do not work around it."
 }
 

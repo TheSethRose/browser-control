@@ -19,7 +19,7 @@ export type BackendTarget = {
 };
 
 export interface Backend {
-  /** Short id, also the prefix of this backend's target ids (`browse:123`). */
+  /** Short id, also the prefix of this backend's target ids (`extension:123`). */
   readonly name: string;
   /**
    * Whether this backend runs `op` for `input`. `active` is true when this backend owns the

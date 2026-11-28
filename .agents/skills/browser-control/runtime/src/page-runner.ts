@@ -1,6 +1,6 @@
 /**
  * Page helper runner shared by the daemon HTTP handler and unit tests.
- * Runs `__bc` in an isolated world (falling back cleanly on mocks/browse tabs),
+ * Runs `__bc` in an isolated world (falling back cleanly on mocks),
  * dispatches mouse/key/drag input in-process with delivery checks, reports DOM diffs,
  * and exposes structured readers (`form`, `query`, `read-urls`, `text --scroll`),
  * DevTools inspection (`styles`, `issues`, `perf`), site notes, saved GET flows, and `script`.
@@ -9,7 +9,6 @@ import type { InvokeResult } from "@agent-software/core";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
-import { runBrowse, type Runner } from "./backends/browse";
 import {
   backendOrder,
   extensionOnlyMessage,
@@ -67,11 +66,9 @@ import {
 import { appendNote, approveNote, getNote, listNotes, noteHeaderForUrl, removeNote, setNote } from "./notes";
 import { recognizeText, type Recognizer } from "./ocr";
 import {
-  HONEYPOT_NAME,
   KEYS,
   PAGE_HELPERS_SOURCE,
   PAGE_HELPERS_VERSION,
-  PAYMENT_FIELD,
   normalizeHelperCall,
   parseLocator,
   renderElementStep,
@@ -147,12 +144,6 @@ const valueOf = (res: InvokeResult): string => (res.ok ? String((res.data as Jso
 const messageOf = (res: InvokeResult): string => (res.ok ? "" : res.error.message);
 const js = (v: unknown) => JSON.stringify(v);
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-function browseTabNumber(targetId: unknown): number | undefined {
-  if (typeof targetId !== "string" || !targetId.startsWith("browse:")) return undefined;
-  const n = Number(targetId.slice("browse:".length));
-  return Number.isInteger(n) ? n : undefined;
-}
 
 function stripHash(url: string): string {
   const idx = url.indexOf("#");
@@ -276,45 +267,11 @@ function helperError(res: InvokeResult): InvokeResult {
   return m ? failure(res.error.code, m[1]!) : res;
 }
 
-export type BrowseEntry = { ref: string; role: string; name: string; disabled: boolean; line: string };
-
-/** Parse `browse snapshot` output lines (supports `[e12]`, `[ref=e12]`, or `@e12`). */
-export function parseBrowseSnapshot(text: string): BrowseEntry[] {
-  const entries: BrowseEntry[] = [];
-  for (const raw of text.split("\n")) {
-    const line = raw.trim();
-    const refMatch = /(?:\[(?:ref=)?|@)(e\d+)\]?/.exec(line);
-    if (!refMatch) continue;
-    const roleMatch = /^-\s+([a-zA-Z0-9_-]+)/.exec(line);
-    const nameMatch = /"([^"]*)"/.exec(line);
-    entries.push({
-      ref: refMatch[1]!,
-      role: (roleMatch?.[1] ?? "").toLowerCase(),
-      name: nameMatch?.[1] ?? "",
-      disabled: /\[disabled\]|\bdisabled\b/i.test(line),
-      line,
-    });
-  }
-  return entries;
-}
-
-const BROWSE_TYPEABLE = /^(textbox|searchbox|combobox|spinbutton|listbox|input|textarea)$/;
-
 /** Actions that send trusted input, so a pending post-`nav` dwell or pagination gap pays out first. */
 const PACE_INPUT_ACTIONS = new Set(["click", "hover", "type", "select", "upload", "drag", "key"]);
 
 /** Reading steps planned up front for `text --scroll` (bounds a 60 s scroll at ~1 s per step). */
 const TEXT_SCROLL_PLAN_STEPS = 64;
-
-function checkBrowseFieldGuard(labelOrLine: string, ref: string): InvokeResult | null {
-  if (/\btrap\b/i.test(labelOrLine) || HONEYPOT_NAME.test(labelOrLine)) {
-    return failure("EXECUTION_FAILED", `REFUSED: ${ref} looks like a bot-trap field; leave it empty`);
-  }
-  if (/\bpayment\b/i.test(labelOrLine) || PAYMENT_FIELD.test(labelOrLine)) {
-    return failure("EXECUTION_FAILED", `REFUSED: ${ref} is a payment field; the user enters payment details`);
-  }
-  return null;
-}
 
 type Point = { x: number; y: number; hidden: boolean; before?: string; box?: Box2D; viewport?: Viewport };
 type ScrollerDetail = {
@@ -342,7 +299,8 @@ type Step = { action: string; input: Json; label: string };
 
 export function createPageHelperHandler(
   invoke: Invoker,
-  browseRunner: Runner = runBrowse,
+  /** Unused slot, kept so positional callers stay valid. */
+  _reserved?: unknown,
   recognize: Recognizer = recognizeText,
   options: {
     notesDir?: string;
@@ -501,8 +459,6 @@ export function createPageHelperHandler(
   const frameTargets = new Map<string, string[]>();
   /** Last isolated-world executionContextId seen per target, used by upload/styles. */
   const contextIds = new Map<string, number>();
-  /** Last parsed snapshot entries per browse tab, used for trap/payment guard checks. */
-  const browseCache = new Map<number, Map<string, BrowseEntry>>();
   /** Non-secret typed values remembered per tab for `flow save` parameterization. */
   const recentTyped = new Map<string, Record<string, string>>();
   /** Active human handoff id per extension tab id (at most one active handoff per tab). */
@@ -575,7 +531,6 @@ export function createPageHelperHandler(
   const picture = createPictureTracker(invoke, evalHelper, recognize);
 
   type ResolvedTarget = {
-    browseTab?: number;
     extensionTarget?: string;
     cdpTarget?: string;
     extensionOnly?: boolean;
@@ -585,10 +540,7 @@ export function createPageHelperHandler(
 
   async function resolveTargetBackend(targetId?: string): Promise<ResolvedTarget> {
     if (targetId !== undefined) {
-      return {
-        browseTab: browseTabNumber(targetId),
-        extensionTarget: extensionTabOf(targetId) !== undefined ? targetId : undefined,
-      };
+      return { extensionTarget: extensionTabOf(targetId) !== undefined ? targetId : undefined };
     }
     const status = await invoke("get_browser_status");
     if (!status.ok) return {};
@@ -599,10 +551,6 @@ export function createPageHelperHandler(
     const extensionOnly = order ? isExtensionOnlyOrder(order) : false;
     const extState = backends?.["extension"] as Json | undefined;
     const extensionAvailable = typeof extState?.["available"] === "boolean" ? extState["available"] : undefined;
-    if (activeBackend === "browse") {
-      const browseState = backends?.["browse"] as Json | undefined;
-      return { browseTab: browseTabNumber(browseState?.["activeTargetId"]), extensionOnly, extensionAvailable, activeBackend };
-    }
     if (activeBackend === "extension") {
       const activeId = extState?.["activeTargetId"];
       return {
@@ -616,77 +564,6 @@ export function createPageHelperHandler(
       backends === undefined || activeBackend === "cdp" || (activeBackend === null && (!order || order.includes("cdp")));
     const cdpTarget = cdpAllowed && typeof data["activeTargetId"] === "string" ? (data["activeTargetId"] as string) : undefined;
     return { cdpTarget, extensionOnly, extensionAvailable, activeBackend };
-  }
-
-  async function callBrowse(tool: string, args: Json, timeoutMs = 60_000): Promise<InvokeResult> {
-    const res = await browseRunner([tool, "--json", JSON.stringify(args)], timeoutMs);
-    const out = res.stdout || res.stderr;
-    if (res.code === 127) {
-      return failure("EXECUTION_FAILED", "BACKEND_UNAVAILABLE: the browse CLI is not installed");
-    }
-    if (res.code !== 0) {
-      return failure("EXECUTION_FAILED", out || `browse ${tool} failed (exit ${res.code})`);
-    }
-    return success(out);
-  }
-
-  function cacheBrowseSnapshot(tab: number, snapshotText: string): BrowseEntry[] {
-    const entries = parseBrowseSnapshot(snapshotText);
-    if (entries.length > 0) {
-      const map = browseCache.get(tab) ?? new Map<string, BrowseEntry>();
-      for (const e of entries) map.set(e.ref, e);
-      browseCache.set(tab, map);
-    }
-    return entries;
-  }
-
-  /** Resolve a ref or label on a `browse:<n>` tab to a bare browse ref (`e12`). */
-  async function resolveBrowseRef(
-    raw: unknown,
-    kind: "click" | "type",
-    tab: number,
-  ): Promise<{ ok: true; ref: string; entry?: BrowseEntry } | { ok: false; res: InvokeResult }> {
-    let loc: Locator;
-    try {
-      loc = parseLocator(raw);
-    } catch (error) {
-      return { ok: false, res: failure("INPUT_VALIDATION_FAILED", (error as Error).message) };
-    }
-    if (loc.kind === "dom") {
-      return { ok: true, ref: loc.ref, entry: browseCache.get(tab)?.get(loc.ref) };
-    }
-    if (loc.kind !== "label") {
-      return {
-        ok: false,
-        res: failure("INPUT_VALIDATION_FAILED", `INPUT_INVALID: ${String(raw)} needs a DevTools tab`),
-      };
-    }
-    const snap = await callBrowse("snapshot", { tab, interactive: true });
-    if (!snap.ok) return { ok: false, res: snap };
-    let entries = cacheBrowseSnapshot(tab, valueOf(snap));
-    if (kind === "type") {
-      const typeable = entries.filter((e) => BROWSE_TYPEABLE.test(e.role));
-      if (typeable.length) entries = typeable;
-    }
-    const want = loc.label.replace(/\s+/g, " ").trim().toLowerCase();
-    let hits = entries.filter((e) => e.name.toLowerCase() === want);
-    if (!hits.length) hits = entries.filter((e) => e.name.toLowerCase().includes(want));
-    const live = hits.filter((e) => !e.disabled);
-    if (live.length) hits = live;
-    if (hits.length === 1) return { ok: true, ref: hits[0]!.ref, entry: hits[0]! };
-    if (hits.length > 1) {
-      return {
-        ok: false,
-        res: failure(
-          "EXECUTION_FAILED",
-          `AMBIGUOUS: "${loc.label}" matches ${hits.length} controls; use one of these refs:\n${hits.slice(0, 12).map((h) => h.line).join("\n")}`,
-        ),
-      };
-    }
-    return {
-      ok: false,
-      res: failure("EXECUTION_FAILED", `NO_MATCH: no control named "${loc.label}". Run snap to see the controls.`),
-    };
   }
 
   async function cdp(method: string, params: Json, targetId?: string, timeoutMs?: number): Promise<InvokeResult> {
@@ -1805,15 +1682,6 @@ export function createPageHelperHandler(
     }
   }
 
-  async function browseDelta(res: InvokeResult, tab: number): Promise<InvokeResult> {
-    const delta = await callBrowse("snapshot", { tab, interactive: true, delta: true });
-    if (delta.ok) {
-      cacheBrowseSnapshot(tab, valueOf(delta));
-      return success(`${valueOf(res)}\n${valueOf(delta)}`);
-    }
-    return res;
-  }
-
   /** Perform HTML5 drag-and-drop (via Input.setInterceptDrags) or plain mouse drag. */
   async function runDrag(input: Json, rawTargetId: string | undefined, quiet: boolean, healInBatch: boolean): Promise<InvokeResult> {
     // Pin the tab once: press, moves, and release must all land on the tab the drag started on.
@@ -1997,10 +1865,9 @@ export function createPageHelperHandler(
     input: Json,
     targetId: string | undefined,
     quiet: boolean,
-    browseTab: number | undefined,
     healInBatch = false,
   ): Promise<InvokeResult> {
-    if (browseTab === undefined && PACE_INPUT_ACTIONS.has(action) && isNatural(input)) await paceBeforeInput(targetId);
+    if (PACE_INPUT_ACTIONS.has(action) && isNatural(input)) await paceBeforeInput(targetId);
     switch (action) {
       case "click": {
         const natural = isNatural(input);
@@ -2009,7 +1876,6 @@ export function createPageHelperHandler(
           if (!Number.isFinite(x) || !Number.isFinite(y)) {
             return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: --xy takes x,y in CSS pixels");
           }
-          if (browseTab !== undefined) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: --xy needs a DevTools tab");
           const hit = await evalHelper(
             { steps: [{ kind: "bc", method: "baseline" }, { kind: "bc", method: "hit", args: [x!, y!] }], join: "\n" },
             targetId,
@@ -2022,12 +1888,6 @@ export function createPageHelperHandler(
           if (!clicked.ok) return inputFailed(clicked, `click ${x},${y}`);
           if (isCanvas) return success(`click ${x},${y}: delivered. ${what}\n${await picture.pictureChanges(targetId, beforeHash)}`);
           return withChanges(`click ${x},${y}: delivered. ${what}`, before, quiet, targetId);
-        }
-        if (browseTab !== undefined) {
-          const resolved = await resolveBrowseRef(input["ref"], "click", browseTab);
-          if (!resolved.ok) return resolved.res;
-          const res = await callBrowse("click", { tab: browseTab, ref: resolved.ref });
-          return res.ok && !quiet ? browseDelta(res, browseTab) : res;
         }
         const found = await locate(input["ref"], "click", targetId, healInBatch);
         if (!found.ok) return found.res;
@@ -2057,17 +1917,6 @@ export function createPageHelperHandler(
         const natural = isNatural(input);
         const mode: "human" | "fast" | "keys" =
           input["fast"] === true ? "fast" : input["keys"] === true ? "keys" : natural ? "human" : "fast";
-        if (browseTab !== undefined) {
-          if (input["focused"] === true) {
-            return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: type --focused needs a DevTools tab");
-          }
-          const resolved = await resolveBrowseRef(input["ref"], "type", browseTab);
-          if (!resolved.ok) return resolved.res;
-          const guardErr = checkBrowseFieldGuard(`${String(input["ref"] ?? "")} ${resolved.entry?.line ?? ""}`, resolved.ref);
-          if (guardErr) return guardErr;
-          const res = await callBrowse("fill", { tab: browseTab, ref: resolved.ref, value: text });
-          return res.ok && !quiet ? browseDelta(res, browseTab) : res;
-        }
         if (input["focused"] === true) {
           const g = await evalHelper({ kind: "bc", method: "guardFocused" }, targetId);
           if (!g.ok) return g;
@@ -2194,9 +2043,6 @@ export function createPageHelperHandler(
         if (typeof input["option"] !== "string" || input["option"] === "") {
           return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: option is required");
         }
-        if (browseTab !== undefined) {
-          return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: select needs a DevTools tab");
-        }
         const option = input["option"];
         const found = await locate(input["ref"], "select", targetId, healInBatch);
         if (!found.ok) return found.res;
@@ -2251,9 +2097,6 @@ export function createPageHelperHandler(
         if (!existsSync(filePath)) {
           return failure("INPUT_VALIDATION_FAILED", `INPUT_INVALID: file does not exist: ${filePath}`);
         }
-        if (browseTab !== undefined) {
-          return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: upload needs a DevTools tab");
-        }
         const refInput = typeof input["ref"] === "string" ? input["ref"].trim() : "";
         if (!refInput) {
           return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: a file input ref, label, or CSS selector is required");
@@ -2294,7 +2137,6 @@ export function createPageHelperHandler(
       }
 
       case "drag": {
-        if (browseTab !== undefined) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: drag needs a DevTools tab");
         return runDrag(input, targetId, quiet, healInBatch);
       }
 
@@ -2305,10 +2147,6 @@ export function createPageHelperHandler(
         const keyName = typeof input["key"] === "string" ? input["key"] : "";
         if (!KEYS[keyName]) {
           return failure("INPUT_VALIDATION_FAILED", `INPUT_INVALID: key must be ${Object.keys(KEYS).join(", ")}`);
-        }
-        if (browseTab !== undefined) {
-          const res = await callBrowse("press", { tab: browseTab, key: keyName });
-          return res.ok && !quiet ? browseDelta(res, browseTab) : res;
         }
         const isPic = !quiet && (await picture.isPicture(targetId));
         const beforeHash = isPic ? await picture.canvasHash(targetId) : "";
@@ -2454,9 +2292,7 @@ export function createPageHelperHandler(
     input: Json,
     targetId: string | undefined,
     quiet: boolean,
-    browseTab: number | undefined,
   ): Promise<InvokeResult> {
-    if (browseTab !== undefined) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: hover needs a DevTools tab");
     const natural = isNatural(input);
     // Hover is pointer input: pay any post-nav dwell before it scrolls or moves.
     if (natural) await paceBeforeInput(targetId);
@@ -2498,12 +2334,11 @@ export function createPageHelperHandler(
   }
 
   /** Accept or dismiss an open JavaScript alert/confirm/prompt/beforeunload dialog. */
-  async function runDialog(input: Json, targetId: string | undefined, browseTab: number | undefined): Promise<InvokeResult> {
+  async function runDialog(input: Json, targetId: string | undefined): Promise<InvokeResult> {
     const sub = String(input["sub"] ?? "").toLowerCase();
     if (sub !== "accept" && sub !== "dismiss") {
       return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: dialog subcommand must be accept or dismiss");
     }
-    if (browseTab !== undefined) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: dialog needs a DevTools tab");
     const text = input["text"];
     if (text !== undefined && typeof text !== "string") {
       return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: dialog prompt text must be a string");
@@ -2537,13 +2372,11 @@ export function createPageHelperHandler(
   async function runEmulate(
     input: Json,
     targetId: string | undefined,
-    browseTab: number | undefined,
     cdpTarget: string | undefined,
   ): Promise<InvokeResult> {
-    if (browseTab !== undefined) return runEmulateNow(input, targetId, browseTab);
     const pinned = targetId ?? cdpTarget;
     const key = pinned ?? "";
-    const run = (emulateQueue.get(key) ?? Promise.resolve()).then(() => runEmulateNow(input, pinned, browseTab));
+    const run = (emulateQueue.get(key) ?? Promise.resolve()).then(() => runEmulateNow(input, pinned));
     const tail = run.catch(() => undefined);
     emulateQueue.set(key, tail);
     try {
@@ -2554,8 +2387,7 @@ export function createPageHelperHandler(
   }
 
   /** Device, media, network, and user-agent emulation. Reset uses Chrome's double-clear race fix. */
-  async function runEmulateNow(input: Json, targetId: string | undefined, browseTab: number | undefined): Promise<InvokeResult> {
-    if (browseTab !== undefined) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: emulate needs a DevTools tab");
+  async function runEmulateNow(input: Json, targetId: string | undefined): Promise<InvokeResult> {
     const keys = ["viewport", "mobile", "colorScheme", "reducedMotion", "offline", "ua", "reset"] as const;
 
     let width = 0;
@@ -2876,28 +2708,6 @@ export function createPageHelperHandler(
   }
 
   /**
-   * Read the same probe on a `browse:<n>` tab. browse has no `__bc` helper and no wall probe, but its
-   * `eval` tool is read-only and already the route for `evaluate` on these tabs, so the self-contained
-   * probe expression runs there unchanged and feeds the same classifier.
-   */
-  async function readChallengeProbeBrowse(
-    browseTab: number,
-    timeoutMs = 4_000,
-    deadline?: number,
-    strict = false,
-  ): Promise<ProbeReadResult> {
-    const budget = deadline !== undefined ? Math.min(timeoutMs, deadline - Date.now()) : timeoutMs;
-    if (budget <= 0) return { kind: "error" };
-    const res = await raceDeadline(
-      callBrowse("eval", { tab: browseTab, expression: CHALLENGE_PROBE_EXPR, timeout: Math.max(1, Math.floor(budget)) }, budget),
-      deadline,
-      failure("EXECUTION_FAILED", "CHALLENGE_PROBE_TIMEOUT"),
-    );
-    if (!res.ok) return { kind: "error" };
-    return parseProbeReadback(valueOf(res), strict);
-  }
-
-  /**
    * Read a lightweight bot-challenge probe for the current page.
    * - On extension tabs: stays on the silent `evalHelper` (`bc_call`) tier so normal pages never attach `chrome.debugger`.
    * - During a non-interactive interstitial wait, if a throttled/collapsed background extension tab stops answering
@@ -2910,12 +2720,6 @@ export function createPageHelperHandler(
   ): Promise<ProbeReadResult> {
     const remaining = (cap: number): number =>
       opts.deadline !== undefined ? Math.min(cap, opts.deadline - Date.now()) : cap;
-
-    // browse tabs have no `__bc` helper; their read-only `eval` runs the same self-contained probe.
-    const browseTab = browseTabNumber(targetId);
-    if (browseTab !== undefined) {
-      return readChallengeProbeBrowse(browseTab, opts.reprobe ? 1_500 : 4_000, opts.deadline, opts.strict);
-    }
 
     if (extensionTabOf(targetId) !== undefined) {
       const baseTimeout = opts.reprobe ? 1_500 : 4_000;
@@ -3137,11 +2941,9 @@ export function createPageHelperHandler(
 
   async function handlePage(action: string, input: Json, rawTargetId?: string): Promise<InvokeResult> {
     const resolved = await resolveTargetBackend(rawTargetId);
-    const { browseTab, extensionTarget, cdpTarget } = resolved;
+    const { extensionTarget, cdpTarget } = resolved;
     if (rawTargetId === undefined) implicitCdpTarget = cdpTarget;
-    // A browse batch resolves only a tab number, so pin `browse:<n>`: the guard and every probe route by
-    // target id, and an empty id sent them to the CDP backend instead of the browse tab they act on.
-    const targetId = rawTargetId ?? extensionTarget ?? (browseTab !== undefined ? `browse:${browseTab}` : undefined);
+    const targetId = rawTargetId ?? extensionTarget;
     const quiet = input["quiet"] === true;
 
     switch (action) {
@@ -3150,16 +2952,6 @@ export function createPageHelperHandler(
         const full = input["full"] === true;
         const find = typeof input["find"] === "string" && input["find"] !== "" ? input["find"] : undefined;
         const within = typeof input["within"] === "string" && input["within"] !== "" ? input["within"] : undefined;
-        if (browseTab !== undefined) {
-          const res = await callBrowse("snapshot", {
-            tab: browseTab,
-            ...(all ? {} : { interactive: true }),
-            ...(find ? { find } : {}),
-            ...(within ? { within } : {}),
-          });
-          if (res.ok) cacheBrowseSnapshot(browseTab, valueOf(res));
-          return maybeSaveOut(res, input);
-        }
         if (input["ax"] === true) return maybeSaveOut(await snapAx(find, targetId), input);
         const opts: Json = {
           all,
@@ -3217,13 +3009,11 @@ export function createPageHelperHandler(
       }
 
       case "form": {
-        if (browseTab !== undefined) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: form needs a DevTools tab");
         const opts: Json = typeof input["within"] === "string" && input["within"] !== "" ? { within: input["within"] } : {};
         return maybeSaveOut(await evalHelper({ kind: "bc", method: "form", args: [opts] }, targetId), input);
       }
 
       case "query": {
-        if (browseTab !== undefined) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: query needs a DevTools tab");
         const opts: Json = {
           selector: input["selector"],
           ...(input["fields"] ? { fields: input["fields"] } : {}),
@@ -3234,7 +3024,6 @@ export function createPageHelperHandler(
       }
 
       case "read-urls": {
-        if (browseTab !== undefined) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: read-urls needs a DevTools tab");
         const opts: Json = {
           urls: input["urls"],
           ...(Number(input["concurrency"]) > 0 ? { concurrency: Number(input["concurrency"]) } : {}),
@@ -3251,16 +3040,16 @@ export function createPageHelperHandler(
       case "drag":
       case "wait":
       case "key":
-        return act(action, input, targetId, quiet, browseTab);
+        return act(action, input, targetId, quiet);
 
       case "hover":
-        return runHover(input, targetId, quiet, browseTab);
+        return runHover(input, targetId, quiet);
 
       case "dialog":
-        return runDialog(input, targetId, browseTab);
+        return runDialog(input, targetId);
 
       case "emulate":
-        return runEmulate(input, targetId, browseTab, cdpTarget);
+        return runEmulate(input, targetId, cdpTarget);
 
       case "handoff":
         return runHandoff(input, targetId, resolved);
@@ -3317,10 +3106,8 @@ export function createPageHelperHandler(
         const steps = parseSteps(input);
         if (typeof steps === "string") return failure("INPUT_VALIDATION_FAILED", `INPUT_INVALID: ${steps}`);
         if (steps.length === 0) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: no steps given");
-        const start = browseTab === undefined
-          ? await evalHelper({ kind: "bc", method: "baseline" }, targetId)
-          : await readProperty("href", targetId);
-        if (browseTab === undefined && start && !start.ok) return start;
+        const start = await evalHelper({ kind: "bc", method: "baseline" }, targetId);
+        if (start && !start.ok) return start;
         const startUrl = start?.ok ? valueOf(start) : "";
         let prevUrl = startUrl;
         const out: string[] = [];
@@ -3330,13 +3117,8 @@ export function createPageHelperHandler(
         // Nothing looks at the page until a step has run, so a batch would act on a challenge page before the
         // post-step check could see it. Probe up front on the same terms as that check: a wall, a challenge, a
         // page that could not be read, or a redirect off the start host stops the batch with every step unrun.
-        // Attach-free on DevTools tabs (one bc_call read plus the silent probe); on browse tabs the href read
-        // and the read-only `eval` probe are the equivalent.
+        // Attach-free on DevTools tabs: one bc_call read plus the silent probe.
         const readPreStepState = async (): Promise<{ url: string; wall: string }> => {
-          if (browseTab !== undefined) {
-            const href = await readProperty("href", targetId);
-            return { url: href.ok ? valueOf(href) : "", wall: "" };
-          }
           const state = await evalHelper(
             { steps: [{ kind: "href" }, { kind: "bc", method: "wall", fallback: "" }], join: "\n" },
             targetId,
@@ -3399,7 +3181,7 @@ export function createPageHelperHandler(
             ...step.input,
             quiet: true,
           };
-          const res = await act(step.action, stepInput, targetId, true, browseTab, true);
+          const res = await act(step.action, stepInput, targetId, true, true);
           if (!res.ok) {
             out.push(`${i + 1}. ${step.label}: FAILED ${messageOf(res)}`);
             stopped = `step ${i + 1} failed`;
@@ -3407,7 +3189,6 @@ export function createPageHelperHandler(
           }
           out.push(`${i + 1}. ${valueOf(res)}`);
           if (
-            browseTab === undefined &&
             step.action === "type" &&
             !valueOf(res).includes(": delivered (") &&
             !valueOf(res).includes("secure field") &&
@@ -3417,7 +3198,6 @@ export function createPageHelperHandler(
             break;
           }
           const isLastStep = i === steps.length - 1;
-          if (isLastStep && browseTab !== undefined) continue;
           const settleStartedAt = now();
           const state = await evalHelper(
             {
@@ -3449,7 +3229,7 @@ export function createPageHelperHandler(
           const navigated = Boolean(url && prevUrl && stripHash(url) !== stripHash(prevUrl));
           if (navigated) resetMotion(targetId);
           const challengeWall = wall === "captcha" || wall === "rate-limit" || /^# [1-9]\d* row/.test(markerRows);
-          if (browseTab === undefined && (navigated || challengeWall)) {
+          if (navigated || challengeWall) {
             const challenge = await checkChallenge(targetId, { wallHint: wall, knownUrl: url });
             if (challenge.status === "block") {
               challengeReport = formatChallengeOutput(challenge.detection, challenge.url || url, {
@@ -3493,29 +3273,13 @@ export function createPageHelperHandler(
           }
         }
         if (stopped) out.push(`# STOPPED: ${stopped}. ${steps.length - out.length} step(s) not run.`);
-        if (!quiet) {
-          if (browseTab !== undefined) {
-            const delta = await callBrowse("snapshot", { tab: browseTab, interactive: true, delta: true });
-            if (delta.ok) {
-              cacheBrowseSnapshot(browseTab, valueOf(delta));
-              out.push(valueOf(delta));
-            }
-          } else if (!challengeReport) {
-            out.push(await changes(startUrl, targetId));
-          }
-        }
+        if (!quiet && !challengeReport) out.push(await changes(startUrl, targetId));
         if (challengeReport) out.unshift(challengeReport);
         if (pacingTrace) out.push(`# PACING ${JSON.stringify({ think: pacingTrace })}`);
         return stopped ? failure("EXECUTION_FAILED", out.join("\n")) : success(out.join("\n"));
       }
 
       case "value": {
-        if (browseTab !== undefined) {
-          return failure(
-            "INPUT_VALIDATION_FAILED",
-            "INPUT_INVALID: value <ref> reads DevTools refs; on browse:<n> tabs use snap or eval",
-          );
-        }
         const found = await locate(input["ref"], "read", targetId);
         if (!found.ok) return found.res;
         if (found.loc.kind === "ax") {
@@ -3530,7 +3294,6 @@ export function createPageHelperHandler(
 
       case "text": {
         if (input["scroll"] === true) {
-          if (browseTab !== undefined) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: text --scroll needs a DevTools tab");
           const opts: Json = {
             ...(typeof input["within"] === "string" && input["within"] !== "" ? { within: input["within"] } : {}),
             ...(typeof input["filter"] === "string" && input["filter"] !== "" ? { match: input["filter"] } : {}),
@@ -3555,7 +3318,6 @@ export function createPageHelperHandler(
       }
 
       case "ocr": {
-        if (browseTab !== undefined) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: ocr needs a DevTools tab");
         const read = await picture.readPicture(targetId);
         if (!read.ok) return read.res;
         picture.remember(targetId, read.lines);
@@ -3575,10 +3337,6 @@ export function createPageHelperHandler(
           ...(typeof input["path"] === "string" && input["path"] !== "" ? { path: input["path"] } : {}),
           ...(targetId ? { targetId } : {}),
         };
-        if (browseTab !== undefined) {
-          const shot = await invoke("capture_screenshot", base);
-          return shot.ok ? success(String((shot.data as Json)["path"])) : shot;
-        }
         if (input["full"] === true) {
           const shot = await invoke("capture_screenshot", { ...base, fullPage: true });
           return shot.ok
@@ -3714,10 +3472,9 @@ export function createPageHelperHandler(
           data["created"] === true && typeof data["targetId"] === "string" && extensionTabOf(data["targetId"]) !== undefined
             ? (data["targetId"] as string)
             : undefined;
-        const onBrowse = browseTabNumber(tab) !== undefined || (tab === undefined && browseTab !== undefined);
         const lines = [JSON.stringify(data)];
         if (data["reused"] === true && tab) lines.push(`# reused this session's tab ${tab}; --new-tab opens another`);
-        if (!onBrowse) {
+        {
           const state = await evalHelper(
             {
               steps: [
@@ -3819,22 +3576,19 @@ export function createPageHelperHandler(
           if (!wall && paced) recordNavPace(tab, final || url, navAt, chars, paceKey);
         }
         if (input["snap"] === true) {
-          const snap = await handlePage("snap", { _skipChallengeCheck: !onBrowse }, tab);
+          const snap = await handlePage("snap", { _skipChallengeCheck: true }, tab);
           lines.push(snap.ok ? valueOf(snap) : `# snap failed: ${messageOf(snap).slice(0, 200)}`);
         }
         return success(lines.join("\n"));
       }
 
       case "styles":
-        if (browseTab !== undefined) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: styles needs a DevTools tab");
         return inspectStyles(invoke, resolveObject, input, targetId);
 
       case "issues":
-        if (browseTab !== undefined) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: issues needs a DevTools tab");
         return inspectIssues(invoke, input, targetId);
 
       case "perf":
-        if (browseTab !== undefined) return failure("INPUT_VALIDATION_FAILED", "INPUT_INVALID: perf needs a DevTools tab");
         return inspectPerf(invoke, input, targetId);
 
       case "notes":

@@ -2,9 +2,6 @@
 // Two-tier local-only relay (127.0.0.1, ports 49222-49229):
 //   1. Silent tier (no yellow banner): chrome.tabs + chrome.scripting (ISOLATED world) for __bc reads.
 //   2. Full CDP tier (on-demand): chrome.debugger per tab, auto-detached after 30s idle.
-//
-// Keepalive (`chrome.runtime.getPlatformInfo`) and mutual HMAC handshake patterns adapted from
-// anomalyco/browse (MIT License).
 
 import { createDebuggerHub, tabNotSharedMessage } from "./lib/debugger-hub.js";
 import { createFrameDecoder, encodeMessage, TRANSPORT_MAX_PAYLOAD_BYTES, utf8ByteLength } from "./lib/frames.js";

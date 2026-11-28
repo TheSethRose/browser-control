@@ -5,9 +5,6 @@
  * Needs no remote-debugging flag and no per-connection "Allow" click. Silent reads run in the
  * extension's ISOLATED content-script world via `bc_call`; trusted input and DevTools calls
  * attach `chrome.debugger` on demand via `cdp`.
- *
- * Mutual HMAC-SHA256 challenge-response handshake, BrowserLinks multi-browser identity, and MV3
- * keepalive patterns adapted from anomalyco/browse (MIT License).
  */
 
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
